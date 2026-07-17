@@ -1,0 +1,114 @@
+syntax = "proto3";
+package styx.control;
+option go_package = "github.com/arloliu/styx/internal/control/controlpb";
+
+message ControlMessage {
+  uint64 correlation_id = 1;
+  uint64 generation = 2;
+  oneof body {
+    Hello hello = 3;
+    HelloAck hello_ack = 4;
+    AttachRegion attach_region = 5;
+    AttachRegionAck attach_region_ack = 6;
+    Heartbeat heartbeat = 7;
+    HeartbeatAck heartbeat_ack = 8;
+    Drain drain = 9;
+    DrainAck drain_ack = 10;
+    Resume resume = 11;
+    ResumeAck resume_ack = 12;
+    SaveState save_state = 13;
+    SaveStateAck save_state_ack = 14;
+    Shutdown shutdown = 15;
+    ShutdownAck shutdown_ack = 16;
+    Poisoned poisoned = 17;
+  }
+}
+
+message FeatureFlag {
+  string name = 1;
+  bool required = 2;
+  bool supported = 3; // set by the receiver when echoing in HelloAck
+}
+
+message ServiceRequirement {
+  string service = 1;
+  uint32 min_version = 2;
+  uint32 max_version = 3;
+}
+
+message ServiceVersion {
+  string service = 1;
+  uint32 version = 2;
+}
+
+message Hello {
+  uint32 protocol_min = 1;
+  uint32 protocol_max = 2;
+  repeated FeatureFlag features = 3;
+  repeated string transports = 4;
+  repeated string codecs = 5;
+  uint64 nonce = 6;
+  repeated ServiceRequirement services = 7; // host->plugin only; empty from plugin
+}
+
+message HelloAck {
+  uint32 protocol_version = 1;
+  string transport = 2;
+  uint32 layout_version = 3; // 0 unless transport == "shm"
+  repeated FeatureFlag features = 4;
+  string codec = 5;
+  uint64 nonce = 6; // echoed from Hello
+  string plugin_name = 7;
+  string plugin_semver = 8;
+  string binary_sha256 = 9;
+  repeated ServiceVersion services = 10;
+  // incompatible_reason, when non-empty, marks this HelloAck as a
+  // negotiation-rejection reply rather than a success ack: a plugin that
+  // cannot satisfy the host's per-service requirements fails handshake
+  // with the offending service named in the error. The plugin still
+  // replies (echoing nonce) instead of silently closing, so the host
+  // can reconstruct a typed IncompatibleError instead of observing an
+  // undifferentiated connection loss. Every other field is unset on a
+  // rejection reply.
+  string incompatible_reason = 11;
+}
+
+message AttachRegion {
+  uint64 generation = 1;
+  uint64 layout_size = 2;
+  uint32 layout_version = 3;
+  uint32 fd_count = 4; // declared fd count carried via SCM_RIGHTS
+}
+message AttachRegionAck {}
+
+message ActiveHandlerLease {
+  uint64 call_id = 1;
+  int64 start_unix_nano = 2;
+  int64 lease_renewed_unix_nano = 3;
+}
+message Heartbeat {
+  uint64 sequence = 1;
+  uint64 descriptors_consumed_h2p = 2;
+  uint64 descriptors_produced_p2h = 3;
+  uint64 inflight_count = 4;
+  uint64 arena_occupancy_bytes = 5;
+  repeated ActiveHandlerLease leases = 6;
+}
+message HeartbeatAck { uint64 sequence = 1; }
+
+message Drain { int64 deadline_unix_nano = 1; }
+message DrainAck {}
+message Resume {}
+message ResumeAck {}
+
+message SaveState {
+  uint32 snapshot_fd_count = 1; // always 1: the sealed snapshot memfd
+  uint64 declared_length = 2;
+  uint32 format_version = 3;
+}
+message SaveStateAck { bytes checksum = 1; }
+
+message Shutdown { int64 deadline_unix_nano = 1; }
+message ShutdownAck {}
+
+message Poisoned { string reason = 1; }
