@@ -1,0 +1,1 @@
+{"impl":"shm-spike","payload_bytes":1048576,"concurrency":512,"regime":"gomaxprocs1","p50_ns":77617212,"p95_ns":1088883920,"p99_ns":2053810011,"p999_ns":3044782111,"throughput_ops_sec":378.66648075190204,"allocs_per_op":10.24237060546875,"wakeup_syscalls_per_op":0.1962890625,"samples":16384,"timestamp":"2026-07-16T20:23:10.32510214Z"}

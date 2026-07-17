@@ -1,0 +1,1 @@
+{"impl":"shm-spike","payload_bytes":1048576,"concurrency":512,"regime":"gc-churn","p50_ns":1024769158,"p95_ns":3025531298,"p99_ns":4020102174,"p999_ns":4025767444,"throughput_ops_sec":147.50586375069682,"allocs_per_op":16.97265625,"wakeup_syscalls_per_op":0.4205729166666667,"samples":4608,"timestamp":"2026-07-16T20:26:33.839969139Z"}

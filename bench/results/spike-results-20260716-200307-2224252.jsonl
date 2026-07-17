@@ -1,0 +1,2 @@
+{"impl":"shm-spike","payload_bytes":1048576,"concurrency":8,"regime":"default","p50_ns":838255,"p95_ns":1376011,"p99_ns":1548680,"p999_ns":1789679,"throughput_ops_sec":6307.906297930439,"allocs_per_op":7.640575,"wakeup_syscalls_per_op":0.2559375,"samples":80000,"timestamp":"2026-07-16T20:03:20.090065841Z"}
+{"impl":"shm-spike","payload_bytes":64,"concurrency":1,"regime":"idle-wake","p50_ns":9390,"p95_ns":17140,"p99_ns":30719,"p999_ns":47930,"throughput_ops_sec":0,"allocs_per_op":0,"wakeup_syscalls_per_op":2,"samples":10000,"timestamp":"2026-07-16T20:03:30.864420574Z"}
