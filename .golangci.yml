@@ -1,0 +1,28 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - unused
+    - errcheck
+    - ineffassign
+    - revive
+    - gocyclo
+    - lll
+  settings:
+    gocyclo:
+      min-complexity: 22
+    lll:
+      line-length: 120
+    revive:
+      rules:
+        - name: context-as-argument
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
