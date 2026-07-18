@@ -27,6 +27,33 @@
 
 Every cross-process invariant is frozen once, in `docs/specs/shm-abi.md`, before any layer above is coded; every task after the one that authors that document implements a named section of it rather than inventing wire details inline.
 
+## Deferred to M3
+
+> Grilling-session amendment. Not a frozen Global Constraint above — a scope
+> boundary note for this plan, cross-referenced from Task 7.
+
+`docs/specs/shm-abi.md` Appendix A ("Large messages (> `max_payload`)") records a
+**composite size-based routing transport** ("Path 4") as the intended long-term
+mechanism for plugins that mix frequent-small and rare-large messages: it routes
+each message by size — `≤ shm_inline_max` (the largest configured slab's usable
+capacity) travels inline over the SHM transport built in this plan; larger, rare
+messages route on demand over the `uds` transport, giving gRPC-like *transient*
+memory behavior for the rare giants instead of permanently sizing a huge top slab
+class into every region. It lives **entirely in `internal/rpcruntime`, above the
+`transport.Transport` interface** — no ABI hooks, no `layout_version` bump, no
+descriptor/flag additions, no changes to `internal/shm`/`ring`/`arena`/`event` —
+and is **deferred to M3**, where per `shm-abi.md` Appendix A it is **the
+preferred mechanism and supersedes "Path 3"**, the previously-documented
+out-of-band-spill mechanism (a dedicated sealed memfd passed over the control
+plane, referenced from the frame via a negotiated flag bit). Path 3 stays
+documented in `shm-abi.md` as a retained alternative, not deleted, but Path 4 is
+the one this program intends to build.
+
+**M2 ships per-plugin transport selection only** (Task 7, above): a plugin picks
+`shm` or `uds` wholesale at attach time, using its configured `max_payload`
+against SHM's feasible geometry. Per-message routing between the two transports
+for a single plugin — Path 4 — is out of this plan's scope.
+
 ## Task Overview & Model Assignment
 
 | Task | Model | Effort | Rationale |
@@ -863,6 +890,51 @@ func (w *writer) emit(i intent) { panic("per shm-abi.md") }
 > CRC32C `checksum` flag) MUST build the dependency-declaration/validation
 > mechanics alongside the support matrix, not bolt them on after.
 
+> **Grilling-session amendment — `max_payload` is per-plugin and retires `transport.MaxFrameSize`
+> (`docs/specs/shm-abi.md` §2/Appendix A, "Concrete decision: geometry is
+> configuration").** `max_payload` becomes a **per-plugin** configuration value,
+> not a package-level global, and is honored by **both** the `uds` and `shm`
+> transports for a given plugin, so the same plugin enforces the same payload
+> ceiling regardless of which transport it runs over. The M1
+> `transport.MaxFrameSize` compile-time constant (`internal/transport/transport.go:15`,
+> currently `1 << 20`) is retired in favor of this per-plugin value: the UDS recv
+> guard (`internal/transport/uds.go`, which currently checks the constant before
+> allocating the payload buffer — see the `payloadLen > MaxFrameSize` checks) MUST
+> be retrofitted to check the plugin's configured `max_payload` instead, while
+> **preserving the pre-allocation bound** — the guard is security-critical (it is
+> what stops a malicious peer from forcing unbounded allocation before the length
+> is validated) and the retrofit must remain check-before-allocate, never
+> check-after. This is a **reviewed change to shipped M1 security code**; call it
+> out explicitly in review for this task, and add a regression test asserting the
+> bound is still enforced pre-allocation.
+>
+> Transport selection is **per-plugin**, not per-message: a plugin picks the `shm`
+> or `uds` transport wholesale at attach time. A plugin whose configured
+> `max_payload` exceeds what feasible SHM geometry can serve (the §18
+> config-sanity bound — i.e., no size class can be configured large enough
+> without violating the capacity invariant this task's `admission.go` validates)
+> uses `uds`. Per-message routing between the two transports for a single plugin
+> is explicitly **not** in M2 scope — see the "Deferred to M3" section near the
+> top of this plan (right after Global Constraints), which is `shm-abi.md`
+> Appendix A's "Path 4".
+
+> **Grilling-session amendment — `trace` joins the negotiated feature tuple
+> (`docs/specs/shm-abi.md` §5, "Controller-authorized deviation (trace is a
+> negotiated feature)").** `trace` is additive and symmetric with the existing
+> `checksum`/`compression` features in the acknowledged handshake tuple and in the
+> `allowed_flags` computation this task's dependency-declaration/support-matrix
+> machinery drives (`TRACE_PRESENT` MAY be set on the wire only when `trace` is
+> negotiated, exactly the same shape as `CRC32C_PRESENT`/`checksum`) — implement
+> `trace` negotiation using `checksum` as the template: same
+> intersection/negotiation path, same support-matrix entry, same
+> dependency-declaration/validation mechanics. This **replaces trace's former
+> base-v1 always-on status**: the design spec's observability section describes
+> trace context as an always-available base capability, but `shm-abi.md` records
+> the deliberate deviation to a negotiated feature (removing the always-on 32-byte
+> trace-prefix tax and the small-message size-class jump it caused when tracing is
+> unused) — this task is where that deviation becomes real negotiation code, not
+> just ABI text.
+
 **Model/Effort/Why:** sonnet / high — composition of already-proven parts (the packages built in the tasks above) behind the existing framework's `transport.Transport` interface; the design decisions were made upstream, this task wires them together and adds admission control.
 
 **Files:**
@@ -996,6 +1068,41 @@ func validateCapacityInvariant(cfg Config, geom shm.RingGeometry, arenaGeom shm.
 >   transports: the existing framework's `closeOnce`+shutdown is adequate for single-owner callers,
 >   but the SHM transport's Close/unmap interaction makes the remaining fd-reuse
 >   window load-bearing — close it here.
+
+> **Grilling-session amendment — generation-mismatch escalation policy
+> (`docs/specs/shm-abi.md` §15: "the concrete threshold and action are owned by
+> Task 8, not frozen here").** The ABI layer normatively discards every
+> stale-generation frame and increments a diagnostic counter
+> (`stale_frames_discarded`); it takes no position on whether a given discard
+> stream is benign or alarming — that adjudication is this task's. A **mandatory
+> low absolute-count threshold is wrong**: a dying process legitimately emits a
+> short, bounded burst of late writes against its outgoing generation as it
+> unwinds, and a healthy respawn must not be poisoned by its predecessor's death
+> throes. This task defines, concretely:
+> - **Grace window per generation bump.** Every `bumpGeneration` call starts a
+>   grace window (bounded by the teardown state machine's own step budget rather
+>   than an unrelated fresh magic number). Discards observed during the grace
+>   window whose stamped generation is exactly one behind current are the
+>   expected benign-burst case: counted, never escalated.
+> - **Rate, not raw count, once the grace window has elapsed.** Discards of the
+>   immediately-prior generation observed after the grace window closes are
+>   evaluated as a *rate over a sliding window*, not a cumulative low-water-mark
+>   count: a burst that decays toward zero as the window closes stays benign and
+>   never escalates; a rate that stays sustained past the grace window is
+>   evidence of systematic corruption (e.g. a peer still writing against a stale
+>   mapping) and escalates via `PoisonFlag.Set(PoisonCauseStaleGeneration)`.
+> - **Immediate escalation for anything more than one generation stale, or for a
+>   future generation.** A discard whose generation is two or more behind
+>   current, or (per `detectLateWrite`'s `violatesFuture` case) ahead of current,
+>   cannot be explained by a single dying predecessor's late writes and escalates
+>   immediately, without waiting on the rate condition above.
+> The exact grace-window duration and sustained-rate threshold are
+> **configuration, not compile-time constants** (consistent with this plan's
+> admission-control and spin-budget values elsewhere) — this task picks and
+> documents defaults, but must not hardcode a single "N discards = poison" rule.
+> Add TDD coverage for the benign-burst case (a simulated dying respawn's late
+> writes never poison a healthy successor) alongside the existing
+> stale-generation tests below.
 
 **Model/Effort/Why:** sonnet / high — supervisor integration; state transitions are enumerable directly from the design spec's lifecycle section (teardown state machine) and shared-memory-layout section (poison flag), lowering design risk to composition + typed-error surfacing.
 
@@ -1343,6 +1450,28 @@ func RunMatrix(t *testing.T, windows []WindowSpec) { panic("unimplemented") }
 > only instrumented the mux path) executed on performance-governed dedicated
 > hardware — the 25 µs park/wake target is judged only against that measurement,
 > and any recalibration (with recorded justification) happens only then.
+
+> **Grilling-session amendment — empirically tune the lifecycle reserve and
+> default size-class counts under load.** Two currently-defaulted values get
+> tuned as part of this rerun, not left at their placeholder starting points:
+> - **The lifecycle reserve `R`** (`docs/specs/shm-abi.md` §18: `0 < R < C`,
+>   "**RECOMMENDED** default `R = C/16`" — 256 at the `default` profile's
+>   `C = 4096`, 512 at the `benchmark` profile's `C = 8192` — documented there as
+>   "a **starting** default, empirically tuned in Task 11; it is a scaling rule,
+>   not a magic constant"). Confirm or revise `C/16` against real load; record
+>   the result and rationale in `REPORT.md`.
+> - **The default-profile size-class COUNTS** (currently arbitrary placeholders
+>   per the arena task's size-class table, e.g. the `default`/`benchmark`
+>   profiles' `{4095, 1024, 26}` / `{8192, 2048, 64}` usable-slab figures in
+>   `shm-abi.md` §18's worked example). Tune per size class under the same load
+>   the `R` measurement uses.
+> Record the recommended **eqp-hub** profile (ring capacity `C`, `R`, and
+> per-class counts) in `REPORT.md` alongside the dimension-matrix results.
+> eqp-hub's real traffic is **< 1 MiB/s host↔plugin** — latency-bound, not
+> throughput-bound — so its recommended profile is expected to land lean, well
+> under 10 MiB total region size, rather than sized for sustained throughput;
+> state this explicitly as the recommendation's rationale rather than just the
+> numbers.
 
 **Files:**
 - `bench/shm/` — production-transport benchmark suite, mirroring the spike's structure (`bench/spike/`) but exercising `internal/transport/shm.Transport` instead of the spike prototype.
