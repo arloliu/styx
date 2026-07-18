@@ -36,7 +36,7 @@ file rather than guess its contents.
 
 ## Before Validation, Commit, or PR Work
 - **[500-validation-and-workflow.md](500-validation-and-workflow.md)** —
-  validation gates, Go toolchain commands (no Makefile yet), GitHub/`gh`
+  validation gates, `Makefile` targets, GitHub/`gh`
   workflow, review checklist.
 
 ## Before Crafting Commits or PRs

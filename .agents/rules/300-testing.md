@@ -97,5 +97,7 @@ design:
   incomplete, regardless of unit-test pass rate.
 
 ## Running Tests
-No per-package Make targets exist yet — see
-[500](500-validation-and-workflow.md) for the current `go test` invocations.
+`make test` runs the full suite with `-race`. No per-package Make target
+exists — for a fast local loop on one package, drop to
+`go test ./internal/ring/... -race` directly; see
+[500](500-validation-and-workflow.md) for the full command list.

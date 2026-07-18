@@ -14,9 +14,9 @@ over a Unix domain socket. Pure Go, Linux-first, protobuf IDL via a custom
 [`docs/specs/2026-07-16-styx-design.md`](docs/specs/2026-07-16-styx-design.md) before
 any non-trivial change — it is the design of record.
 
-This repo does not yet have a `Makefile` or task runner — it predates that tooling
-work. Until one exists, invoke the Go toolchain and linter directly;
-see [`500-validation-and-workflow.md`](.agents/rules/500-validation-and-workflow.md).
+This repo has a `Makefile` — prefer its targets (`make build`, `make test`,
+`make vet`, `make lint`, `make ci`, ...) over invoking the Go toolchain
+directly; see [`500-validation-and-workflow.md`](.agents/rules/500-validation-and-workflow.md).
 
 ## Rules
 
@@ -32,5 +32,5 @@ Two things to know before you touch code:
   package is the only public import; everything sharp — `internal/ring`,
   `internal/arena`, `internal/shm` — lives under `internal/` and stays there.
 - **Validation** ([`500`](.agents/rules/500-validation-and-workflow.md)): run
-  `go build ./...`, `go vet ./...`, `golangci-lint run`, and `go test ./... -race`
+  `make build`, `make vet`, `make lint`, and `make test` (or just `make ci`)
   before calling work done; this repo uses GitHub and `gh`, not GitLab.

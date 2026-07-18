@@ -2,8 +2,8 @@
 
 Apply when editing Go code. Don't refactor untouched code just to satisfy this
 file, unless the task already touches that code or the violation blocks the
-lint gate. Once a `.golangci.yaml` exists in this repo, it is the source of
-truth — if a number here disagrees with it, the config wins (see
+lint gate. `.golangci.yml` is the source of truth — if a number here
+disagrees with it, the config wins (see
 [500](500-validation-and-workflow.md), [700](700-go-after-write.md)).
 
 ## Go Style
@@ -46,7 +46,7 @@ receiver) → unexported methods (by receiver).
   errors together, since callers branch on the distinction
   (`styx.IsRetryable`).
 
-## Linter-Enforced Limits (interim — no `.golangci.yaml` yet)
+## Linter-Enforced Limits (`.golangci.yml`)
 - Function length: warn at 100 lines, prefer < 50.
 - Cyclomatic complexity: keep well under 22.
 - Line length: 120 chars.

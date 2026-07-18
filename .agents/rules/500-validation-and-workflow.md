@@ -1,37 +1,39 @@
 # 500 - Validation and Workflow
 
-Apply before validation, commits, or PR work. This repo has no `Makefile`/task
-runner yet — the commands below are the direct Go-toolchain equivalents until
-one is added. If a `Makefile` appears later, prefer its targets and update this
-file to point at them instead of duplicating logic here.
+Apply before validation, commits, or PR work. This repo has a `Makefile` —
+prefer its targets over invoking the Go toolchain directly.
 
 ## Validation Gates
-- Always run the lint step after Go changes (`golangci-lint run ./...` once a
-  config exists; `go vet ./...` at minimum today), fix all issues (loop:
-  [700](700-go-after-write.md)).
-- `go test ./...` (add `-race` for anything touching concurrency, and always
-  for `internal/ring`/`internal/arena`/`internal/transport`) before calling
-  work done. Add differential/chaos runs when the change is transport- or
+- Always run the lint step after Go changes (`make lint`, pinned
+  `golangci-lint` via `.golangci.yml` + `.linter.go.mod`), fix all issues
+  (loop: [700](700-go-after-write.md)).
+- `make test` (race detector is always on) before calling work done. Add
+  differential/chaos runs when the change is transport- or
   lifecycle-sensitive.
-- Changed a `.proto` file once `protoc-gen-go-styx` exists → regenerate and
-  commit output; never hand-edit generated files.
+- Changed a `.proto` file → `make generate` (pinned `buf` via `.buf.go.mod`,
+  driving the local `protoc-gen-go` and `protoc-gen-go-styx` plugins per
+  `buf.gen.yaml`/`buf.yaml`) and commit output; never hand-edit generated
+  files.
 - Exported API changes → update docs ([400](400-docs.md)).
-- Perf-sensitive change → run the relevant `bench/` benchmark before/after and
-  cite the numbers; "should be faster" is not evidence (see
-  [800](800-performance-security.md)).
+- Perf-sensitive change → `make bench` before/after and cite the numbers;
+  "should be faster" is not evidence (see [800](800-performance-security.md)).
 
-## Commands (interim — no Makefile yet)
+## Commands
 ```bash
-go build ./...          # Build everything
-go vet ./...             # Static checks
-golangci-lint run ./...  # Once a .golangci.yaml exists in this repo
-go test ./...             # All tests
-go test ./... -race       # Required for concurrency-touching packages
-go test ./... -run Fuzz -fuzz=FuzzX -fuzztime=30s   # Fuzz a specific target
-go generate ./...         # Once //go:generate directives exist
+make build      # Build the protoc-gen-go-styx binary
+make vet        # go vet ./...
+make lint       # golangci-lint run (pinned version, .golangci.yml)
+make fmt        # gofmt + goimports (golangci-lint fmt)
+make test       # go test ./... -race
+make bench      # bench/spike benchmark suite
+make generate   # buf generate (protobuf + Styx codegen)
+make ci         # lint + vet + test
+make help       # list all targets
 ```
-Prefer the narrowest package path (`go test ./internal/ring/...`) for fast
-local loops, then run the full gate before finishing.
+For fuzzing or a single package, drop to the raw toolchain:
+`go test ./internal/ring/... -run Fuzz -fuzz=FuzzX -fuzztime=30s`. Prefer the
+narrowest package path for fast local loops, then run `make ci` before
+finishing.
 
 ## Code Review Checklist
 - [ ] Correctness

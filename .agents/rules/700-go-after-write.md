@@ -4,19 +4,17 @@ After modifying any `.go` file:
 
 1. `go fix ./path/to/pkg/...` on affected packages only.
 2. Review the diff — confirm `go fix` only modernized code you touched.
-3. `go vet ./...` and `golangci-lint run ./...` (once a config exists) — fix
-   all reported issues.
+3. `make vet` and `make lint` — fix all reported issues.
 4. Re-run validation ([500](500-validation-and-workflow.md)) until clean.
 
 Never run `go fix ./...` in a feature commit — repo-wide modernization is its
 own dedicated change.
 
 ## Linting Notes
-- No `.golangci.yaml` exists in this repo yet. Until it does, `go vet ./...`
-  plus the limits in [200](200-coding-standards.md) are the working bar; once
-  a config lands, it becomes the source of truth and this file should point
-  at the pinned invocation the same way [500](500-validation-and-workflow.md)
-  does.
+- `.golangci.yml` (config) + `.linter.go.mod` (pinned `golangci-lint`
+  version, invoked via `go tool -modfile=.linter.go.mod`) is the source of
+  truth; `make lint` runs it. The limits in [200](200-coding-standards.md)
+  mirror this config — if they disagree, the config wins.
 
 ## Common Fixes
 | Lint error | Fix |

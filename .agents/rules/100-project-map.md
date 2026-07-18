@@ -14,9 +14,8 @@ not a claim about what `ls` shows today — always check reality first.
   once one exists). **Platform:** Linux-first, amd64 primary, arm64 CI-built
   best-effort. Pure Go — no cgo unless there is an extremely
   strong, documented reason.
-- **Lint:** no pinned `golangci-lint` config yet — see
-  [500](500-validation-and-workflow.md) and [700](700-go-after-write.md) for
-  the interim direct-toolchain workflow.
+- **Lint:** pinned via `.golangci.yml` + `.linter.go.mod` (`make lint`) — see
+  [500](500-validation-and-workflow.md) and [700](700-go-after-write.md).
 - **CI/VCS:** GitHub; use `gh`. No workflow files exist yet.
 
 ## Structure (planned)
@@ -77,13 +76,16 @@ styx/                      // public: Host, HostConfig, PluginSpec, PluginServer
   intentional exception, or you may be introducing a regression.
 
 ## Code Generation
-- `protoc-gen-go-styx` (planned, `cmd/protoc-gen-go-styx/`) consumes ordinary
-  protobuf `service` definitions and emits Styx client/server stubs — no gRPC
-  dependency in generated code.
-- Until this generator exists, do not hand-write files that *look* generated
-  (e.g. a `*.pb.go`-style header) — write plain Go and say so.
-- Once codegen exists: never hand-edit its output — change the `.proto`
-  source and regenerate. See [500](500-validation-and-workflow.md).
+- `protoc-gen-go-styx` (`cmd/protoc-gen-go-styx/`) consumes ordinary protobuf
+  `service` definitions and emits Styx client/server stubs — no gRPC
+  dependency in generated code. Wired into `buf.gen.yaml`/`buf.yaml`; run via
+  `make generate` (builds the plugin, then `buf generate` through the pinned
+  `.buf.go.mod` toolchain).
+- Never hand-edit generated output (`*.pb.go`, `*.styx.go`) — change the
+  `.proto` source and regenerate. See [500](500-validation-and-workflow.md).
+- Don't hand-write new files that *look* generated (a `*.pb.go`-style header)
+  for something the generator doesn't actually produce — write plain Go and
+  say so.
 
 ## Dependency Policy
 - Prefer stdlib. Pure Go, no cgo without an extremely strong, stated reason

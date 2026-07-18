@@ -3,6 +3,6 @@ plugins:
   - local: protoc-gen-go
     out: .
     opt: module=github.com/arloliu/styx
-  - local: /tmp/protoc-gen-go-styx
+  - local: bin/protoc-gen-go-styx
     out: .
     opt: module=github.com/arloliu/styx
