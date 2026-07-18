@@ -18,6 +18,7 @@ func newReclaimRing(t *testing.T, capacity uint64) *ring.Ring {
 	buf := make([]byte, capacity*shmregion.DescriptorSize)
 	tail := new(uint64)
 	head := new(uint64)
+
 	return ring.New(buf, tail, head, capacity)
 }
 

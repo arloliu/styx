@@ -123,6 +123,8 @@ func serviceID(fullName protoreflect.FullName) uint64 {
 // since method dispatch tables are scoped per service (pluginserver.go's
 // newServiceHandler builds one methods map per registered service), so
 // only same-service method names need to stay distinct once hashed.
+//
+//nolint:unparam // service is intentionally unused in the hash itself; see the doc above.
 func methodID(service protoreflect.FullName, method string) uint64 {
 	return fnv64a(method)
 }

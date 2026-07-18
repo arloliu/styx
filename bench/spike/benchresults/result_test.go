@@ -46,6 +46,7 @@ func readLines(t *testing.T, path string) []benchresults.Result {
 		out = append(out, r)
 	}
 	require.NoError(t, sc.Err())
+
 	return out
 }
 

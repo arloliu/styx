@@ -44,6 +44,7 @@ func (r *RawUDSBaseline) Start() error {
 	_ = os.Remove(path)
 	r.sockPath = path
 
+	//nolint:noctx // benchmark-harness Start has no ctx param; matches every other baseline in this package
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return err
@@ -51,11 +52,13 @@ func (r *RawUDSBaseline) Start() error {
 	r.ln = ln
 	go r.serve()
 
+	//nolint:noctx // see above
 	conn, err := net.Dial("unix", path)
 	if err != nil {
 		return err
 	}
 	r.conn = conn
+
 	return nil
 }
 
@@ -64,6 +67,7 @@ func (r *RawUDSBaseline) Call(payload []byte) ([]byte, error) {
 	defer r.callMu.Unlock()
 
 	lenBuf := make([]byte, 4)
+	//nolint:gosec // payload is this benchmark's own generated request, well under 4GiB
 	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
 	if _, err := r.conn.Write(lenBuf); err != nil {
 		return nil, err
@@ -79,6 +83,7 @@ func (r *RawUDSBaseline) Call(payload []byte) ([]byte, error) {
 	if _, err := io.ReadFull(r.conn, out); err != nil {
 		return nil, err
 	}
+
 	return out, nil
 }
 
@@ -95,6 +100,7 @@ func (r *RawUDSBaseline) Stop() error {
 	if err := os.Remove(r.sockPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+
 	return nil
 }
 

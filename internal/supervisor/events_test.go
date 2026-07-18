@@ -31,7 +31,7 @@ func TestEventBus_DropsOldestInformationalEvent_WhenSubscriberBufferFull(t *test
 	base := time.Now()
 	capacity := supervisor.InformationalBufferCapacity
 	total := capacity + 3
-	for i := 0; i < total; i++ {
+	for i := range total {
 		bus.Publish(ordinalEvent(supervisor.EventStarting, base, i))
 	}
 
@@ -66,7 +66,9 @@ drained:
 	dropped := bus.DroppedInformationalCounts()
 	require.Len(t, dropped, 1)
 	require.Positive(t, dropped[0], "the drop counter must be incremented, not just inferred from survivors")
-	require.Equal(t, uint64(total-len(got)), dropped[0], "drop counter must equal exactly how many events did not survive")
+	require.Equal(
+		t, uint64(total-len(got)), dropped[0], "drop counter must equal exactly how many events did not survive",
+	)
 }
 
 // Test EventBus coalescing a lifecycle-critical event to latest instead of dropping it
@@ -118,7 +120,7 @@ func TestEventBus_Publish_NeverBlocks_OnUnreadSlowSubscriber(t *testing.T) {
 	go func() {
 		defer close(done)
 		base := time.Now()
-		for i := 0; i < 10_000; i++ {
+		for i := range 10_000 {
 			kind := supervisor.EventStarting
 			if i%97 == 0 {
 				kind = supervisor.EventCrashed

@@ -86,7 +86,12 @@ func (s *PluginServer) Serve() error {
 }
 
 // serve is the testable core of Serve, minus the process-global
-// InstallDeathSignal side effect.
+// InstallDeathSignal side effect. export_test.go re-exports this pattern
+// (see e.g. toControlServiceRequirements/ToControlServiceRequirements in
+// host.go); the case-only difference from Serve is intentional, not a
+// naming accident.
+//
+//nolint:revive // see doc above
 func (s *PluginServer) serve(ctx context.Context) error {
 	conn := control.NewConn(controlChildFD, firstGeneration)
 
@@ -180,7 +185,9 @@ func (s *PluginServer) pluginHandshake(ctx context.Context, conn *control.Conn) 
 
 	tuple, err := control.Negotiate(control.HelloToOffer(hello), m1PluginOffer(), services)
 	if err != nil {
-		rejectAck := control.IncompatibleToHelloAck(m1PluginOffer(), services, incompatibleReason(err), hello.GetNonce())
+		rejectAck := control.IncompatibleToHelloAck(
+			m1PluginOffer(), services, incompatibleReason(err), hello.GetNonce(),
+		)
 		rejectMsg := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_HelloAck{HelloAck: rejectAck}}
 		_ = sendControl(ctx, conn, rejectMsg, control.ReplyDeadlines[control.KindHello])
 
@@ -200,7 +207,11 @@ func (s *PluginServer) pluginHandshake(ctx context.Context, conn *control.Conn) 
 // modes builds one — see its doc), but this guards defensively against a
 // future failure mode that doesn't, so a rejection ack can never carry an
 // empty reason indistinguishable from a malformed message (rather than
-// relying on IncompatibleToHelloAck's own fallback alone).
+// relying on IncompatibleToHelloAck's own fallback alone). export_test.go's
+// IncompatibleReason deliberately re-exports this for pluginserver_test;
+// the case-only difference is intentional.
+//
+//nolint:revive // see doc above
 func incompatibleReason(err error) string {
 	var incompatErr *control.IncompatibleError
 	if errors.As(err, &incompatErr) && incompatErr.Reason != "" {

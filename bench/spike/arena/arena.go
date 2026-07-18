@@ -66,6 +66,7 @@ func New(base []byte) *Arena {
 		a.classes[c] = classPool{slabSize: spec.size, slabCount: spec.count, baseOffset: offset, free: free}
 		offset += spec.size * spec.count
 	}
+
 	return a
 }
 
@@ -79,6 +80,7 @@ func (a *Arena) Alloc(class Class) (Handle, []byte, error) {
 	idx := cp.free[len(cp.free)-1]
 	cp.free = cp.free[:len(cp.free)-1]
 	h := Handle{Class: class, Index: idx}
+
 	return h, a.Slice(h), nil
 }
 

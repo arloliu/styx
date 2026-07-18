@@ -32,9 +32,8 @@ func TestMain(m *testing.M) {
 	helperBins.deathsig = buildHelper(dir, "deathsig_helper")
 	helperBins.spawn = buildHelper(dir, "spawn_helper")
 
-	code := m.Run()
+	m.Run()
 	_ = os.RemoveAll(dir)
-	os.Exit(code)
 }
 
 // buildHelper compiles ./testdata/<name> to dir/<name> and returns its path.
@@ -81,7 +80,7 @@ func TestOrphaned_DetectsReparenting_ButNotLivePID1Host(t *testing.T) {
 func TestInstallDeathSignal_ExitsChild_WhenOriginalParentDiesBeforeInstall(t *testing.T) {
 	const iterations = 20
 
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		// Given: an intermediary shell that backgrounds the helper, waits for
 		// its ready file, then exits — reparenting the helper.
 		readyFile := filepath.Join(t.TempDir(), fmt.Sprintf("ready-%d", i))

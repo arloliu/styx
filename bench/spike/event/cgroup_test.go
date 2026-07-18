@@ -142,7 +142,9 @@ func TestOwnCgroupPath_FindsExistingReadableCPUMax_OnThisHost(t *testing.T) {
 
 	full := cgroupRoot + path + "/cpu.max"
 	_, statErr := os.Stat(full)
-	require.NoErrorf(t, statErr, "expected the process's own resolved cgroup path to have a readable cpu.max at %s", full)
+	require.NoErrorf(
+		t, statErr, "expected the process's own resolved cgroup path to have a readable cpu.max at %s", full,
+	)
 
 	quota, quotaOK := quotaFromPathUpward(path)
 	t.Logf("own cgroup path=%q cpu.max=%q quota=%v ok=%v", path, full, quota, quotaOK)

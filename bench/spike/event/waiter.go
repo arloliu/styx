@@ -62,6 +62,7 @@ func effectiveSpinBudget(configured time.Duration) time.Duration {
 	if cpus, ok := CgroupCPUQuota(); ok && cpus < 2.0 {
 		return 0
 	}
+
 	return configured
 }
 
@@ -128,8 +129,10 @@ func (w *Waiter) Signal() error {
 			return err
 		}
 		atomic.AddUint64(&w.syscalls, 1) // count the write(2) that armed the wake
+
 		return nil
 	}
+
 	return nil
 }
 
@@ -162,6 +165,7 @@ func writeEventfd(efd int) error {
 		if err == unix.EINTR {
 			continue
 		}
+
 		return err
 	}
 }
@@ -236,6 +240,7 @@ func ownCgroupPath() (string, bool) {
 	if err != nil {
 		return "", false
 	}
+
 	return parseOwnCgroupPath(data)
 }
 
@@ -243,7 +248,7 @@ func ownCgroupPath() (string, bool) {
 // testable against synthetic content without touching the filesystem
 // (real hosts vary: pure v2, hybrid v1+v2, containers).
 func parseOwnCgroupPath(data []byte) (string, bool) {
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		rest, ok := strings.CutPrefix(line, "0::")
 		if !ok {
 			continue
@@ -252,8 +257,10 @@ func parseOwnCgroupPath(data []byte) (string, bool) {
 		if rest == "" {
 			return "", false
 		}
+
 		return rest, true
 	}
+
 	return "", false
 }
 
@@ -291,6 +298,7 @@ func parentCgroupPath(path string) string {
 	if i <= 0 {
 		return ""
 	}
+
 	return path[:i]
 }
 
@@ -310,6 +318,7 @@ func readFileNoFail(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return buf[:n], nil
 }
 
@@ -322,6 +331,7 @@ func parseCPUMax(data []byte) (float64, bool) {
 	if quota <= 0 || period <= 0 {
 		return 0, false // "max" or unparsable => no quota
 	}
+
 	return float64(quota) / float64(period), true
 }
 
@@ -350,5 +360,6 @@ func parseTwoInts(data []byte) ([2]int64, error) {
 			return out, unix.EINVAL // "max" or garbage
 		}
 	}
+
 	return out, unix.EINVAL
 }

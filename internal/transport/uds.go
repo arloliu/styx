@@ -255,7 +255,7 @@ func (t *UDSTransport) Close() error {
 // abortFrame can tell a clean pre-frame abort from a connection-poisoning
 // mid-frame one (see Send's doc and abortFrame).
 func (t *UDSTransport) writeFrame(ctx context.Context, f Frame, body []byte) error {
-	// len(body) already bounds-checked <= MaxFrameSize by Send.
+	//nolint:gosec // len(body) already bounds-checked <= MaxFrameSize by Send.
 	header := encodeHeader(f, uint32(len(body)))
 
 	t.writeMu.Lock()
@@ -424,11 +424,14 @@ func encodeStatus(s *FrameStatus) []byte {
 
 	buf := make([]byte, size)
 	binary.BigEndian.PutUint32(buf[0:4], s.Code)
+	//nolint:gosec // Message/Details are already bounded by MaxFrameSize (see doc above)
 	binary.BigEndian.PutUint32(buf[4:8], uint32(len(s.Message)))
+	//nolint:gosec // same as above
 	binary.BigEndian.PutUint32(buf[8:12], uint32(len(s.Details)))
 	off := statusHeadSize
 	off += copy(buf[off:], s.Message)
 	for _, d := range s.Details {
+		//nolint:gosec // bounded by MaxFrameSize, same as above
 		binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(d)))
 		off += 4
 		off += copy(buf[off:], d)
@@ -459,6 +462,7 @@ func decodeStatus(body []byte) (*FrameStatus, error) {
 
 	off := statusHeadSize
 	rem := len(body) - off
+	//nolint:gosec // rem is len(body)-off, never negative here (off <= len(body) by construction)
 	if uint64(msgLen) > uint64(rem) {
 		return nil, fmt.Errorf("transport: recv: status message length %d overruns body: %w",
 			msgLen, ErrMalformedStatusFrame)
@@ -473,18 +477,20 @@ func decodeStatus(body []byte) (*FrameStatus, error) {
 		// attacker-controlled detailCount can't drive an oversized allocation
 		// before the per-detail bounds checks below ever run.
 		capHint := (len(body) - off) / 4
+		//nolint:gosec // capHint derives from len(body), body is already bounded by MaxFrameSize
 		if uint64(detailCount) < uint64(capHint) {
 			capHint = int(detailCount)
 		}
 		details = make([][]byte, 0, capHint)
 	}
-	for i := uint32(0); i < detailCount; i++ {
+	for i := range detailCount {
 		if len(body)-off < 4 {
 			return nil, fmt.Errorf("transport: recv: status detail %d missing length prefix: %w",
 				i, ErrMalformedStatusFrame)
 		}
 		dLen := binary.BigEndian.Uint32(body[off : off+4])
 		off += 4
+		//nolint:gosec // off <= len(body) here (checked just above), so len(body)-off is never negative
 		if uint64(dLen) > uint64(len(body)-off) {
 			return nil, fmt.Errorf("transport: recv: status detail %d length %d overruns body: %w",
 				i, dLen, ErrMalformedStatusFrame)
@@ -510,6 +516,7 @@ func encodeHeader(f Frame, payloadLen uint32) []byte {
 	buf[12] = byte(f.Kind)
 	binary.BigEndian.PutUint64(buf[13:21], f.Service)
 	binary.BigEndian.PutUint64(buf[21:29], f.Method)
+	//nolint:gosec // int64->uint64 is a lossless bit-pattern round-trip, undone by decodeHeader's matching cast
 	binary.BigEndian.PutUint64(buf[29:37], uint64(int64(f.Budget)))
 
 	return buf
@@ -521,7 +528,8 @@ func encodeHeader(f Frame, payloadLen uint32) []byte {
 // not re-validated here.
 func decodeHeader(buf []byte) (Frame, uint32) {
 	payloadLen := binary.BigEndian.Uint32(buf[0:4])
-	budgetNanos := int64(binary.BigEndian.Uint64(buf[29:37])) // round-trips encodeHeader's uint64(int64(...)) cast
+	//nolint:gosec // round-trips encodeHeader's uint64(int64(...)) cast, lossless
+	budgetNanos := int64(binary.BigEndian.Uint64(buf[29:37]))
 	f := Frame{
 		CallID:  binary.BigEndian.Uint64(buf[4:12]),
 		Kind:    FrameKind(buf[12]),

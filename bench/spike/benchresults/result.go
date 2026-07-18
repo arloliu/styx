@@ -70,6 +70,7 @@ func WriteJSONL(path string, results []Result) error {
 			return err
 		}
 	}
+
 	return w.Flush()
 }
 
@@ -79,5 +80,6 @@ func dirOf(path string) string {
 			return path[:i]
 		}
 	}
+
 	return "."
 }

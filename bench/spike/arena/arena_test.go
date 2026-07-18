@@ -39,7 +39,7 @@ func TestArena_AllocReturnsDistinctSlabs_UntilExhausted(t *testing.T) {
 func TestArena_FreedSlab_BecomesAvailableAgain(t *testing.T) {
 	// Given
 	a := newTestArena(t)
-	var handles []arena.Handle
+	handles := make([]arena.Handle, 0, shmregion.SlabCount4KiB)
 	for range shmregion.SlabCount4KiB {
 		h, _, err := a.Alloc(arena.Class4KiB)
 		require.NoError(t, err)

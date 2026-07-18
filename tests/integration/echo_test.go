@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -90,12 +91,12 @@ func mkfifo(t *testing.T) string {
 	return path
 }
 
-// openFifoOrFail opens path with flag, blocking until the crashy plugin
+// openFifoOrFail opens path write-only, blocking until the crashy plugin
 // process opens the paired end, then closes it — releasing whichever
 // checkpoint the plugin is waiting on. Bounded to 5s so a broken pairing
 // (e.g. the plugin never reached the checkpoint) fails the test instead of
 // hanging it forever.
-func openFifoOrFail(t *testing.T, path string, flag int) {
+func openFifoOrFail(t *testing.T, path string) {
 	t.Helper()
 
 	type result struct {
@@ -104,7 +105,7 @@ func openFifoOrFail(t *testing.T, path string, flag int) {
 	}
 	ch := make(chan result, 1)
 	go func() {
-		f, err := os.OpenFile(path, flag, 0)
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
 		ch <- result{f, err}
 	}()
 
@@ -130,7 +131,8 @@ func TestEcho_HandshakeAndUnaryRoundTrip_Succeeds(t *testing.T) {
 
 	// Then
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
+		ee := &exec.ExitError{}
+		if errors.As(err, &ee) {
 			t.Fatalf("echo-host failed: %v\nstderr:\n%s", err, ee.Stderr)
 		}
 		t.Fatalf("echo-host failed: %v", err)
@@ -234,7 +236,7 @@ func TestEcho_Cancellation_ReturnsErrCanceled_BeforeHandlerCompletes(t *testing.
 
 	// When: block until the handler has genuinely been entered, then
 	// cancel before it can ever complete.
-	openFifoOrFail(t, fifo, os.O_WRONLY)
+	openFifoOrFail(t, fifo)
 	cancel()
 
 	// Then
@@ -283,7 +285,7 @@ func TestEcho_PluginCrashMidCall_ReturnsErrOutcomeUnknown_WhenDispatchMayHaveBeg
 
 	// When: block until the handler has genuinely been dispatched, then
 	// let it crash.
-	openFifoOrFail(t, fifo, os.O_WRONLY)
+	openFifoOrFail(t, fifo)
 
 	// Then
 	var err error
@@ -342,7 +344,7 @@ func TestEcho_PluginCrashBeforeDispatch_ReturnsRetryablePluginCrashError(t *test
 	// runs td.Run to completion before returning to Run, which only then
 	// publishes), so observing GaveUp here guarantees the ClientConn's
 	// routing has already been torn down (cc.state reset to unavailable).
-	openFifoOrFail(t, fifo, os.O_WRONLY)
+	openFifoOrFail(t, fifo)
 	awaitEvent(t, h.Events(), styx.EventGaveUp)
 
 	client := echopb.NewEchoClient(h.Plugin("echo"))
@@ -517,7 +519,7 @@ func TestEcho_SupervisorRestartsCrashingPlugin_PerConfiguredPolicy(t *testing.T)
 	// each time.
 	const cycles = 3
 	for range cycles {
-		openFifoOrFail(t, fifo, os.O_WRONLY)
+		openFifoOrFail(t, fifo)
 		awaitEvent(t, h.Events(), styx.EventRestarting)
 		awaitEvent(t, h.Events(), styx.EventReady)
 	}
@@ -554,11 +556,11 @@ func TestEcho_SupervisorEmitsGaveUp_WhenRestartPolicyMaxExceeded(t *testing.T) {
 	// When: crash the plugin maxRestarts+1 times — the policy allows the
 	// first maxRestarts crashes to restart, then gives up on the next one.
 	for range maxRestarts {
-		openFifoOrFail(t, fifo, os.O_WRONLY)
+		openFifoOrFail(t, fifo)
 		awaitEvent(t, h.Events(), styx.EventRestarting)
 		awaitEvent(t, h.Events(), styx.EventReady)
 	}
-	openFifoOrFail(t, fifo, os.O_WRONLY)
+	openFifoOrFail(t, fifo)
 	ev := awaitEvent(t, h.Events(), styx.EventGaveUp)
 
 	// Then: GaveUp carries a non-nil reason, and the plugin is now

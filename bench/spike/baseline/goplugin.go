@@ -2,6 +2,7 @@ package baseline
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 
 	goplugin "github.com/hashicorp/go-plugin"
@@ -53,8 +54,12 @@ func (g *GoPluginBaseline) Name() string { return "hashicorp-go-plugin-grpc" }
 
 func (g *GoPluginBaseline) Start() error {
 	g.client = goplugin.NewClient(&goplugin.ClientConfig{
-		HandshakeConfig:  handshakeConfig,
-		Plugins:          goplugin.PluginSet{"ping": &pingGRPCPlugin{}},
+		HandshakeConfig: handshakeConfig,
+		Plugins:         goplugin.PluginSet{"ping": &pingGRPCPlugin{}},
+		// g.pluginBinPath is the benchmark suite's own built helper binary
+		// path (see NewGoPlugin), not externally supplied input; Start has no
+		// ctx param, matching every other baseline in this package.
+		//nolint:gosec,noctx // see comment above
 		Cmd:              exec.Command(g.pluginBinPath),
 		AllowedProtocols: []goplugin.Protocol{goplugin.ProtocolGRPC},
 	})
@@ -66,7 +71,12 @@ func (g *GoPluginBaseline) Start() error {
 	if err != nil {
 		return err
 	}
-	g.pingClient = raw.(pingpb.PingClient)
+	pingClient, ok := raw.(pingpb.PingClient)
+	if !ok {
+		return fmt.Errorf("goplugin: dispensed value is not a pingpb.PingClient (got %T)", raw)
+	}
+	g.pingClient = pingClient
+
 	return nil
 }
 
@@ -75,6 +85,7 @@ func (g *GoPluginBaseline) Call(payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return resp.Payload, nil
 }
 

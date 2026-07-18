@@ -14,13 +14,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func newTestTransportPair(t *testing.T) (*transport.UDSTransport, *transport.UDSTransport) {
+func newTestTransportPair(t *testing.T) (a, b *transport.UDSTransport) {
 	t.Helper()
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	require.NoError(t, err)
-	a, err := transport.NewUDSTransport(fds[0])
+	a, err = transport.NewUDSTransport(fds[0])
 	require.NoError(t, err)
-	b, err := transport.NewUDSTransport(fds[1])
+	b, err = transport.NewUDSTransport(fds[1])
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
 
@@ -339,13 +339,11 @@ func TestUDSTransport_Send_SerializesConcurrentCallers_WithoutCorruptingStream(t
 
 	// When
 	for i := range n {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			payload := []byte(fmt.Sprintf("payload-%02d", i))
+		wg.Go(func() {
+			payload := fmt.Appendf(nil, "payload-%02d", i)
 			f := transport.Frame{CallID: uint64(i), Kind: transport.FrameUnaryReq, Payload: payload}
 			require.NoError(t, a.Send(t.Context(), f))
-		}(i)
+		})
 	}
 
 	got := make(map[uint64][]byte, n)
@@ -359,7 +357,7 @@ func TestUDSTransport_Send_SerializesConcurrentCallers_WithoutCorruptingStream(t
 	// Then
 	require.Len(t, got, n)
 	for i := range n {
-		require.Equal(t, []byte(fmt.Sprintf("payload-%02d", i)), got[uint64(i)])
+		require.Equal(t, fmt.Appendf(nil, "payload-%02d", i), got[uint64(i)])
 	}
 }
 
@@ -395,7 +393,9 @@ func TestUDSTransport_Recv_ReturnsDeadlineExceeded_WhenTimeoutFires(t *testing.T
 	// Then
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.GreaterOrEqual(t, elapsed, timeout, "Recv must not return before the deadline elapses")
-	require.Less(t, elapsed, 5*time.Second, "generous upper bound to keep this non-flaky, not an exact timing assertion")
+	require.Less(
+		t, elapsed, 5*time.Second, "generous upper bound to keep this non-flaky, not an exact timing assertion",
+	)
 }
 
 // Test UDSTransport.Recv unblocking within one poll interval of a bare

@@ -43,9 +43,8 @@ func TestMain(m *testing.M) {
 	crashyPluginBin = filepath.Join(dir, "echo-crashy-plugin")
 	buildOrPanic(crashyPluginBin, "../../examples/echo/plugin/crashy")
 
-	code := m.Run()
+	m.Run()
 	_ = os.RemoveAll(dir)
-	os.Exit(code)
 }
 
 // buildOrPanic runs `go build -o binPath pkgPath`, panicking with the

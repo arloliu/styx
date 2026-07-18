@@ -79,7 +79,7 @@ func TestStdioCapture_DeliversLinesUpToBound_AndCountsDropsBeyondIt(t *testing.T
 	// writer so the reader goroutine reaches EOF.
 	const totalLines = 20
 	go func() {
-		for i := 0; i < totalLines; i++ {
+		for i := range totalLines {
 			_, _ = fmt.Fprintf(stdoutW, "line-%d\n", i)
 		}
 		_ = stdoutW.Close()

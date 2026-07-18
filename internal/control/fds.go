@@ -74,6 +74,7 @@ func closeAll(fds []int) {
 // detect it. Ownership of fds remains with the caller: SendFDs never
 // closes them.
 func (c *Conn) SendFDs(ctx context.Context, msg *controlpb.ControlMessage, fds []int) error {
+	//nolint:gosec // len(fds) is a handful of control-plane fds, never near uint32's range
 	if declared := declaredFDCount(msg); declared != uint32(len(fds)) {
 		return fmt.Errorf("control: SendFDs: declared fd_count %d != len(fds) %d: %w",
 			declared, len(fds), ErrProtocolViolation)
@@ -149,6 +150,7 @@ func (c *Conn) RecvFDs(ctx context.Context, maxFDs int) (*controlpb.ControlMessa
 		return nil, nil, fmt.Errorf("control: unmarshal: %w", err)
 	}
 
+	//nolint:gosec // len(fds) is bounded by maxFDs, never near uint32's range
 	if declared := declaredFDCount(msg); declared != uint32(len(fds)) {
 		closeAll(fds)
 
@@ -166,6 +168,11 @@ func (c *Conn) RecvFDs(ctx context.Context, maxFDs int) (*controlpb.ControlMessa
 // guard: the count check lives in the exported SendFDs wrapper, not this
 // helper, precisely so tests can construct a mismatch (a real caller never
 // wants that, so production code always goes through SendFDs).
+// export_test.go's SendFDsUnchecked deliberately re-exports this for tests
+// outside the package; the case-only difference is the intended shape of
+// that pattern, not a naming accident.
+//
+//nolint:revive // see doc above
 func (c *Conn) sendFDsUnchecked(ctx context.Context, msg *controlpb.ControlMessage, fds []int) error {
 	if err := ctx.Err(); err != nil {
 		return err

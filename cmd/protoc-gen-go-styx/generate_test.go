@@ -151,26 +151,26 @@ func TestRun_FailsGeneration_OnStreamingMethod(t *testing.T) {
 	// into a FileDescriptorProto (constructing a minimal streaming service
 	// by hand rather than adding a second .proto fixture).
 	streamProto := &descriptorpb.FileDescriptorProto{
-		Name:    proto.String("stream.proto"),
-		Package: proto.String("streamtest"),
-		Syntax:  proto.String("proto3"),
+		Name:    new("stream.proto"),
+		Package: new("streamtest"),
+		Syntax:  new("proto3"),
 		Options: &descriptorpb.FileOptions{
-			GoPackage: proto.String("github.com/arloliu/styx/cmd/protoc-gen-go-styx/testdata/streampb"),
+			GoPackage: new("github.com/arloliu/styx/cmd/protoc-gen-go-styx/testdata/streampb"),
 		},
 		MessageType: []*descriptorpb.DescriptorProto{
 			{
-				Name: proto.String("Empty"),
+				Name: new("Empty"),
 			},
 		},
 		Service: []*descriptorpb.ServiceDescriptorProto{
 			{
-				Name: proto.String("Streamer"),
+				Name: new("Streamer"),
 				Method: []*descriptorpb.MethodDescriptorProto{
 					{
-						Name:            proto.String("Watch"),
-						InputType:       proto.String(".streamtest.Empty"),
-						OutputType:      proto.String(".streamtest.Empty"),
-						ServerStreaming: proto.Bool(true),
+						Name:            new("Watch"),
+						InputType:       new(".streamtest.Empty"),
+						OutputType:      new(".streamtest.Empty"),
+						ServerStreaming: new(true),
 					},
 				},
 			},
@@ -204,24 +204,24 @@ func TestRun_Succeeds_WhenTwoServicesShareAMethodName(t *testing.T) {
 	// invocation-wide map instead of a map scoped fresh per service.
 	newGetMethod := func() *descriptorpb.MethodDescriptorProto {
 		return &descriptorpb.MethodDescriptorProto{
-			Name:       proto.String("Get"),
-			InputType:  proto.String(".twoservice.Empty"),
-			OutputType: proto.String(".twoservice.Empty"),
+			Name:       new("Get"),
+			InputType:  new(".twoservice.Empty"),
+			OutputType: new(".twoservice.Empty"),
 		}
 	}
 	twoServiceProto := &descriptorpb.FileDescriptorProto{
-		Name:    proto.String("twoservice.proto"),
-		Package: proto.String("twoservice"),
-		Syntax:  proto.String("proto3"),
+		Name:    new("twoservice.proto"),
+		Package: new("twoservice"),
+		Syntax:  new("proto3"),
 		Options: &descriptorpb.FileOptions{
-			GoPackage: proto.String("github.com/arloliu/styx/cmd/protoc-gen-go-styx/testdata/twoservicepb"),
+			GoPackage: new("github.com/arloliu/styx/cmd/protoc-gen-go-styx/testdata/twoservicepb"),
 		},
 		MessageType: []*descriptorpb.DescriptorProto{
-			{Name: proto.String("Empty")},
+			{Name: new("Empty")},
 		},
 		Service: []*descriptorpb.ServiceDescriptorProto{
-			{Name: proto.String("ServiceA"), Method: []*descriptorpb.MethodDescriptorProto{newGetMethod()}},
-			{Name: proto.String("ServiceB"), Method: []*descriptorpb.MethodDescriptorProto{newGetMethod()}},
+			{Name: new("ServiceA"), Method: []*descriptorpb.MethodDescriptorProto{newGetMethod()}},
+			{Name: new("ServiceB"), Method: []*descriptorpb.MethodDescriptorProto{newGetMethod()}},
 		},
 	}
 

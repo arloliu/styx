@@ -101,7 +101,12 @@ type ReadyHooks struct {
 // Process.Kill abort path, which does not surface a *os.ProcessState).
 // CrashInfo implements error (and Unwrap, so errors.Is/As still reach
 // Cause) so it can populate Event.Err directly; styx/host.go translates it
-// into *styx.PluginCrashError at the public boundary.
+// into *styx.PluginCrashError at the public boundary. "CrashInfo" names
+// what it carries (crash detail), matching styx.PluginCrashError's own
+// naming one layer up; it happens to implement error the same way, not
+// primarily be one.
+//
+//nolint:errname // see doc above
 type CrashInfo struct {
 	Cause           error
 	ExitStatus      int
@@ -410,7 +415,7 @@ func (s *Supervisor) runOneInstance(
 	readyAt := time.Now()
 	s.publish(Event{Kind: EventReady, Time: readyAt})
 
-	endErr, stopped := s.heartbeatLoop(ctx, conn)
+	stopped, endErr := s.heartbeatLoop(ctx, conn)
 
 	cancelCapture()
 
@@ -447,13 +452,13 @@ func (s *Supervisor) runOneInstance(
 // unhealthy (missed heartbeats or Classify-wedged), the connection is
 // lost (crash), or ctx/Stop ends the instance deliberately (stopped=true,
 // endErr=nil).
-func (s *Supervisor) heartbeatLoop(ctx context.Context, conn *control.Conn) (endErr error, stopped bool) {
+func (s *Supervisor) heartbeatLoop(ctx context.Context, conn *control.Conn) (stopped bool, endErr error) {
 	missed := 0
 	var prev *HeartbeatSample
 
 	for {
 		if s.stopped() || ctx.Err() != nil {
-			return nil, true
+			return true, nil
 		}
 
 		rctx, cancel := context.WithTimeout(ctx, s.cfg.HeartbeatInterval)
@@ -467,18 +472,18 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, conn *control.Conn) (end
 					reason := fmt.Errorf("supervisor: missed %d consecutive heartbeats", missed)
 					s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: reason})
 
-					return reason, false
+					return false, reason
 				}
 
 				continue
 			}
 
-			return err, false // any other Recv error: treat as a lost connection.
+			return false, err // any other Recv error: treat as a lost connection.
 		}
 
 		kind, ok := control.KindOf(msg)
 		if !ok {
-			return io.EOF, false // body-less datagram: the plugin closed its end (see AwaitHostDisconnect).
+			return false, io.EOF // body-less datagram: the plugin closed its end (see AwaitHostDisconnect).
 		}
 		if kind != control.KindHeartbeat {
 			continue // nothing else is currently expected from the plugin during serving.
@@ -493,7 +498,7 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, conn *control.Conn) (end
 			if class == HealthWedged {
 				s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: errWedged})
 
-				return errWedged, false
+				return false, errWedged
 			}
 		}
 		prev = &cur

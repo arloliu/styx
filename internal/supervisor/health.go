@@ -65,6 +65,7 @@ func Classify(prev, cur HeartbeatSample, window time.Duration, highWaterBytes, h
 	// deliberately plays no part here: it counts calls already consumed
 	// and handed to a handler, which is dispatch-side state, not an H2P
 	// backlog.
+	//nolint:gosec // descriptor counters never approach int64's range
 	gap := int64(cur.DescriptorsProducedP2H) - int64(cur.DescriptorsConsumedH2P)
 	unconsumedWork := gap > 0
 	transportWedged := consumeStalled && unconsumedWork

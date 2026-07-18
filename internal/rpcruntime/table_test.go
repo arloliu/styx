@@ -30,15 +30,14 @@ func TestTable_PublishRacesCancel_ExactlyOneWins(t *testing.T) {
 	id, wait := table.Submit(t.Context(), time.Second)
 	var cancelOK bool
 	var wg sync.WaitGroup
-	wg.Add(2)
 
 	// When: Publish races Cancel. Publish's outcome is not asserted — it is
 	// merely the writer's frame-emission signal; the discriminating pre- vs
 	// post-publication invariants are pinned by the two deterministic tests
 	// (Publish_ReturnsFalse_AfterPrePublicationCancel and
 	// Complete_ReturnsFalse_AfterCallAlreadyCanceled).
-	go func() { defer wg.Done(); table.Publish(id) }()
-	go func() { defer wg.Done(); cancelOK = table.Cancel(id) }()
+	wg.Go(func() { table.Publish(id) })
+	wg.Go(func() { cancelOK = table.Cancel(id) })
 	wg.Wait()
 
 	// Then: Cancel always terminates the call; no call is ever lost.
@@ -93,11 +92,9 @@ func TestTable_Submit_AllocatesUniqueIDs_UnderConcurrency(t *testing.T) {
 
 	// When
 	for i := range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			ids[i], _ = table.Submit(t.Context(), time.Second)
-		}()
+		})
 	}
 	wg.Wait()
 

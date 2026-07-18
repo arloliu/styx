@@ -41,14 +41,15 @@ func TestMain(m *testing.M) {
 	// the actual public-API boundary, not just internal/supervisor's own
 	// *control.IncompatibleError one layer down.
 	fixtureVersionedPlugin = filepath.Join(dir, "versionedplugin")
-	vBuild := exec.Command("go", "build", "-o", fixtureVersionedPlugin, "./internal/supervisor/testdata/versionedplugin")
+	vBuild := exec.Command(
+		"go", "build", "-o", fixtureVersionedPlugin, "./internal/supervisor/testdata/versionedplugin",
+	)
 	if out, err := vBuild.CombinedOutput(); err != nil {
 		panic("building versionedplugin fixture: " + err.Error() + "\n" + string(out))
 	}
 
-	code := m.Run()
+	m.Run()
 	_ = os.RemoveAll(dir)
-	os.Exit(code)
 }
 
 // countOpenFDs counts this process's open fds via /proc/self/fd, used to

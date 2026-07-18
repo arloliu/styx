@@ -23,6 +23,7 @@ func NewGRPCTCP() *GRPCTCPBaseline { return &GRPCTCPBaseline{} }
 func (g *GRPCTCPBaseline) Name() string { return "grpc-tcp-loopback" }
 
 func (g *GRPCTCPBaseline) Start() error {
+	//nolint:noctx // benchmark-harness Start has no ctx param; matches every other baseline in this package
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -38,6 +39,7 @@ func (g *GRPCTCPBaseline) Start() error {
 	}
 	g.conn = conn
 	g.client = pingpb.NewPingClient(conn)
+
 	return nil
 }
 
@@ -46,6 +48,7 @@ func (g *GRPCTCPBaseline) Call(payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return resp.Payload, nil
 }
 
@@ -56,5 +59,6 @@ func (g *GRPCTCPBaseline) Stop() error {
 	if g.srv != nil {
 		g.srv.GracefulStop()
 	}
+
 	return nil
 }

@@ -15,6 +15,7 @@ func sortedDurations(n int) []time.Duration {
 	for i := range n {
 		out[i] = time.Duration(i + 1)
 	}
+
 	return out
 }
 
@@ -56,7 +57,7 @@ func TestPercentile_SingleElement_ReturnsThatElement_ForAnyPercentile(t *testing
 // shape: many calls clustered at a floor, a long thin tail).
 func TestPercentile_Monotonic_AsRequestedPercentileIncreases(t *testing.T) {
 	// Given: 900 samples at 1000ns, 90 at 2000ns, 9 at 5000ns, 1 at 50000ns.
-	var sorted []time.Duration
+	sorted := make([]time.Duration, 0, 1000)
 	for range 900 {
 		sorted = append(sorted, 1000)
 	}

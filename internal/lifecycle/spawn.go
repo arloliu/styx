@@ -72,6 +72,14 @@ func Spawn(spec Spec) (*Process, error) {
 
 	childFile := os.NewFile(uintptr(childFD), "styx-control-child")
 
+	// spec.Path/Args are the host's own plugin configuration, not externally
+	// supplied input — spawning the configured plugin binary is Spawn's job.
+	// Deliberately not exec.CommandContext: the child's lifetime is owned by
+	// internal/lifecycle.Teardown's graceful sequence (StopAdmission ->
+	// FailInFlight -> JoinGoroutines -> ShutdownDeadline -> SIGKILL
+	// fallback), not by a context — binding it to a ctx would let a ctx
+	// cancellation hard-kill the child, bypassing that teardown entirely.
+	//nolint:gosec,noctx // see comment above
 	cmd := exec.Command(spec.Path, spec.Args...)
 	cmd.Env = sanitizedEnv(spec.Env)
 	cmd.ExtraFiles = []*os.File{childFile} // becomes fd 3 in the child

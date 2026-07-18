@@ -33,6 +33,7 @@ func New(descBytes []byte, tail, head *uint64, capacity uint64) *Ring {
 		panic("ring: descBytes length does not match capacity*64")
 	}
 	desc := unsafe.Slice((*Descriptor)(unsafe.Pointer(&descBytes[0])), capacity)
+
 	return &Ring{desc: desc, tail: tail, head: head, capacity: capacity, mask: capacity - 1}
 }
 
@@ -56,6 +57,7 @@ func (r *Ring) TryEnqueue(d Descriptor) bool {
 	}
 	r.desc[tail&r.mask] = d            // descriptor write
 	atomic.StoreUint64(r.tail, tail+1) // seq_cst tail publish
+
 	return true
 }
 
@@ -78,6 +80,7 @@ func (r *Ring) TryPeek() (Descriptor, bool) {
 	if head == tail {
 		return Descriptor{}, false // empty
 	}
+
 	return r.desc[head&r.mask], true // descriptor read; head NOT advanced
 }
 

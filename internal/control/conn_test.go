@@ -11,11 +11,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func newTestConnPair(t *testing.T) (*control.Conn, *control.Conn) {
+func newTestConnPair(t *testing.T) (host, plugin *control.Conn) {
 	t.Helper()
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = unix.Close(fds[0]); _ = unix.Close(fds[1]) })
+
 	return control.NewConn(fds[0], 1), control.NewConn(fds[1], 1)
 }
 
@@ -97,5 +98,7 @@ func TestConn_Recv_ReturnsDeadlineExceeded_WhenTimeoutFires(t *testing.T) {
 	// Then
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.GreaterOrEqual(t, elapsed, timeout, "Recv must not return before the deadline elapses")
-	require.Less(t, elapsed, 5*time.Second, "generous upper bound to keep this non-flaky, not an exact timing assertion")
+	require.Less(
+		t, elapsed, 5*time.Second, "generous upper bound to keep this non-flaky, not an exact timing assertion",
+	)
 }

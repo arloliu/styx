@@ -102,6 +102,7 @@ func SpawnPlugin(binPath string) (b *Bootstrap, err error) {
 	}
 
 	childFile = os.NewFile(uintptr(childFD), "control")
+	//nolint:noctx // SpawnPlugin has no ctx param; the child is torn down via Bootstrap.Close, not ctx cancellation
 	cmd = exec.Command(binPath)
 	cmd.ExtraFiles = []*os.File{childFile}
 	cmd.Stdout = os.Stdout
@@ -137,6 +138,7 @@ func SpawnPlugin(binPath string) (b *Bootstrap, err error) {
 	// contaminate the benchmark's latency numbers — mirror the plugin's cached
 	// signalResp.
 	b.signalHP = event.NewWaiter(efdHP, region.ParkStateHP(), region.TailHP(), &b.shutdown, 0)
+
 	return b, nil
 }
 
@@ -204,6 +206,7 @@ func (b *Bootstrap) Close() error {
 	if err := unix.Close(b.EventHP); err != nil {
 		return fmt.Errorf("close EventHP: %w", err)
 	}
+
 	return unix.Close(b.EventPH)
 }
 
@@ -221,5 +224,6 @@ func recvReady(sock int) error {
 	if n != 1 || buf[0] != readyByte {
 		return fmt.Errorf("unexpected ready payload: %v", buf[:n])
 	}
+
 	return nil
 }

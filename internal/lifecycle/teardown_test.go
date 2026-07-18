@@ -58,8 +58,11 @@ func TestTeardown_Run_ExecutesStepsInNormativeOrder(t *testing.T) {
 
 	var order []string
 	td := &lifecycle.Teardown{
-		StopAdmission:  func() { order = append(order, "stop") },
-		FailInFlight:   func(err error) { order = append(order, "fail"); require.ErrorIs(t, err, lifecycle.ErrTornDown) },
+		StopAdmission: func() { order = append(order, "stop") },
+		FailInFlight: func(err error) {
+			order = append(order, "fail")
+			require.ErrorIs(t, err, lifecycle.ErrTornDown)
+		},
 		JoinGoroutines: func() { order = append(order, "join") },
 		Unmap: func() {
 			order = append(order, "unmap")

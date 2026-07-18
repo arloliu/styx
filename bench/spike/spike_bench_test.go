@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,6 +82,7 @@ func currentRegime() string {
 	if v := os.Getenv("STYX_SPIKE_REGIME"); v != "" {
 		return v
 	}
+
 	return "default"
 }
 
@@ -216,6 +217,7 @@ func expectedRounds() (int, bool) {
 	if err != nil || n <= 0 {
 		return 0, false
 	}
+
 	return n, true
 }
 
@@ -228,6 +230,7 @@ func percentile(sorted []time.Duration, p float64) float64 {
 		return 0
 	}
 	idx := int(p * float64(len(sorted)-1))
+
 	return float64(sorted[idx].Nanoseconds())
 }
 
@@ -313,6 +316,7 @@ func newSHMClient(bp *harness.Bootstrap) *shmClient {
 		pending: make(map[uint64]chan []byte),
 	}
 	go c.dispatchLoop()
+
 	return c
 }
 
@@ -443,7 +447,8 @@ func (c *shmClient) attemptCall(payload []byte) ([]byte, error) {
 		c.pendingMu.Unlock()
 		c.bp.ArenaHP().Free(h)
 		c.submitMu.Unlock()
-		return nil, fmt.Errorf("shm-spike: request ring full")
+
+		return nil, errors.New("shm-spike: request ring full")
 	}
 	c.tracker.Track(pos, h)
 	sigErr := c.bp.SignalHP()
@@ -464,6 +469,7 @@ func (c *shmClient) attemptCall(payload []byte) ([]byte, error) {
 		c.pendingMu.Lock()
 		delete(c.pending, callID)
 		c.pendingMu.Unlock()
+
 		return nil, errShmAttemptDropped
 	}
 }
@@ -569,7 +575,7 @@ func runLatencySuite(
 		return
 	}
 
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	slices.SortFunc(latencies, func(a, b time.Duration) int { return int(a - b) })
 	throughput := float64(len(latencies)) / elapsed.Seconds()
 	allocsPerOp := float64(allocsAfter.Mallocs-allocsBefore.Mallocs) / float64(len(latencies))
 
@@ -615,6 +621,7 @@ func buildSpikePlugin(b *testing.B) string {
 	if err := cmd.Run(); err != nil {
 		b.Fatal(err)
 	}
+
 	return out
 }
 
@@ -709,7 +716,7 @@ func spikeSyncCall(
 		PayloadLength: uint32(len(payload)),
 	}) {
 		bp.ArenaHP().Free(h)
-		return nil, fmt.Errorf("shm-spike-sync: request ring full")
+		return nil, errors.New("shm-spike-sync: request ring full")
 	}
 	tracker.Track(pos, h)
 	if err := bp.SignalHP(); err != nil {
@@ -719,7 +726,7 @@ func spikeSyncCall(
 	for {
 		newTail, ok := bp.WaitPH(*lastSeen)
 		if !ok {
-			return nil, fmt.Errorf("shm-spike-sync: shutdown while waiting for response")
+			return nil, errors.New("shm-spike-sync: shutdown while waiting for response")
 		}
 		*lastSeen = newTail
 		for {
@@ -758,7 +765,7 @@ func BenchmarkBaselines(b *testing.B) {
 		if err := impl.Start(); err != nil {
 			b.Fatal(err)
 		}
-		defer func(i baseline.Baseline) { _ = i.Stop() }(impl)
+		defer func(i baseline.Baseline) { _ = i.Stop() }(impl) //nolint:revive // intentional: every baseline must stay running until this function returns
 	}
 
 	for _, payloadBytes := range payloadSizes {
@@ -784,6 +791,7 @@ func buildGoPluginServerForBench(b *testing.B) string {
 	if err := cmd.Run(); err != nil {
 		b.Fatal(err)
 	}
+
 	return out
 }
 
@@ -810,6 +818,7 @@ func BenchmarkSpikeIdleToActive(b *testing.B) {
 		time.Sleep(gap)
 		t0 := time.Now()
 		_, err := client.Call(payload)
+
 		return time.Since(t0), err
 	}
 
@@ -833,7 +842,7 @@ func BenchmarkSpikeIdleToActive(b *testing.B) {
 	}
 	syscallsAfter := client.syscallCount()
 
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	slices.SortFunc(latencies, func(a, b time.Duration) int { return int(a - b) })
 	var wakeupPerOp float64
 	if len(latencies) > 0 {
 		wakeupPerOp = float64(syscallsAfter-syscallsBefore) / float64(len(latencies))

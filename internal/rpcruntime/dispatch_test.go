@@ -58,7 +58,9 @@ func TestDispatcher_Dispatch_SkipsHandler_WhenBudgetAlreadyElapsed(t *testing.T)
 	}})
 	// recvAt in the past so the budget is already elapsed relative to now.
 	recvAt := time.Now().Add(-time.Second)
-	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3, Budget: 10 * time.Millisecond}
+	req := transport.Frame{
+		CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3, Budget: 10 * time.Millisecond,
+	}
 
 	// When
 	out := d.Dispatch(t.Context(), req, recvAt)

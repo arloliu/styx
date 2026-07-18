@@ -41,6 +41,7 @@ func (g *GRPCUDSBaseline) Start() error {
 	_ = os.Remove(path)
 	g.sockPath = path
 
+	//nolint:noctx // benchmark-harness Start has no ctx param; matches every other baseline in this package
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return err
@@ -55,6 +56,7 @@ func (g *GRPCUDSBaseline) Start() error {
 	}
 	g.conn = conn
 	g.client = pingpb.NewPingClient(conn)
+
 	return nil
 }
 
@@ -63,6 +65,7 @@ func (g *GRPCUDSBaseline) Call(payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return resp.Payload, nil
 }
 
@@ -79,5 +82,6 @@ func (g *GRPCUDSBaseline) Stop() error {
 	if err := os.Remove(g.sockPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+
 	return nil
 }

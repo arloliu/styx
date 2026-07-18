@@ -42,6 +42,7 @@ func (n *NetRPCBaseline) Start() error {
 	if err := srv.RegisterName("Echo", echoService{}); err != nil {
 		return err
 	}
+	//nolint:noctx // benchmark-harness Start has no ctx param; matches every other baseline in this package
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return err
@@ -62,6 +63,7 @@ func (n *NetRPCBaseline) Start() error {
 		return err
 	}
 	n.client = client
+
 	return nil
 }
 
@@ -70,6 +72,7 @@ func (n *NetRPCBaseline) Call(payload []byte) ([]byte, error) {
 	if err := n.client.Call("Echo.Echo", &EchoArgs{Payload: payload}, &reply); err != nil {
 		return nil, err
 	}
+
 	return reply.Payload, nil
 }
 
@@ -86,5 +89,6 @@ func (n *NetRPCBaseline) Stop() error {
 	if err := os.Remove(n.sockPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+
 	return nil
 }

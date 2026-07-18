@@ -22,6 +22,7 @@ func newTestRing(t *testing.T, capacity uint64) *ring.Ring {
 	t.Helper()
 	buf := make([]byte, capacity*64)
 	var tail, head uint64
+
 	return ring.New(buf, &tail, &head, capacity)
 }
 
@@ -141,7 +142,7 @@ func TestRing_ConcurrentProducerConsumer_NoTornOrLostDescriptors(t *testing.T) {
 
 	// When: one producer, one consumer, on distinct goroutines
 	go func() {
-		for i := uint64(0); i < total; i++ {
+		for i := range uint64(total) {
 			d := ring.Descriptor{
 				CallID:        i,
 				Kind:          ring.KindRequest,
@@ -156,7 +157,7 @@ func TestRing_ConcurrentProducerConsumer_NoTornOrLostDescriptors(t *testing.T) {
 
 	// Then: consumer sees every descriptor exactly once, in order, with all
 	// fields consistent with the single producer write that set them.
-	for want := uint64(0); want < total; want++ {
+	for want := range uint64(total) {
 		var d ring.Descriptor
 		var ok bool
 		for {

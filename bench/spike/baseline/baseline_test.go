@@ -20,6 +20,7 @@ func buildGoPluginServer(t *testing.T) string {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	require.NoError(t, cmd.Run())
+
 	return out
 }
 

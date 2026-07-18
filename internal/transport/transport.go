@@ -116,6 +116,8 @@ type Transport interface {
 	// transport is closed (returns io.EOF on peer close, distinct from a
 	// ctx-deadline error).
 	Recv(ctx context.Context) (Frame, error)
+	// Close releases the transport's underlying resources. Safe to call
+	// more than once.
 	Close() error
 }
 
@@ -124,7 +126,11 @@ type Transport interface {
 // ErrUnimplementedFrameKind for anything else — the five reserved Stream*
 // values by name (so removing/renaming one is a compile error here, not a
 // silently-widened range check) and any other out-of-range byte a
-// corrupt/foreign peer might put on the wire.
+// corrupt/foreign peer might put on the wire. The frameStream* case is kept
+// explicit (rather than merged into default) precisely for that
+// compile-error property.
+//
+//nolint:revive // identical-switch-branches: see doc above
 func checkImplementedKind(k FrameKind) error {
 	switch k {
 	case FrameUnaryReq, FrameUnaryResp, FrameCancel, FrameUnaryErr:

@@ -11,6 +11,7 @@ import (
 // Sink receives captured lines; a Sink that blocks or is slow only
 // affects its own delivery (drops, counted), never the plugin.
 type Sink interface {
+	// WriteLine delivers one captured line from stream ("stdout" or "stderr").
 	WriteLine(stream string, line []byte)
 }
 
@@ -68,9 +69,8 @@ func NewStdioCapture(stdout, stderr io.Reader, sink Sink, maxLineBytes, bufferLi
 // for exactly which goroutines Run waits on.
 func (c *StdioCapture) Run(ctx context.Context) {
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); c.readLoop(c.stdout, c.stdoutQueue, &c.stdoutDropped) }()
-	go func() { defer wg.Done(); c.readLoop(c.stderr, c.stderrQueue, &c.stderrDropped) }()
+	wg.Go(func() { c.readLoop(c.stdout, c.stdoutQueue, &c.stdoutDropped) })
+	wg.Go(func() { c.readLoop(c.stderr, c.stderrQueue, &c.stderrDropped) })
 
 	go c.deliverLoop(ctx, "stdout", c.stdoutQueue, &c.stdoutPanicked)
 	go c.deliverLoop(ctx, "stderr", c.stderrQueue, &c.stderrPanicked)

@@ -32,6 +32,15 @@ var initialPPID = os.Getppid()
 // signal is best-effort: a Prctl failure does not by itself orphan the
 // process, so it is not treated as fatal — the getppid re-check is the
 // authoritative orphan test.
+//
+// The os.Exit below IS the safety contract this function exists to provide
+// — a caller that forgot to check a returned bool would reintroduce the
+// exact "orphaned plugin keeps running" failure this guards against.
+// Covered end to end by
+// TestInstallDeathSignal_ExitsChild_WhenOriginalParentDiesBeforeInstall via
+// testdata/deathsig_helper, a real spawned child process.
+//
+//nolint:revive // deep-exit: see doc above
 func InstallDeathSignal() {
 	// Best-effort backstop; the getppid re-check below is authoritative.
 	_ = unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(unix.SIGKILL), 0, 0, 0)

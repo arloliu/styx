@@ -44,7 +44,10 @@ type connState struct {
 // is its only intended caller once spawn/handshake exists; this package's
 // own unit tests call it directly (same package) to wire a ClientConn to
 // an in-process Table/Transport pair (a socketpair helper) without
-// a spawned plugin process.
+// a spawned plugin process. Every current caller happens to pass "echo",
+// but name will vary once internal/lifecycle is the real caller.
+//
+//nolint:unparam // see doc above
 func newClientConn(name string, table *rpcruntime.Table, tr transport.Transport, cdc codec.Codec) *ClientConn {
 	c := &ClientConn{name: name}
 	state := &connState{table: table, tr: tr, codec: cdc, readLoopDone: make(chan struct{})}
@@ -173,6 +176,8 @@ func runReadLoop(state *connState) {
 			return
 		}
 
+		//exhaustive:ignore -- FrameUnaryReq/FrameCancel flow host->plugin only and
+		// never arrive here; the trailing comment below documents the discard.
 		switch f.Kind {
 		case transport.FrameUnaryResp:
 			state.table.Complete(f.CallID, f.Payload)

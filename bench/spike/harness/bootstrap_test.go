@@ -24,6 +24,7 @@ func buildSpikePlugin(t *testing.T) string {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	require.NoError(t, cmd.Run())
+
 	return out
 }
 
@@ -75,6 +76,7 @@ func TestSpawnPlugin_EchoesRequestPayload_OnResponseRing(t *testing.T) {
 		got = d
 		payload = string(b.ArenaPH().SliceAt(d.PayloadOffset, d.PayloadLength)) // copy out before advancing
 		b.ResponseRing().AdvanceHead()
+
 		return true
 	}, 5*time.Second, time.Millisecond)
 	require.Equal(t, uint64(1), got.CallID)

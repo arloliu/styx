@@ -12,7 +12,12 @@ import (
 // It travels as the descriptor's status payload instead of a
 // normal response payload, so it must marshal through the same Codec as
 // ordinary messages — Details are opaque proto.Message values, not
-// interpreted by the runtime.
+// interpreted by the runtime. "Status" (not "StatusError") matches the
+// established status-plus-code convention (e.g. grpc-go's status.Status),
+// which also implements error; renaming it would break the public API for
+// no benefit.
+//
+//nolint:errname // see doc above
 type Status struct {
 	Code    Code
 	Message string

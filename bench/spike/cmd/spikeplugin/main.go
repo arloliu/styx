@@ -6,6 +6,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -22,6 +23,9 @@ import (
 const controlFD = 3
 
 func main() {
+	if installParentDeathSignal() {
+		os.Exit(1) // already reparented before the prctl landed
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "spikeplugin:", err)
 		os.Exit(1)
@@ -29,18 +33,16 @@ func main() {
 }
 
 func run() error {
-	installParentDeathSignal()
-
-	regionFD, efdHP, efdPH, err := recvHandshake(controlFD)
+	hs, err := recvHandshake(controlFD)
 	if err != nil {
 		return fmt.Errorf("handshake: %w", err)
 	}
-	// Attach dups regionFD and owns only the duplicate (see shmregion.Attach's
+	// Attach dups hs.regionFD and owns only the duplicate (see shmregion.Attach's
 	// fd-ownership contract); this process retains ownership of the fd it
 	// received over SCM_RIGHTS and must close it itself, on every path,
 	// or it leaks.
-	region, attachErr := shmregion.Attach(regionFD)
-	closeErr := unix.Close(regionFD)
+	region, attachErr := shmregion.Attach(hs.regionFD)
+	closeErr := unix.Close(hs.regionFD)
 	if attachErr != nil {
 		return fmt.Errorf("attach region: %w", attachErr)
 	}
@@ -57,8 +59,8 @@ func run() error {
 	arenaPH := arena.New(region.ArenaPHBytes())
 
 	var shutdown uint32
-	waitReq := event.NewWaiter(efdHP, region.ParkStateHP(), region.TailHP(), &shutdown, event.DefaultSpinBudget)
-	signalResp := event.NewWaiter(efdPH, region.ParkStatePH(), region.TailPH(), &shutdown, 0)
+	waitReq := event.NewWaiter(hs.efdHP, region.ParkStateHP(), region.TailHP(), &shutdown, event.DefaultSpinBudget)
+	signalResp := event.NewWaiter(hs.efdPH, region.ParkStatePH(), region.TailPH(), &shutdown, 0)
 
 	// outbound tracks the plugin's own response-arena allocations so they
 	// can be reclaimed once the host's response-ring head has advanced past
@@ -77,6 +79,7 @@ func run() error {
 	outbound := harness.NewOutboundTracker()
 
 	serve(reqRing, respRing, arenaHP, arenaPH, waitReq, signalResp, outbound, &shutdown)
+
 	return nil
 }
 
@@ -163,36 +166,43 @@ func classForLength(n uint32) arena.Class {
 	}
 }
 
-func recvHandshake(sock int) (regionFD, efdHP, efdPH int, err error) {
+// handshakeFDs bundles the three fds recvHandshake receives via SCM_RIGHTS,
+// keeping its result count within revive's function-result-limit.
+type handshakeFDs struct {
+	regionFD, efdHP, efdPH int
+}
+
+func recvHandshake(sock int) (handshakeFDs, error) {
 	buf := make([]byte, 1)
 	oob := make([]byte, unix.CmsgSpace(3*4))
 	// MSG_CMSG_CLOEXEC: the received fds land with O_CLOEXEC set atomically, so
 	// a fork/exec racing this recv can never leak the region/eventfd fds.
 	_, oobn, recvFlags, _, err := unix.Recvmsg(sock, buf, oob, unix.MSG_CMSG_CLOEXEC)
 	if err != nil {
-		return 0, 0, 0, err
+		return handshakeFDs{}, err
 	}
 	// MSG_CTRUNC in the returned flags means the kernel truncated the ancillary
 	// (control) data — we'd be parsing a short fd array and silently dropping
 	// fds. Fail loudly rather than operate on a partial handshake.
 	if recvFlags&unix.MSG_CTRUNC != 0 {
-		return 0, 0, 0, fmt.Errorf("control message truncated (MSG_CTRUNC); fds dropped")
+		return handshakeFDs{}, errors.New("control message truncated (MSG_CTRUNC); fds dropped")
 	}
 	msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
 	if err != nil {
-		return 0, 0, 0, err
+		return handshakeFDs{}, err
 	}
 	if len(msgs) != 1 {
-		return 0, 0, 0, fmt.Errorf("expected 1 control message, got %d", len(msgs))
+		return handshakeFDs{}, fmt.Errorf("expected 1 control message, got %d", len(msgs))
 	}
 	fds, err := unix.ParseUnixRights(&msgs[0])
 	if err != nil {
-		return 0, 0, 0, err
+		return handshakeFDs{}, err
 	}
 	if len(fds) != 3 {
-		return 0, 0, 0, fmt.Errorf("expected 3 fds, got %d", len(fds))
+		return handshakeFDs{}, fmt.Errorf("expected 3 fds, got %d", len(fds))
 	}
-	return fds[0], fds[1], fds[2], nil
+
+	return handshakeFDs{regionFD: fds[0], efdHP: fds[1], efdPH: fds[2]}, nil
 }
 
 func sendReady(sock int) error {
@@ -200,9 +210,12 @@ func sendReady(sock int) error {
 	return err
 }
 
-func installParentDeathSignal() {
+// installParentDeathSignal arms SIGKILL-on-parent-death and reports whether
+// the parent had already died (reparented to init) before the prctl call
+// landed — the caller must exit immediately in that case rather than serve
+// on a socket whose other end is already gone.
+func installParentDeathSignal() bool {
 	_ = unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(unix.SIGKILL), 0, 0, 0)
-	if os.Getppid() == 1 {
-		os.Exit(1) // already reparented before the prctl landed
-	}
+
+	return os.Getppid() == 1
 }

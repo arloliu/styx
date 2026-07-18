@@ -62,9 +62,8 @@ func TestMain(m *testing.M) {
 		panic("building versionedplugin fixture: " + err.Error() + "\n" + string(out))
 	}
 
-	code := m.Run()
+	m.Run()
 	_ = os.RemoveAll(dir)
-	os.Exit(code)
 }
 
 // eventCollector subscribes to a bus and lets a test wait for a specific
@@ -83,22 +82,24 @@ func newEventCollector(bus *supervisor.EventBus) *eventCollector {
 	return &eventCollector{ch: ch, unsub: unsub}
 }
 
-// awaitKind blocks until an event of kind is observed (recording every
-// event seen along the way), or fails the test on timeout.
-func (c *eventCollector) awaitKind(t *testing.T, kind supervisor.EventKind, timeout time.Duration) []supervisor.Event {
+// awaitKind blocks until an EventGaveUp is observed (recording every event
+// seen along the way), or fails the test on timeout. Every caller waits for
+// EventGaveUp with the same 10s timeout, so both are hardcoded rather than
+// parameterized.
+func (c *eventCollector) awaitKind(t *testing.T) []supervisor.Event {
 	t.Helper()
 
 	var seen []supervisor.Event
-	deadline := time.After(timeout)
+	deadline := time.After(10 * time.Second)
 	for {
 		select {
 		case ev := <-c.ch:
 			seen = append(seen, ev)
-			if ev.Kind == kind {
+			if ev.Kind == supervisor.EventGaveUp {
 				return seen
 			}
 		case <-deadline:
-			t.Fatalf("timed out waiting for event kind %d; observed %d events: %+v", kind, len(seen), seen)
+			t.Fatalf("timed out waiting for EventGaveUp; observed %d events: %+v", len(seen), seen)
 		}
 	}
 }
@@ -127,8 +128,8 @@ func TestSupervisor_EmitsStartingThenReady_ForHealthyPlugin(t *testing.T) {
 	go func() { defer close(runDone); sup.Run(ctx) }()
 
 	// When: collect events until Ready (or fail on timeout).
-	first := requireEvent(t, ch, 5*time.Second)
-	second := requireEvent(t, ch, 5*time.Second)
+	first := requireEvent(t, ch)
+	second := requireEvent(t, ch)
 
 	// Then
 	require.Equal(t, supervisor.EventStarting, first.Kind)
@@ -177,7 +178,7 @@ func TestSupervisor_StaysHealthy_PastMissedHeartbeatsWindow_WithRealHeartbeatSen
 	runDone := make(chan struct{})
 	go func() { defer close(runDone); sup.Run(ctx) }()
 
-	_ = requireEventOfKind(t, ch, supervisor.EventReady, 5*time.Second)
+	requireEventOfKind(t, ch, supervisor.EventReady, 5*time.Second)
 
 	// When: observe for several MissedHeartbeats x interval windows —
 	// long enough that a plugin NOT actually sending heartbeats would
@@ -223,8 +224,10 @@ func TestSupervisor_RestartsPerPolicy_ThenEmitsGaveUp_WhenMaxExceeded(t *testing
 
 	const maxRestarts = 2
 	cfg := supervisor.Config{
-		Spec:    lifecycle.Spec{Path: fixtureCrashPlugin},
-		Restart: supervisor.RestartPolicy{Max: maxRestarts, Backoff: func(int) time.Duration { return 5 * time.Millisecond }},
+		Spec: lifecycle.Spec{Path: fixtureCrashPlugin},
+		Restart: supervisor.RestartPolicy{
+			Max: maxRestarts, Backoff: func(int) time.Duration { return 5 * time.Millisecond },
+		},
 	}
 	sup := supervisor.New(cfg, bus)
 
@@ -234,7 +237,7 @@ func TestSupervisor_RestartsPerPolicy_ThenEmitsGaveUp_WhenMaxExceeded(t *testing
 	go func() { defer close(runDone); sup.Run(ctx) }()
 
 	// When: observe the event stream until GaveUp.
-	seen := collector.awaitKind(t, supervisor.EventGaveUp, 10*time.Second)
+	seen := collector.awaitKind(t)
 
 	// Then: GaveUp is terminal — it is the LAST event observed, and it
 	// carries a non-nil reason; Restarting fired at least once (a restart
@@ -251,6 +254,8 @@ func TestSupervisor_RestartsPerPolicy_ThenEmitsGaveUp_WhenMaxExceeded(t *testing
 	var crashedCount, restartingCount int
 	var sawStderrTail bool
 	for _, ev := range seen {
+		//exhaustive:ignore -- only Crashed/Restarting are tallied here; every
+		// other kind is irrelevant to this assertion.
 		switch ev.Kind {
 		case supervisor.EventCrashed:
 			crashedCount++
@@ -313,7 +318,7 @@ func TestSupervisor_MakesProgress_WithWedgedSubscriber(t *testing.T) {
 	// When / Then: the observer still reaches GaveUp — restarts and the
 	// final terminal event were never delayed by the wedged subscriber —
 	// and Run still returns.
-	seen := observer.awaitKind(t, supervisor.EventGaveUp, 10*time.Second)
+	seen := observer.awaitKind(t)
 	require.Equal(t, supervisor.EventGaveUp, seen[len(seen)-1].Kind)
 
 	select {
@@ -346,7 +351,7 @@ func TestSupervisor_Stop_DuringBackoff_ReturnsPromptly(t *testing.T) {
 
 	// When: wait for the first Restarting event (confirms we are inside the
 	// minute-long backoff sleep), then Stop.
-	_ = requireEventOfKind(t, ch, supervisor.EventRestarting, 5*time.Second)
+	requireEventOfKind(t, ch, supervisor.EventRestarting, 5*time.Second)
 
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- sup.Stop(t.Context()) }()
@@ -366,13 +371,15 @@ func TestSupervisor_Stop_DuringBackoff_ReturnsPromptly(t *testing.T) {
 }
 
 // requireEvent reads the next event from ch, failing the test on timeout.
-func requireEvent(t *testing.T, ch <-chan supervisor.Event, timeout time.Duration) supervisor.Event {
+// Every caller uses the same 5s timeout, so it's hardcoded rather than
+// parameterized.
+func requireEvent(t *testing.T, ch <-chan supervisor.Event) supervisor.Event {
 	t.Helper()
 
 	select {
 	case ev := <-ch:
 		return ev
-	case <-time.After(timeout):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for an event")
 
 		return supervisor.Event{}
@@ -380,9 +387,9 @@ func requireEvent(t *testing.T, ch <-chan supervisor.Event, timeout time.Duratio
 }
 
 // requireEventOfKind drains ch until it observes kind, failing on timeout.
-func requireEventOfKind(
-	t *testing.T, ch <-chan supervisor.Event, kind supervisor.EventKind, timeout time.Duration,
-) supervisor.Event {
+// No caller uses the observed event itself (only that kind eventually
+// arrived), so this reports nothing back.
+func requireEventOfKind(t *testing.T, ch <-chan supervisor.Event, kind supervisor.EventKind, timeout time.Duration) {
 	t.Helper()
 
 	deadline := time.After(timeout)
@@ -390,12 +397,12 @@ func requireEventOfKind(
 		select {
 		case ev := <-ch:
 			if ev.Kind == kind {
-				return ev
+				return
 			}
 		case <-deadline:
 			t.Fatalf("timed out waiting for event kind %d", kind)
 
-			return supervisor.Event{}
+			return
 		}
 	}
 }
@@ -504,7 +511,7 @@ func TestSupervisor_CrashedEvent_CarriesRealExitStatus_ForNonzeroExitAfterReady(
 	go func() { defer close(runDone); sup.Run(ctx) }()
 
 	// When: observe through to GaveUp (Max: 0, so the first crash is terminal).
-	seen := collector.awaitKind(t, supervisor.EventGaveUp, 10*time.Second)
+	seen := collector.awaitKind(t)
 
 	// Then: some event along the way (Crashed, wrapped again into GaveUp)
 	// reports the real exit code, not an "unknown" placeholder.
@@ -517,7 +524,9 @@ func TestSupervisor_CrashedEvent_CarriesRealExitStatus_ForNonzeroExitAfterReady(
 			sawRealExitStatus = true
 		}
 	}
-	require.True(t, sawRealExitStatus, "expected a Crashed/GaveUp event reporting exit status %d; got %+v", exitCode, seen)
+	require.True(
+		t, sawRealExitStatus, "expected a Crashed/GaveUp event reporting exit status %d; got %+v", exitCode, seen,
+	)
 
 	select {
 	case <-runDone:
@@ -541,7 +550,9 @@ func TestSupervisor_ReachesReady_WhenPluginServiceVersionSatisfiesRequirement(t 
 		Spec:              lifecycle.Spec{Path: fixtureVersionedPlugin, Args: []string{"2"}},
 		Restart:           supervisor.RestartPolicy{Max: 0},
 		HeartbeatInterval: 100 * time.Millisecond,
-		Services:          []control.ServiceRequirement{{Service: "versiontest.Versioned", MinVersion: 2, MaxVersion: 2}},
+		Services: []control.ServiceRequirement{
+			{Service: "versiontest.Versioned", MinVersion: 2, MaxVersion: 2},
+		},
 	}
 	sup := supervisor.New(cfg, bus)
 
@@ -552,8 +563,8 @@ func TestSupervisor_ReachesReady_WhenPluginServiceVersionSatisfiesRequirement(t 
 
 	// When / Then: Starting, then Ready — the matching requirement never
 	// blocks the handshake.
-	first := requireEvent(t, ch, 5*time.Second)
-	second := requireEvent(t, ch, 5*time.Second)
+	first := requireEvent(t, ch)
+	second := requireEvent(t, ch)
 	require.Equal(t, supervisor.EventStarting, first.Kind)
 	require.Equal(t, supervisor.EventReady, second.Kind)
 
@@ -606,7 +617,7 @@ func TestSupervisor_ShortCircuitsToGaveUp_WithZeroRestarts_OnHandshakeIncompatib
 	go func() { defer close(runDone); sup.Run(ctx) }()
 
 	// When: observe the event stream until GaveUp.
-	seen := collector.awaitKind(t, supervisor.EventGaveUp, 10*time.Second)
+	seen := collector.awaitKind(t)
 
 	// Then: GaveUp is terminal and carries a *control.IncompatibleError
 	// naming the offending service, reached through the exact chain a real
@@ -635,7 +646,9 @@ func TestSupervisor_ShortCircuitsToGaveUp_WithZeroRestarts_OnHandshakeIncompatib
 	// the restart/backoff loop at all, so it can never burn the budget
 	// (Max: 5 above was never exercised) waiting out a doomed retry.
 	for _, ev := range seen {
-		require.NotEqual(t, supervisor.EventRestarting, ev.Kind, "handshake incompatibility must never restart: %+v", ev)
+		require.NotEqual(
+			t, supervisor.EventRestarting, ev.Kind, "handshake incompatibility must never restart: %+v", ev,
+		)
 	}
 
 	select {

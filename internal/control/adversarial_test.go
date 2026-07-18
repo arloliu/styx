@@ -22,18 +22,19 @@ import (
 // a parser — every one must yield a typed error or a harmless zero value.
 func adversarialBlobs() [][]byte {
 	r := rand.New(rand.NewSource(1)) //nolint:gosec // deterministic corpus, not security-sensitive
-	blobs := [][]byte{
+	blobs := make([][]byte, 0, 42)
+	blobs = append(blobs,
 		nil,
-		{},
-		{0x00},
-		{0xFF},
-		{0x08}, // field-1 varint tag, value truncated
-		{0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // overlong varint
-		{0x0A, 0x7F}, // length-delimited field claiming 127 bytes, none present
+		[]byte{},
+		[]byte{0x00},
+		[]byte{0xFF},
+		[]byte{0x08}, // field-1 varint tag, value truncated
+		[]byte{0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // overlong varint
+		[]byte{0x0A, 0x7F}, // length-delimited field claiming 127 bytes, none present
 		bytes.Repeat([]byte{0xAB}, control.MaxMessageSize),     // oversized
 		bytes.Repeat([]byte{0x00}, control.MaxMessageSize+100), // oversized zeros
 		append([]byte{0x0A, 0x04}, []byte("uds\x00")...),       // embedded NUL in a string field
-	}
+	)
 	for range 32 {
 		b := make([]byte, r.Intn(5000))
 		_, _ = r.Read(b)

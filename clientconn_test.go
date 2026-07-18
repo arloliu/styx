@@ -18,15 +18,15 @@ import (
 // socketpair wrapped as transport.Transport, mirroring
 // internal/transport's own unexported test helper — reconstructed here
 // from the same primitives since this package can't import that helper.
-func newInProcessTransportPairForTest(t *testing.T) (transport.Transport, transport.Transport) {
+func newInProcessTransportPairForTest(t *testing.T) (a, b transport.Transport) {
 	t.Helper()
 
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	require.NoError(t, err)
 
-	a, err := transport.NewUDSTransport(fds[0])
+	a, err = transport.NewUDSTransport(fds[0])
 	require.NoError(t, err)
-	b, err := transport.NewUDSTransport(fds[1])
+	b, err = transport.NewUDSTransport(fds[1])
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
 

@@ -43,7 +43,11 @@ const (
 
 // ReplyDeadlines is the per-message-type reply deadline. Drain and
 // Shutdown carry their own deadline_unix_nano field for the phase itself;
-// this map is the deadline for the *reply* to arrive at all.
+// this map is the deadline for the *reply* to arrive at all. Ack kinds and
+// Resume/Poisoned are deliberately absent — they ARE replies, or (Poisoned)
+// arrive unsolicited, so none has a reply deadline of its own.
+//
+//exhaustive:ignore -- see comment above: only kinds that expect a reply appear here.
 var ReplyDeadlines = map[MessageKind]time.Duration{
 	KindHello:        2 * time.Second,
 	KindAttachRegion: 2 * time.Second,

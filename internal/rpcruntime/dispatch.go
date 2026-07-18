@@ -16,6 +16,8 @@ import (
 // reverse) — ServiceHandler is the seam. status is a package-local *Status (not
 // styx.Status) for the same import-cycle-avoidance reason documented on Result.
 type ServiceHandler interface {
+	// Handle dispatches a single method call by ID, returning either a
+	// successful response payload or a Status describing the failure.
 	Handle(ctx context.Context, methodID uint64, payload []byte) (respPayload []byte, status *Status, err error)
 }
 
@@ -73,6 +75,8 @@ func (d *Dispatcher) Register(serviceID uint64, h ServiceHandler) {
 //
 // Any other kind is discarded (returns no Frame).
 func (d *Dispatcher) Dispatch(ctx context.Context, f transport.Frame, recvAt time.Time) []transport.Frame {
+	//exhaustive:ignore -- FrameUnaryResp/FrameUnaryErr flow plugin->host only
+	// and never arrive here; see the doc comment above for the discard rule.
 	switch f.Kind {
 	case transport.FrameUnaryReq:
 		return d.dispatchUnary(ctx, f, recvAt)
@@ -109,8 +113,8 @@ func (d *Dispatcher) dispatchUnary(ctx context.Context, f transport.Frame, recvA
 	}
 
 	callCtx, cancel := contextFor(ctx, deadline)
-	d.register(f.CallID, cancel)
-	defer d.unregister(f.CallID, cancel)
+	d.trackCall(f.CallID, cancel)
+	defer d.untrackCall(f.CallID, cancel)
 
 	payload, status, err := h.Handle(callCtx, f.Method, f.Payload)
 
@@ -163,16 +167,16 @@ func statusFrame(f transport.Frame, s *Status) transport.Frame {
 	}
 }
 
-// register records cancel against callID so a later CANCEL Frame can reach the
-// in-flight handler's context.
-func (d *Dispatcher) register(callID uint64, cancel context.CancelFunc) {
+// trackCall records cancel against callID so a later CANCEL Frame can reach
+// the in-flight handler's context.
+func (d *Dispatcher) trackCall(callID uint64, cancel context.CancelFunc) {
 	d.mu.Lock()
 	d.inFlight[callID] = cancel
 	d.mu.Unlock()
 }
 
-// unregister removes callID's in-flight entry and releases its context.
-func (d *Dispatcher) unregister(callID uint64, cancel context.CancelFunc) {
+// untrackCall removes callID's in-flight entry and releases its context.
+func (d *Dispatcher) untrackCall(callID uint64, cancel context.CancelFunc) {
 	d.mu.Lock()
 	delete(d.inFlight, callID)
 	d.mu.Unlock()

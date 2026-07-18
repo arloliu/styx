@@ -10,7 +10,9 @@ type Codec interface {
 	// Name identifies the codec during handshake negotiation; it is the
 	// exact string compared against both sides' offered codec lists.
 	Name() string
+	// Marshal encodes m into its wire representation.
 	Marshal(m proto.Message) ([]byte, error)
+	// Unmarshal decodes data into m.
 	Unmarshal(data []byte, m proto.Message) error
 }
 

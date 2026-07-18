@@ -26,26 +26,34 @@ func blockingEventfd(t *testing.T) int {
 	efd, err := unix.Eventfd(0, unix.EFD_CLOEXEC)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = unix.Close(efd) })
+
 	return efd
+}
+
+// testWaiterState bundles the state/tail/shutdown words a Waiter is built
+// over, keeping newTestWaiter's result count within revive's
+// function-result-limit.
+type testWaiterState struct {
+	state, shutdown *uint32
+	tail            *uint64
 }
 
 // newTestWaiter builds a Waiter over a BLOCKING eventfd so that Wait can park
 // without busy-spinning. Tests that specifically need a non-blocking fd (to
 // assert EAGAIN on a drained read) construct their own fd instead.
-func newTestWaiter(t *testing.T, spinBudget time.Duration) (*event.Waiter, *uint32, *uint64, *uint32) {
+func newTestWaiter(t *testing.T, spinBudget time.Duration) (*event.Waiter, testWaiterState) {
 	t.Helper()
 	efd := blockingEventfd(t)
-	var state uint32
-	var tail uint64
-	var shutdown uint32
-	return event.NewWaiter(efd, &state, &tail, &shutdown, spinBudget), &state, &tail, &shutdown
+	ws := testWaiterState{state: new(uint32), tail: new(uint64), shutdown: new(uint32)}
+
+	return event.NewWaiter(efd, ws.state, ws.tail, ws.shutdown, spinBudget), ws
 }
 
 // Test Wait returns immediately when the tail has already advanced past lastSeen
 func TestWaiter_Wait_ReturnsImmediately_WhenTailAlreadyAdvanced(t *testing.T) {
 	// Given
-	w, _, tail, _ := newTestWaiter(t, 0)
-	atomic.StoreUint64(tail, 5)
+	w, ws := newTestWaiter(t, 0)
+	atomic.StoreUint64(ws.tail, 5)
 
 	// When
 	got, ok := w.Wait(0)

@@ -37,28 +37,44 @@ func TestNegotiate_ReturnsIncompatibleError_OnEachFailureMode(t *testing.T) {
 		wantReasonHas  string
 	}{
 		{
-			name:          "empty protocol range intersection",
-			host:          control.Offer{ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"proto"}},
-			plugin:        control.Offer{ProtocolMin: 2, ProtocolMax: 2, Transports: []string{"uds"}, Codecs: []string{"proto"}},
+			name: "empty protocol range intersection",
+			host: control.Offer{
+				ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"proto"},
+			},
+			plugin: control.Offer{
+				ProtocolMin: 2, ProtocolMax: 2, Transports: []string{"uds"}, Codecs: []string{"proto"},
+			},
 			wantReasonHas: "protocol range",
 		},
 		{
-			name:          "no common transport",
-			host:          control.Offer{ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"proto"}},
-			plugin:        control.Offer{ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"shm"}, Codecs: []string{"proto"}},
+			name: "no common transport",
+			host: control.Offer{
+				ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"proto"},
+			},
+			plugin: control.Offer{
+				ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"shm"}, Codecs: []string{"proto"},
+			},
 			wantReasonHas: "transport",
 		},
 		{
-			name:          "no common codec",
-			host:          control.Offer{ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"proto"}},
-			plugin:        control.Offer{ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"cbor"}},
+			name: "no common codec",
+			host: control.Offer{
+				ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"proto"},
+			},
+			plugin: control.Offer{
+				ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"cbor"},
+			},
 			wantReasonHas: "codec",
 		},
 		{
 			name: "host requires unsupported feature",
-			host: control.Offer{ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"proto"},
-				Features: []control.FeatureFlag{{Name: "trace_context", Required: true}}},
-			plugin:        control.Offer{ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"proto"}},
+			host: control.Offer{
+				ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"proto"},
+				Features: []control.FeatureFlag{{Name: "trace_context", Required: true}},
+			},
+			plugin: control.Offer{
+				ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"proto"},
+			},
 			wantReasonHas: "trace_context",
 		},
 		{

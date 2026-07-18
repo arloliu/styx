@@ -185,6 +185,9 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	firstOutcome := make(chan error, 1)
 
 	go h.relayEvents(spec.Name, events, stopRelay, relayDone, firstOutcome)
+	//nolint:gosec // sup.Run's lifetime is host-scoped (until sup.Stop, e.g. on
+	// Host shutdown), not scoped to ctx, which only bounds this call's wait for
+	// the first Ready/GaveUp outcome below.
 	go sup.Run(context.Background())
 
 	var startErr error
@@ -238,6 +241,8 @@ func (h *Host) relayEvents(
 		case ev := <-events:
 			h.publish(translateEvent(name, ev))
 
+			//exhaustive:ignore -- only Ready/GaveUp affect firstOutcome; every
+			// other kind is already handled above via h.publish.
 			switch ev.Kind {
 			case supervisor.EventReady:
 				select {
@@ -425,7 +430,12 @@ func translateEventErr(name string, err error) error {
 // internal/supervisor.Config's own type: a pure, allocation-free-when-
 // empty mapping with no other logic — enforcement lives entirely in
 // control.Negotiate, this only carries the requirement across the
-// styx/internal/supervisor boundary. nil in, nil out.
+// styx/internal/supervisor boundary. nil in, nil out. export_test.go's
+// ToControlServiceRequirements deliberately re-exports this for tests
+// outside the package; the case-only difference is the intended shape of
+// that pattern, not a naming accident.
+//
+//nolint:revive // see doc above
 func toControlServiceRequirements(reqs []ServiceRequirement) []control.ServiceRequirement {
 	if len(reqs) == 0 {
 		return nil
@@ -442,7 +452,11 @@ func toControlServiceRequirements(reqs []ServiceRequirement) []control.ServiceRe
 // translateEventKind maps internal/supervisor.EventKind to styx.EventKind.
 // Written as an explicit switch rather than a same-index int conversion so
 // the two enums are never silently allowed to drift out of sync.
+// EventCrashed intentionally falls through to default (same return value)
+// rather than an explicit case, to avoid identical-switch-branches — see
+// default's comment below.
 func translateEventKind(k supervisor.EventKind) EventKind {
+	//exhaustive:ignore -- see doc above
 	switch k {
 	case supervisor.EventStarting:
 		return EventStarting
@@ -450,13 +464,14 @@ func translateEventKind(k supervisor.EventKind) EventKind {
 		return EventReady
 	case supervisor.EventUnhealthy:
 		return EventUnhealthy
-	case supervisor.EventCrashed:
-		return EventCrashed
 	case supervisor.EventRestarting:
 		return EventRestarting
 	case supervisor.EventGaveUp:
 		return EventGaveUp
 	default:
+		// Also covers supervisor.EventCrashed: same branch as an unrecognized
+		// kind, so revive's identical-switch-branches doesn't flag a
+		// duplicate case that returns the same value as default.
 		return EventCrashed
 	}
 }

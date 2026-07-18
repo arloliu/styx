@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
+	"slices"
 	"unicode/utf8"
 
 	"github.com/arloliu/styx/internal/control/controlpb"
@@ -222,7 +222,7 @@ func firstCommon(a, b []string) (string, bool) {
 	if len(common) == 0 {
 		return "", false
 	}
-	sort.Strings(common)
+	slices.Sort(common)
 
 	return common[0], true
 }
@@ -350,7 +350,7 @@ func TupleToHelloAck(t Tuple, nonce uint64, identity PluginIdentity, services []
 	for name := range t.Features {
 		names = append(names, name)
 	}
-	sort.Strings(names) // deterministic wire order, independent of map iteration
+	slices.Sort(names) // deterministic wire order, independent of map iteration
 	for _, name := range names {
 		ack.Features = append(ack.Features, &controlpb.FeatureFlag{Name: name, Supported: t.Features[name]})
 	}
