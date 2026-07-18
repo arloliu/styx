@@ -19,6 +19,15 @@ disagrees with it, the config wins (see
   [800](800-performance-security.md) and
   [300](300-testing.md#unsafe-core-ringarena).
 
+## Comments
+No jargon — general rule in the root
+[`AGENTS.md`](../../AGENTS.md#no-jargon-anywhere). A comment explains the
+invariant, the *why*, or a non-obvious constraint; it never references the
+current task, plan step, or a PR/issue number.
+- Bad: `// added for the hot-reload fix, see plan step 4`
+- Good: `// generation must be checked before dereferencing: a late write
+  from a torn-down peer must never be read as current`
+
 ## Naming
 - Packages: short, lowercase. Exported `CamelCase`, unexported `camelCase`.
 - Receivers: short, consistent per type.

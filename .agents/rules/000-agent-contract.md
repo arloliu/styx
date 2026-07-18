@@ -44,3 +44,7 @@ user instruction overrides it.
 - Checkpoint after significant steps: what changed, what is verified, what remains.
 - Do not say "done" or "tests pass" if anything was skipped or unverified.
 - Default to surfacing uncertainty, not hiding it.
+
+## No Jargon
+State facts plainly in rules, code, commits, everywhere — see the root
+[`AGENTS.md`](../../AGENTS.md#no-jargon-anywhere) for the full rule.

@@ -5,6 +5,31 @@ here; other agents read `AGENTS.md` directly. If instructions here conflict with
 default behavior, this file and the rules it references win — only an explicit user
 instruction overrides them.
 
+## No Jargon, Anywhere
+
+State facts plainly — in agent rules, code comments, commit messages, PR
+descriptions, everywhere. A future reader (human or agent) has no memory of
+this conversation, this plan, or this review round; jargon that made sense
+mid-task is meaningless or actively misleading once that context is gone.
+
+Don't cite: sequencing labels (`PR-1`, `Phase 4`), "Open Question N" or
+finding numbers, review-round references (`round 2`, `v3 findings`),
+work-item/ticket/session/task IDs, `tmp/*` paths, or "resolved `<date>`"
+provenance trails. State the current fact, not the process that produced it.
+
+- **Agent rules** (this file, `.agents/rules/*.md`): describe current
+  behavior, not decision history — dated resolutions belong in
+  `docs/specs/*.md` only, where that's the point.
+- **Code comments/docstrings:** explain the invariant or the *why*, never the
+  task/PR/plan step that added the code — see
+  [200-coding-standards.md](.agents/rules/200-coding-standards.md#comments).
+- **Commits and PRs:** see
+  [600-git-conventions.md](.agents/rules/600-git-conventions.md#no-planreview-jargon)
+  for detailed do/don't examples.
+
+A committed spec file *path* is always fine to cite; its internal section
+numbers, round numbers, or open-question numbering are not.
+
 Styx (module `github.com/arloliu/styx`, final module path) is a
 process-isolated Go plugin framework in the spirit of `hashicorp/go-plugin`, with a
 shared-memory data plane (memfd rings + slab arena + eventfd wakeups) in place of gRPC

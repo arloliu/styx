@@ -18,6 +18,8 @@ below are enforced by convention/review, not tooling.
   test lists.
 
 ### No Plan/Review Jargon
+General rule (applies everywhere, not just commits): root
+[`AGENTS.md`](../../AGENTS.md#no-jargon-anywhere). For commits specifically:
 `git log`/`git blame` readers can't see in-progress plans. Never cite
 sequencing labels (`PR-1`, `Phase 4`), work-item IDs, review jargon
 (`review round 2`, `v3 findings`), or `tmp/*` paths. A committed spec file
