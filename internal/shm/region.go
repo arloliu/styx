@@ -314,7 +314,9 @@ func (r *Region) Layout() Layout {
 }
 
 // Close munmaps the region and closes the local fd. Idempotent: a second
-// call is a no-op.
+// call is a no-op. Both resources are marked released up front, so even if
+// Munmap fails, Close still attempts to close the fd (never leaking it on
+// a subsequent Close call) and a later Close remains a clean no-op.
 func (r *Region) Close() error {
 	if r.data == nil {
 		return nil
@@ -323,9 +325,18 @@ func (r *Region) Close() error {
 	data := r.data
 	r.data = nil
 
-	if err := unix.Munmap(data); err != nil {
-		return fmt.Errorf("shm: Close: munmap: %w", err)
+	munmapErr := unix.Munmap(data)
+	closeErr := unix.Close(r.fd)
+
+	return errors.Join(wrapErrNonNil("shm: Close: munmap", munmapErr), wrapErrNonNil("shm: Close: close", closeErr))
+}
+
+// wrapErrNonNil returns nil for a nil err (so errors.Join drops it), or err
+// wrapped with a "prefix: " message otherwise.
+func wrapErrNonNil(prefix string, err error) error {
+	if err == nil {
+		return nil
 	}
 
-	return unix.Close(r.fd)
+	return fmt.Errorf("%s: %w", prefix, err)
 }

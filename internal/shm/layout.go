@@ -130,6 +130,15 @@ const (
 // Phase 2 runs.
 const poisonWordOffset = 4480
 
+// syncPageReservedTailOffset is the in-page byte offset where the sync
+// page's reserved tail begins (shm-abi.md §3: "bytes from offset 4608 to
+// 8191 of the sync page are reserved"; 4608 = sync-page base 4096 + this
+// 512-byte in-page offset). This package proves only that the whole tail
+// range is zero at attach (Phase 2 step 7) — the sync page's word schema
+// (tail/head/park_state/poison/shutdown offsets, §3) belongs to
+// internal/ring and internal/event, not this package (see doc.go).
+const syncPageReservedTailOffset = 512
+
 // classTableRecommendedOffset is where CreateRegion places the H→P
 // size-class table; the P→H table immediately follows it. shm-abi.md §2
 // documents 256 as the RECOMMENDED (not mandatory) placement — a
@@ -785,6 +794,9 @@ func checkReservedZero(
 	if !isZero(data[offReservedHdr : offReservedHdr+reservedHdrSize]) {
 		return fmt.Errorf("shm: reserved_hdr is not all-zero: %w", ErrBadGeometry)
 	}
+	if err := checkSyncPageReservedTailZero(data, spans); err != nil {
+		return err
+	}
 	if err := checkClassEntriesReservedZero(data, classTableHPOff, numHP); err != nil {
 		return err
 	}
@@ -808,6 +820,28 @@ func checkClassEntriesReservedZero(data []byte, tableOff uint64, n uint32) error
 		if v := readU32(data, entryOff+offSizeClassReserved); v != 0 {
 			return fmt.Errorf("shm: size-class[%d]: reserved %#x != 0: %w", i, v, ErrBadGeometry)
 		}
+	}
+
+	return nil
+}
+
+// checkSyncPageReservedTailZero checks the sync page's reserved tail —
+// absolute byte range [spans.syncPageOffset+syncPageReservedTailOffset,
+// spans.syncPageOffset+SyncPageSize), shm-abi.md §3's "offset 4608 to 8191"
+// — is all-zero. Fail-closed like every other reserved region this
+// function validates: no negotiated-feature tuple reaches OpenRegion (see
+// checkReservedZero's doc comment), so the whole tail is required to be
+// zero unconditionally. This is a pure byte-range check; the sync page's
+// word schema (§3) is a later package's concern, not this one's. Safe to
+// slice: checkSpansAndCoverage (step 6, run before this) already proved
+// [0, spans.regionSize) — which always contains [4096, 8192), since every
+// valid geometry's spans place the sync page immediately after the layout
+// page and before ring_hp — lies inside data.
+func checkSyncPageReservedTailZero(data []byte, spans derivedGeometry) error {
+	start := spans.syncPageOffset + syncPageReservedTailOffset
+	end := spans.syncPageOffset + SyncPageSize
+	if !isZero(data[start:end]) {
+		return fmt.Errorf("shm: sync page reserved tail [%d,%d) is not all-zero: %w", start, end, ErrBadGeometry)
 	}
 
 	return nil

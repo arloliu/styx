@@ -138,19 +138,44 @@ func buildRawSealedRegion(t *testing.T, layout shm.Layout, regionSize uint64) (f
 }
 
 // Test OpenRegion's Phase 2 attach validation (shm-abi.md §1): a
-// hand-crafted layout page whose size-class table makes the class_total
-// accumulation overflow uint64 is rejected as a typed geometry error, not
-// a panic and not a silently wrapped (and therefore wrong) offset.
-// CreateRegion's own input validation would never let a caller build this
-// geometry — this constructs the on-wire bytes directly to exercise the
-// attach-time defense against a corrupt or malicious peer, per
-// shm-abi.md's untrusted-shared-memory trust model.
+// hand-crafted layout page whose size-class table makes class_total
+// accumulation overflow uint64 inside computeClassBaseOffsets is rejected
+// via that function's addOverflowSafe guard specifically — not via any
+// other Phase 2 check (contiguity, roundup, slab-bounds) that could also
+// reject a corrupt table for an unrelated reason. CreateRegion's own input
+// validation would never let a caller build this geometry — this
+// constructs the on-wire bytes directly to exercise the attach-time
+// defense against a corrupt or malicious peer, per shm-abi.md's
+// untrusted-shared-memory trust model.
 func TestRegion_OpenRegion_RejectsClassTotalOverflow(t *testing.T) {
-	// Given
-	overflowingClasses := []shm.SizeClass{
-		{SlabSize: 64, SlabCount: 1},
-		{SlabSize: 0xFFFFFFC0, SlabCount: 0xFFFFFFFF}, // product ~= uint64 max; + the first class's extent overflows
-	}
+	// Given: two large, strictly-ascending H->P classes whose per-class
+	// byte extents (slab_size*slab_count, each a uint32*uint32 product that
+	// always fits uint64) individually fit uint64, but whose running SUM
+	// overflows uint64 — the only way to reach computeClassBaseOffsets'
+	// addOverflowSafe guard before any other check can reject the table.
+	// Both slab_sizes are multiples of CacheLine (64), strictly ascending,
+	// and the largest is >= minLargestSlabSize (4096), so validateSlabBounds
+	// — which checkClassRules runs BEFORE checkClassBaseOffsets — passes and
+	// does not short-circuit the case.
+	class0 := shm.SizeClass{SlabSize: 0xFFFFFF80, SlabCount: 0xFFFFFFFF}
+	class1 := shm.SizeClass{SlabSize: 0xFFFFFFC0, SlabCount: 0xFFFFFFFF}
+	extent0 := uint64(class0.SlabSize) * uint64(class0.SlabCount)
+	extent1 := uint64(class1.SlabSize) * uint64(class1.SlabCount)
+	// Self-check the test's own premise, in plain uint64 wraparound
+	// arithmetic independent of the package under test: extent0+extent1
+	// really does carry past math.MaxUint64. Guards against this test
+	// silently degrading back into exercising an unrelated check, the way
+	// its previous geometry did.
+	require.Less(t, extent0+extent1, extent0,
+		"test geometry sanity: extent0+extent1 must wrap uint64, or this test no longer reaches addOverflowSafe")
+
+	// class1's ClassBaseOffset is left at 0 (its zero value): the true
+	// expected base for class1 is extent0, which cannot fit the wire's
+	// uint32 ClassBaseOffset field regardless, and computeClassBaseOffsets
+	// returns its overflow error while accumulating class1 before
+	// checkClassBaseOffsets ever compares a wire ClassBaseOffset value
+	// against it — proven below by asserting on the overflow error's text.
+	overflowingClasses := []shm.SizeClass{class0, class1}
 	layout := shm.Layout{
 		Magic:            [8]byte{'S', 'T', 'Y', 'X', 'S', 'H', 'M', 'R'},
 		LayoutVersion:    1,
@@ -173,6 +198,14 @@ func TestRegion_OpenRegion_RejectsClassTotalOverflow(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, shm.ErrBadGeometry)
 	require.Nil(t, r)
+
+	// Prove the rejection came from addOverflowSafe specifically, not from
+	// the unrelated class_base_offset contiguity check (error text "...
+	// class_base_offset ... != expected ...") that also wraps ErrBadGeometry
+	// and would otherwise be indistinguishable from require.ErrorIs alone.
+	require.ErrorContains(t, err, "uint64 overflow computing region geometry",
+		"rejection must come from addOverflowSafe, not the class_base_offset contiguity check")
+	require.ErrorContains(t, err, "size-class[1]", "overflow must be detected while accumulating the second class")
 }
 
 // Test that CreateRegion rejects every host-chosen-geometry violation
@@ -312,11 +345,13 @@ func TestRegion_OpenRegion_RejectsPhase2Violations(t *testing.T) {
 // Test that OpenRegion's Phase 2 reserved-zero checks (shm-abi.md §1
 // Phase 2 step 7) reject a byte this package has no visibility into a
 // negotiated feature tuple for, and therefore always requires zero:
-// reserved_hdr, a size-class entry's reserved field, and a nonzero byte
-// in an arena's page-alignment pad range. shm.WriteLayoutPageForTest
-// always writes these fields zero, so each case pokes one byte directly
-// into the mapped bytes after the write — on-wire corruption CreateRegion
-// itself could never produce.
+// reserved_hdr, a size-class entry's reserved field, the sync page's
+// reserved tail, and a nonzero byte in an arena's page-alignment pad
+// range. shm.WriteLayoutPageForTest always writes these fields zero (and
+// never touches the sync page at all, which a freshly ftruncate'd memfd
+// already zero-fills), so each case pokes one byte directly into the
+// mapped bytes after the write — on-wire corruption CreateRegion itself
+// could never produce.
 func TestRegion_OpenRegion_RejectsReservedNonZero(t *testing.T) {
 	// Given: a geometry whose H->P class_total (64*1 + 4096*1 = 4160) is
 	// NOT a page multiple, so roundup pads it to 8192 and leaves a real,
@@ -364,6 +399,12 @@ func TestRegion_OpenRegion_RejectsReservedNonZero(t *testing.T) {
 			size:   paddedLayout.RegionSize,
 			// one byte into [class_total, arena_bytes)
 			corruptAt: int(paddedLayout.Arenas[shm.HostToPlugin].Offset) + 4160,
+		},
+		{
+			name:      "sync-page reserved tail byte nonzero",
+			layout:    good,
+			size:      regionSize,
+			corruptAt: 4608, // shm-abi.md §3: sync-page reserved tail starts at absolute offset 4608
 		},
 	}
 
@@ -417,6 +458,35 @@ func TestRegion_Close_IsIdempotent(t *testing.T) {
 	require.NoError(t, r.Close())
 
 	// Then
+	require.NoError(t, r.Close())
+}
+
+// Test that Close still closes the fd even when its internal Munmap call
+// fails, so a failed unmap never leaks the descriptor, and that a second
+// Close call afterward remains a clean, idempotent no-op rather than
+// retrying (and failing again on) an fd that was never closed. A real
+// Region built via CreateRegion/OpenRegion can never make Munmap fail —
+// its data always comes from a successful mmap of a nonzero,
+// page-aligned length — so shm.NewRegionForTest constructs a Region
+// directly with a zero-length data slice, which unix.Munmap rejects with
+// EINVAL, to exercise this path deterministically.
+func TestRegion_Close_ClosesFDEvenIfMunmapFails(t *testing.T) {
+	// Given
+	fd, err := unix.MemfdCreate("shm-close-fd-leak-test", unix.MFD_CLOEXEC)
+	require.NoError(t, err)
+	r := shm.NewRegionForTest(fd, make([]byte, 0))
+
+	// When
+	err = r.Close()
+
+	// Then
+	require.Error(t, err, "Close must surface the munmap failure")
+
+	var stat unix.Stat_t
+	statErr := unix.Fstat(fd, &stat)
+	require.ErrorIs(t, statErr, unix.EBADF, "Close must still close the fd even though munmap failed")
+
+	// A second Close call must be a clean, idempotent no-op.
 	require.NoError(t, r.Close())
 }
 
