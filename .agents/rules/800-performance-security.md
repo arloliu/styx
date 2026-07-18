@@ -54,3 +54,10 @@ it changes what the input boundary is.
 - Explicitly out of scope for v1 (don't build speculatively): seccomp/
   namespace/cgroup sandboxing, cross-user isolation, plugin authentication
   beyond binary identity.
+- **Internal goroutines that touch plugin-controlled or user-supplied data
+  must be panic-isolated** — a malformed line from a plugin's stdout/stderr,
+  or a panicking user-supplied `supervisor.Sink`, must never crash the host.
+  This isn't speculative hardening: the `arloliu/go-plugin` fork hit exactly
+  this failure mode in production. Known gap: `internal/supervisor/capture.go`'s
+  `deliverLoop` calls `sink.WriteLine` with no `recover()`. Add one when next
+  touching that file.

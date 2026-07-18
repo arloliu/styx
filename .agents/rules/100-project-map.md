@@ -7,13 +7,15 @@ from [`docs/specs/2026-07-16-styx-design.md`](../../docs/specs/2026-07-16-styx-d
 not a claim about what `ls` shows today — always check reality first.
 
 ## Identity
-- **Project:** Styx, module `github.com/arloliu/styx` (org not yet finalized —
-  see the design document's open-questions section). **Language:** Go, floor is
-  the latest stable release at the start of the initial framework work
-  (`tmp/kickoff.md` says 1.27 — confirm against `go.mod`
-  once one exists). **Platform:** Linux-first, amd64 primary, arm64 CI-built
-  best-effort. Pure Go — no cgo unless there is an extremely
-  strong, documented reason.
+- **Project:** Styx, module `github.com/arloliu/styx` — final module path.
+  **Language:** Go 1.26.0 (see `go.mod`). **Platform:** Linux-first, amd64
+  primary, arm64 CI-built best-effort. Pure Go — no cgo unless there is an
+  extremely strong, documented reason.
+- **Plugin package fetching stays host-side, not a Styx concern:**
+  `PluginSpec` takes a local binary path and an optional SHA-256 hash only.
+  Don't add a fetch-by-name/version abstraction to `styx` — that's eqp-hub's
+  `PackageStore`/`Fetcher`, deliberately kept out of this module (see the
+  design doc's Non-Goals section).
 - **Lint:** pinned via `.golangci.yml` + `.linter.go.mod` (`make lint`) — see
   [500](500-validation-and-workflow.md) and [700](700-go-after-write.md).
 - **CI/VCS:** GitHub; use `gh`. No workflow files exist yet.

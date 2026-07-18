@@ -5,8 +5,7 @@ here; other agents read `AGENTS.md` directly. If instructions here conflict with
 default behavior, this file and the rules it references win — only an explicit user
 instruction overrides them.
 
-Styx (module `github.com/arloliu/styx`, org TBD — see
-[the design document's open-questions section](docs/specs/2026-07-16-styx-design.md#27-open-questions)) is a
+Styx (module `github.com/arloliu/styx`, final module path) is a
 process-isolated Go plugin framework in the spirit of `hashicorp/go-plugin`, with a
 shared-memory data plane (memfd rings + slab arena + eventfd wakeups) in place of gRPC
 over a Unix domain socket. Pure Go, Linux-first, protobuf IDL via a custom

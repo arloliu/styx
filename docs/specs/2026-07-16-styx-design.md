@@ -63,6 +63,10 @@ handshake, typed interfaces, host-side lifecycle ownership, crash isolation.
   run with the UDS transport on macOS for dev convenience).
 - Not a stream-multiplexing transport: streaming exists as a high-level API, but the
   transport layer never grows HTTP/2-style stream states, windows, or priorities.
+- Not a plugin-package distributor/fetcher: `PluginSpec` takes a local binary path and
+  an optional SHA-256 hash. Downloading, caching, or resolving plugin packages at
+  runtime (eqp-hub's `PackageStore`/`Fetcher`) is the host application's job, not
+  Styx's (§27, Open Question 4).
 
 ## 5. Requirements from the Reference Consumer (eqp-hub)
 
@@ -81,6 +85,16 @@ what eqp-hub currently builds around go-plugin:
 - Prometheus-friendly metrics hooks; zap-friendly structured logging (no forced deps)
 - container/Kubernetes deployment: host and plugins share one container; no reliance on
   named files in `/dev/shm` surviving restarts
+- **process-group-scoped kill, not single-PID.** `arloliu/go-plugin` originally
+  SIGKILL'd only the plugin's own PID, orphaning any grandchild it forked (drivers,
+  subprocess tooling); fixed upstream-of-Styx by killing the plugin's whole process
+  group, with a configurable opt-out for TTY-interactive dev use (§27 Open Question 2
+  catalog). Styx's teardown machine (§9) must do the same from day one.
+- **panic-isolated internal goroutines.** The same fork catalog found host-crashing
+  panics in log-pump/stdout-capture goroutines triggered by malformed plugin output or
+  a panicking user-supplied sink. Styx's capture and observability goroutines (§18)
+  must recover from panics in anything touching plugin-controlled or user-supplied
+  data — this is not optional hardening, it's a repeat of a real incident class.
 
 ## 6. Architecture
 
@@ -198,8 +212,11 @@ routing target; (2) fail every in-flight call and open stream with the appropria
 error and wake all waiters (including parked eventfd waiters, via a dedicated shutdown
 signal); (3) join every goroutine that can touch the mapping; (4) `munmap`;
 (5) **when teardown is terminating a child process** (old hot-reload instance, poisoned
-or wedged plugin, shutdown), graceful `Shutdown` with deadline over the still-open
-control socket → `SIGKILL` fallback → `waitpid` reap, always; (6) close all local fds exactly
+or wedged plugin, shutdown), graceful `Shutdown` with a deadline (configurable per
+plugin, not hard-coded — a fork pain point, §27 Open Question 2) over the still-open
+control socket → `SIGKILL` fallback **sent to the plugin's process group, not just its
+PID** (configurable opt-out for TTY-interactive dev use — the same fork pain point) →
+`waitpid` reap, always; (6) close all local fds exactly
 once — fd closure is deliberately last so step 5's `Shutdown` exchange still has its
 control socket. Teardown is not complete until the reap. After a crash or
 health-triggered restart, a successor instance must not be promoted `Ready` while the
@@ -598,7 +615,10 @@ existing backoff policy.
 **Sinks and subscribers can be slow; supervision must not care.** Child stdout/stderr
 pipes are always drained by dedicated goroutines into bounded buffers with per-line
 size caps and explicit drop accounting — a blocked sink drops output (counted) rather
-than filling the pipe and blocking the plugin inside a write. `host.Events()` delivery
+than filling the pipe and blocking the plugin inside a write, and the capture goroutine
+itself is panic-isolated: a panicking user-supplied sink or malformed plugin output must
+never crash the host (a recurring `arloliu/go-plugin` fork pain point, §27 Open
+Question 2). `host.Events()` delivery
 is per-subscriber buffered and non-blocking: informational events are
 drop-oldest-with-counter; lifecycle-critical events (`Crashed`, `GaveUp`, `Poisoned`)
 coalesce to latest-state and never silently vanish. An unread subscription can never
@@ -736,12 +756,39 @@ reflection, stream-aware transport features (windows/priorities).
 
 ## 27. Open Questions
 
-1. Final module path/org (`github.com/arloliu/styx` assumed).
-2. Catalog what the `arloliu/go-plugin` fork changed vs. upstream (README doesn't say;
-   needs commit-history review) — fold those pain points into requirements before the
-   framework's public API is frozen.
+1. Final module path/org — resolved: `github.com/arloliu/styx` (Arlo, 2026-07-18;
+   matches the personal-namespace convention of the other reference projects,
+   e.g. `zapwire`, `mebo`, `parti`, `go-secs`, `helix`, `otx`).
+2. Catalog what the `arloliu/go-plugin` fork changed vs. upstream — resolved (Arlo,
+   2026-07-18). The fork diverges from `hashicorp/go-plugin` at commit `d662936`
+   (40 commits ahead as of this review; full history at
+   `/home/arlo/projects/go-plugin`, `git log d662936..HEAD`). Commit messages are
+   unusually self-documenting (failure mode + fix + regression test each), and the
+   recurring "mission-critical"/"fleet scale"/equipment language strongly suggests
+   these are real eqp-hub production incidents, not speculative hardening — though no
+   commit or doc names eqp-hub explicitly, so that link is inferred, not confirmed.
+   Disposition of each pain point against this design:
+   - **Folded in as new requirements** (not previously explicit in this doc):
+     process-group-scoped kill instead of single-PID (§5, §9); configurable
+     shutdown/teardown grace period instead of hard-coded (§9); panic isolation for
+     internal goroutines that touch plugin-controlled or user-supplied data — log/stdout
+     capture, not just observability hooks (§5, §18).
+   - **Already satisfied by the existing design, no change needed:** no silent
+     fallback on negotiation failure (§10's typed `ErrIncompatible` vs. the fork's fix
+     for a `sync.Once`-swallowed mux-init error causing silent fallback); guarding
+     against attaching to a stale/wrong process (§10's per-launch nonce vs. the fork's
+     `os.FindProcess(0)` reattach bug); structured internal diagnostics instead of raw
+     `log.Printf` (§21's `observe.Logger` seam vs. the fork's `SetInternalLogger`);
+     configurable liveness deadlines (§18's heartbeat-as-progress-contract already
+     exceeds the fork's simple configurable `Ping` timeout).
+   - **Not applicable:** fork-only housekeeping (module rename, dependency bumps,
+     lint/CI setup) and gRPC-broker-specific bugs (mux timeouts, broker map/stream
+     leaks) — Styx has no gRPC broker or mux to inherit that bug class.
 3. eventfd vs. futex numbers on target fab hardware — decided by performance-spike and
    SHM-transport benchmark data, not opinion.
 4. Whether eqp-hub's plugin *package fetching* (PackageStore/Fetcher) belongs in Styx or
-   stays host-side (current assumption: host-side; Styx takes a path + optional hash).
+   stays host-side — resolved: host-side (Arlo, 2026-07-18). `PluginSpec` takes a path
+   and optional SHA-256 hash only; fetching/caching plugin binaries stays the host
+   application's job (eqp-hub's own `PackageStore`), keeping Styx's dependency surface
+   minimal and consistent with the non-goals in §4.
 5. Go version floor — resolved: `go 1.26.0` (Arlo, 2026-07-17; supersedes the kickoff's 1.27).
