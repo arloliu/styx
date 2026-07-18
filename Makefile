@@ -25,10 +25,11 @@ build:
 	@mkdir -p $(BIN_DIR)
 	go build -o $(GENERATOR_BIN) ./cmd/protoc-gen-go-styx
 
-## test: Run unit tests with the race detector (plus the tagged ring ordering proof)
+## test: Run unit tests with the race detector (plus the tagged ring/event ordering proofs)
 test:
 	go test ./... -race -timeout=$(TEST_TIMEOUT)
 	go test -tags ringhook ./internal/ring/... -race -timeout=$(TEST_TIMEOUT)
+	go test -tags eventhook ./internal/event/... -race -timeout=$(TEST_TIMEOUT)
 
 ## bench: Run the SHM spike benchmark suite (see bench/spike)
 bench:
