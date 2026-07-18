@@ -58,6 +58,8 @@ it changes what the input boundary is.
   must be panic-isolated** — a malformed line from a plugin's stdout/stderr,
   or a panicking user-supplied `supervisor.Sink`, must never crash the host.
   This isn't speculative hardening: the `arloliu/go-plugin` fork hit exactly
-  this failure mode in production. Known gap: `internal/supervisor/capture.go`'s
-  `deliverLoop` calls `sink.WriteLine` with no `recover()`. Add one when next
-  touching that file.
+  this failure mode in production. `internal/supervisor/capture.go`'s
+  `deliverLoop` recovers a panicking `sink.WriteLine` and counts it
+  (`StdioCapture.PanicCount`) rather than letting it escape — match this
+  pattern for any other goroutine that calls into plugin- or user-supplied
+  code.

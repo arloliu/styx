@@ -42,6 +42,9 @@ type StdioCapture struct {
 
 	stdoutDropped atomic.Uint64
 	stderrDropped atomic.Uint64
+
+	stdoutPanicked atomic.Uint64
+	stderrPanicked atomic.Uint64
 }
 
 // NewStdioCapture builds a StdioCapture reading stdout/stderr and
@@ -69,8 +72,8 @@ func (c *StdioCapture) Run(ctx context.Context) {
 	go func() { defer wg.Done(); c.readLoop(c.stdout, c.stdoutQueue, &c.stdoutDropped) }()
 	go func() { defer wg.Done(); c.readLoop(c.stderr, c.stderrQueue, &c.stderrDropped) }()
 
-	go c.deliverLoop(ctx, "stdout", c.stdoutQueue)
-	go c.deliverLoop(ctx, "stderr", c.stderrQueue)
+	go c.deliverLoop(ctx, "stdout", c.stdoutQueue, &c.stdoutPanicked)
+	go c.deliverLoop(ctx, "stderr", c.stderrQueue, &c.stderrPanicked)
 
 	wg.Wait()
 }
@@ -80,6 +83,13 @@ func (c *StdioCapture) Run(ctx context.Context) {
 // keeping up.
 func (c *StdioCapture) DroppedCount() (stdout, stderr uint64) {
 	return c.stdoutDropped.Load(), c.stderrDropped.Load()
+}
+
+// PanicCount returns the number of times c.sink.WriteLine has panicked so
+// far for each stream. A panicking Sink never crashes the host (see
+// deliverLoop) — this is the only signal that it happened.
+func (c *StdioCapture) PanicCount() (stdout, stderr uint64) {
+	return c.stdoutPanicked.Load(), c.stderrPanicked.Load()
 }
 
 // readLoop reads r line by line (truncating any line beyond
@@ -133,16 +143,32 @@ func readLine(br *bufio.Reader, maxLineBytes int) ([]byte, error) {
 // deliverLoop drains queue and calls c.sink.WriteLine for each line,
 // until queue is closed-and-drained or ctx is canceled. It is
 // deliberately not joined by Run — see StdioCapture's type doc.
-func (c *StdioCapture) deliverLoop(ctx context.Context, stream string, queue <-chan []byte) {
+func (c *StdioCapture) deliverLoop(ctx context.Context, stream string, queue <-chan []byte, panicked *atomic.Uint64) {
 	for {
 		select {
 		case line, ok := <-queue:
 			if !ok {
 				return
 			}
-			c.sink.WriteLine(stream, line)
+			c.deliverLine(stream, line, panicked)
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// deliverLine calls c.sink.WriteLine for a single line, recovering and
+// counting a panic instead of letting it escape: a plugin controls what
+// bytes reach the Sink (via stdout/stderr) and the Sink itself is
+// user-supplied, so either can panic — and per the type doc, that must
+// never take the host process down with it. Recovering here (rather than
+// letting deliverLoop's goroutine die) also means one bad line never stops
+// subsequent lines on the same stream from being delivered.
+func (c *StdioCapture) deliverLine(stream string, line []byte, panicked *atomic.Uint64) {
+	defer func() {
+		if recover() != nil {
+			panicked.Add(1)
+		}
+	}()
+	c.sink.WriteLine(stream, line)
 }

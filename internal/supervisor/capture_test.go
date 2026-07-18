@@ -209,6 +209,78 @@ func (s *boundSink) snapshot() (maxLen, count int) {
 	return s.maxLen, s.count
 }
 
+// panicSink panics on a designated line and records every other line it
+// sees, safe for concurrent use across the stdout/stderr goroutines.
+type panicSink struct {
+	mu      sync.Mutex
+	lines   []string
+	panicOn string
+}
+
+func (s *panicSink) WriteLine(_ string, line []byte) {
+	if string(line) == s.panicOn {
+		panic("simulated sink panic: " + s.panicOn)
+	}
+	s.mu.Lock()
+	s.lines = append(s.lines, string(line))
+	s.mu.Unlock()
+}
+
+func (s *panicSink) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]string, len(s.lines))
+	copy(out, s.lines)
+
+	return out
+}
+
+// Test StdioCapture recovering a panicking Sink, counting it, and still delivering later lines
+func TestStdioCapture_RecoversSinkPanic_AndStillDeliversLaterLines(t *testing.T) {
+	// Given: a sink that panics on exactly one line and behaves normally
+	// otherwise — simulating a buggy user-supplied Sink or a plugin
+	// emitting a line that happens to trip it.
+	sink := &panicSink{panicOn: "boom"}
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	_ = stderrW.Close() // unused in this test; closed up front so Run's stderr readLoop reaches EOF immediately
+	sc := supervisor.NewStdioCapture(stdoutR, stderrR, sink, 1024, 4)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); sc.Run(ctx) }()
+
+	// When: the panicking line is written, followed by a normal line.
+	go func() {
+		_, _ = fmt.Fprintln(stdoutW, "boom")
+		_, _ = fmt.Fprintln(stdoutW, "after")
+		_ = stdoutW.Close()
+	}()
+
+	// Then: the panic is recovered and counted — it never reaches the test
+	// goroutine or crashes the process — and the line delivered after the
+	// panicking one still arrives, proving deliverLoop keeps running rather
+	// than dying with its goroutine.
+	require.Eventually(t, func() bool {
+		return len(sink.snapshot()) > 0
+	}, time.Second, 5*time.Millisecond, "expected the line after the panic to be delivered")
+
+	require.Equal(t, []string{"after"}, sink.snapshot())
+
+	stdoutPanicked, stderrPanicked := sc.PanicCount()
+	require.Equal(t, uint64(1), stdoutPanicked, "the panic must be counted")
+	require.Zero(t, stderrPanicked)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("StdioCapture.Run did not return after ctx was canceled")
+	}
+}
+
 // Test StdioCapture never panicking and holding its per-line byte cap under
 // adversarial input: a single enormous line with no trailing newline (EOF
 // mid-line) carrying every byte value including NUL on stdout, and a flood
