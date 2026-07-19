@@ -10,23 +10,27 @@
 // shm-abi.md §1 Phase 2 and §16 require a structural geometry failure to
 // poison the region: a seq_cst CAS on the sync page's poison word,
 // followed by an unconditional shutdown store and a write to both
-// per-direction eventfds. This package does none of that — the poison
-// word lives on the sync page (§3), which this package never writes, and
-// the eventfd wake requires internal/event, a package that does not exist
-// yet. Instead, CreateRegion and OpenRegion perform the full two-phase
+// per-direction eventfds. This package performs none of that write itself —
+// the eventfd wake needs internal/event, and internal/shm and internal/event
+// are siblings (both leaves internal/transport depends on, see
+// .agents/rules/100-project-map.md), so this package deliberately does not
+// import it. Instead, CreateRegion and OpenRegion perform the full two-phase
 // validation shm-abi.md §1 mandates and return typed, distinguishable
 // errors:
 //
 //   - ErrAttachRejected wraps a Phase 1 failure (the size/seal gate, run
 //     before any shared memory is touched). The control plane MUST treat
 //     this as a handshake/attach rejection, never as a poison cause,
-//     because nothing was ever mapped.
+//     because nothing was ever mapped — OpenRegion returns (nil, err).
 //   - ErrBadGeometry wraps a Phase 2 failure (a structural violation found
 //     after mapping). shm-abi.md §16 calls this disposition
-//     POISON_BAD_GEOMETRY; a later orchestration layer (once
-//     internal/event exists to provide the eventfd wake) is responsible
-//     for turning this error into an actual poison-word write, not this
-//     package.
+//     POISON_BAD_GEOMETRY; OpenRegion returns the still-mapped Region
+//     alongside this error, rather than unmapping it, because the poison
+//     word's offset is already known-addressable at that point (Phase 1
+//     passed) and the actuating layer needs the mapping to reach it. The
+//     orchestration layer that does the actual CAS + eventfd wake — and
+//     then unmaps — is internal/transport/shm.Attach, which has both the
+//     region and the eventfds.
 //
 // A caller distinguishes the two with errors.Is against either sentinel.
 //

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -86,6 +87,32 @@ func TestSpawn_PassesControlFDAsFD3_WithSanitizedEnv(t *testing.T) {
 	require.Empty(t, report["leak_canary"], "host env must not leak to the child")
 	require.Equal(t, "true", report["path_present"], "PATH must survive env sanitization")
 	require.Equal(t, "passed-through", report["extra"], "explicitly-passed env var must reach the child")
+}
+
+// Test Process.Kill returning the reaped *os.ProcessState instead of
+// discarding it, so a pre-attach abort (a handshake failure before any
+// Teardown runs) can recover a real exit status: ExitStatusKnown must
+// reflect the actual reaped status for a crash detected on this path, never
+// unconditionally false, even though the process was, in fact, reaped with a
+// known status.
+func TestProcess_Kill_ReturnsReapedExitStatus(t *testing.T) {
+	// Given a spawned child that blocks forever and never exits on its own
+	// (deathsig_helper ignores the control socket).
+	proc, err := lifecycle.Spawn(lifecycle.Spec{Path: helperBins.deathsig})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = unix.Close(proc.ControlFD) })
+
+	// When Kill force-terminates and reaps it.
+	state, err := proc.Kill()
+
+	// Then the reap succeeded and the returned state reports the real
+	// SIGKILL termination, not a discarded/unknown status.
+	require.NoError(t, err)
+	require.NotNil(t, state, "Kill must return the reaped process state, not discard it")
+	ws, ok := state.Sys().(syscall.WaitStatus)
+	require.True(t, ok, "ProcessState.Sys() must be a syscall.WaitStatus on Linux")
+	require.True(t, ws.Signaled(), "Kill's SIGKILL must reap a signal-terminated process")
+	require.Equal(t, syscall.SIGKILL, ws.Signal())
 }
 
 // Test Spawn's child observing PR_SET_PDEATHSIG armed immediately.

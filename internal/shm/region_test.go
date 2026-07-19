@@ -109,6 +109,22 @@ func TestRegion_OpenRegion_RejectsSizeMismatch_OnOverflow(t *testing.T) {
 	}
 }
 
+// requirePhase2BadGeometry asserts the shape of an OpenRegion Phase 2
+// failure: a typed error wrapping ErrBadGeometry, AND the still-mapped
+// region returned alongside it (shm-abi.md §1:296/§16 -- Phase 1 already
+// proved the poison word's offset is mapped, so a caller needing to poison
+// before discarding the region, e.g. internal/transport/shm.Attach, must be
+// able to reach the mapping; unlike a Phase 1 rejection, where nothing was
+// ever mapped and r is nil). It closes r itself so every call site does not
+// have to.
+func requirePhase2BadGeometry(t *testing.T, r *shm.Region, err error) {
+	t.Helper()
+	require.Error(t, err)
+	require.ErrorIs(t, err, shm.ErrBadGeometry)
+	require.NotNil(t, r, "a Phase 2 failure must return the still-mapped region, not nil")
+	require.NoError(t, r.Close())
+}
+
 // buildRawSealedRegion memfd_create's, ftruncate's, mmap's, writes layout
 // via shm.WriteLayoutPageForTest, and seals a region of exactly
 // regionSize bytes — for tests that need to hand-construct on-wire state
@@ -195,9 +211,7 @@ func TestRegion_OpenRegion_RejectsClassTotalOverflow(t *testing.T) {
 	r, err := shm.OpenRegion(fd, regionSize)
 
 	// Then
-	require.Error(t, err)
-	require.ErrorIs(t, err, shm.ErrBadGeometry)
-	require.Nil(t, r)
+	requirePhase2BadGeometry(t, r, err)
 
 	// Prove the rejection came from addOverflowSafe specifically, not from
 	// the unrelated class_base_offset contiguity check (error text "...
@@ -335,9 +349,7 @@ func TestRegion_OpenRegion_RejectsPhase2Violations(t *testing.T) {
 			r, err := shm.OpenRegion(fd, regionSize)
 
 			// Then
-			require.Error(t, err)
-			require.ErrorIs(t, err, shm.ErrBadGeometry)
-			require.Nil(t, r)
+			requirePhase2BadGeometry(t, r, err)
 		})
 	}
 }
@@ -416,9 +428,7 @@ func TestRegion_OpenRegion_RejectsReservedNonZero(t *testing.T) {
 			r, err := shm.OpenRegion(fd, tt.size)
 
 			// Then
-			require.Error(t, err)
-			require.ErrorIs(t, err, shm.ErrBadGeometry)
-			require.Nil(t, r)
+			requirePhase2BadGeometry(t, r, err)
 		})
 	}
 }

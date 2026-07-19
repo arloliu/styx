@@ -17,11 +17,14 @@ var ErrAttachRejected = errors.New("shm: attach rejected")
 
 // ErrBadGeometry wraps every shm-abi.md §1/§2 structural geometry
 // failure: at CreateRegion, a host-chosen input that violates a
-// structural bound; at OpenRegion, a shm-abi.md §1 Phase 2 failure found
-// after mapping. shm-abi.md §16 calls the Phase 2 case
-// POISON_BAD_GEOMETRY — this package does not poison (see doc.go); it
-// returns this error so a later orchestration layer can map it to an
-// actual poison-word write.
+// structural bound (nothing was mapped, so CreateRegion returns nil); at
+// OpenRegion, a shm-abi.md §1 Phase 2 failure found after mapping (the
+// still-mapped Region is returned alongside this error — see OpenRegion's
+// doc). shm-abi.md §16 calls the Phase 2 case POISON_BAD_GEOMETRY — this
+// package still does not perform that write itself (see doc.go); it
+// returns the error, and now the mapping it applies to, so a later
+// orchestration layer can actuate the poison word before discarding the
+// region.
 var ErrBadGeometry = errors.New("shm: bad geometry")
 
 // wantSeals is the exact seal set shm-abi.md §1 requires: the region's
@@ -172,16 +175,22 @@ func createSealedRegion(layout Layout) (*Region, error) {
 //
 //	Phase 1 (before any shared memory is touched): fstat, the fixed-header
 //	minimum, the exact-size check, and the seal-set check. Any Phase 1
-//	failure returns an error wrapping ErrAttachRejected and never maps
+//	failure returns (nil, err) wrapping ErrAttachRejected and never maps
 //	anything — the control plane MUST treat this as a handshake/attach
 //	rejection, not a poison cause.
 //
 //	Phase 2 (after mapping): the full structural geometry check
 //	(parseLayoutPhase2), reading only the fixed v1 schema offsets in the
-//	exact order §1 mandates. Any Phase 2 failure returns an error wrapping
-//	ErrBadGeometry — shm-abi.md §16's POISON_BAD_GEOMETRY disposition is a
-//	later orchestration layer's responsibility (see doc.go), not this
-//	package's.
+//	exact order §1 mandates. Any Phase 2 failure returns the region
+//	ALONGSIDE an error wrapping ErrBadGeometry, rather than unmapping it —
+//	shm-abi.md §1:296/§16 requires POISON_BAD_GEOMETRY on a Phase 2
+//	failure, and the poison word is known-addressable because Phase 1
+//	already proved the mapping is at least minRegionSize long, so a caller
+//	needing to poison it (a later orchestration layer, see doc.go) must be
+//	able to reach the still-mapped bytes before discarding it. The caller
+//	owns the returned Region in this case and MUST Close it; Region.Layout
+//	is unspecified (the parse that would fill it failed) and MUST NOT be
+//	relied on.
 func OpenRegion(fd int, expectedSize uint64) (*Region, error) {
 	ownFD, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
@@ -189,19 +198,24 @@ func OpenRegion(fd int, expectedSize uint64) (*Region, error) {
 	}
 
 	region, err := openRegionOwned(ownFD, expectedSize)
-	if err != nil {
+	if region == nil && err != nil {
+		// Nothing usable was mapped (a Phase 1 rejection, or the mmap syscall
+		// itself failed): close the duplicate fd here, since no Region was
+		// returned to do it via Close.
 		_ = unix.Close(ownFD)
-
-		return nil, err
 	}
 
-	return region, nil
+	return region, err
 }
 
 // openRegionOwned runs OpenRegion's two-phase attach against a descriptor
 // this call already owns (a duplicate OpenRegion made, so the caller's
-// original fd is untouched). The caller closes ownFD on any error this
-// returns; on success, ownership passes to the returned Region.
+// original fd is untouched). A Phase 1 failure (or an mmap syscall failure)
+// returns (nil, err) and the caller closes ownFD; a Phase 2 failure instead
+// returns (region, err) BOTH non-nil — the mapping succeeded, so ownership of
+// the still-mapped region passes to the caller, which MUST Close it (see
+// OpenRegion's doc); on success, (region, nil), ownership likewise passing to
+// the caller.
 func openRegionOwned(ownFD int, expectedSize uint64) (*Region, error) {
 	// Phase 1 — size/seal gate BEFORE mapping (shm-abi.md §1 Phase 1).
 	// regionSize is bounded to maxRegionSize (1<<40) below before it is
@@ -251,9 +265,11 @@ func openRegionOwned(ownFD int, expectedSize uint64) (*Region, error) {
 	// Phase 2 — structural geometry check AFTER mapping (shm-abi.md §1 Phase 2).
 	layout, err := parseLayoutPhase2(data, expectedSize)
 	if err != nil {
-		_ = unix.Munmap(data)
-
-		return nil, err
+		// Do NOT unmap here: the mapping is returned to the caller instead, so
+		// a caller that needs to poison the region (shm-abi.md §1:296/§16)
+		// still can, before it Closes this Region (see this function's and
+		// OpenRegion's doc).
+		return &Region{fd: ownFD, data: data}, err
 	}
 
 	return &Region{fd: ownFD, data: data, layout: layout}, nil

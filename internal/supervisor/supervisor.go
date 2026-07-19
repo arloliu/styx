@@ -95,10 +95,13 @@ type ReadyHooks struct {
 // notification — crash reason capture: exit status, last stderr lines.
 // ExitStatus/ExitStatusKnown follow the same convention as
 // styx.PluginCrashError (see its doc): a non-negative ExitStatus is the
-// process's own exit code, a negative one is -signal; ExitStatusKnown is
-// false when runOneInstance never reached internal/lifecycle.Teardown at
-// all (a crash detected before/during handshake uses the simpler
-// Process.Kill abort path, which does not surface a *os.ProcessState).
+// process's own exit code, a negative one is -signal. A crash detected
+// before/during handshake uses the simpler Process.Kill abort path rather
+// than internal/lifecycle.Teardown, but both paths now surface a real
+// *os.ProcessState, so ExitStatusKnown is true on either path once the
+// process has actually been reaped; it is false only in the
+// (should-not-happen) case that the reaped state's platform-specific Sys()
+// value is not the expected syscall.WaitStatus (see exitStatusFromState).
 // CrashInfo implements error (and Unwrap, so errors.Is/As still reach
 // Cause) so it can populate Event.Err directly; styx/host.go translates it
 // into *styx.PluginCrashError at the public boundary. "CrashInfo" names
@@ -397,14 +400,13 @@ func (s *Supervisor) runOneInstance(
 	tr, hsErr := s.handshakeAndAttach(ctx, conn, generation)
 	if hsErr != nil {
 		cancelCapture()
-		_ = proc.Kill()
+		state, _ := proc.Kill()
 		_ = conn.Close()
 		<-captureDone
 
-		// Process.Kill (unlike internal/lifecycle.Teardown) does not
-		// surface a *os.ProcessState to its caller, so the exit status is
-		// not known for a pre-attach failure.
-		return time.Time{}, false, crashReason(stderrTail, hsErr, 0, false)
+		exitStatus, exitStatusKnown := exitStatusFromState(state)
+
+		return time.Time{}, false, crashReason(stderrTail, hsErr, exitStatus, exitStatusKnown)
 	}
 
 	var hooks ReadyHooks

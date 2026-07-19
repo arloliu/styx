@@ -136,6 +136,19 @@ type writer struct {
 	// closure (shm-abi.md §12).
 	signal func()
 
+	// poison is the region's poison/shutdown query-and-actuation seam
+	// (shm-abi.md §16), used three ways: prePublishFault re-checks it
+	// immediately before every tail store (§8's producer pre-publish gate),
+	// rolling the admission back rather than publishing if either word is
+	// set; a Ring.Push that reports ring.ErrCorrupt actuates
+	// PoisonRingCorrupt through it (§8/§9's producer-side ring depth >
+	// capacity case); and reclaim's own bound check actuates the same cause
+	// when the untrusted peer head fails either validation before reclaim
+	// walks or frees anything. nil in isolated unit tests that build a writer
+	// with no attached region -- all three uses become no-ops; production
+	// wires the real PoisonFlag via newRegionWriter.
+	poison *PoisonFlag
+
 	// handleTable, handleMask, and lastReclaimed drive head-gated slab reclaim
 	// (shm-abi.md §6): handleTable[seq & handleMask] records the slab published at
 	// ring sequence seq, and reclaim frees every slab in [lastReclaimed, head)
@@ -199,20 +212,38 @@ func newWriterFromParts(r descriptorRing, a payloadArena, dataDepth, lifecycleDe
 // newRegionWriter builds the production writer over a region's outbound ring and
 // arena. It wires the region generation stamped into every descriptor
 // (shm-abi.md §15), the negotiated checksum feature (§5), the §12 producer
-// signal that wakes a parked consumer, and the head-gated reclaim handle table
-// sized to the ring capacity (§6). Admission blocks the caller until data-queue
-// space frees, matching transport.Send's blocking contract.
+// signal that wakes a parked consumer, the region's poison/shutdown seam for
+// the pre-publish gate and producer-side ring-corruption actuation (§8/§16),
+// and the head-gated reclaim handle table sized to the ring capacity (§6).
+// Admission blocks the caller until data-queue space frees, matching
+// transport.Send's blocking contract.
 func newRegionWriter(
-	r *ring.Ring, a *arena.Arena, cfg Config, gen uint32, capacity uint64, signal func(),
+	r *ring.Ring, a *arena.Arena, cfg Config, gen uint32, capacity uint64, signal func(), poison *PoisonFlag,
 ) *writer {
 	w := newWriterFromParts(r, a, cfg.DataQueueDepth, cfg.LifecycleQueueDepth, admitBlock)
 	w.gen = gen
 	w.checksum = cfg.Checksum
 	w.signal = signal
+	w.poison = poison
 	w.handleTable = make([]slabRef, capacity)
 	w.handleMask = capacity - 1
 
 	return w
+}
+
+// prePublishFault re-checks poison/shutdown immediately before a tail store
+// (shm-abi.md §8's producer pre-publish gate, best-effort early-out): a fault
+// observed here means the region was poisoned or shut down between admission
+// and this store, so the caller must roll the reservation back and not
+// publish. Returns nil (always healthy) when poison is nil -- the isolated
+// unit-test construction with no attached region -- so the gate is a no-op
+// until newRegionWriter wires it.
+func (w *writer) prePublishFault() error {
+	if w.poison == nil {
+		return nil
+	}
+
+	return w.poison.TeardownError()
 }
 
 // start launches the single writer goroutine. It must be called exactly once,
@@ -381,8 +412,23 @@ func (w *writer) emitLifecycle(i intent) {
 		return // build already reported a terminal kind/lane error
 	}
 
+	// Pre-publish gate (shm-abi.md §8/§16): a fault observed here means the
+	// region was poisoned or shut down since admission, so this CANCEL must
+	// not publish.
+	if err := w.prePublishFault(); err != nil {
+		w.report(i, err)
+
+		return
+	}
+
 	seq := w.publishSeq()
 	if err := w.ring.Push(d); err != nil {
+		if errors.Is(err, ring.ErrCorrupt) {
+			// depth > capacity on producer admission MUST poison
+			// POISON_RING_CORRUPT (shm-abi.md §8/§9) -- symmetric to the
+			// consumer's poisonOnConformanceFault.
+			w.poisonRingCorrupt()
+		}
 		w.report(i, err)
 
 		return
@@ -444,10 +490,29 @@ func (w *writer) place(c *carry) emitResult {
 		}
 	}
 
+	// Pre-publish gate (shm-abi.md §8/§16): a fault observed here means the
+	// region was poisoned or shut down since admission. Roll the reservation
+	// back -- free the slab this intent already allocated, if any -- rather
+	// than publish it.
+	if err := w.prePublishFault(); err != nil {
+		if c.hasSlab {
+			_ = w.arena.Free(c.h)
+		}
+		w.report(c.i, err)
+
+		return emitDone
+	}
+
 	seq := w.publishSeq()
 	if err := w.ring.Push(c.d); err != nil {
 		if errors.Is(err, ring.ErrFull) {
 			return emitStuck
+		}
+		if errors.Is(err, ring.ErrCorrupt) {
+			// depth > capacity on producer admission MUST poison
+			// POISON_RING_CORRUPT (shm-abi.md §8/§9) -- symmetric to the
+			// consumer's poisonOnConformanceFault.
+			w.poisonRingCorrupt()
 		}
 		w.report(c.i, err) // ring.ErrCorrupt or another push fault, surfaced honestly
 
@@ -570,7 +635,11 @@ func (w *writer) stampPayload(i intent, d ring.Descriptor) (ring.Descriptor, bui
 
 	// Head-gated reclaim before reserving: free slabs the consumer's head has
 	// passed (shm-abi.md §6). A slightly-stale head just reclaims less — safe.
-	w.reclaim()
+	// This is the LEADING reclaim (before this build's eventual Push): no push
+	// has happened since the last reclaim, so the honest reconcile-distance
+	// bound is capacity, not capacity+1 (see reclaim's doc for why the two call
+	// sites differ).
+	w.reclaim(w.capacity())
 
 	//nolint:gosec // storedLen <= MaxFrameSize+4, far below math.MaxUint32 (guarded above)
 	h, buf, err := w.arena.Alloc(uint32(storedLen))
@@ -646,7 +715,13 @@ func (w *writer) stampPayload(i intent, d ring.Descriptor) (ring.Descriptor, bui
 // internal/ring is wrap-safe for exactly this reason).
 func (w *writer) published(seq uint64, ref slabRef) {
 	if w.handleTable != nil {
-		w.reclaim()
+		// This is the POST-PUSH reclaim (Ring.Push above has already advanced
+		// tail by one): the honest reconcile-distance bound is capacity+1, not
+		// capacity (see reclaim's doc for the proof) -- a fast consumer that
+		// drains a full backlog and immediately consumes this publish can
+		// legitimately advance head one further than the leading reclaim's
+		// bound allows.
+		w.reclaim(w.capacity() + 1)
 		w.handleTable[seq&w.handleMask] = ref
 		if ref.present && w.lastReclaimed == seq+1 {
 			_ = w.arena.Free(ref.h)
@@ -656,18 +731,99 @@ func (w *writer) published(seq uint64, ref slabRef) {
 	w.signal()
 }
 
+// capacity returns the ring capacity reclaim's bounds are checked against —
+// the handle table's length, which newRegionWriter sizes to the ring's
+// layout capacity (shm-abi.md §6). It is 0 when reclaim is unwired (isolated
+// tests), matching reclaim's own no-op guard on a nil handleTable.
+func (w *writer) capacity() uint64 {
+	return uint64(len(w.handleTable))
+}
+
 // reclaim frees every slab the consumer has released — those published at ring
 // sequences below the current head (Tail - Len, both seq_cst; shm-abi.md
 // §6/§10) — advancing lastReclaimed to that head. It is a no-op until the
-// handle table is wired (isolated tests). Freeing before the slot is reused is
-// safe: the ring cannot advance its tail past head + capacity, so a sequence's
-// slot is always reclaimed before the producer overwrites its handle entry.
-func (w *writer) reclaim() {
+// handle table is wired (isolated tests).
+//
+// The head word is written by the untrusted peer (the consumer), so it MUST be
+// validated before it drives any free or counter mutation here — the same
+// validate-before-mutate rule Ring.Push and the ABI's Admit pseudocode apply to
+// depth (shm-abi.md §8/§9/§10, docs/specs/shm-abi.md §8's Admit: depth is
+// checked, then the reconcile walk is separately bounded, both before any
+// counter is touched). Two bounds, checked in order, each wrap-safe unsigned
+// arithmetic exactly like Ring's own depth check:
+//
+//  1. depth = tail - head MUST be <= capacity, the same condition Ring.Push
+//     itself enforces. A corrupt or backwards head makes depth wrap to a huge
+//     unsigned value, mirroring ring.ErrCorrupt. This bound does not depend on
+//     the call site.
+//  2. steps = head - lastReclaimed MUST also be <= maxReconcile, the caller's
+//     honest bound on how far a correct consumer can have advanced head since
+//     the last reclaim. The first bound alone does not cover this: a head
+//     within capacity of tail (so it passes the first bound) can still be
+//     numerically far from lastReclaimed if it was corrupted independently of
+//     tail, since nothing else relates head to lastReclaimed.
+//
+// maxReconcile differs by call site because a Ring.Push can land between two
+// reclaims:
+//
+//   - stampPayload's LEADING reclaim (before this build's Push): no push has
+//     happened since the last reclaim (single writer), so a correct consumer
+//     can be at most one capacity ahead of lastReclaimed. Callers pass
+//     capacity.
+//   - published's POST-PUSH reclaim (after Ring.Push has already advanced
+//     tail by one): let prevHead/prevTail be the values current at the start
+//     of the previous reclaim, so lastReclaimed == prevHead and
+//     prevTail - prevHead <= capacity. This Push makes newTail == prevTail+1,
+//     and a fast consumer can race ahead to head == newTail before this
+//     reclaim runs. So head - lastReclaimed <= newTail - prevHead ==
+//     (prevTail+1) - prevHead <= capacity+1. Using capacity here (as at the
+//     leading site) would falsely poison this exact healthy
+//     full-backlog -> drain -> publish -> immediate-consume race. Callers
+//     pass capacity+1.
+//
+// A gap beyond the call site's honest maximum is corruption, not a legitimate
+// race, in either case.
+//
+// Walking up to maxReconcile == capacity+1 slots is still safe: the
+// (capacity+1)-th sequence aliases the slot this same walk already cleared
+// earlier in its own loop (sequence lastReclaimed and lastReclaimed+capacity
+// share slot lastReclaimed & handleMask), and the just-published frame's own
+// handle is written into the table by published AFTER this call returns — so
+// the walk never double-frees a slot and never frees a live, not-yet-consumed
+// frame's slab. A distance beyond the call site's honest maximum WOULD reach a
+// live slab, which is exactly why the bound must stay tight at each site's
+// true maximum rather than being widened uniformly or dropped.
+//
+// Either bound violation poisons POISON_RING_CORRUPT and returns immediately,
+// before the loop below runs or touches a single handle-table entry or slab —
+// never trusting the peer head past the bound. Freeing before the slot is
+// reused is safe once past both checks: the ring cannot advance its tail past
+// head + capacity, so a sequence's slot is always reclaimed before the
+// producer overwrites its handle entry.
+func (w *writer) reclaim(maxReconcile uint64) {
 	if w.handleTable == nil {
 		return
 	}
 
-	head := w.ring.Tail() - w.ring.Len() // consumer head; monotonic, so >= lastReclaimed
+	capacity := w.capacity() // handleTable is sized to ring capacity (newRegionWriter)
+
+	tail := w.ring.Tail()
+	depth := w.ring.Len() // tail - head, the same wrap-safe computation Ring.Push checks
+	if depth > capacity {
+		w.poisonRingCorrupt()
+
+		return
+	}
+
+	head := tail - depth // wrap-safe: the exact head value Len() itself read (shm-abi.md §10)
+
+	steps := head - w.lastReclaimed
+	if steps > maxReconcile {
+		w.poisonRingCorrupt()
+
+		return
+	}
+
 	for w.lastReclaimed != head {
 		slot := w.lastReclaimed & w.handleMask
 		if ref := w.handleTable[slot]; ref.present {
@@ -678,6 +834,17 @@ func (w *writer) reclaim() {
 			w.handleTable[slot] = slabRef{}
 		}
 		w.lastReclaimed++
+	}
+}
+
+// poisonRingCorrupt actuates POISON_RING_CORRUPT (shm-abi.md §8/§9): a ring
+// depth exceeding capacity or a reclaim-reconcile distance exceeding its
+// call-site bound (capacity leading, capacity+1 post-push), from either a
+// Ring.Push/Peek report or reclaim's own bound check. A no-op when poison is
+// nil (isolated unit tests that build a writer with no attached region).
+func (w *writer) poisonRingCorrupt() {
+	if w.poison != nil {
+		w.poison.Set(PoisonRingCorrupt)
 	}
 }
 

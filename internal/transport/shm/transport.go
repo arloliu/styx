@@ -90,16 +90,32 @@ var _ inboundReader = (*ring.Ring)(nil)
 // admission constructs no writer or arena (the region is opened, validated, and
 // closed, with neither seam reached).
 var (
+	// attachOpenRegion wraps shm.OpenRegion, preserving its Phase-1-vs-Phase-2
+	// failure contract: a Phase 1 failure returns (nil, err) -- nothing was
+	// mapped -- while a Phase 2 failure returns the still-mapped region
+	// ALONGSIDE the error, so Attach can poison it (shm-abi.md §1:296) before
+	// closing it. A nil *shm.Region must become a nil regionHandle, not a
+	// non-nil interface wrapping a nil pointer, hence the explicit guard
+	// rather than a bare `return r, err`.
 	attachOpenRegion = func(fd int, size uint64) (regionHandle, error) {
 		r, err := shm.OpenRegion(fd, size)
-		if err != nil {
+		if r == nil {
 			return nil, err
 		}
 
-		return r, nil
+		return r, err
 	}
 	attachNewArena  = arena.New
 	attachNewWriter = newRegionWriter
+	// attachClock returns the current time for a freshly attached region's
+	// EscalationPolicy: bumpedAt (recovery.go's EscalationPolicy doc) is set
+	// to attachClock() at construction, and the same func is retained on the
+	// Transport (its clock field) so every later escalation.Observe call
+	// during classify uses it too. A package-level seam, like the three
+	// construction seams above, rather than an inline time.Now(): a test
+	// overrides it (before Attach) to drive the grace/rate-window logic
+	// deterministically.
+	attachClock = time.Now
 )
 
 // Transport implements transport.Transport over a shared-memory region: one
@@ -118,7 +134,25 @@ type Transport struct {
 	inboundEFD        *event.EventFD
 	inboundPark       *event.ParkState
 	shutdownPtr       *uint32
-	poisonPtr         *uint32
+	// poison wraps the same shared poison word teardownError checks (via
+	// Check) and actuates (via Set) for a detected conformance fault
+	// (shm-abi.md §16) -- the sole access path to that word; there is no
+	// separate raw poison pointer on Transport.
+	poison *PoisonFlag
+	// escalation adjudicates the stale-generation discard stream classify
+	// feeds it via Observe (shm-abi.md §15's supervisor-owned policy,
+	// recovery.go's EscalationPolicy doc): a discard stream this side cannot
+	// explain as a single dying predecessor's late writes escalates to
+	// PoisonPeerCrash through the same poison field above. Constructed once
+	// per Attach, scoped to this generation's grace window.
+	escalation *EscalationPolicy
+	// clock returns the current time for escalation.Observe's grace/rate-
+	// window evaluation. It is attachClock's value captured at construction
+	// time, so a test overriding attachClock before Attach gets a Transport
+	// whose live escalation path stays on that same deterministic clock for
+	// its whole lifetime, never a fresh read of the (possibly since-restored)
+	// package var.
+	clock func() time.Time
 
 	gen        shm.Generation
 	checksum   bool
@@ -134,6 +168,20 @@ type Transport struct {
 	lastSeen       uint64
 	staleDiscarded uint64
 
+	// closeMu is the closing gate: Send and Recv hold the read side for their
+	// whole call, since both read region-mapped memory directly on the calling
+	// goroutine (the poison/shutdown words, and Recv's ring/arena/park-state
+	// accesses); Close takes the write side around the munmap, after the
+	// writer goroutine has already been joined, so no data-plane access can
+	// still be touching the mapping when it is unmapped -- closeOnce alone
+	// only dedupes Close itself, it does not exclude a concurrent Send/Recv.
+	// closed is guarded by closeMu and checked before anything else under the
+	// read side: it is what keeps a Send/Recv call that starts AFTER Close has
+	// already unmapped from touching the mapping at all, rather than merely
+	// being excluded from the narrow in-flight-at-close window closeMu's
+	// mutual exclusion alone covers.
+	closeMu   sync.RWMutex
+	closed    bool
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -148,6 +196,12 @@ type producerSignal struct {
 	efd      *event.EventFD
 	poison   *uint32
 	shutdown *uint32
+	// actuate performs the §16 poison(cause) helper when signal detects a
+	// conformance fault. Publish already succeeded by the time signal runs
+	// (shm-abi.md §12), so there is no separate later call site to surface the
+	// fault through -- detection and actuation happen together here, the same
+	// way classify's discard site drives the escalation policy in recovery.go.
+	actuate *PoisonFlag
 	// badSync records an illegal park-state value observed by the signal — a
 	// conformance fault the §16 poison protocol elevates to POISON_BAD_SYNC
 	// (shm-abi.md §3/§12).
@@ -170,17 +224,19 @@ func (s *producerSignal) signal() {
 		if err := s.efd.Write(); err != nil {
 			// A wake write can only fail here outside teardown (teardown is gated
 			// above), so a lost wake is a real liveness fault: the parked consumer
-			// may never observe this frame. Record it via the fault seam instead of
-			// dropping it (shm-abi.md §12).
+			// may never observe this frame. Record it via the fault seam and
+			// actuate the region poison so both sides stop (shm-abi.md §12/§16).
 			s.lostWake.Store(true)
+			s.actuate.Set(PoisonGeneric)
 		}
 	case event.StateAwake:
 		// The consumer is running; it re-scans and observes the new tail (§12).
 	default:
 		// Only AWAKE/PARKED are legal (shm-abi.md §3). An illegal value is a
-		// conformance fault; the poison-word CAS is the supervisor's, so record
-		// the fault as the seam rather than acting on it here.
+		// conformance fault: record it via the fault seam and poison the region
+		// (shm-abi.md §3/§12/§16).
 		s.badSync.Store(true)
+		s.actuate.Set(PoisonBadSync)
 	}
 }
 
@@ -204,9 +260,27 @@ func (s *producerSignal) fault() error {
 // carves the per-direction rings, arenas, waiter, and writer for this role
 // (shm-abi.md §1/§18). On a validation failure it munmaps the region and
 // returns the typed error, having constructed nothing.
+//
+// A Phase-2 structural geometry failure (shm.ErrBadGeometry) is a special
+// case of "validation failure": attachOpenRegion still returns the
+// still-mapped region alongside that error (shm.OpenRegion's contract, see
+// internal/shm/region.go's doc), and Attach poisons it with
+// PoisonBadGeometry -- the full §16 poison(cause) helper: CAS, shutdown
+// store, both eventfd writes -- BEFORE closing it (shm-abi.md §1:296: the
+// poison word is known-addressable because Phase 1 already proved the
+// mapping is at least minRegionSize long). A Phase-1 failure
+// (shm.ErrAttachRejected) returns a nil region and is never poisoned --
+// nothing was ever mapped.
 func Attach(p AttachParams) (*Transport, error) {
 	region, err := attachOpenRegion(p.RegionFD, p.ExpectedSize)
 	if err != nil {
+		if region != nil && errors.Is(err, shm.ErrBadGeometry) {
+			poisonBadGeometry(region, p)
+		}
+		if region != nil {
+			_ = region.Close()
+		}
+
 		return nil, err
 	}
 
@@ -227,6 +301,26 @@ func Attach(p AttachParams) (*Transport, error) {
 	t.outbound.start()
 
 	return t, nil
+}
+
+// poisonBadGeometry runs the shm-abi.md §16 poison(PoisonBadGeometry) helper
+// against a region that mapped successfully (Phase 1 passed) but failed
+// Phase 2 structural validation, called from Attach BEFORE that region is
+// closed. It resolves the poison/shutdown words from the schema-fixed
+// sync-page offset (sync_page_offset is "4096 (fixed)" under
+// layout_version = 1, shm-abi.md §2 -- never host-chosen, so this holds
+// regardless of which Phase 2 check failed) rather than from
+// region.Layout(), which Phase 2 never finished validating and so must not
+// be trusted.
+func poisonBadGeometry(region regionHandle, p AttachParams) {
+	hpEFD, phEFD := hpPhEventFDs(p.Role, p.InboundEFD, p.OutboundEFD)
+	bytes := region.Bytes()
+	poison := NewPoisonFlag(
+		regionU32(bytes, shm.LayoutPageSize+syncPoison),
+		regionU32(bytes, shm.LayoutPageSize+syncShutdown),
+		hpEFD, phEFD,
+	)
+	poison.Set(PoisonBadGeometry)
 }
 
 // newTransport carves the region views and constructs the writer/reader state
@@ -251,14 +345,25 @@ func newTransport(region regionHandle, layout shm.Layout, p AttachParams) (*Tran
 		return nil, err
 	}
 
+	hpEFD, phEFD := hpPhEventFDs(p.Role, p.InboundEFD, p.OutboundEFD)
+	poison := NewPoisonFlag(poisonWord(bytes, layout), shutdownWord(bytes, layout), hpEFD, phEFD)
+
+	// The escalation policy's grace window starts now, at attach time
+	// (recovery.go's EscalationPolicy doc): this generation's discard stream
+	// gets a fresh grace window regardless of how long the PREVIOUS
+	// generation's policy had been running.
+	clock := attachClock
+	escalation := NewEscalationPolicy(p.Config.Escalation, poison, clock())
+
 	sig := &producerSignal{
 		park:     event.NewParkState(parkWord(bytes, layout, outDir)),
 		efd:      p.OutboundEFD,
 		poison:   poisonWord(bytes, layout),
 		shutdown: shutdownWord(bytes, layout),
+		actuate:  poison,
 	}
 
-	w := attachNewWriter(outRing, outArena, p.Config, gen.Truncated(), uint64(layout.RingCapacity), sig.signal)
+	w := attachNewWriter(outRing, outArena, p.Config, gen.Truncated(), uint64(layout.RingCapacity), sig.signal, poison)
 
 	// max_payload for the inbound direction: the largest slab minus the negotiated
 	// per-frame overhead (4 for the CRC32C trailer when checksum is negotiated;
@@ -280,7 +385,9 @@ func newTransport(region regionHandle, layout shm.Layout, p AttachParams) (*Tran
 		inboundEFD:        p.InboundEFD,
 		inboundPark:       event.NewParkState(parkWord(bytes, layout, inDir)),
 		shutdownPtr:       shutdownWord(bytes, layout),
-		poisonPtr:         poisonWord(bytes, layout),
+		poison:            poison,
+		escalation:        escalation,
+		clock:             clock,
 		gen:               gen,
 		checksum:          p.Config.Checksum,
 		maxPayload:        p.Config.MaxPayload,
@@ -299,10 +406,26 @@ func (t *Transport) signalFault() error {
 
 // Send hands the frame to the outbound writer on the lane its kind selects —
 // CANCEL to the lifecycle lane, every other kind to the data lane — after
-// bounding its payload by the negotiated max_payload (shm-abi.md §18). It
-// returns the writer's result verbatim (ctx-cancel, backpressure, or
-// transport.ErrClosed).
+// bounding its payload by the negotiated max_payload (shm-abi.md §18). A
+// poisoned or shut-down region is refused at admission, before it reaches the
+// writer (shm-abi.md §16's producer-side detection point, top of Admit);
+// otherwise it returns the writer's result verbatim (ctx-cancel, backpressure,
+// or transport.ErrClosed).
+//
+// It holds the closing gate's read side for its whole call, since the
+// admission check reads region-mapped memory (the poison/shutdown words)
+// directly on the calling goroutine: Close must not unmap while that read is
+// in flight (see Transport.closeMu's doc).
 func (t *Transport) Send(ctx context.Context, f transport.Frame) error {
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+
+	if t.closed {
+		return transport.ErrClosed
+	}
+	if err := t.teardownError(); err != nil {
+		return err
+	}
 	if len(f.Payload) > int(t.maxPayload) {
 		return transport.ErrPayloadTooLarge
 	}
@@ -318,14 +441,29 @@ func (t *Transport) Send(ctx context.Context, f transport.Frame) error {
 // Recv waits for inbound work, drains descriptors from the inbound ring in
 // order, and returns the next deliverable frame (shm-abi.md §9/§11). It
 // discards stale-generation descriptors without reading their slab (§15) and
-// maps a shutdown wake to transport.ErrClosed. Conformance faults surface as
-// typed errors (the poison protocol is elsewhere, shm-abi.md §16).
+// distinguishes a poisoned region (ErrPoisoned) from a graceful shutdown
+// (transport.ErrClosed, shm-abi.md §16). A conformance fault poisons the
+// region (the §16 actuation this package owns) and is returned as its own
+// typed error, not ErrPoisoned — the specific fault is more informative to
+// this caller; a later Send/Recv call observes ErrPoisoned instead.
+//
+// It holds the closing gate's read side for its whole call: the waiter and
+// drain read region-mapped memory (ring, arena, park-state, poison/shutdown
+// words) throughout, including while blocked, so Close must not unmap while
+// any of that is in flight (see Transport.closeMu's doc).
 func (t *Transport) Recv(ctx context.Context) (transport.Frame, error) {
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+
+	if t.closed {
+		return transport.Frame{}, transport.ErrClosed
+	}
+
 	for {
 		newTail, err := t.waiter.Wait(ctx, t.inboundRing, t.lastSeen, t.inboundPark, t.inboundEFD, t.shutdownPtr)
 		if err != nil {
 			if errors.Is(err, event.ErrShutdown) {
-				return transport.Frame{}, transport.ErrClosed
+				return transport.Frame{}, t.teardownError()
 			}
 
 			return transport.Frame{}, err
@@ -333,7 +471,7 @@ func (t *Transport) Recv(ctx context.Context) (transport.Frame, error) {
 
 		f, ok, err := t.drain(newTail)
 		if err != nil {
-			return transport.Frame{}, err
+			return transport.Frame{}, t.poisonOnConformanceFault(err)
 		}
 		if ok {
 			return f, nil
@@ -357,8 +495,8 @@ func (t *Transport) drain(newTail uint64) (transport.Frame, bool, error) {
 	for t.lastSeen != newTail {
 		// Fail-closed gate before each peek: a poisoned or shutting-down region
 		// consumes nothing more (shm-abi.md §9).
-		if t.torndown() {
-			return transport.Frame{}, false, transport.ErrClosed
+		if err := t.teardownError(); err != nil {
+			return transport.Frame{}, false, err
 		}
 
 		d, status := t.inboundRing.Peek()
@@ -376,8 +514,8 @@ func (t *Transport) drain(newTail uint64) (transport.Frame, bool, error) {
 				// Final gate before dispatch (shm-abi.md §9/§16): re-load both words
 				// after the copy; if the region is torn down, do NOT advance — the
 				// slot is never released as consumed.
-				if t.torndown() {
-					return transport.Frame{}, false, transport.ErrClosed
+				if err := t.teardownError(); err != nil {
+					return transport.Frame{}, false, err
 				}
 				t.inboundRing.Advance() // reclaim signal, after copy-out (§9)
 				t.lastSeen++
@@ -394,11 +532,31 @@ func (t *Transport) drain(newTail uint64) (transport.Frame, bool, error) {
 	return transport.Frame{}, false, nil
 }
 
-// torndown reports whether the region is poisoned or shutting down, the
-// fail-closed condition §9 re-checks around every dispatch (shm-abi.md
-// §9/§14/§16). Both words are shared and read seq_cst.
-func (t *Transport) torndown() bool {
-	return atomic.LoadUint32(t.poisonPtr) != 0 || atomic.LoadUint32(t.shutdownPtr) != 0
+// teardownError reports the error a torn-down region surfaces, or nil while
+// healthy -- the fail-closed condition §9 re-checks around every dispatch
+// (shm-abi.md §9/§14/§16). It delegates to PoisonFlag.TeardownError, the same
+// two-word (poison-then-shutdown) check the writer's producer-side
+// pre-publish gate uses (shm-abi.md §8/§16), so both sides of the region fail
+// closed for the same reason under the same rule.
+func (t *Transport) teardownError() error {
+	return t.poison.TeardownError()
+}
+
+// poisonOnConformanceFault actuates the §16 poison(cause) helper for a
+// detected conformance fault before returning it to the Recv caller, so a
+// poisoned region also stops the peer, not just this side (shm-abi.md §16).
+// err is returned unchanged in every case: the specific fault
+// (errRingCorrupt, errBadFrame, errChecksum) is more informative to this
+// caller than ErrPoisoned, which a later Send/Recv call observes instead.
+// transport.ErrClosed and errGenerationMismatch are not in the fault->cause
+// table, so they pass through without poisoning (a generation mismatch is the
+// canonical discard-not-poison case, §15/§16).
+func (t *Transport) poisonOnConformanceFault(err error) error {
+	if cause, ok := faultToPoisonCause(err); ok {
+		t.poison.Set(cause)
+	}
+
+	return err
 }
 
 // classify validates a peeked descriptor and decodes a deliverable frame, or
@@ -407,8 +565,15 @@ func (t *Transport) torndown() bool {
 func (t *Transport) classify(d ring.Descriptor) (transport.Frame, bool, error) {
 	// Generation discard first (shm-abi.md §15): a stale descriptor may carry a
 	// garbage offset/length, so it is skipped without reading the arena slab.
-	if t.gen.Stale(d.Generation()) {
+	if discardIfStale(d, t.gen) {
 		t.staleDiscarded++
+		// Feed the live discard stream to the escalation policy this side
+		// owns (shm-abi.md §15's supervisor-owned adjudication,
+		// recovery.go's EscalationPolicy doc): a pattern no single dying
+		// predecessor's late writes can explain escalates to
+		// PoisonPeerCrash through the same poison field teardownError
+		// checks.
+		t.escalation.Observe(t.clock(), d.Generation(), t.gen)
 
 		return transport.Frame{}, false, nil
 	}
@@ -582,9 +747,27 @@ func slabInClass(classes []shm.SizeClass, off, storedLen uint64) bool {
 // caller's and are not re-performed here; the region fd the caller passed is
 // closed by the caller after Close returns. The eventfds are the caller's too,
 // so Close does not close them.
+//
+// closeOnce alone dedupes concurrent/repeated Close calls, but does not by
+// itself exclude a Send/Recv call still touching the mapping when munmap
+// runs — a real fd-reuse hazard, since a virtual address freed by munmap can
+// be reused by a later, unrelated mapping. The munmap therefore runs under
+// closeMu's write side, which waits for every in-flight Send/Recv (holding
+// the read side for their whole call) to finish first, and sets closed = true
+// in the same critical section so any Send/Recv call that starts afterward
+// observes it and returns transport.ErrClosed immediately, before touching
+// the mapping at all. outbound.stop() runs before that: it joins the writer
+// goroutine and drains every queued intent with transport.ErrClosed, which
+// also unblocks any caller currently blocked inside Send's submit — so by the
+// time Close waits on closeMu, no Send call should still be in flight either.
 func (t *Transport) Close() error {
 	t.closeOnce.Do(func() {
 		t.outbound.stop()
+
+		t.closeMu.Lock()
+		defer t.closeMu.Unlock()
+
+		t.closed = true
 		t.closeErr = t.region.Close()
 	})
 

@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -229,6 +230,37 @@ func (g *gateRing) Push(d ring.Descriptor) error {
 
 func (g *gateRing) Tail() uint64 { return 0 }
 func (g *gateRing) Len() uint64  { return 0 }
+
+// panicOnPushRing is a descriptorRing double that panics if Push is ever
+// called, so a test can prove the writer's pre-publish gate (shm-abi.md
+// §8/§16) short-circuits before reaching the tail store, never merely that
+// the store happened to fail harmlessly.
+type panicOnPushRing struct{}
+
+func (panicOnPushRing) Push(ring.Descriptor) error {
+	panic("shm test: Push must not be called past the pre-publish gate")
+}
+func (panicOnPushRing) Tail() uint64 { return 0 }
+func (panicOnPushRing) Len() uint64  { return 0 }
+
+// allocFreeArena is a payloadArena double that always serves the same fixed
+// slab handle from Alloc and records every handle passed to Free, so a test
+// can assert a rolled-back admission frees exactly the slab it allocated
+// (shm-abi.md §8's RollbackAdmit).
+type allocFreeArena struct {
+	handle arena.SlabHandle
+	freed  []arena.SlabHandle
+}
+
+func (a *allocFreeArena) Alloc(size uint32) (arena.SlabHandle, []byte, error) {
+	return a.handle, make([]byte, size), nil
+}
+
+func (a *allocFreeArena) Free(h arena.SlabHandle) error {
+	a.freed = append(a.freed, h)
+
+	return nil
+}
 
 // realRing builds a Ring at capacity over fresh in-process slots and head/tail
 // words, the same synthetic backing the ring package's own tests use.
@@ -994,6 +1026,273 @@ func (a *freeRecordArena) Free(h arena.SlabHandle) error {
 	a.freed = append(a.freed, h.Offset)
 
 	return nil
+}
+
+// Test that a Ring.Push reporting ring.ErrCorrupt actuates the §16
+// poison(POISON_RING_CORRUPT) helper on the producer side (shm-abi.md
+// §8/§9's ring depth > capacity case) -- symmetric to the consumer's
+// poisonOnConformanceFault. Both tail-store call sites are covered: the data
+// lane's place (via emit/submit) and the lifecycle lane's emitLifecycle.
+func TestWriter_PoisonsRingCorruption_OnProducerPush(t *testing.T) {
+	t.Run("data lane: Push reporting ErrCorrupt poisons POISON_RING_CORRUPT", func(t *testing.T) {
+		rr := &recordRing{err: ring.ErrCorrupt}
+		tf := newTestPoisonFlag(t)
+		w := newWriterFromParts(rr, noArena{}, 1, 1, admitBlock)
+		w.poison = tf.flag
+		w.start()
+		t.Cleanup(w.stop)
+
+		// An empty-payload data frame allocates no slab, isolating the
+		// push-corruption path from allocation/rollback.
+		err := w.submit(t.Context(), dataReqFrame(1), laneData)
+		require.ErrorIs(t, err, ring.ErrCorrupt)
+
+		cause, poisoned := tf.flag.Check()
+		require.True(t, poisoned)
+		require.Equal(t, PoisonRingCorrupt, cause)
+	})
+
+	t.Run("lifecycle lane: Push reporting ErrCorrupt poisons POISON_RING_CORRUPT", func(t *testing.T) {
+		rr := &recordRing{err: ring.ErrCorrupt}
+		tf := newTestPoisonFlag(t)
+		w := newWriterFromParts(rr, noArena{}, 1, 1, admitBlock)
+		w.poison = tf.flag
+		w.start()
+		t.Cleanup(w.stop)
+
+		err := w.submit(t.Context(), cancelFrame(1), laneLifecycle)
+		require.ErrorIs(t, err, ring.ErrCorrupt)
+
+		cause, poisoned := tf.flag.Check()
+		require.True(t, poisoned)
+		require.Equal(t, PoisonRingCorrupt, cause)
+	})
+}
+
+// Test that reclaim bounds the untrusted peer head before it drives any
+// free or handle-table mutation (shm-abi.md §8's Admit: depth is checked,
+// then the reconcile distance is separately bounded, both before any counter
+// is touched). Unlike TestWriter_PoisonsRingCorruption_OnProducerPush above,
+// this drives a REAL *ring.Ring (so the wrap-safe Tail/Len arithmetic reclaim
+// reads is genuine, not a double rigged to fail) through a payload-bearing
+// submit (so stampPayload's leading reclaim, and the handle table it walks,
+// are actually exercised -- the hazard reclaim's own free loop poses is
+// invisible to an empty-payload frame, which never allocates a slab or
+// touches the handle table at all).
+//
+// The scenario: the ring's head word (a value only the untrusted peer ever
+// writes) is set far ahead of what this writer has reconciled
+// (lastReclaimed == 0), while still staying within ring_capacity of tail --
+// so the depth check alone (tail - head <= capacity) would NOT catch it; only
+// the second, reconcile-distance bound (head - lastReclaimed <= capacity)
+// does. A pre-existing handle-table entry, standing in for a slab this writer
+// published earlier and has not yet reclaimed, is what an unbounded walk
+// toward the corrupt head would prematurely free -- exactly the
+// use-after-free / premature-reuse hazard the bound closes.
+func TestWriter_Reclaim_BoundsCorruptPeerHead_BeforeAnyFreeOrAlloc(t *testing.T) {
+	const capacity = 64 // ring.New's minimum; also sizes the writer's handle table
+
+	head := new(uint64)
+	tail := new(uint64)
+	r, err := ring.New(make([]ring.Descriptor, capacity), head, tail, capacity)
+	require.NoError(t, err)
+
+	// A corrupt/backwards head the untrusted peer wrote directly: only 3
+	// behind tail (depth == 3 <= capacity, so Ring.Push's own check would
+	// accept it), but 97 ahead of lastReclaimed == 0 -- impossible for any
+	// correct consumer, which can advance head by at most one ring's worth of
+	// slots between two of this writer's reclaims.
+	atomic.StoreUint64(tail, 100)
+	atomic.StoreUint64(head, 97)
+
+	aa := &allocFreeArena{handle: arena.SlabHandle{Offset: 4096}}
+	tf := newTestPoisonFlag(t)
+	w := newWriterFromParts(r, aa, 1, 1, admitBlock)
+	w.poison = tf.flag
+	w.handleTable = make([]slabRef, capacity)
+	w.handleMask = capacity - 1
+
+	// A slab this writer published earlier and has not yet reclaimed --
+	// standing in for what an unbounded walk toward the corrupt head would
+	// prematurely free.
+	stranded := slabRef{h: arena.SlabHandle{Offset: 8192}, present: true}
+	w.handleTable[0] = stranded
+
+	w.start()
+	t.Cleanup(w.stop)
+
+	// When a payload-bearing data frame is submitted, stampPayload's leading
+	// reclaim reads this corrupt head before ever allocating.
+	err = w.submit(t.Context(), transport.Frame{
+		CallID: 1, Kind: transport.FrameUnaryReq, Payload: []byte("hello-shm-poison"),
+	}, laneData)
+	require.ErrorIs(t, err, ErrPoisoned, "the pre-publish gate must refuse once reclaim has poisoned")
+
+	// Then the region is poisoned POISON_RING_CORRUPT...
+	cause, poisoned := tf.flag.Check()
+	require.True(t, poisoned)
+	require.Equal(t, PoisonRingCorrupt, cause)
+
+	// ...reclaim's bound check ran BEFORE any free: the pre-existing
+	// handle-table entry is untouched (reclaim's loop never started) and
+	// lastReclaimed never advanced toward the corrupt head.
+	require.Equal(t, stranded, w.handleTable[0], "reclaim must not free a live slab toward a corrupt head")
+	require.Equal(t, uint64(0), w.lastReclaimed, "reclaim must not advance toward a corrupt head")
+	require.NotContains(t, aa.freed, stranded.h, "the pre-existing slab must never be freed")
+
+	// ...and the ring itself was never touched: Push was never reached, so
+	// tail is exactly what it was before submit (the one free recorded is
+	// this intent's own newly-allocated slab, rolled back by the ordinary,
+	// already-safe pre-publish gate once reclaim had poisoned -- not the
+	// unbounded-walk hazard this test guards against).
+	require.Equal(t, uint64(100), r.Tail(), "Push must never be reached once reclaim has poisoned")
+	require.Equal(t, []arena.SlabHandle{aa.handle}, aa.freed)
+}
+
+// fastConsumerRing wraps a real *ring.Ring and, once armed, advances the
+// ring's head immediately after a successful Push returns -- modeling a fast
+// consumer that copies and consumes a just-published frame before the
+// producer's own post-push bookkeeping (published's reclaim) runs. Every
+// Tail/Len read afterward still comes from the same real ring, so reclaim's
+// wrap-safe arithmetic is genuine, not simulated; only the timing of the
+// consumer's head advance is injected, deterministically and without
+// goroutines or sleeps.
+type fastConsumerRing struct {
+	*ring.Ring
+	armed bool // when true, Push advances the head right after it succeeds
+}
+
+func (r *fastConsumerRing) Push(d ring.Descriptor) error {
+	if err := r.Ring.Push(d); err != nil {
+		return err
+	}
+	if r.armed {
+		r.Advance()
+	}
+
+	return nil
+}
+
+// Test that published's post-push reclaim does NOT poison the healthy
+// interleaving where a fast consumer legitimately drives the reconcile
+// distance to capacity+1: a post-push reclaim bounded at only capacity would
+// false-poison it (reclaim's doc has the full proof for why the post-push
+// site's honest bound is capacity+1, not capacity). With ring capacity C:
+//
+//  1. A full backlog is already reclaimed: lastReclaimed == head == 0,
+//     tail == C.
+//  2. The consumer drains it: head -> C.
+//  3. A lifecycle publish (which never runs stampPayload's leading reclaim)
+//     pushes sequence C: tail -> C+1.
+//  4. The consumer immediately consumes the just-published frame: head ->
+//     C+1, before this publish's post-push reclaim runs.
+//
+// published's post-push reclaim then sees steps = head - lastReclaimed ==
+// C+1 -- the honest post-push maximum, not corruption -- and must complete
+// without poisoning.
+func TestWriter_Reclaim_PostPushAllowsCapacityPlusOne_HealthyFastConsumer(t *testing.T) {
+	const capacity = 64 // ring.New's minimum; also sizes the writer's handle table
+
+	fr := &fastConsumerRing{Ring: realRing(t, capacity)}
+	tf := newTestPoisonFlag(t)
+	w := newWriterFromParts(fr, noArena{}, 1, 1, admitBlock)
+	w.poison = tf.flag
+	w.handleTable = make([]slabRef, capacity)
+	w.handleMask = capacity - 1
+	w.start()
+	t.Cleanup(w.stop)
+
+	// Step 1: fill to a full, already-reclaimed backlog. Every one of these
+	// publishes' post-push reclaim runs while head is still 0 (the consumer
+	// has not advanced yet), so each reclaim is a no-op and lastReclaimed
+	// stays 0 -- exactly "a full backlog already reclaimed".
+	for i := range uint64(capacity) {
+		require.NoError(t, w.submit(t.Context(), cancelFrame(i), laneLifecycle))
+	}
+	require.Equal(t, uint64(capacity), fr.Tail())
+	require.Equal(t, uint64(0), w.lastReclaimed)
+
+	// Step 2: the consumer drains the full backlog: head -> capacity.
+	for range capacity {
+		fr.Advance()
+	}
+	require.Equal(t, uint64(0), fr.Len())
+
+	// Steps 3+4: arm the fast-consumer hook, then publish one more lifecycle
+	// frame with no leading reclaim; the hook advances head to capacity+1
+	// immediately after the real Push succeeds, before published's post-push
+	// reclaim runs.
+	fr.armed = true
+	require.NoError(t, w.submit(t.Context(), cancelFrame(999), laneLifecycle))
+
+	_, poisoned := tf.flag.Check()
+	require.False(t, poisoned, "a healthy fast-consumer race must not false-poison POISON_RING_CORRUPT")
+	require.Equal(t, uint64(capacity+1), w.lastReclaimed, "reclaim must still walk all the way to the real head")
+}
+
+// Test the producer pre-publish gate (shm-abi.md §8/§16): immediately before
+// every tail store, the writer re-checks poison/shutdown; if either is set it
+// rolls the admission back (frees any allocated slab) and does not publish,
+// rather than letting an intent queued before the fault still land on the
+// ring. Both lanes are covered, plus the poisoned-vs-merely-shut-down error
+// distinction (mirroring Transport.teardownError's).
+func TestWriter_PrePublishGate_RollsBackAdmission_WhenRegionUnhealthy(t *testing.T) {
+	t.Run("poisoned before publish: data intent's slab is freed and Push is never reached", func(t *testing.T) {
+		tf := newTestPoisonFlag(t)
+		tf.flag.Set(PoisonGeneric) // poisoned before the writer ever dequeues the intent
+
+		aa := &allocFreeArena{handle: arena.SlabHandle{Offset: 64, Length: 8}}
+		w := newWriterFromParts(panicOnPushRing{}, aa, 1, 1, admitBlock)
+		w.poison = tf.flag
+		w.start()
+		t.Cleanup(w.stop)
+
+		err := w.submit(t.Context(),
+			transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: []byte("x")}, laneData)
+
+		require.ErrorIs(t, err, ErrPoisoned)
+		require.Equal(t, []arena.SlabHandle{aa.handle}, aa.freed,
+			"the pre-publish gate must roll back (free) the allocated slab, not publish it")
+	})
+
+	t.Run("poisoned before publish: lifecycle intent is refused and Push is never reached", func(t *testing.T) {
+		tf := newTestPoisonFlag(t)
+		tf.flag.Set(PoisonGeneric)
+
+		w := newWriterFromParts(panicOnPushRing{}, noArena{}, 1, 1, admitBlock)
+		w.poison = tf.flag
+		w.start()
+		t.Cleanup(w.stop)
+
+		err := w.submit(t.Context(), cancelFrame(1), laneLifecycle)
+		require.ErrorIs(t, err, ErrPoisoned)
+	})
+
+	t.Run("shut down (not poisoned) before publish reports transport.ErrClosed, not ErrPoisoned", func(t *testing.T) {
+		tf := newTestPoisonFlag(t)
+		atomic.StoreUint32(tf.shutdownWord, 1) // shutdown alone; poison word stays clear
+
+		w := newWriterFromParts(panicOnPushRing{}, noArena{}, 1, 1, admitBlock)
+		w.poison = tf.flag
+		w.start()
+		t.Cleanup(w.stop)
+
+		err := w.submit(t.Context(), cancelFrame(1), laneLifecycle)
+		require.ErrorIs(t, err, transport.ErrClosed)
+		require.NotErrorIs(t, err, ErrPoisoned)
+	})
+
+	t.Run("healthy region: the gate is a no-op and the intent publishes normally", func(t *testing.T) {
+		rr := &recordRing{}
+		tf := newTestPoisonFlag(t)
+		w := newWriterFromParts(rr, noArena{}, 1, 1, admitBlock)
+		w.poison = tf.flag
+		w.start()
+		t.Cleanup(w.stop)
+
+		require.NoError(t, w.submit(t.Context(), cancelFrame(1), laneLifecycle))
+		require.Len(t, rr.snapshot(), 1)
+	})
 }
 
 // Test that published's "consumer already passed seq" free is uint64-wrap safe

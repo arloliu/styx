@@ -175,19 +175,22 @@ func (p *Process) Wait() (*os.ProcessState, error) {
 	return p.osProcess.Wait()
 }
 
-// Kill force-terminates the process group and reaps the child (waitpid). It
-// is the startup-abort reap: when handshake fails before a ClientConn is
-// wired there is no Teardown to run, but a spawned child must still never be
-// left as a zombie. Teardown.Run's step 5 is the normal-path reap; this is
-// its abort-path analogue and, like it, always ends in a waitpid. It also
-// closes Stdout/Stderr if Spec.CaptureStdio was set (a no-op, since they are
-// nil, for every caller that left it false).
-func (p *Process) Kill() error {
+// Kill force-terminates the process group and reaps the child (waitpid),
+// returning the reaped *os.ProcessState so the caller can recover a real exit
+// status. It is the startup-abort reap: when handshake fails before a
+// ClientConn is wired there is no Teardown to run, but a spawned child must
+// still never be left as a zombie. Teardown.Run's step 5 is the normal-path
+// reap (it keeps its own *os.ProcessState on Teardown.Reaped); this is its
+// abort-path analogue and, like it, always ends in a waitpid, now surfacing
+// the same kind of state instead of discarding it. It also closes
+// Stdout/Stderr if Spec.CaptureStdio was set (a no-op, since they are nil,
+// for every caller that left it false).
+func (p *Process) Kill() (*os.ProcessState, error) {
 	_ = p.signal(unix.SIGKILL)
-	_, err := p.Wait()
+	state, err := p.Wait()
 	closeIfNonNil(p.Stdout, p.Stderr)
 
-	return err
+	return state, err
 }
 
 // signal sends sig to the process's whole process group (Spawn set Setpgid,

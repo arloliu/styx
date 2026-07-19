@@ -91,16 +91,19 @@
 // this milestone (shm-abi.md §11/§12 define only producer→consumer wakes) and is
 // left to a later load/recovery task.
 //
-// # Conformance faults are the poison seam
+// # Conformance faults poison the region
 //
 // A received descriptor that violates the frame contract — ring depth over
 // capacity, an unassigned kind, a flag outside allowed_flags, a descriptor-only
 // frame carrying payload state, a payload span outside the arena, or a CRC32C
-// mismatch — is detected and surfaced as a typed error (errRingCorrupt,
-// errBadFrame, errChecksum), and an illegal park-state value observed by the
-// producer signal as errBadSync. Recv does not deliver the offending frame.
-// These faults do NOT perform the poison-word CAS or surface a poisoned-region
-// error: the §16 poison protocol (CAS the cause, set shutdown, wake both
-// directions) is a separate concern that maps each typed fault to its poison
-// cause. Generation mismatch is a discard (counted), never a fault (§15).
+// mismatch — is detected, surfaced as a typed error (errRingCorrupt,
+// errBadFrame, errChecksum) to the Recv caller, and actuates the §16
+// poison(cause) helper (CAS the mapped cause, set shutdown, wake both
+// directions) so the peer stops too, not just this call; an illegal
+// park-state value observed by the producer signal does the same as
+// errBadSync. Recv does not deliver the offending frame. A later Send/Recv
+// call on either side observes ErrPoisoned. Generation mismatch is a discard
+// (counted), never a poison (§15): PoisonFlag and the fault->cause mapping
+// live in poison.go, the generation-recovery helpers and the discard-
+// escalation policy in recovery.go.
 package shm

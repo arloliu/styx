@@ -36,6 +36,13 @@ type Config struct {
 	// receiver verifies it (shm-abi.md §5). It also adds 4 bytes to the §18
 	// per-frame overhead admission counts.
 	Checksum bool
+	// Escalation configures the generation-mismatch discard-stream escalation
+	// policy Attach constructs for this side (recovery.go's EscalationPolicy
+	// doc, shm-abi.md §15's supervisor-owned adjudication). The zero value is
+	// valid: every zero field falls back to its Default* constant
+	// (NewEscalationPolicy), not a capacity-invariant admission rule, so it
+	// is not validated by validateCapacityInvariant below.
+	Escalation EscalationConfig
 }
 
 // validateCapacityInvariant enforces the two normative startup invariants

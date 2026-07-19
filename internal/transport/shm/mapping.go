@@ -3,6 +3,7 @@ package shm
 import (
 	"unsafe"
 
+	"github.com/arloliu/styx/internal/event"
 	"github.com/arloliu/styx/internal/ring"
 	"github.com/arloliu/styx/internal/shm"
 )
@@ -41,6 +42,19 @@ func directions(role Role) (outbound, inbound shm.Direction) {
 	}
 
 	return shm.PluginToHost, shm.HostToPlugin
+}
+
+// hpPhEventFDs maps a role's already-resolved inbound/outbound eventfds back
+// to the region's fixed hp/ph identity (shm-abi.md §3/§14): PoisonFlag's
+// unconditional wake writes both regardless of which side calls Set, so it
+// needs the fixed host-to-plugin/plugin-to-host pair, not a role-relative
+// in/out pair.
+func hpPhEventFDs(role Role, inbound, outbound *event.EventFD) (hp, ph *event.EventFD) {
+	if role == RoleHost {
+		return outbound, inbound
+	}
+
+	return inbound, outbound
 }
 
 // carveRing overlays a *ring.Ring on the region mapping for one direction: its
