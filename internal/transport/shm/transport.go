@@ -644,7 +644,12 @@ func (t *Transport) classifyPayload(d ring.Descriptor, tk transport.FrameKind) (
 			return transport.Frame{}, false, errBadFrame
 		}
 
-		return decodedFrame(d, tk, []byte{}), true, nil
+		f, err := decodedFrame(d, tk, []byte{})
+		if err != nil {
+			return transport.Frame{}, false, errBadFrame
+		}
+
+		return f, true, nil
 	}
 
 	// Slab present: offset and stamp MUST both be nonzero (offset 0 is the reserved
@@ -677,20 +682,44 @@ func (t *Transport) classifyPayload(d ring.Descriptor, tk transport.FrameKind) (
 		}
 	}
 
-	return decodedFrame(d, tk, payload), true, nil
+	f, err := decodedFrame(d, tk, payload)
+	if err != nil {
+		return transport.Frame{}, false, errBadFrame
+	}
+
+	return f, true, nil
 }
 
 // decodedFrame assembles the delivered transport.Frame from a validated
-// descriptor and its copied payload (shm-abi.md §4/§5).
-func decodedFrame(d ring.Descriptor, tk transport.FrameKind, payload []byte) transport.Frame {
-	return transport.Frame{
+// descriptor and its copied payload (shm-abi.md §4/§5). For a FrameUnaryErr,
+// payload is the encoded Status (its wire payload, shm-abi.md UNARY_ERR): it
+// is decoded into Frame.Status and Frame.Payload is left nil, symmetric to
+// what UDS produces. A FrameUnaryErr whose payload does not decode is a
+// conformance fault, not a deliverable frame -- the error is returned so the
+// caller can route it through the same poison path as any other malformed
+// descriptor, rather than delivering a Frame with a nil Status.
+func decodedFrame(d ring.Descriptor, tk transport.FrameKind, payload []byte) (transport.Frame, error) {
+	f := transport.Frame{
 		CallID:  d.CallID(),
 		Kind:    tk,
 		Service: d.ServiceID(),
 		Method:  d.MethodID(),
 		Budget:  time.Duration(d.BudgetNS()),
-		Payload: payload,
 	}
+
+	if tk == transport.FrameUnaryErr {
+		status, err := transport.DecodeStatus(payload)
+		if err != nil {
+			return transport.Frame{}, err
+		}
+		f.Status = status
+
+		return f, nil
+	}
+
+	f.Payload = payload
+
+	return f, nil
 }
 
 // servingClass returns the index of the smallest class whose slab_size can hold

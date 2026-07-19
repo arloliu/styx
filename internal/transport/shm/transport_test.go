@@ -302,6 +302,132 @@ func TestTransport_PayloadChecksum_RoundTripsAndDetectsCorruption_WhenFeatureNeg
 	})
 }
 
+// Test that a FrameUnaryErr's Status (code, message, and every detail)
+// round-trips over the shm data plane byte-identical to what UDS delivers for
+// the same sent frame, with Payload left nil (docs/specs/shm-abi.md UNARY_ERR
+// carries a status payload, not a normal one).
+func TestSHM_FrameUnaryErr_CarriesStatus_CodeMessageDetails(t *testing.T) {
+	// Given a host and plugin attached to one region.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	want := &transport.FrameStatus{
+		Code:    7,
+		Message: "method not found",
+		Details: [][]byte{[]byte("detail-one"), []byte("detail-two")},
+	}
+
+	// When a FrameUnaryErr carrying that status is sent and received.
+	require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
+		CallID: 1, Kind: transport.FrameUnaryErr, Service: 11, Method: 22, Status: want,
+	}))
+	f, err := ep.plugin.Recv(t.Context())
+
+	// Then the received frame carries the same status, field by field, and no payload.
+	require.NoError(t, err)
+	require.Equal(t, transport.FrameUnaryErr, f.Kind)
+	require.NotNil(t, f.Status)
+	require.Equal(t, want.Code, f.Status.Code)
+	require.Equal(t, want.Message, f.Status.Message)
+	require.Equal(t, want.Details, f.Status.Details)
+	require.Nil(t, f.Payload)
+}
+
+// Test that a FrameUnaryErr whose Status is zero-value (nil or an empty
+// *FrameStatus) still round-trips to a non-nil all-zero *FrameStatus, matching
+// what UDS produces for the same sent frame -- neither side special-cases a
+// missing status.
+func TestSHM_FrameUnaryErr_EmptyStatus_RoundTrips(t *testing.T) {
+	t.Run("zero-value status", func(t *testing.T) {
+		// Given a host and plugin attached to one region.
+		ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+		// When a FrameUnaryErr with an explicit zero-value Status is sent and received.
+		require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
+			CallID: 2, Kind: transport.FrameUnaryErr, Status: &transport.FrameStatus{},
+		}))
+		f, err := ep.plugin.Recv(t.Context())
+
+		// Then it round-trips to a non-nil all-zero status and no payload.
+		require.NoError(t, err)
+		require.NotNil(t, f.Status)
+		require.Zero(t, f.Status.Code)
+		require.Empty(t, f.Status.Message)
+		require.Empty(t, f.Status.Details)
+		require.Nil(t, f.Payload)
+	})
+
+	t.Run("nil status", func(t *testing.T) {
+		// Given a host and plugin attached to one region.
+		ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+		// When a FrameUnaryErr with a nil Status is sent and received.
+		require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
+			CallID: 3, Kind: transport.FrameUnaryErr, Status: nil,
+		}))
+		f, err := ep.plugin.Recv(t.Context())
+
+		// Then a nil sent Status decodes the same as an explicit zero-value one.
+		require.NoError(t, err)
+		require.NotNil(t, f.Status)
+		require.Zero(t, f.Status.Code)
+		require.Empty(t, f.Status.Message)
+		require.Empty(t, f.Status.Details)
+		require.Nil(t, f.Payload)
+	})
+}
+
+// Test that a FrameUnaryErr's Status still round-trips intact when the CRC32C
+// checksum feature is negotiated, proving the checksum covers the encoded
+// status bytes rather than a stale raw Payload (shm-abi.md §5).
+func TestSHM_FrameUnaryErr_CarriesStatus_WithChecksumNegotiated(t *testing.T) {
+	// Given a host and plugin attached to one region with checksum negotiated.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(true))
+	want := &transport.FrameStatus{Code: 3, Message: "budget exceeded"}
+
+	// When a FrameUnaryErr carrying that status is sent and received.
+	require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
+		CallID: 4, Kind: transport.FrameUnaryErr, Status: want,
+	}))
+	f, err := ep.plugin.Recv(t.Context())
+
+	// Then the status decodes intact and no payload is set.
+	require.NoError(t, err)
+	require.NotNil(t, f.Status)
+	require.Equal(t, want.Code, f.Status.Code)
+	require.Equal(t, want.Message, f.Status.Message)
+	require.Nil(t, f.Payload)
+}
+
+// Test that a FrameUnaryErr descriptor whose slab is too short to hold a valid
+// encoded status (payload_length < the 12-byte status head) is rejected as a
+// conformance fault, not delivered: a real status is always >= 12 bytes, so
+// this is a peer-side ABI violation, decoded and detected the same way any
+// other malformed descriptor is (shm-abi.md §5/§9/§16).
+func TestSHM_FrameUnaryErr_MalformedStatusSlab_IsConformanceFault(t *testing.T) {
+	// Given a raw producer and a real (non-slab-zero) slab offset in the
+	// smallest class, referenced by a descriptor whose declared length is
+	// shorter than any encoded status can be.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	producer := hpProducer(t, ep.region)
+	class := ep.region.Layout().Arenas[shm.HostToPlugin].Classes[0]
+	off := class.ClassBaseOffset + class.SlabSize // slab index 1; index 0 is reserved slab-zero
+
+	bad := makeDesc(ring.KindUnaryErr, 1, 7)
+	bad.SetPayloadOffset(off)
+	bad.SetPayloadLength(4) // < statusHeadSize (12): cannot be a valid encoded status
+	bad.SetAllocSeq(1)
+	require.NoError(t, producer.Push(bad))
+
+	// When Recv decodes it.
+	_, err := ep.plugin.Recv(t.Context())
+
+	// Then it is rejected as a conformance fault and the region is poisoned,
+	// not delivered to the caller.
+	require.ErrorIs(t, err, errBadFrame)
+	cause, poisoned := ep.plugin.poison.Check()
+	require.True(t, poisoned)
+	require.Equal(t, PoisonBadFrame, cause)
+}
+
 // Test that Recv fails closed on the conformance faults the consumer must
 // detect (shm-abi.md §5/§9): a corrupt ring, an unassigned kind, a flag outside
 // allowed_flags, and a descriptor-only frame carrying payload state. Each

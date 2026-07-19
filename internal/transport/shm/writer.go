@@ -594,33 +594,51 @@ func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 	d.SetMethodID(i.frame.Method)
 	d.SetBudgetNS(int64(i.frame.Budget))
 
-	if len(i.frame.Payload) == 0 && !w.checksum {
+	wire := wirePayload(i.frame)
+	if len(wire) == 0 && !w.checksum {
 		// Empty-payload data frame with no negotiated payload-layout features:
 		// stored_length == 0, so no slab is allocated and the descriptor keeps the
 		// "no slab" encoding (offset/length/alloc_seq 0), shm-abi.md §5. When the
 		// checksum feature is negotiated the frame instead falls through to
 		// stampPayload, which stores a CRC32C(empty) trailer (stored_length == 4)
 		// and sets CRC32C_PRESENT, so every data frame is uniformly checksummed.
+		// A FrameUnaryErr never reaches this branch: EncodeStatus always returns
+		// at least statusHeadSize bytes, so its wire payload is never empty.
 		return d, buildOK
 	}
 
-	return w.stampPayload(i, d)
+	return w.stampPayload(i, d, wire)
 }
 
-// stampPayload allocates a slab holding the payload and, under the negotiated
-// checksum feature, a trailing CRC32C, copies the payload in, and stamps the
+// wirePayload returns the bytes a frame stores in its slab: the encoded
+// Status for a FrameUnaryErr (shm-abi.md UNARY_ERR carries a status payload
+// in place of a normal one), or the raw Payload for every other kind.
+// transport.EncodeStatus never returns an empty slice (a nil status still
+// encodes to the statusHeadSize-byte all-zero head), so a FrameUnaryErr
+// always has a non-empty wire payload and therefore always allocates a slab.
+func wirePayload(f transport.Frame) []byte {
+	if f.Kind == transport.FrameUnaryErr {
+		return transport.EncodeStatus(f.Status)
+	}
+
+	return f.Payload
+}
+
+// stampPayload allocates a slab holding wire (a frame's wirePayload: its raw
+// Payload, or a FrameUnaryErr's encoded Status) and, under the negotiated
+// checksum feature, a trailing CRC32C, copies wire in, and stamps the
 // descriptor's offset/length/generation/alloc_seq from the returned handle
 // (shm-abi.md §5/§6). It first reclaims slabs the consumer released, so
 // continuous traffic never leaks (§6). ErrExhausted is typed backpressure
 // (retry later); ErrTooLarge is a terminal reject.
-func (w *writer) stampPayload(i intent, d ring.Descriptor) (ring.Descriptor, buildStatus) {
+func (w *writer) stampPayload(i intent, d ring.Descriptor, wire []byte) (ring.Descriptor, buildStatus) {
 	// The transport surface bounds payload length before submit, so this is a
 	// defensive fail-closed guard against a caller bug: without it an oversize
 	// length would truncate in the uint32 cast, alloc a too-small slab, and panic
 	// in the copy below inside the writer goroutine. Reject it terminally instead.
 	// MaxFrameSize is far below math.MaxUint32, so past this guard every uint32
 	// cast is safe.
-	msgLen := len(i.frame.Payload)
+	msgLen := len(wire)
 	if msgLen > transport.MaxFrameSize {
 		w.report(i, transport.ErrPayloadTooLarge)
 
@@ -661,11 +679,11 @@ func (w *writer) stampPayload(i intent, d ring.Descriptor) (ring.Descriptor, bui
 		return d, buildFailed
 	}
 
-	copy(buf[:msgLen], i.frame.Payload)
+	copy(buf[:msgLen], wire)
 	if w.checksum {
 		// CRC32C over the message payload only (shm-abi.md §5), 4 LE bytes right
 		// after it; trace is out of scope, so the slab is [payload][4B CRC].
-		binary.LittleEndian.PutUint32(buf[msgLen:storedLen], crc32.Checksum(i.frame.Payload, castagnoliTable))
+		binary.LittleEndian.PutUint32(buf[msgLen:storedLen], crc32.Checksum(wire, castagnoliTable))
 		d.SetFlags(d.Flags() | flagCRC32CPresent)
 	}
 
