@@ -36,11 +36,13 @@
 // shm-abi.md §18); recovering a wedged consumer is wedge-detection's job, not
 // this writer's. The writer must never spin on that backpressure while a CANCEL
 // waits (design §12), so a data intent that cannot be placed is set aside and the
-// writer returns to its lifecycle-first wait, retrying the set-aside intent when a
-// resume signal reports the consumer freed a ring slot or slab. That signal is a
-// seam here (see signalRetry); the assembly layer wires it to the real
-// consumer→producer wakeup. It never busy-waits and never blocks the lifecycle
-// lane on data-lane progress.
+// writer returns to its lifecycle-first wait, resuming that intent on the next
+// lifecycle intent or at shutdown. A resume driven by the consumer itself freeing
+// space (signalRetry) is a deliberately-unwired seam: no production caller signals
+// it yet, because the cross-process consumer→producer "space-available" wake is
+// not specified for this milestone (shm-abi.md §11/§12 define only
+// producer→consumer wakes); a test drives it directly. The writer never busy-waits
+// and never blocks the lifecycle lane on data-lane progress.
 //
 // # Completion protocol
 //
@@ -53,12 +55,52 @@
 // context cancel — an abandoned intent may still be emitted, which is harmless
 // because nobody waits on it and the writer never blocks reporting it.
 //
-// # Scope
+// # The assembled transport
 //
-// This package builds only the writer mechanism over an already-attached
-// ring/arena pair. Startup capacity-invariant validation and the C - R
-// arithmetic, real region attachment, the eventfd wakeup that signals a parked
-// consumer after a push, poison-on-corruption, generation-staleness discard, and
-// the Transport.Send/Recv surface are assembled around it elsewhere; the depths
-// handed to the writer are a trusted-caller contract.
+// Attach wires this writer, plus a SpinWaiter-driven inbound reader, onto a real
+// region: it opens the memfd, validates the capacity invariant against the
+// region's actual geometry before allocating any writer or arena state
+// (shm-abi.md §18), then carves the per-direction rings, arenas, and sync-page
+// words (§1/§3) and returns a Transport that satisfies transport.Transport. Send
+// hands a frame to the writer on the lane its kind selects; Recv waits for
+// inbound work, discards stale-generation descriptors (§15), verifies an
+// optional CRC32C trailer (§5), copies the payload out before releasing the slot
+// (§9), and returns the decoded frame. Close performs teardown step 4 (munmap)
+// exactly once; steps 1-3 (admission stop, waiter wake, goroutine join) are the
+// caller's, and the eventfds are the caller's to close.
+//
+// # Head-gated reclaim and its idle-stuck limitation
+//
+// The writer frees a slab once the consumer's ring head has passed the
+// descriptor that referenced it (shm-abi.md §6): on every publish, and again
+// before each allocation, it reclaims every slab below the current head. Under
+// continuous traffic this keeps the arena from leaking, including when a burst
+// of no-slab frames (a CANCEL storm, empty-payload data) reuses an earlier data
+// frame's ring slot.
+//
+// Reclaim runs only while the writer is making progress; it cannot run while the
+// writer is parked. So a writer already stuck on arena exhaustion does not
+// recover from its draining consumer alone: it resumes on its next lifecycle
+// intent or at shutdown — both re-drive the set-aside intent through
+// place → build → stampPayload → reclaim → alloc — never from pure data traffic,
+// since a stuck writer stops pulling data to stay within its queue bound, so
+// further data sends do not wake it. A workload of pure data frames with no
+// lifecycle traffic, under a consumer that drains but sends no cancels, is the
+// uncovered corner: nothing wakes the stuck writer until the cross-process
+// consumer→producer "space-available" wake is wired, which is not specified for
+// this milestone (shm-abi.md §11/§12 define only producer→consumer wakes) and is
+// left to a later load/recovery task.
+//
+// # Conformance faults are the poison seam
+//
+// A received descriptor that violates the frame contract — ring depth over
+// capacity, an unassigned kind, a flag outside allowed_flags, a descriptor-only
+// frame carrying payload state, a payload span outside the arena, or a CRC32C
+// mismatch — is detected and surfaced as a typed error (errRingCorrupt,
+// errBadFrame, errChecksum), and an illegal park-state value observed by the
+// producer signal as errBadSync. Recv does not deliver the offending frame.
+// These faults do NOT perform the poison-word CAS or surface a poisoned-region
+// error: the §16 poison protocol (CAS the cause, set shutdown, wake both
+// directions) is a separate concern that maps each typed fault to its poison
+// cause. Generation mismatch is a discard (counted), never a fault (§15).
 package shm

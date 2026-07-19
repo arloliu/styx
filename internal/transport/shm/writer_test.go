@@ -2,6 +2,7 @@ package shm
 
 import (
 	"context"
+	"math"
 	"math/rand/v2"
 	"sync"
 	"testing"
@@ -50,6 +51,13 @@ func (r *recordRing) snapshot() []ring.Descriptor {
 	return out
 }
 
+// Tail and Len report an idle ring so head-gated reclaim is a no-op: the
+// isolated writer tests construct the writer without a handle table, so these
+// are never consulted for real reclaim; they exist only to satisfy the
+// descriptorRing interface.
+func (r *recordRing) Tail() uint64 { return 0 }
+func (r *recordRing) Len() uint64  { return 0 }
+
 // tooLargeArena is a payloadArena double whose Alloc always reports
 // arena.ErrTooLarge, the terminal oversize reject.
 type tooLargeArena struct{}
@@ -58,6 +66,11 @@ func (tooLargeArena) Alloc(uint32) (arena.SlabHandle, []byte, error) {
 	return arena.SlabHandle{}, nil, arena.ErrTooLarge
 }
 
+// Free satisfies the payloadArena interface. The isolated writer tests build the
+// writer without a handle table, so head-gated reclaim never runs and Free is
+// never called; it exists only for the interface.
+func (tooLargeArena) Free(arena.SlabHandle) error { return nil }
+
 // noArena is a payloadArena double that panics if Alloc is called, so a test can
 // assert a descriptor-only or empty-payload frame allocates no slab.
 type noArena struct{}
@@ -65,6 +78,8 @@ type noArena struct{}
 func (noArena) Alloc(uint32) (arena.SlabHandle, []byte, error) {
 	panic("shm test: Alloc called for a frame that must take no slab")
 }
+
+func (noArena) Free(arena.SlabHandle) error { return nil }
 
 // stubArena is a payloadArena double that returns a fixed slab handle and a
 // buffer the test can inspect, so a test can assert the writer stamps the
@@ -87,6 +102,8 @@ func (a *stubArena) Alloc(size uint32) (arena.SlabHandle, []byte, error) {
 	}, a.slab, nil
 }
 
+func (a *stubArena) Free(arena.SlabHandle) error { return nil }
+
 // signalArena is a payloadArena double that reports arena.ErrExhausted and, on the
 // first Alloc attempt, signals allocated. A test waits on allocated to know the
 // writer has provably dequeued a data intent and driven it into the stuck carry
@@ -105,6 +122,8 @@ func (a *signalArena) Alloc(uint32) (arena.SlabHandle, []byte, error) {
 	return arena.SlabHandle{}, nil, arena.ErrExhausted
 }
 
+func (a *signalArena) Free(arena.SlabHandle) error { return nil }
+
 // switchArena starts exhausted and, once free is called, serves a known slab. It
 // models the consumer freeing a slab: a set-aside data intent can be placed only
 // after free and a retry wake, so it exercises the resume-on-space seam. Each
@@ -117,7 +136,7 @@ type switchArena struct {
 	allocated chan struct{}
 }
 
-func (a *switchArena) free() {
+func (a *switchArena) release() {
 	a.mu.Lock()
 	a.freed = true
 	a.mu.Unlock()
@@ -139,6 +158,8 @@ func (a *switchArena) Alloc(size uint32) (arena.SlabHandle, []byte, error) {
 
 	return arena.SlabHandle{Offset: 128, Length: size, Generation: 1, Sequence: 1}, a.slab, nil
 }
+
+func (a *switchArena) Free(arena.SlabHandle) error { return nil }
 
 // dataFullRing returns ring.ErrFull for a payload-bearing data push and records
 // descriptor-only lifecycle pushes, so a test can drive the ring-window carry path
@@ -178,6 +199,9 @@ func (r *dataFullRing) snapshot() []ring.Descriptor {
 	return out
 }
 
+func (r *dataFullRing) Tail() uint64 { return 0 }
+func (r *dataFullRing) Len() uint64  { return 0 }
+
 // gateRing blocks the writer inside Push until release is closed, and signals
 // reached on the first Push entry. It lets a test hold the writer mid-emit — after
 // an intent is dequeued but before it is reported — to drive the report-into-an-
@@ -202,6 +226,9 @@ func (g *gateRing) Push(d ring.Descriptor) error {
 
 	return nil
 }
+
+func (g *gateRing) Tail() uint64 { return 0 }
+func (g *gateRing) Len() uint64  { return 0 }
 
 // realRing builds a Ring at capacity over fresh in-process slots and head/tail
 // words, the same synthetic backing the ring package's own tests use.
@@ -412,7 +439,7 @@ func TestWriter_ResumesStuckData_OnRetrySignal(t *testing.T) {
 	}
 
 	// When space frees and the writer is signaled to retry.
-	sa.free()
+	sa.release()
 	w.signalRetry()
 
 	// Then the data intent completes and its descriptor is published.
@@ -936,4 +963,93 @@ func TestWriter_SubmitPublishesFullyStampedDescriptor(t *testing.T) {
 	require.Equal(t, uint64(9), d.AllocSeq())
 	require.Equal(t, uint16(0), d.Flags())
 	require.Equal(t, payload, sa.slab[:len(payload)])
+}
+
+// headRing is a descriptorRing double whose consumer head (Tail - Len) is fixed
+// at construction, so a test can place the head at an exact ring sequence —
+// including the uint64 wrap boundary — and drive the head-gated reclaim
+// bookkeeping directly. Push is never called: published runs after the ring
+// Push, so these tests exercise only the post-push reclaim/free path.
+type headRing struct {
+	tail   uint64
+	length uint64
+}
+
+func (r headRing) Push(ring.Descriptor) error { panic("shm test: headRing.Push must not be called") }
+func (r headRing) Tail() uint64               { return r.tail }
+func (r headRing) Len() uint64                { return r.length }
+
+// freeRecordArena is a payloadArena double that records the offset of every slab
+// handle passed to Free, so a test can assert which slab published freed. Alloc
+// is never called on the published path.
+type freeRecordArena struct {
+	freed []uint32
+}
+
+func (a *freeRecordArena) Alloc(uint32) (arena.SlabHandle, []byte, error) {
+	panic("shm test: freeRecordArena.Alloc must not be called")
+}
+
+func (a *freeRecordArena) Free(h arena.SlabHandle) error {
+	a.freed = append(a.freed, h.Offset)
+
+	return nil
+}
+
+// Test that published's "consumer already passed seq" free is uint64-wrap safe
+// (shm-abi.md §6/§10): the slab of a frame the consumer has advanced the head
+// past is freed at once, and one it is still holding is kept, at every ring
+// sequence including the wrap boundary seq == math.MaxUint64.
+//
+// The consumer head is placed at Tail - Len via a headRing double, and
+// lastReclaimed is seeded equal to that head so the leading reclaim is a no-op
+// that leaves lastReclaimed == head — isolating the post-push predicate. The
+// wrap-passed row is the one a "lastReclaimed > seq" test strands (0 is not >
+// math.MaxUint64), so it fails RED against that predicate and passes GREEN
+// against the wrap-safe "lastReclaimed == seq+1".
+func TestWriter_Published_FreesConsumedSlab_AcrossWrapBoundary(t *testing.T) {
+	const capacity = 8 // ring capacity; a power of two so handleMask == capacity-1
+
+	// slabOffset is a distinct, nonzero slab identity so a recorded Free proves it
+	// was this frame's slab that was freed. Offset 0 is the reserved "no slab"
+	// marker (shm-abi.md §5), so it is never used here.
+	const slabOffset = 0x1000
+
+	cases := []struct {
+		name     string
+		seq      uint64 // ring sequence the just-published descriptor occupies
+		head     uint64 // consumer head after reclaim; head <= tail == seq+1 always
+		wantFree bool
+	}{
+		{"normal: consumer passed seq", 5, 6, true},
+		{"normal: consumer sits at seq", 5, 5, false},
+		{"normal: consumer behind seq", 5, 3, false},
+		{"wrap: consumer passed the last seq", math.MaxUint64, 0, true},
+		{"wrap: consumer sits at the last seq", math.MaxUint64, math.MaxUint64, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ar := &freeRecordArena{}
+			w := newWriterFromParts(headRing{tail: tc.head, length: 0}, ar, 1, 1, admitBlock)
+			w.handleTable = make([]slabRef, capacity)
+			w.handleMask = capacity - 1
+			w.lastReclaimed = tc.head // reclaim is a no-op; isolate the predicate
+
+			ref := slabRef{h: arena.SlabHandle{Offset: slabOffset}, present: true}
+			w.published(tc.seq, ref)
+
+			slot := tc.seq & w.handleMask
+			if tc.wantFree {
+				require.Equal(t, []uint32{slabOffset}, ar.freed,
+					"a slab the consumer's head has passed must be freed, not stranded (shm-abi.md §6)")
+				require.False(t, w.handleTable[slot].present, "a freed slab's handle-table slot must be cleared")
+			} else {
+				require.Empty(t, ar.freed,
+					"a slab the consumer is still holding must not be freed early (shm-abi.md §9)")
+				require.Equal(t, ref, w.handleTable[slot],
+					"a kept slab stays recorded for a later head-gated reclaim")
+			}
+		})
+	}
 }

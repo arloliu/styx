@@ -313,6 +313,13 @@ func (r *Region) Layout() Layout {
 	return l
 }
 
+// Bytes returns the region's whole mapped byte slice, so a consumer that
+// owns the layout (internal/transport/shm) can carve the ring, arena, and
+// sync-page spans over it (shm-abi.md §1). It returns nil after Close. The
+// caller MUST NOT retain the slice past Close: the backing memory is
+// unmapped there, and any access afterward reads freed address space.
+func (r *Region) Bytes() []byte { return r.data }
+
 // Close munmaps the region and closes the local fd. Idempotent: a second
 // call is a no-op. Both resources are marked released up front, so even if
 // Munmap fails, Close still attempts to close the fd (never leaking it on

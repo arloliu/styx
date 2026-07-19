@@ -29,7 +29,7 @@ build:
 test:
 	go test ./... -race -timeout=$(TEST_TIMEOUT)
 	go test -tags ringhook ./internal/ring/... -race -timeout=$(TEST_TIMEOUT)
-	go test -tags eventhook ./internal/event/... -race -timeout=$(TEST_TIMEOUT)
+	go test -tags eventhook ./internal/event/... ./internal/transport/shm/... -race -timeout=$(TEST_TIMEOUT)
 
 ## bench: Run the SHM spike benchmark suite (see bench/spike)
 bench:

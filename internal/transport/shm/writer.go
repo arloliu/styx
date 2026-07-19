@@ -2,7 +2,9 @@ package shm
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"sync"
 
 	"github.com/arloliu/styx/internal/arena"
@@ -10,19 +12,28 @@ import (
 	"github.com/arloliu/styx/internal/transport"
 )
 
-// descriptorRing is the writer's view of its outbound ring: the single publish
-// operation it performs. Narrowing *ring.Ring to this one method lets a test
+// castagnoliTable is the CRC32C (Castagnoli, polynomial 0x1EDC6F41) table the
+// checksum feature stamps and the receiver verifies against (shm-abi.md §5).
+var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
+
+// descriptorRing is the writer's view of its outbound ring: publish plus the
+// two seq_cst progress loads head-gated reclaim needs (current head is
+// Tail - Len, shm-abi.md §6/§10). Narrowing *ring.Ring to these lets a test
 // substitute a ring that returns ring.ErrFull on command, which a concrete
 // *ring.Ring cannot easily be forced to do.
 type descriptorRing interface {
 	Push(ring.Descriptor) error
+	Tail() uint64
+	Len() uint64
 }
 
-// payloadArena is the writer's view of its outbound arena: the single allocation
-// it performs to stage a data payload. Narrowing *arena.Arena to this one method
-// lets a test substitute an arena that returns arena.ErrExhausted on command.
+// payloadArena is the writer's view of its outbound arena: allocate a slab to
+// stage a payload, and free one the consumer has released (head-gated reclaim,
+// shm-abi.md §6). Narrowing *arena.Arena to these lets a test substitute an
+// arena that returns arena.ErrExhausted on command.
 type payloadArena interface {
 	Alloc(size uint32) (arena.SlabHandle, []byte, error)
+	Free(arena.SlabHandle) error
 }
 
 var (
@@ -65,6 +76,20 @@ type carry struct {
 	i     intent
 	d     ring.Descriptor
 	built bool
+	// h and hasSlab record the slab this intent allocated, so the writer can
+	// index it into the reclaim handle table at publish time (shm-abi.md §6).
+	// hasSlab is false for a descriptor-only or empty-payload frame (no slab).
+	h       arena.SlabHandle
+	hasSlab bool
+}
+
+// slabRef records, per ring sequence, the slab a published descriptor
+// references, so head-gated reclaim can free it once the consumer's head passes
+// that sequence (shm-abi.md §6). present is false for a descriptor-only or
+// empty-payload publish, which allocated no slab.
+type slabRef struct {
+	h       arena.SlabHandle
+	present bool
 }
 
 // writer is the single producer goroutine plus the two bounded intent queues for
@@ -83,13 +108,48 @@ type writer struct {
 	stopped  chan struct{} // closed by run once it has fully drained and returned
 
 	// retry wakes run to re-attempt a set-aside data intent after backpressure may
-	// have cleared. The assembly layer signals it when the consumer frees a ring
-	// slot or a slab (post-reclaim); in isolation a test drives it. It is the seam
-	// that turns "block until space" into a real resume path instead of a wait that
-	// only a lifecycle intent or shutdown can end. See signalRetry.
+	// have cleared. It is a deliberately-unwired seam: no production caller signals
+	// it yet — the cross-process consumer→producer "space-available" wake that would
+	// is not specified for this milestone (shm-abi.md §11/§12 define only
+	// producer→consumer wakes); a test drives it directly. Until then a set-aside
+	// data intent resumes on the next lifecycle intent or at shutdown. See signalRetry.
 	retry chan struct{}
 
 	mode admissionMode
+
+	// gen is the low 32 bits of the region generation, stamped into every
+	// descriptor this writer publishes so the peer's staleness check accepts them
+	// (shm-abi.md §4/§15). It is 0 only in isolated unit tests that build a writer
+	// with no region; a real region's generation is always >= 1 (shm-abi.md §2),
+	// so the arena-consistency check in stampPayload is active in every production
+	// path.
+	gen uint32
+
+	// checksum records whether the CRC32C feature is negotiated; when set, a
+	// payload frame stores a 4-byte CRC32C trailer and sets CRC32C_PRESENT
+	// (shm-abi.md §5).
+	checksum bool
+
+	// signal runs the §12 producer signal after each successful publish: it wakes
+	// a parked consumer via the outbound eventfd. It is injected so isolated tests
+	// pass a no-op; production wires the real park-state/eventfd/poison/shutdown
+	// closure (shm-abi.md §12).
+	signal func()
+
+	// handleTable, handleMask, and lastReclaimed drive head-gated slab reclaim
+	// (shm-abi.md §6): handleTable[seq & handleMask] records the slab published at
+	// ring sequence seq, and reclaim frees every slab in [lastReclaimed, head)
+	// before each allocation. handleTable is nil in isolated tests (reclaim
+	// disabled); production sizes it to ring capacity.
+	handleTable   []slabRef
+	handleMask    uint64
+	lastReclaimed uint64
+
+	// pendingSlab threads the slab a payload build allocated from stampPayload
+	// out to place, which records it in handleTable at publish time. Touched only
+	// by the single run goroutine (build/place/emitLifecycle), so it needs no
+	// synchronization; it is reset at the top of every build.
+	pendingSlab slabRef
 
 	// closeMu guards the closed flag and, held for read across an enqueue, forms
 	// the barrier stop waits on: stop takes the write lock only after closing
@@ -132,7 +192,27 @@ func newWriterFromParts(r descriptorRing, a payloadArena, dataDepth, lifecycleDe
 		stopped:        make(chan struct{}),
 		retry:          make(chan struct{}, 1),
 		mode:           mode,
+		signal:         func() {}, // no-op until wired; production overrides via newRegionWriter
 	}
+}
+
+// newRegionWriter builds the production writer over a region's outbound ring and
+// arena. It wires the region generation stamped into every descriptor
+// (shm-abi.md §15), the negotiated checksum feature (§5), the §12 producer
+// signal that wakes a parked consumer, and the head-gated reclaim handle table
+// sized to the ring capacity (§6). Admission blocks the caller until data-queue
+// space frees, matching transport.Send's blocking contract.
+func newRegionWriter(
+	r *ring.Ring, a *arena.Arena, cfg Config, gen uint32, capacity uint64, signal func(),
+) *writer {
+	w := newWriterFromParts(r, a, cfg.DataQueueDepth, cfg.LifecycleQueueDepth, admitBlock)
+	w.gen = gen
+	w.checksum = cfg.Checksum
+	w.signal = signal
+	w.handleTable = make([]slabRef, capacity)
+	w.handleMask = capacity - 1
+
+	return w
 }
 
 // start launches the single writer goroutine. It must be called exactly once,
@@ -231,9 +311,12 @@ func (w *writer) enqueue(ctx context.Context, i intent, l lane) error {
 // guarantee is that lifecycle is never blocked or starved, not that no data ever
 // precedes it, and one non-blocking op is the bound. While a data intent is stuck
 // it neither pulls more data (which would exceed the queue bound) nor blocks on
-// data-lane progress: it waits only for a lifecycle intent, a resume signal
-// (retry), or shutdown, so a CANCEL always preempts the backpressure and a freed
-// slot resumes the stuck data.
+// data-lane progress: it waits only for a lifecycle intent, the retry seam, or
+// shutdown, so a CANCEL always preempts the backpressure. Reclaiming a slab does
+// not by itself resume the stuck data: the consumer→producer "space-available"
+// wake is not wired for this milestone (shm-abi.md §11/§12 specify only
+// producer→consumer wakes) and the retry seam has no production caller yet, so
+// absent further lifecycle traffic the set-aside intent resumes at shutdown.
 func (w *writer) run() {
 	var stuck *carry
 
@@ -298,12 +381,16 @@ func (w *writer) emitLifecycle(i intent) {
 		return // build already reported a terminal kind/lane error
 	}
 
+	seq := w.publishSeq()
 	if err := w.ring.Push(d); err != nil {
 		w.report(i, err)
 
 		return
 	}
 
+	// A CANCEL allocates no slab, but the publish still wakes a parked consumer
+	// (shm-abi.md §12) and records "no slab" at its sequence.
+	w.published(seq, slabRef{})
 	w.report(i, nil)
 }
 
@@ -322,11 +409,13 @@ func (w *writer) emit(i intent) *carry {
 	return nil
 }
 
-// signalRetry wakes run to re-attempt a set-aside data intent. The assembly layer
-// calls it when the consumer frees a ring slot or a slab (post-reclaim); in
-// isolation a test drives it. The send is non-blocking into a cap-1 coalescing
-// channel, so it never blocks the signaller, and a spurious or coalesced wake is
-// harmless because the retry is an idempotent non-blocking place.
+// signalRetry wakes run to re-attempt a set-aside data intent. It is the resume
+// seam for the consumer→producer "space-available" wake, which is not specified
+// for this milestone and has no production caller yet (shm-abi.md §11/§12 define
+// only producer→consumer wakes); a test drives it directly. The send is
+// non-blocking into a cap-1 coalescing channel, so it never blocks the signaller,
+// and a spurious or coalesced wake is harmless because the retry is an idempotent
+// non-blocking place.
 func (w *writer) signalRetry() {
 	select {
 	case w.retry <- struct{}{}:
@@ -350,9 +439,12 @@ func (w *writer) place(c *carry) emitResult {
 		case buildOK:
 			c.d = d
 			c.built = true
+			c.h = w.pendingSlab.h
+			c.hasSlab = w.pendingSlab.present
 		}
 	}
 
+	seq := w.publishSeq()
 	if err := w.ring.Push(c.d); err != nil {
 		if errors.Is(err, ring.ErrFull) {
 			return emitStuck
@@ -362,9 +454,23 @@ func (w *writer) place(c *carry) emitResult {
 		return emitDone
 	}
 
+	w.published(seq, slabRef{h: c.h, present: c.hasSlab})
 	w.report(c.i, nil)
 
 	return emitDone
+}
+
+// publishSeq reads the ring sequence the next Push will occupy — the pre-push
+// tail — so published can index the slab handle at that sequence. It is a
+// no-op returning 0 when reclaim is not wired (isolated tests). The single run
+// goroutine is the sole tail writer, so no publish races between this load and
+// the Push that consumes the sequence.
+func (w *writer) publishSeq() uint64 {
+	if w.handleTable == nil {
+		return 0
+	}
+
+	return w.ring.Tail()
 }
 
 // build turns an intent into a ready-to-push ring descriptor. It validates the
@@ -374,6 +480,10 @@ func (w *writer) place(c *carry) emitResult {
 // reporting a terminal caller-bug or oversize error on the intent.
 func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 	var d ring.Descriptor
+
+	// Reset the slab thread-through: only a payload build sets it, so a
+	// descriptor-only or empty-payload frame leaves it "no slab".
+	w.pendingSlab = slabRef{}
 
 	// The lane must be one the writer knows. Trusted in-package callers use the two
 	// lane constants, so an out-of-domain lane is a caller bug: reject it closed
@@ -402,6 +512,11 @@ func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 
 	d.SetKind(rk)
 	d.SetCallID(i.frame.CallID)
+	// Every descriptor carries the region generation so the peer's staleness
+	// check accepts it (shm-abi.md §4/§15). This includes CANCEL and
+	// empty-payload frames, which allocate no slab and so would otherwise ship a
+	// generation of 0 and be discarded by the consumer as stale.
+	d.SetGeneration(w.gen)
 
 	if descriptorOnly {
 		// Descriptor-only frame (CANCEL): no slab, no service/method/budget, no
@@ -414,35 +529,51 @@ func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 	d.SetMethodID(i.frame.Method)
 	d.SetBudgetNS(int64(i.frame.Budget))
 
-	if len(i.frame.Payload) == 0 {
+	if len(i.frame.Payload) == 0 && !w.checksum {
 		// Empty-payload data frame with no negotiated payload-layout features:
 		// stored_length == 0, so no slab is allocated and the descriptor keeps the
-		// "no slab" encoding (offset/length/alloc_seq 0), shm-abi.md §5.
+		// "no slab" encoding (offset/length/alloc_seq 0), shm-abi.md §5. When the
+		// checksum feature is negotiated the frame instead falls through to
+		// stampPayload, which stores a CRC32C(empty) trailer (stored_length == 4)
+		// and sets CRC32C_PRESENT, so every data frame is uniformly checksummed.
 		return d, buildOK
 	}
 
 	return w.stampPayload(i, d)
 }
 
-// stampPayload allocates a slab sized to the payload, copies the payload in, and
-// stamps the descriptor's offset/length/generation/alloc_seq from the returned
-// handle (shm-abi.md §6). ErrExhausted is typed backpressure (retry later);
-// ErrTooLarge is a terminal reject.
+// stampPayload allocates a slab holding the payload and, under the negotiated
+// checksum feature, a trailing CRC32C, copies the payload in, and stamps the
+// descriptor's offset/length/generation/alloc_seq from the returned handle
+// (shm-abi.md §5/§6). It first reclaims slabs the consumer released, so
+// continuous traffic never leaks (§6). ErrExhausted is typed backpressure
+// (retry later); ErrTooLarge is a terminal reject.
 func (w *writer) stampPayload(i intent, d ring.Descriptor) (ring.Descriptor, buildStatus) {
-	// The transport surface bounds payload length by MaxFrameSize before submit, so
-	// this is a defensive fail-closed guard against a caller bug: without it an
-	// oversize length would truncate in the uint32 cast, alloc a too-small slab, and
-	// panic in the copy below inside the writer goroutine. Reject it terminally
-	// instead. MaxFrameSize is far below math.MaxUint32, so past this guard the cast
-	// cannot overflow.
-	if len(i.frame.Payload) > transport.MaxFrameSize {
+	// The transport surface bounds payload length before submit, so this is a
+	// defensive fail-closed guard against a caller bug: without it an oversize
+	// length would truncate in the uint32 cast, alloc a too-small slab, and panic
+	// in the copy below inside the writer goroutine. Reject it terminally instead.
+	// MaxFrameSize is far below math.MaxUint32, so past this guard every uint32
+	// cast is safe.
+	msgLen := len(i.frame.Payload)
+	if msgLen > transport.MaxFrameSize {
 		w.report(i, transport.ErrPayloadTooLarge)
 
 		return d, buildFailed
 	}
 
-	//nolint:gosec // guarded above: len(payload) <= MaxFrameSize, far below math.MaxUint32
-	h, buf, err := w.arena.Alloc(uint32(len(i.frame.Payload)))
+	crcTrailer := 0
+	if w.checksum {
+		crcTrailer = crc32TrailerLen
+	}
+	storedLen := msgLen + crcTrailer
+
+	// Head-gated reclaim before reserving: free slabs the consumer's head has
+	// passed (shm-abi.md §6). A slightly-stale head just reclaims less — safe.
+	w.reclaim()
+
+	//nolint:gosec // storedLen <= MaxFrameSize+4, far below math.MaxUint32 (guarded above)
+	h, buf, err := w.arena.Alloc(uint32(storedLen))
 	if err != nil {
 		if errors.Is(err, arena.ErrExhausted) {
 			return d, buildStuck
@@ -452,13 +583,102 @@ func (w *writer) stampPayload(i intent, d ring.Descriptor) (ring.Descriptor, bui
 		return d, buildFailed
 	}
 
-	copy(buf[:len(i.frame.Payload)], i.frame.Payload)
+	// A real region's arena is built from the same layout-page generation as this
+	// writer (shm-abi.md §2/§6); a disagreement is a construction bug, failed
+	// closed rather than published with a stamp the peer would discard as stale.
+	if w.gen != 0 && h.Generation != w.gen {
+		w.report(i, errGenerationMismatch)
+
+		return d, buildFailed
+	}
+
+	copy(buf[:msgLen], i.frame.Payload)
+	if w.checksum {
+		// CRC32C over the message payload only (shm-abi.md §5), 4 LE bytes right
+		// after it; trace is out of scope, so the slab is [payload][4B CRC].
+		binary.LittleEndian.PutUint32(buf[msgLen:storedLen], crc32.Checksum(i.frame.Payload, castagnoliTable))
+		d.SetFlags(d.Flags() | flagCRC32CPresent)
+	}
+
 	d.SetPayloadOffset(h.Offset)
-	d.SetPayloadLength(h.Length)
+	//nolint:gosec // msgLen <= MaxFrameSize, far below math.MaxUint32 (guarded above)
+	d.SetPayloadLength(uint32(msgLen)) // message bytes only, excludes the CRC trailer (§5)
 	d.SetGeneration(h.Generation)
 	d.SetAllocSeq(h.Sequence)
 
+	w.pendingSlab = slabRef{h: h, present: true}
+
 	return d, buildOK
+}
+
+// published records, for reclaim, the slab a just-pushed descriptor references
+// at ring sequence seq, then runs the §12 producer signal to wake a parked
+// consumer. Called on every successful publish (data and lifecycle).
+//
+// It reclaims before overwriting the slot's handle-table entry so every
+// publish — including a no-slab one (CANCEL, empty-payload data) that never
+// reaches stampPayload's reclaim — frees the slot's prior occupant before that
+// entry is lost. At push time depth < capacity guarantees the head has passed
+// the prior occupant (sequence seq − capacity), so it is already reclaimable
+// (shm-abi.md §6). Without this, a data slab whose slot is reused by a burst of
+// no-slab frames is stranded and eventually exhausts the arena.
+//
+// An awake consumer needs no producer signal (shm-abi.md §12), so it can copy
+// this frame and advance the ring head past seq (shm-abi.md §9) in the window
+// between the ring Push and this call. When that happens the leading reclaim
+// moves lastReclaimed past seq and will never revisit it, so the handle recorded
+// here would be stranded until the slot's reuse at seq + capacity overwrites it —
+// a permanent slab leak. Detect it and free the slab now: copy-before-advance
+// (§9) guarantees the consumer has finished reading the slab once the head has
+// passed seq, so the free is safe and happens exactly once (the slot is cleared,
+// and a later reclaim starts past seq). The single writer goroutine is the sole
+// writer of handleTable and lastReclaimed; the consumer only advances the head.
+//
+// The "consumer already passed seq" test is the exact equality lastReclaimed ==
+// seq+1, not lastReclaimed > seq. After the leading reclaim, lastReclaimed ==
+// head, and the head can never exceed the tail, which is seq+1 because the writer
+// just pushed seq (shm-abi.md §10). So head is at most seq+1, and the only value
+// meaning "the consumer advanced the head one past seq" is exactly seq+1. seq+1
+// is computed in uint64, so at the wrap boundary seq == math.MaxUint64 it is 0 —
+// the same value head wraps to when the consumer passes that last descriptor —
+// and the equality still holds. A ">" comparison instead loses that boundary: 0 >
+// math.MaxUint64 is false, so it would skip the free and strand the slab (§10;
+// internal/ring is wrap-safe for exactly this reason).
+func (w *writer) published(seq uint64, ref slabRef) {
+	if w.handleTable != nil {
+		w.reclaim()
+		w.handleTable[seq&w.handleMask] = ref
+		if ref.present && w.lastReclaimed == seq+1 {
+			_ = w.arena.Free(ref.h)
+			w.handleTable[seq&w.handleMask] = slabRef{}
+		}
+	}
+	w.signal()
+}
+
+// reclaim frees every slab the consumer has released — those published at ring
+// sequences below the current head (Tail - Len, both seq_cst; shm-abi.md
+// §6/§10) — advancing lastReclaimed to that head. It is a no-op until the
+// handle table is wired (isolated tests). Freeing before the slot is reused is
+// safe: the ring cannot advance its tail past head + capacity, so a sequence's
+// slot is always reclaimed before the producer overwrites its handle entry.
+func (w *writer) reclaim() {
+	if w.handleTable == nil {
+		return
+	}
+
+	head := w.ring.Tail() - w.ring.Len() // consumer head; monotonic, so >= lastReclaimed
+	for w.lastReclaimed != head {
+		slot := w.lastReclaimed & w.handleMask
+		if ref := w.handleTable[slot]; ref.present {
+			// A pass-once head never frees the same slab twice, so an error here
+			// would be a bookkeeping bug; there is no poison path in this scope, so
+			// the reclaim is best-effort and the slot is cleared regardless.
+			_ = w.arena.Free(ref.h)
+			w.handleTable[slot] = slabRef{}
+		}
+		w.lastReclaimed++
+	}
 }
 
 // drainAndStop reports transport.ErrClosed to every intent still pending at
