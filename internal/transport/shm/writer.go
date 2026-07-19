@@ -519,6 +519,11 @@ func (w *writer) place(c *carry) emitResult {
 		return emitDone
 	}
 
+	// Failpoint AfterTailPublish: descriptor committed to the ring, consumer can observe it (shm-abi.md §8).
+	if failpointEnabled && fpAfterTailPublish != nil {
+		fpAfterTailPublish()
+	}
+
 	w.published(seq, slabRef{h: c.h, present: c.hasSlab})
 	w.report(c.i, nil)
 
@@ -694,6 +699,11 @@ func (w *writer) stampPayload(i intent, d ring.Descriptor, wire []byte) (ring.De
 		d.SetFlags(d.Flags() | flagCRC32CPresent)
 	}
 
+	// Failpoint AfterPayloadWrite: payload (and any CRC) is in the slab, no descriptor pushed yet (shm-abi.md §8).
+	if failpointEnabled && fpAfterPayloadWrite != nil {
+		fpAfterPayloadWrite()
+	}
+
 	d.SetPayloadOffset(h.Offset)
 	//nolint:gosec // msgLen <= MaxFrameSize, far below math.MaxUint32 (guarded above)
 	d.SetPayloadLength(uint32(msgLen)) // message bytes only, excludes the CRC trailer (§5)
@@ -752,6 +762,11 @@ func (w *writer) published(seq uint64, ref slabRef) {
 			_ = w.arena.Free(ref.h)
 			w.handleTable[seq&w.handleMask] = slabRef{}
 		}
+	}
+
+	// Failpoint BeforeWakeupArm: published, about to wake a parked consumer (shm-abi.md §12).
+	if failpointEnabled && fpBeforeWakeupArm != nil {
+		fpBeforeWakeupArm()
 	}
 	w.signal()
 }
@@ -856,6 +871,10 @@ func (w *writer) reclaim(maxReconcile uint64) {
 			// would be a bookkeeping bug; there is no poison path in this scope, so
 			// the reclaim is best-effort and the slot is cleared regardless.
 			_ = w.arena.Free(ref.h)
+			// Failpoint AfterSlabRelease: consumer-released slab just freed by head-gated reclaim (shm-abi.md §6).
+			if failpointEnabled && fpAfterSlabRelease != nil {
+				fpAfterSlabRelease()
+			}
 			w.handleTable[slot] = slabRef{}
 		}
 		w.lastReclaimed++

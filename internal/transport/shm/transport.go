@@ -803,6 +803,10 @@ func (t *Transport) Close() error {
 		defer t.closeMu.Unlock()
 
 		t.closed = true
+		// Failpoint BeforeUnmap: about to munmap the region (shm-abi.md §16).
+		if failpointEnabled && fpBeforeUnmap != nil {
+			fpBeforeUnmap()
+		}
 		t.closeErr = t.region.Close()
 	})
 

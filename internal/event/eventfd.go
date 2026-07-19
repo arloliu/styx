@@ -38,7 +38,13 @@ var eventfdWriteValue = [8]byte{1, 0, 0, 0, 0, 0, 0, 0}
 // "MUST be created in blocking mode" wording.
 type EventFD struct {
 	file *os.File
-	read func([]byte) (int, error) // seam for tests; defaults to file.Read
+	// rawFD is the underlying eventfd descriptor, captured at construction so
+	// FD() can return it WITHOUT calling os.File.Fd() -- which would switch the
+	// fd to blocking mode and detach it from the runtime poller, breaking the
+	// poller-backed Read below (see Read's doc). The number equals file.Fd()'s;
+	// it is only cached to avoid that side effect on an in-use EventFD.
+	rawFD int
+	read  func([]byte) (int, error) // seam for tests; defaults to file.Read
 	// syscalls counts eventfd read(2)/write(2) calls that actually
 	// completed (not spin-loop iterations, which never touch the eventfd).
 	// This is the wakeup_syscalls_per_op metric the benchmark suite samples
@@ -55,16 +61,41 @@ func NewEventFD() (*EventFD, error) {
 		return nil, fmt.Errorf("event: NewEventFD: eventfd: %w", err)
 	}
 
-	return wrapEventFD(os.NewFile(uintptr(fd), "eventfd")), nil
+	return wrapEventFD(fd, os.NewFile(uintptr(fd), "eventfd")), nil
 }
 
 // wrapEventFD wraps an already-non-blocking eventfd file, factored out of
-// NewEventFD so tests can substitute the read seam without a real eventfd.
-func wrapEventFD(f *os.File) *EventFD {
-	e := &EventFD{file: f}
+// NewEventFD so tests can substitute the read seam without a real eventfd. fd is
+// f's descriptor, cached in rawFD so FD() can return it without os.File.Fd()'s
+// blocking-mode side effect.
+func wrapEventFD(fd int, f *os.File) *EventFD {
+	e := &EventFD{file: f, rawFD: fd}
 	e.read = e.file.Read
 
 	return e
+}
+
+// NewEventFDFromFD wraps an already-non-blocking eventfd inherited from another
+// process — passed over SCM_RIGHTS or handed down across exec — so this process
+// can signal and wait on the same kernel eventfd object as its peer. fd MUST
+// already be in non-blocking mode (EFD_NONBLOCK); inherited Styx eventfds are,
+// because NewEventFD creates them that way, so the wrapping os.File registers
+// with the Go runtime poller exactly like NewEventFD's own fd (shm-abi.md §14).
+//
+// NewEventFDFromFD TAKES OWNERSHIP of fd: the returned EventFD's Close closes it,
+// so the caller MUST NOT close fd separately. A negative or otherwise invalid fd
+// is rejected with an error rather than wrapped, because os.NewFile returns a nil
+// *os.File for such a descriptor and every later EventFD method would then panic.
+func NewEventFDFromFD(fd int) (*EventFD, error) {
+	if fd < 0 {
+		return nil, fmt.Errorf("event: NewEventFDFromFD: invalid fd %d", fd)
+	}
+	f := os.NewFile(uintptr(fd), "eventfd")
+	if f == nil {
+		return nil, fmt.Errorf("event: NewEventFDFromFD: os.NewFile returned nil for fd %d", fd)
+	}
+
+	return wrapEventFD(fd, f), nil
 }
 
 // Write arms/signals the eventfd: the producer's conditional write when the
@@ -186,6 +217,23 @@ func (e *EventFD) watchContext(ctx context.Context) (stop func()) {
 		<-watchDone
 		_ = e.file.SetReadDeadline(time.Time{}) // clear before any later Read
 	}
+}
+
+// FD returns the underlying eventfd file descriptor so it can be handed to a
+// peer process — duplicated into a child's cmd.ExtraFiles or sent over
+// SCM_RIGHTS — letting both ends share one kernel eventfd object (shm-abi.md
+// §14). The returned fd is BORROWED: this EventFD's *os.File still owns it and
+// Close still closes it, so the caller MUST NOT close the returned fd and MUST
+// NOT keep using it after Close. Duplicate it (for example F_DUPFD_CLOEXEC) if
+// the fd must outlive this EventFD.
+//
+// FD returns the descriptor cached at construction rather than calling
+// os.File.Fd(): that call would put the file into blocking mode and detach it
+// from the runtime poller, which would break the poller-backed Read (see Read's
+// doc) on an EventFD this process is still using. So calling FD() on an in-use
+// EventFD — the parent duplicating an eventfd it also waits on — is safe.
+func (e *EventFD) FD() int {
+	return e.rawFD
 }
 
 // Close releases the eventfd.
