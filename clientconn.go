@@ -209,7 +209,7 @@ func isFrameLocalRecvErr(err error) bool {
 // statusFromFrame converts the transport-owned FrameStatus carried by a
 // FrameUnaryErr into the package-local rpcruntime.Status the Table delivers.
 // A nil frame status (a malformed peer that set FrameUnaryErr without a
-// status — Recv never produces this, decodeStatus always yields one) is
+// status — Recv never produces this, DecodeStatus always yields one) is
 // treated as an empty internal status rather than panicking.
 func statusFromFrame(fs *transport.FrameStatus) *rpcruntime.Status {
 	if fs == nil {

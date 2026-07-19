@@ -15,7 +15,7 @@ func (t *UDSTransport) WriteFrameUnchecked(ctx context.Context, f Frame) error {
 // WriteRawBodyUnchecked writes a header declaring len(body) for f's kind
 // followed by body verbatim, bypassing frameBody's own status encoding. It
 // lets a test put a deliberately malformed FrameUnaryErr body on the wire
-// to exercise Recv's decodeStatus bounds checks. Not part of the public API.
+// to exercise Recv's DecodeStatus bounds checks. Not part of the public API.
 func (t *UDSTransport) WriteRawBodyUnchecked(ctx context.Context, f Frame, body []byte) error {
 	return t.writeFrame(ctx, f, body)
 }

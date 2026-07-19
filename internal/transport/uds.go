@@ -187,7 +187,7 @@ func (t *UDSTransport) Recv(ctx context.Context) (Frame, error) {
 	// leaves the stream synchronized — reject only this frame, don't poison
 	// the connection (contrast the mid-frame aborts above).
 	if f.Kind == FrameUnaryErr {
-		status, err := decodeStatus(body)
+		status, err := DecodeStatus(body)
 		if err != nil {
 			return Frame{}, err
 		}
@@ -400,19 +400,23 @@ const statusHeadSize = 4 + 4 + 4
 // (bounds check) and writeFrame can call it.
 func frameBody(f Frame) []byte {
 	if f.Kind == FrameUnaryErr {
-		return encodeStatus(f.Status)
+		return EncodeStatus(f.Status)
 	}
 
 	return f.Payload
 }
 
-// encodeStatus serializes a FrameStatus into a self-describing,
+// EncodeStatus serializes a FrameStatus into a self-describing,
 // length-delimited body: code, then a length-prefixed message, then a
 // count-prefixed sequence of length-prefixed details. A nil status encodes
 // as the all-zero head (code 0, empty message, no details) so the shape is
 // always decodable. The whole body rides inside the frame's payload region,
 // so MaxFrameSize (checked by Send) already bounds message+details.
-func encodeStatus(s *FrameStatus) []byte {
+//
+// This is the canonical FrameStatus wire codec, shared by both the uds and
+// shm transports so a FrameUnaryErr's Status arrives byte-identical
+// regardless of which transport carried it.
+func EncodeStatus(s *FrameStatus) []byte {
 	if s == nil {
 		s = &FrameStatus{}
 	}
@@ -440,7 +444,7 @@ func encodeStatus(s *FrameStatus) []byte {
 	return buf
 }
 
-// decodeStatus parses a FrameUnaryErr body produced by encodeStatus,
+// DecodeStatus parses a FrameUnaryErr body produced by EncodeStatus,
 // validating every length prefix against the bytes actually remaining so a
 // corrupt or hostile body (an oversized message/detail length, a truncated
 // tail) yields ErrMalformedStatusFrame rather than an out-of-range slice
@@ -450,7 +454,11 @@ func encodeStatus(s *FrameStatus) []byte {
 // raw wire detailCount — so a 12-byte frame declaring detailCount=0xFFFFFFFF
 // can never request a ~100 GB slice header. Every allocation here is thus
 // bounded transitively.
-func decodeStatus(body []byte) (*FrameStatus, error) {
+//
+// This is the canonical FrameStatus wire codec, shared by both the uds and
+// shm transports so a FrameUnaryErr's Status arrives byte-identical
+// regardless of which transport carried it.
+func DecodeStatus(body []byte) (*FrameStatus, error) {
 	if len(body) < statusHeadSize {
 		return nil, fmt.Errorf("transport: recv: status body %d bytes < %d: %w",
 			len(body), statusHeadSize, ErrMalformedStatusFrame)
