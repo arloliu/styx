@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -426,6 +427,54 @@ func TestSHM_FrameUnaryErr_MalformedStatusSlab_IsConformanceFault(t *testing.T) 
 	cause, poisoned := ep.plugin.poison.Check()
 	require.True(t, poisoned)
 	require.Equal(t, PoisonBadFrame, cause)
+}
+
+// Test that a FrameUnaryErr whose encoded status exceeds the negotiated
+// MaxPayload is rejected synchronously by Send, before the frame ever reaches
+// the writer: admission must validate the status's actual encoded bytes, not
+// the frame's nil Payload field (an encoded status is produced later, in the
+// writer, from Status rather than Payload).
+func TestSHM_FrameUnaryErr_OversizedStatus_RejectedAtSend(t *testing.T) {
+	// Given a host and plugin negotiated with MaxPayload 4092, and a
+	// FrameUnaryErr whose encoded status (12-byte head + Message) is 4093
+	// bytes: one over the cap.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	status := &transport.FrameStatus{Message: strings.Repeat("a", 4081)}
+
+	// When it is sent.
+	err := ep.host.Send(t.Context(), transport.Frame{
+		CallID: 5, Kind: transport.FrameUnaryErr, Status: status,
+	})
+
+	// Then Send rejects it synchronously with the negotiated-cap error.
+	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+
+	// And nothing was admitted: the plugin's Recv sees no frame at all.
+	recvCtx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, recvErr := ep.plugin.Recv(recvCtx)
+	require.ErrorIs(t, recvErr, context.DeadlineExceeded)
+}
+
+// Test that a FrameUnaryErr whose encoded status is exactly at the negotiated
+// MaxPayload is admitted and round-trips with its Status intact.
+func TestSHM_FrameUnaryErr_StatusAtMaxPayload_RoundTrips(t *testing.T) {
+	// Given a host and plugin negotiated with MaxPayload 4092, and a
+	// FrameUnaryErr whose encoded status (12-byte head + Message) is exactly
+	// 4092 bytes.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	status := &transport.FrameStatus{Message: strings.Repeat("a", 4080)}
+
+	// When it is sent and received.
+	require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
+		CallID: 6, Kind: transport.FrameUnaryErr, Status: status,
+	}))
+	f, err := ep.plugin.Recv(t.Context())
+
+	// Then it is admitted and the status round-trips intact.
+	require.NoError(t, err)
+	require.NotNil(t, f.Status)
+	require.Equal(t, status.Message, f.Status.Message)
 }
 
 // Test that Recv fails closed on the conformance faults the consumer must

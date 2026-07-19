@@ -426,7 +426,13 @@ func (t *Transport) Send(ctx context.Context, f transport.Frame) error {
 	if err := t.teardownError(); err != nil {
 		return err
 	}
-	if len(f.Payload) > int(t.maxPayload) {
+	// Admission must validate the frame's actual wire bytes, not its Payload
+	// field: a FrameUnaryErr's real bytes are its encoded Status, produced
+	// later by the writer from Status rather than Payload. wirePayload is the
+	// same pure function submit's snapshot uses (see intent.wire), so the
+	// bytes validated here and the bytes eventually stamped are identical.
+	wire := wirePayload(f)
+	if len(wire) > int(t.maxPayload) || len(wire) > transport.MaxFrameSize {
 		return transport.ErrPayloadTooLarge
 	}
 

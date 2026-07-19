@@ -76,6 +76,13 @@ const (
 type intent struct {
 	frame transport.Frame
 	lane  lane
+	// wire is the frame's pre-encoded wire payload -- its Payload, or a
+	// FrameUnaryErr's EncodeStatus(Status) -- snapshotted at submit so the
+	// bytes the writer stamps are exactly the bytes admission validated and
+	// cannot change if the caller mutates the frame after Send returns. nil
+	// for a directly-constructed intent (test seams), which build falls back
+	// to computing from frame.
+	wire []byte
 	// done is buffered with capacity 1 so the writer's single completion send
 	// never blocks, even when the caller has already abandoned the intent on a
 	// context cancel. This is the crux of the completion protocol: a caller that

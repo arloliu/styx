@@ -277,7 +277,7 @@ func (w *writer) stop() {
 // full data queue, submit blocks or returns ErrBackpressure per the writer's
 // admission mode; the lifecycle lane never returns ErrBackpressure.
 func (w *writer) submit(ctx context.Context, frame transport.Frame, l lane) error {
-	i := intent{frame: frame, lane: l, done: make(chan error, 1)}
+	i := intent{frame: frame, lane: l, wire: wirePayload(frame), done: make(chan error, 1)}
 
 	if err := w.enqueue(ctx, i, l); err != nil {
 		return err
@@ -594,7 +594,14 @@ func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 	d.SetMethodID(i.frame.Method)
 	d.SetBudgetNS(int64(i.frame.Budget))
 
-	wire := wirePayload(i.frame)
+	// Prefer the snapshot submit took at admission time, so the stamped bytes
+	// are exactly the bytes Send validated even if the caller has since
+	// mutated the frame. A directly-constructed intent (test seams) leaves
+	// wire nil, so it falls back to computing it from the frame here.
+	wire := i.wire
+	if wire == nil {
+		wire = wirePayload(i.frame)
+	}
 	if len(wire) == 0 && !w.checksum {
 		// Empty-payload data frame with no negotiated payload-layout features:
 		// stored_length == 0, so no slab is allocated and the descriptor keeps the
