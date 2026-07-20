@@ -56,8 +56,8 @@ func InstallDeathSignal() {
 // parent — the host died in the fork→PR_SET_PDEATHSIG-install window, which
 // the signal alone cannot cover. A plain getppid mismatch is the entire test:
 // deliberately NOT "currentPPID == 1", because a host that legitimately runs
-// as PID 1 (a container with no init shim — eqp-hub ships host and plugins in
-// one container) has a live parent whose pid IS 1, and initialPPID
+// as PID 1 (a container with no init shim — some deployments ship host and
+// plugins in one container) has a live parent whose pid IS 1, and initialPPID
 // captured it as 1; a "== 1" clause would then wrongly kill every plugin. Real
 // reparenting to init is already caught by the mismatch (1 != the host's pid).
 func orphaned(currentPPID, originalPPID int) bool {

@@ -1465,9 +1465,9 @@ func RunMatrix(t *testing.T, windows []WindowSpec) { panic("unimplemented") }
 >   profiles' `{4095, 1024, 26}` / `{8192, 2048, 64}` usable-slab figures in
 >   `shm-abi.md` §18's worked example). Tune per size class under the same load
 >   the `R` measurement uses.
-> Record the recommended **eqp-hub** profile (ring capacity `C`, `R`, and
+> Record the recommended **device-gateway** profile (ring capacity `C`, `R`, and
 > per-class counts) in `REPORT.md` alongside the dimension-matrix results.
-> eqp-hub's real traffic is **< 1 MiB/s host↔plugin** — latency-bound, not
+> The device gateway's real traffic is **< 1 MiB/s host↔plugin** — latency-bound, not
 > throughput-bound — so its recommended profile is expected to land lean, well
 > under 10 MiB total region size, rather than sized for sustained throughput;
 > state this explicitly as the recommendation's rationale rather than just the

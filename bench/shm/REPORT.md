@@ -560,15 +560,15 @@ it would be new scope.)
 
 ---
 
-## 12. Recommended eqp-hub profile
+## 12. Recommended device-gateway profile
 
-eqp-hub's real host↔plugin traffic is **< 1 MiB/s — latency-bound, not
-throughput-bound** — with low concurrency. Its region should therefore be **lean**,
-sized to its message sizes and a small concurrency ceiling, not for sustained
-throughput. The recommendation below assumes a peak of ~32 concurrent in-flight calls
-(generous for < 1 MiB/s) and typical control/telemetry messages ≤ 4 KiB with an
-occasional larger frame; scale the two starred numbers if eqp-hub's real peak or message
-size differs.
+A device-gateway reference consumer's real host↔plugin traffic is **< 1 MiB/s —
+latency-bound, not throughput-bound** — with low concurrency. Its region should
+therefore be **lean**, sized to its message sizes and a small concurrency ceiling, not
+for sustained throughput. The recommendation below assumes a peak of ~32 concurrent
+in-flight calls (generous for < 1 MiB/s) and typical control/telemetry messages ≤ 4 KiB
+with an occasional larger frame; scale the two starred numbers if the real peak or
+message size differs.
 
 | Parameter | Recommended value | Rationale |
 |---|---|---|
@@ -580,13 +580,13 @@ size differs.
 That lands **well under the 10 MiB ceiling** — under 1 MiB, in fact — precisely because
 the traffic is latency-bound and low-concurrency: there is no throughput argument for a
 large region, so the profile is sized to the concurrency floor and the message sizes and
-nothing more. If eqp-hub carries occasional larger payloads (say up to 64 KiB), raise the
-top class to `65536 B × 64` (region ≈ 8.4 MiB, still under 10 MiB); if its real peak
+nothing more. If the workload carries occasional larger payloads (say up to 64 KiB), raise
+the top class to `65536 B × 64` (region ≈ 8.4 MiB, still under 10 MiB); if its real peak
 concurrency exceeds 32, raise both the per-class counts and C−R together to keep them
 above the §11 floor. The scaling rule, not the specific numbers, is the deliverable:
 **size C−R and every class count to the peak concurrent in-flight, plus headroom; match
-slab sizes to the message-size distribution; do not pad for throughput eqp-hub will never
-generate.**
+slab sizes to the message-size distribution; do not pad for throughput this workload will
+never generate.**
 
 ---
 

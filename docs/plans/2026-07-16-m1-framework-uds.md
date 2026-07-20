@@ -41,7 +41,7 @@ The codec task has no dependency on the package-skeletons task beyond `go.mod` a
 | Task | Model | Effort | Rationale |
 |---|---|---|---|
 | 0. Research: `arloliu/go-plugin` fork deltas | sonnet | medium | Commit-history archaeology, must land before the public API freezes (the module/org name and public API shape is still an open question in the design spec). |
-| 1. Package skeletons + error taxonomy | sonnet | medium | Mechanical but the taxonomy is load-bearing for eqp-hub (the error taxonomy); signatures must match spec exactly. |
+| 1. Package skeletons + error taxonomy | sonnet | medium | Mechanical but the taxonomy is load-bearing for the device gateway (the error taxonomy); signatures must match spec exactly. |
 | 2. `codec` package | sonnet | low | Tiny, well-specified `Codec` interface + protobuf default impl. |
 | 3. Control-plane protocol (`internal/control`) | sonnet | high | Protocol plumbing with strict validation rules from the control-protocol contract. |
 | 4. `SCM_RIGHTS` fd passing | sonnet | high | Subtle unix-domain details; leak-counting tests required (per the host/plugin lifecycle design). |
@@ -57,12 +57,12 @@ The codec task has no dependency on the package-skeletons task beyond `go.mod` a
 
 ### Task 0: Research — `arloliu/go-plugin` fork deltas
 
-**Model/Effort/Why:** sonnet / medium. This is commit-history archaeology and cross-referencing against a real consumer (eqp-hub), not code. It must land before the public-API task freezes the public API shape, since a fork pain point (e.g. a lifecycle hook eqp-hub added itself because upstream lacked it) belongs in the public-API task's API, not bolted on after.
+**Model/Effort/Why:** sonnet / medium. This is commit-history archaeology and cross-referencing against a real consumer (the device gateway), not code. It must land before the public-API task freezes the public API shape, since a fork pain point (e.g. a lifecycle hook the device gateway added itself because upstream lacked it) belongs in the public-API task's API, not bolted on after.
 
 **Files:**
 - `docs/reports/go-plugin-fork-deltas.md` (new)
 
-**Interfaces:** None (no code produced). Consumes: the `arloliu/go-plugin` and `hashicorp/go-plugin` git histories, and `/home/arlo/projects/eqp-hub`'s usage of `github.com/arloliu/go-plugin` (`go.mod` pins `v1.9.0`).
+**Interfaces:** None (no code produced). Consumes: the `arloliu/go-plugin` and `hashicorp/go-plugin` git histories, and the reference consumer's usage of `github.com/arloliu/go-plugin` (`go.mod` pins `v1.9.0`).
 
 **Steps:**
 
@@ -75,11 +75,11 @@ The codec task has no dependency on the package-skeletons task beyond `go.mod` a
   git log --oneline upstream/main..HEAD
   git diff upstream/main...HEAD --stat
   ```
-  Expected output: a commit list unique to the fork and a file-level diff stat. If `arloliu/go-plugin` has no `upstream/main`-comparable branch (renamed default branch, diverged history), fall back to `git log --all --oneline` and diff against the tagged upstream version eqp-hub's fork release was cut from (check the fork's `CHANGELOG.md` or release notes for the base upstream tag).
+  Expected output: a commit list unique to the fork and a file-level diff stat. If `arloliu/go-plugin` has no `upstream/main`-comparable branch (renamed default branch, diverged history), fall back to `git log --all --oneline` and diff against the tagged upstream version the device gateway's fork release was cut from (check the fork's `CHANGELOG.md` or release notes for the base upstream tag).
 - [ ] For every commit unique to the fork, read the full diff (`git show <sha>`) and write one bullet under a `## Commit-by-commit` section in the report: what changed, why (from the commit message/PR if linked), and whether it is a bug fix, a new capability, or a behavior change.
-- [ ] Cross-reference against eqp-hub: `grep -rn "goplugin\." /home/arlo/projects/eqp-hub --include=*.go` (adjust the import alias once found via `grep -rn "arloliu/go-plugin" /home/arlo/projects/eqp-hub/go.mod`) to find which fork-specific APIs eqp-hub actually calls. Any fork capability eqp-hub depends on is a **hard requirement** for Styx's public API (the public-API task), not a nice-to-have — mark it as such in the report.
+- [ ] Cross-reference against the device gateway's codebase: grep it for `goplugin\.` (adjust the import alias once found via a grep for `arloliu/go-plugin` in its `go.mod`) to find which fork-specific APIs it actually calls. Any fork capability the device gateway depends on is a **hard requirement** for Styx's public API (the public-API task), not a nice-to-have — mark it as such in the report.
 - [ ] Write `docs/reports/go-plugin-fork-deltas.md` with sections: `## Summary` (one paragraph), `## Commit-by-commit` (from the step above), `## Requirements for Styx` (a bullet list, each bullet naming the spec section or Task N in this plan that already covers it, or flagging a gap), `## Non-requirements` (fork changes that don't apply to Styx's design, e.g. anything gRPC-transport-specific that Styx's SHM/UDS transport model makes moot).
-- [ ] Self-check the report against this gate (no `go test` applies — this is a documentation deliverable): every fork commit is accounted for in either `Commit-by-commit` or explicitly excluded with a one-line reason; every eqp-hub-used fork API appears in `Requirements for Styx`; no bullet says "TBD" or "investigate further" — if something is genuinely unresolved, state the open question explicitly and name what would resolve it (a further grep, a maintainer question, etc.), not a placeholder.
+- [ ] Self-check the report against this gate (no `go test` applies — this is a documentation deliverable): every fork commit is accounted for in either `Commit-by-commit` or explicitly excluded with a one-line reason; every fork API the device gateway uses appears in `Requirements for Styx`; no bullet says "TBD" or "investigate further" — if something is genuinely unresolved, state the open question explicitly and name what would resolve it (a further grep, a maintainer question, etc.), not a placeholder.
 - [ ] Commit:
   ```bash
   git add docs/reports/go-plugin-fork-deltas.md
@@ -88,7 +88,7 @@ The codec task has no dependency on the package-skeletons task beyond `go.mod` a
 
 ### Task 1: Package skeletons + error taxonomy
 
-**Model/Effort/Why:** sonnet / medium. Mechanical (mostly `errors.New`/struct definitions), but the taxonomy is what eqp-hub branches on for fast-shutdown-vs-retry (the error taxonomy); every exported name here is permanent API.
+**Model/Effort/Why:** sonnet / medium. Mechanical (mostly `errors.New`/struct definitions), but the taxonomy is what the device gateway branches on for fast-shutdown-vs-retry (the error taxonomy); every exported name here is permanent API.
 
 **Files:**
 - `go.mod` (new — `go mod init github.com/arloliu/styx`, `go 1.26.0` directive)

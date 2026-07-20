@@ -180,7 +180,7 @@
 - `*.go` (repo root), `codec/`, `supervisor/`, `observe/` — inline godoc comments for exported types and functions
 
 **Acceptance Criteria:**
-- README is <500 words: problem statement, quick-start (3-line host/plugin pair), performance claim, eqp-hub reference.
+- README is <500 words: problem statement, quick-start (3-line host/plugin pair), performance claim, device-gateway reference.
 - Migration guide covers: API shape differences, lifecycle contract mapping, error handling taxonomy, streaming changes, hot-reload.
 - Three examples compile without errors, run end-to-end, and include inline comments explaining the Styx concepts.
 - Godoc for all exported symbols is present and references the spec sections where applicable.

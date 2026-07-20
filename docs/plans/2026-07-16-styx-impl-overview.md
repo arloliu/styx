@@ -20,7 +20,7 @@ interface with two implementations — `uds` (built first, serving as the
 correctness oracle and fallback) and `shm` (the shared-memory upgrade: memfd
 rings + slab arena + eventfd hybrid wakeups). Streaming, hot-reload, and
 supervision hardening land next, in the enterprise-features work; then
-fuzz/chaos/soak/CI gates, in the hardening work; then the eqp-hub pilot
+fuzz/chaos/soak/CI gates, in the hardening work; then the device-gateway pilot
 integration.
 
 **Tech Stack:** Go 1.26.0 (pinned), `google.golang.org/protobuf`,
@@ -55,14 +55,15 @@ benchmark baselines. No cgo.
 | **Shared-memory transport upgrade** | [`2026-07-16-m2-shm-transport.md`](2026-07-16-m2-shm-transport.md) | Production shared-memory transport behind the same transport interface | `shm-abi.md` approved **before** implementation; differential tests (uds vs shm) identical; failpoint crash-window matrix green; the proof-of-concept spike's bench suite re-passes gate on production code; **the proof-of-concept spike's conditional-go conditions (per its gate report): quota-aware spin policy with cgroup2cpu c=512 p999/p99 ≤ 5, and sync-path park/wake re-measured on performance-governed hardware** |
 | **Enterprise features** | [`2026-07-16-m3-enterprise-features.md`](2026-07-16-m3-enterprise-features.md) | Streaming RPC, hot-reload with state handoff, wedge classifier, observability, error hardening | `stream-protocol.md` approved **before** streaming code; streaming differential tests identical; hot-reload + rollback paths tested under load |
 | **Hardening** | [`2026-07-16-m4-hardening.md`](2026-07-16-m4-hardening.md) | Fuzz, chaos, soak, scheduler-regime CI matrix, bench regression gates, docs | Soak clean (fd/memory/goroutine accounting exact); CI gates active on merges |
-| **eqp-hub pilot** | [`2026-07-16-m5-eqp-hub-pilot.md`](2026-07-16-m5-eqp-hub-pilot.md) | eqp-hub device-plugin contract on Styx; `tap_nats` migrated behind config | Pilot report with go/no-go for broader rollout |
+| **Device-gateway pilot** | *(authored when this stage starts)* | Reference consumer's device-plugin contract implemented on Styx; one representative device type migrated behind a config flag | Pilot report with go/no-go for broader rollout |
 
 Detail level is deliberately graded: the proof-of-concept spike and the initial
 framework plans are fully task-by-task (they execute next); the shared-memory
 transport and enterprise-features plans are task-by-task but defer frozen
 constants to their gating spec documents (authoring those documents is each
-one's first task); the hardening and eqp-hub-pilot plans are outline-level and
-get refined when their predecessor completes. Re-planning a later-stage plan
+one's first task); the hardening and device-gateway-pilot plans are
+outline-level and get refined when their predecessor completes. Re-planning a
+later-stage plan
 after its predecessor's reality check is expected, not a failure.
 
 ## Proof-of-Concept-First Rationale
@@ -96,7 +97,7 @@ Two standing rules:
    work) — build cheap, verify expensive.
 2. **Human approval gates** are never delegated: the proof-of-concept spike's
    gate decision, `shm-abi.md` approval, `stream-protocol.md` approval, and the
-   eqp-hub pilot's go/no-go all require the human's sign-off.
+   device-gateway pilot's go/no-go all require the human's sign-off.
 
 Full per-task tables live in each milestone plan.
 
@@ -131,7 +132,7 @@ Names frozen here so plans written and executed independently do not drift:
 | 1. Module path/org | Before first public release; `github.com/arloliu/styx` assumed throughout |
 | 2. go-plugin fork deltas | The initial framework plan's setup task (a report gating the API freeze) |
 | 3. eventfd vs futex | Benchmark data from the proof-of-concept spike and the shared-memory transport work; futex is a v2-only experiment |
-| 4. Package fetching | Stays host-side; Styx takes path + optional hash (assumed in the eqp-hub pilot plan) |
+| 4. Package fetching | Stays host-side; Styx takes path + optional hash (assumed in the device-gateway pilot plan) |
 | 5. Go version floor | Resolved: `go 1.26.0` directive (Arlo, 2026-07-17) |
 
 ## Orchestration Protocol (how these plans are executed)
@@ -144,5 +145,6 @@ Names frozen here so plans written and executed independently do not drift:
 3. Gate artifacts (bench reports, ABI docs) are committed to the repo before the
    gate decision is requested from the human.
 4. After each milestone: re-read the next milestone's plan against what was
-   actually built; refine before executing. The hardening and eqp-hub-pilot
-   plans require full re-planning to task-by-task detail at that point.
+   actually built; refine before executing. The hardening and
+   device-gateway-pilot plans require full re-planning to task-by-task detail
+   at that point.

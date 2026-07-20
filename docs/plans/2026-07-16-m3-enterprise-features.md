@@ -569,7 +569,7 @@ func (x *imageProcessorWatchClient) Recv() (*WatchEvent, error) {
 
 ### Task 4: Hot-reload state machine (host side)
 
-**Model/Effort/Why:** opus / high — a distributed transaction across two processes where a missed edge silently drops or double-executes equipment calls; the phase/deadline/rollback ordering is normative and dense, and it is the piece eqp-hub most directly depends on.
+**Model/Effort/Why:** opus / high — a distributed transaction across two processes where a missed edge silently drops or double-executes device calls; the phase/deadline/rollback ordering is normative and dense, and it is the piece the device gateway most directly depends on.
 
 **Files:**
 - `internal/control/control.proto` (extended — see below; already exists per the initial framework's control-protocol work, `docs/plans/2026-07-16-m1-framework-uds.md`)
@@ -1250,7 +1250,7 @@ type Logger interface {
 }
 
 // TraceInjector encodes/decodes the descriptor's reserved trace field in
-// W3C trace-context binary form, so eqp-hub can add OTel later
+// W3C trace-context binary form, so the device gateway can add OTel later
 // without a wire change.
 type TraceInjector interface {
     Inject(ctx context.Context) []byte

@@ -3,7 +3,9 @@
 **Date:** 2026-07-16
 **Status:** Draft for review
 **Reference spec:** `tmp/kickoff.md`
-**Reference consumer:** eqp-hub (`/home/arlo/projects/eqp-hub`)
+**Reference consumer:** a device gateway — a host application that manages a
+fleet of out-of-process device-protocol driver plugins for connected
+hardware
 
 ---
 
@@ -17,7 +19,7 @@ payload arena, eventfd-based wakeups, and protobuf payloads.
 
 Target: unary RPC round-trips in the low single-digit microseconds (vs. tens of
 microseconds for gRPC over UDS), with allocation-light steady state, while remaining
-robust enough for enterprise-critical inline semiconductor environments (24/7 fab
+robust enough for enterprise-critical inline industrial environments (24/7
 operation, crash isolation, supervised recovery).
 
 Users define services in standard protobuf `service` blocks and get gRPC-style generated
@@ -49,7 +51,7 @@ clients and servers. They never see shared memory, ring indices, or eventfds.
 | Streaming | yes (gRPC/HTTP2 streams) | yes — gRPC-shaped stubs over plain ring messages (no stream-aware transport) |
 | Cross-language | yes | layout documented, not committed in v1 |
 | Restart/supervision | left to host (host loops) | built-in supervisor with policy |
-| Hot-reload + state handoff | not built-in | built-in (eqp-hub requirement) |
+| Hot-reload + state handoff | not built-in | built-in (device-gateway requirement) |
 
 What Styx deliberately keeps from go-plugin: plugin-as-executable, version-negotiated
 handshake, typed interfaces, host-side lifecycle ownership, crash isolation.
@@ -65,24 +67,27 @@ handshake, typed interfaces, host-side lifecycle ownership, crash isolation.
   transport layer never grows HTTP/2-style stream states, windows, or priorities.
 - Not a plugin-package distributor/fetcher: `PluginSpec` takes a local binary path and
   an optional SHA-256 hash. Downloading, caching, or resolving plugin packages at
-  runtime (eqp-hub's `PackageStore`/`Fetcher`) is the host application's job, not
-  Styx's (§27, Open Question 4).
+  runtime (the device gateway's own package store/fetcher) is the host application's
+  job, not Styx's (§27, Open Question 4).
 
-## 5. Requirements from the Reference Consumer (eqp-hub)
+## 5. Requirements from the Reference Consumer (a device gateway)
 
-eqp-hub already runs out-of-process device plugins via `arloliu/go-plugin` with a
-lifecycle contract (`Init/Start/Stop/HotReload/SaveRuntimeState/CollectMetrics/Ping`).
+The reference consumer is a device gateway: a host application that manages a fleet of
+out-of-process device-protocol driver plugins, each speaking a specific wire protocol
+to a piece of connected hardware. It already runs those plugins via `arloliu/go-plugin`
+with a lifecycle contract (`Init/Start/Stop/HotReload/SaveRuntimeState/CollectMetrics/Ping`).
 Styx must support that contract as an ordinary user-defined service, and natively provide
-what eqp-hub currently builds around go-plugin:
+what the device gateway currently builds around go-plugin:
 
 - health checks / heartbeat with restart policy and exponential backoff
 - hot-reload: graceful drain, state save on the old process, state restore on the new one
-- stdout/stderr capture and structured routing (eqp-hub ships plugin stderr to Fluent)
-- versioned plugin binaries, identity verified at handshake (eqp-hub fetches plugin
-  packages at runtime)
-- an error taxonomy that distinguishes fatal from transient failures — eqp-hub
-  fast-shuts-down on critical device faults, so misclassification is an outage
-- Prometheus-friendly metrics hooks; zap-friendly structured logging (no forced deps)
+- stdout/stderr capture and structured routing (the device gateway ships plugin stderr
+  to a structured log sink)
+- versioned plugin binaries, identity verified at handshake (the device gateway fetches
+  plugin packages at runtime)
+- an error taxonomy that distinguishes fatal from transient failures — the device
+  gateway fast-shuts-down on critical device faults, so misclassification is an outage
+- Prometheus-friendly metrics hooks; structured-logging-friendly hooks (no forced deps)
 - container/Kubernetes deployment: host and plugins share one container; no reliance on
   named files in `/dev/shm` surviving restarts
 - **process-group-scoped kill, not single-PID.** `arloliu/go-plugin` originally
@@ -222,7 +227,7 @@ control socket. Teardown is not complete until the reap. After a crash or
 health-triggered restart, a successor instance must not be promoted `Ready` while the
 predecessor PID is alive or unreaped. Hot-reload promotion is the one deliberate
 exception (hot-reload phase 5): the predecessor is provably drained and frozen —
-incapable of touching equipment or state — when the successor is promoted, and its
+incapable of touching hardware or state — when the successor is promoted, and its
 teardown-with-reap must still complete for the reload transaction to be done. No step
 may be reordered; use-after-unmap is impossible by construction because nothing that
 can touch the region survives step 3. fd discipline:
@@ -238,7 +243,7 @@ outlives its host: `PR_SET_PDEATHSIG` is installed as a backstop, and because th
 may die before installation, the child re-checks `getppid()` immediately after
 installing it and exits if reparented.
 
-**Hot-reload (eqp-hub-critical)** is a transactional state machine, not a command
+**Hot-reload (device-gateway-critical)** is a transactional state machine, not a command
 sequence. Phases, each with an explicit acknowledgement and deadline:
 
 1. **Cutoff** — host atomically stops admitting new calls to the plugin (they queue or
@@ -450,14 +455,14 @@ cross-references it.
   reported as not-dispatched (safely retryable — the handler provably never ran). Any
   failure after the plugin may have begun the handler — crash mid-call, poisoned
   region, lost response — is `ErrOutcomeUnknown`, NOT retryable by default: for
-  equipment-facing calls, "did it happen?" must reach the application. Methods may opt
+  device-facing calls, "did it happen?" must reach the application. Methods may opt
   into automatic retry by declaring idempotency (generated-code option); a retry is a
   NEW call ID and **may execute the handler more than once** — that is what the
   idempotency declaration asserts is safe. Styx transports an application-supplied
   deduplication key with each attempt but does not itself provide an effect-once
   guarantee or a durable dedup store; deduplication, if needed, is owned by the
   application/handler. This is stated bluntly because pretending otherwise is how
-  equipment gets double-actuated.
+  devices get double-actuated.
 - **Handler panic taints the process (default policy).** The plugin runtime returns a
   `PluginPanicError` status for the panicking call when it can, then initiates
   controlled termination; the supervisor restarts per policy. A recovered panic can
@@ -548,7 +553,7 @@ SHM-transport benchmarks show eventfd overhead matters.
 ## 16. Code Generation
 
 Custom `protoc-gen-go-styx`, consuming ordinary gRPC-compatible `service` definitions
-(works under eqp-hub's existing buf pipeline). Emits:
+(works under the device gateway's existing buf pipeline). Emits:
 
 - `New<Service>Client(conn styx.ClientConn) <Service>Client` — same method shapes as
   gRPC: `(ctx, req) (resp, error)` for unary, and gRPC-style stream objects
@@ -574,7 +579,7 @@ Three disjoint classes, distinguishable with `errors.As`/`errors.Is`:
 - **Framework errors** — `ErrIncompatible`, `ErrDeadlineExceeded`, `ErrCanceled`,
   `ErrBackpressure`, `ErrPoisoned`, `ErrServiceNotFound`, `ErrMethodNotFound`.
 
-This taxonomy is what lets eqp-hub map "critical device fault → fast shutdown" versus
+This taxonomy is what lets the device gateway map "critical device fault → fast shutdown" versus
 "transient → retry/restart" without string matching.
 
 ## 18. Process Supervision
@@ -664,7 +669,7 @@ with no-op defaults and no vendored stacks. Built-in instrumentation points: RPC
 histograms, ring depth/occupancy, arena utilization, backpressure events, timeouts,
 cancellations, restarts, heartbeat misses, bytes moved, wakeup syscalls per second.
 Trace context rides the descriptor's reserved trace field (W3C trace-context binary
-form) so eqp-hub can add OTel later without wire changes.
+form) so the device gateway can add OTel later without wire changes.
 
 ## 22. Benchmark Plan
 
@@ -739,8 +744,8 @@ reflection, stream-aware transport features (windows/priorities).
   stream-protocol.md`** — over the proven descriptor path; supervisor policies,
   hot-reload/state handoff, observability, error taxonomy hardening.
 - **Hardening.** Fuzz, chaos, soak, CI benchmark gates, docs and examples.
-- **eqp-hub pilot.** Implement eqp-hub's device-plugin contract on Styx; migrate
-  one low-risk device type (e.g. `tap_nats`) behind config.
+- **Device-gateway pilot.** Implement the device gateway's device-plugin contract
+  on Styx; migrate one low-risk device type (e.g. `example_device`) behind config.
 
 ## 26. Risks
 
@@ -752,7 +757,7 @@ reflection, stream-aware transport features (windows/priorities).
 3. **Two-transport maintenance cost** — accepted deliberately: fallback story + test
    oracle are worth it.
 4. **Codegen surface drift** vs. protobuf/buf ecosystem evolution — pin toolchain
-   versions, follow eqp-hub's existing buf pipeline conventions.
+   versions, follow the device gateway's existing buf pipeline conventions.
 
 ## 27. Open Questions
 
@@ -765,8 +770,9 @@ reflection, stream-aware transport features (windows/priorities).
    `/home/arlo/projects/go-plugin`, `git log d662936..HEAD`). Commit messages are
    unusually self-documenting (failure mode + fix + regression test each), and the
    recurring "mission-critical"/"fleet scale"/equipment language strongly suggests
-   these are real eqp-hub production incidents, not speculative hardening — though no
-   commit or doc names eqp-hub explicitly, so that link is inferred, not confirmed.
+   these are real production incidents from a device-gateway-shaped consumer, not
+   speculative hardening — though no commit or doc names the specific consumer, so
+   that link is inferred, not confirmed.
    Disposition of each pain point against this design:
    - **Folded in as new requirements** (not previously explicit in this doc):
      process-group-scoped kill instead of single-PID (§5, §9); configurable
@@ -784,11 +790,12 @@ reflection, stream-aware transport features (windows/priorities).
    - **Not applicable:** fork-only housekeeping (module rename, dependency bumps,
      lint/CI setup) and gRPC-broker-specific bugs (mux timeouts, broker map/stream
      leaks) — Styx has no gRPC broker or mux to inherit that bug class.
-3. eventfd vs. futex numbers on target fab hardware — decided by performance-spike and
-   SHM-transport benchmark data, not opinion.
-4. Whether eqp-hub's plugin *package fetching* (PackageStore/Fetcher) belongs in Styx or
-   stays host-side — resolved: host-side (Arlo, 2026-07-18). `PluginSpec` takes a path
-   and optional SHA-256 hash only; fetching/caching plugin binaries stays the host
-   application's job (eqp-hub's own `PackageStore`), keeping Styx's dependency surface
+3. eventfd vs. futex numbers on target device-gateway hardware — decided by
+   performance-spike and SHM-transport benchmark data, not opinion.
+4. Whether the device gateway's plugin *package fetching* (its package store/fetcher)
+   belongs in Styx or stays host-side — resolved: host-side (Arlo, 2026-07-18).
+   `PluginSpec` takes a path and optional SHA-256 hash only; fetching/caching plugin
+   binaries stays the host application's job (the device gateway's own package store),
+   keeping Styx's dependency surface
    minimal and consistent with the non-goals in §4.
 5. Go version floor — resolved: `go 1.26.0` (Arlo, 2026-07-17; supersedes the kickoff's 1.27).

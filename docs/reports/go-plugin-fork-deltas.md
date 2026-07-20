@@ -2,28 +2,30 @@
 
 Research investigating every commit unique to the
 `arloliu/go-plugin` fork between its divergence point and `v1.9.0` (the
-version eqp-hub pins), cross-referenced against eqp-hub's actual usage, and
-turned into explicit requirements (or explicit non-requirements) for Styx's
-public API and the surrounding framework implementation work.
+version the device gateway pins), cross-referenced against the device
+gateway's actual usage, and turned into explicit requirements (or explicit
+non-requirements) for Styx's public API and the surrounding framework
+implementation work.
 
 ## Summary
 
 The fork forked from `hashicorp/go-plugin` at commit `96d18ee` (18 commits
 past upstream's `v1.7.0` tag, an ancestor of upstream's `v1.8.0`) and diverged
 into 34 fork-only commits, tagged as its own `v1.8.0`, `v1.8.1`, and `v1.9.0`
-(eqp-hub's pinned version, confirmed identical to fork `HEAD`). The fork is a
-single-maintainer hardening pass over go-plugin's gRPC transport for a
-fleet-of-long-running-daemons use case (eqp-hub's device gateway), not a
-feature fork: roughly two-thirds of the commits are bug fixes for resource
-leaks, hangs, and host-crashing panics that only matter when a host runs many
-plugins for a long time and cannot tolerate one wedged/misbehaving plugin
-taking the host down; the rest are new bounded-timeout knobs on
-`ClientConfig`, a module rename, and repo hygiene (lint, docs, Makefile).
-Concretely, eqp-hub's own code exercises exactly two of the fork's additive
-`ClientConfig` fields (`PingTimeout`, `ShutdownTimeout`) and depends
-pervasively on `Ping()`/`Kill()` semantics; the fork's TLS-conflict rejection,
-reattach hardening, and gRPC dependency bump are not exercised by eqp-hub at
-all because Styx's design (same-host, same-user, UDS/SHM transport, no
+(the device gateway's pinned version, confirmed identical to fork `HEAD`).
+The fork is a single-maintainer hardening pass over go-plugin's gRPC
+transport for a fleet-of-long-running-daemons use case (a device-gateway
+workload), not a feature fork: roughly two-thirds of the commits are bug
+fixes for resource leaks, hangs, and host-crashing panics that only matter
+when a host runs many plugins for a long time and cannot tolerate one
+wedged/misbehaving plugin taking the host down; the rest are new
+bounded-timeout knobs on `ClientConfig`, a module rename, and repo hygiene
+(lint, docs, Makefile). Concretely, the device gateway's own code exercises
+exactly two of the fork's additive `ClientConfig` fields (`PingTimeout`,
+`ShutdownTimeout`) and depends pervasively on `Ping()`/`Kill()` semantics; the
+fork's TLS-conflict rejection, reattach hardening, and gRPC dependency bump
+are not exercised by the device gateway at all because Styx's design
+(same-host, same-user, UDS/SHM transport, no
 reattach-to-existing-process concept) makes the underlying go-plugin
 mechanisms these fixes patch moot. Cross-referencing against
 `docs/specs/2026-07-16-styx-design.md` and
@@ -66,7 +68,8 @@ was established directly from git history:
    upstream's independent evolution).
 4. `git rev-parse HEAD` on the fork clone = `ff4304ec05ba17cb4fa9b3898b3e5188852ebfd0`
    = `git rev-parse v1.9.0` on the same clone — confirms fork `HEAD` at
-   clone time is exactly the `v1.9.0` release eqp-hub's `go.mod` pins.
+   clone time is exactly the `v1.9.0` release the device gateway's `go.mod`
+   pins.
 
 **Baseline: commit `96d18ee73579514cd44c3426890f4f97dc6ae8f0`
 (`hashicorp/go-plugin`, 18 commits past its `v1.7.0` tag). Target:
@@ -117,7 +120,7 @@ maintains.
    fix.**
 7. **`45a9033` — plugin: prefer `GracefulStop` over `Stop` in the gRPC
    controller's Shutdown handler.** `Stop()` cut every in-flight RPC
-   immediately; for equipment-command RPCs this truncated in-flight
+   immediately; for device-command RPCs this truncated in-flight
    responses even during a clean shutdown. `GracefulStop` dispatched in a
    goroutine (synchronous call would deadlock, since `GracefulStop` waits
    for the handler that's calling it), with a bounded fallback to `Stop`
@@ -272,16 +275,16 @@ for above; none excluded.
 
 Each bullet names where Styx's design/plan already covers the underlying
 pain point, or flags a gap. Bullets marked **HARD REQUIREMENT** are backed by
-confirmed eqp-hub usage (grep evidence below); the rest are hardening
-lessons the fork learned the hard way that Styx's spec already anticipates,
-listed to confirm the coverage rather than to introduce something new.
+confirmed device-gateway usage (evidence in the self-check section below); the
+rest are hardening lessons the fork learned the hard way that Styx's spec
+already anticipates, listed to confirm the coverage rather than to introduce
+something new.
 
 - **HARD REQUIREMENT — bounded per-plugin health check with a configurable
   timeout** (fork commits 2, 11: `Ping()` bound + `ClientConfig.PingTimeout`).
-  eqp-hub sets `PingTimeout: 5 * time.Second` on `goplugin.ClientConfig`
-  (`internal/device/plugin/plugin.go:133`) and calls `host.Ping()`
-  pervasively in its test suite to assert liveness/deadness
-  (`tests/devplugin/devplugin_test.go`, `internal/device/plugin/plugin_test.go`).
+  The device gateway sets `PingTimeout: 5 * time.Second` on
+  `goplugin.ClientConfig` in its device-plugin client setup, and calls
+  `host.Ping()` pervasively in its test suite to assert liveness/deadness.
   Covered by the design document's heartbeat model (the supervisor work's `HealthConfig` —
   `HeartbeatInterval`/`MissedHeartbeats`/`WedgeWindow`, defaults 1s/3/5s) —
   Styx's heartbeat is stronger than go-plugin's `Ping()` (a progress
@@ -289,18 +292,18 @@ listed to confirm the coverage rather than to introduce something new.
   a bare liveness RPC), so this is more than satisfied, not just matched.
 - **HARD REQUIREMENT — bounded graceful-shutdown grace window before force
   kill** (fork commits 7, 12: `GracefulStop` preference + `ClientConfig.ShutdownTimeout`).
-  eqp-hub sets `ShutdownTimeout: 10 * time.Second` on `goplugin.ClientConfig`
-  (`internal/device/plugin/plugin.go:134`). Covered by the design document's
+  The device gateway sets `ShutdownTimeout: 10 * time.Second` on the same
+  `goplugin.ClientConfig`. Covered by the design document's
   normative teardown step 5 ("graceful `Shutdown` with deadline → `SIGKILL`
   fallback → `waitpid` reap, always") and the lifecycle/teardown work's
   `Teardown.ShutdownDeadline` field —
   the deadline is a per-teardown-run parameter, matching the fork's
   per-`ClientConfig` granularity.
 - **HARD REQUIREMENT — `Kill()`/process-termination as a primitive the host
-  calls freely and repeatedly.** eqp-hub calls `client.Kill()` in test
-  teardown paths, `defer`s, and error paths throughout
-  (`internal/device/plugin/plugin.go:214` and 20+ call sites across its
-  test suite). Styx does not expose an equivalent public `Kill()` primitive
+  calls freely and repeatedly.** The device gateway calls `client.Kill()` in
+  test teardown paths, `defer`s, and error paths throughout its client setup
+  and 20+ call sites across its test suite. Styx does not expose an
+  equivalent public `Kill()` primitive
   callable by arbitrary user code with the same concurrency hazard the fork
   patched in commits 29/33 (`sync.Once`-gated `Kill`, race with `Start`) —
   in Styx's design, process termination is internal (`internal/lifecycle.Teardown.Run`),
@@ -327,9 +330,9 @@ listed to confirm the coverage rather than to introduce something new.
 - **Process-group-wide kill for plugins that themselves fork
   subprocesses** (fork commits 4, 10: `Setpgid` + `SIGKILL -pgid` on
   POSIX, with a `DisableProcessGroupKill` opt-out for TTY hosts). Not
-  currently exercised by eqp-hub's own device-plugin binaries (grepped
-  `devices/*` for `exec.Command`/`exec.CommandContext` at runtime — none
-  found; the only `exec.Command` call sites in eqp-hub are build/test
+  currently exercised by the device gateway's own device-plugin binaries
+  (grepped its device-plugin source for `exec.Command`/`exec.CommandContext`
+  at runtime — none found; the only `exec.Command` call sites are build/test
   tooling, not the device plugins themselves), so this is not a
   confirmed hard requirement today. It is a real gap against the
   lifecycle/teardown work's current design, though: `internal/lifecycle.Spawn` does not set
@@ -342,8 +345,8 @@ listed to confirm the coverage rather than to introduce something new.
   or wait until a concrete device plugin needs subprocess-spawning and add
   it then? Resolving this needs either (a) a decision from whoever owns
   the framework implementation plan on whether to fold it in now, or (b) confirmation
-  from eqp-hub's device-plugin roadmap that no planned device driver will
-  ever shell out to a helper process.
+  from the device gateway's device-plugin roadmap that no planned device
+  driver will ever shell out to a helper process.
 - **Structured, vendor-agnostic internal logging, panic-isolated
   observability** (fork commit 14: `SetInternalLogger(hclog.Logger)`
   routing internal `log.Printf` sites through the host's structured
@@ -453,27 +456,30 @@ moot:
   cross-referenced into Non-requirements with a named reason (transport
   model, no reattach concept, different RPC stack, fresh module/tooling,
   or "validates an already-listed fix").
-- Every eqp-hub-used fork API appears in Requirements for Styx: confirmed
-  via `grep -rn "arloliu/go-plugin\|goplugin\.\|ShutdownTimeout\|PingTimeout\|DisableProcessGroupKill\|SetInternalLogger\|ErrPingTimeout\|ErrBrokerTimeout" /home/arlo/projects/eqp-hub`.
-  eqp-hub uses: the import itself (`internal/device/plugin/{server,device,plugin}.go`,
-  aliased `goplugin` in `plugin.go`/tests, unaliased `plugin` in
-  `server.go`/`device.go`), `goplugin.NewClient`/`ClientConfig`
+- Every fork API the device gateway uses appears in Requirements for Styx:
+  confirmed by grepping the device gateway's codebase for
+  `arloliu/go-plugin`, `goplugin.`, `ShutdownTimeout`, `PingTimeout`,
+  `DisableProcessGroupKill`, `SetInternalLogger`, `ErrPingTimeout`, and
+  `ErrBrokerTimeout`.
+  The device gateway uses: the import itself (aliased `goplugin` in its
+  client setup and tests, unaliased `plugin` in its server/device code),
+  `goplugin.NewClient`/`ClientConfig`
   (`HandshakeConfig`, `Plugins`, `Cmd`, `AllowedProtocols`, `Logger`, and
   the two fork-only fields `PingTimeout`/`ShutdownTimeout`), `Client.Kill`,
   `Client.Ping` (via its own `ClientProtocol` wrapper interface), `GRPCPlugin`/
   `NetRPCUnsupportedPlugin`, `GRPCBroker`, `Serve`/`ServeConfig`. Of the
   fork-specific (not upstream-inherited) surface, only `PingTimeout` and
-  `ShutdownTimeout` are directly set by eqp-hub — both appear as **HARD
-  REQUIREMENT** bullets above with file:line evidence.
+  `ShutdownTimeout` are directly set by the device gateway — both appear as
+  **HARD REQUIREMENT** bullets above.
   `DisableProcessGroupKill`, `SetInternalLogger`, `ErrPingTimeout`,
   `ErrBrokerTimeout`, `BrokerTimeout`, `AutoMTLS`, `TLSConfig`,
-  `TLSProvider`, `Reattach*`, `Managed` all returned zero hits in eqp-hub —
-  confirmed unused, so correctly excluded from "hard requirement" status
-  and instead classified as hardening lessons (already covered) or
-  non-requirements (moot by design) above.
+  `TLSProvider`, `Reattach*`, `Managed` all returned zero hits — confirmed
+  unused, so correctly excluded from "hard requirement" status and instead
+  classified as hardening lessons (already covered) or non-requirements
+  (moot by design) above.
   Separately: the `Init`/`Start`/`Stop`/`HotReload`/`SaveRuntimeState`/
   `CollectMetrics`/`Ping` "lifecycle contract" the task brief asks about is
-  **eqp-hub's own gRPC service** (`internal/device/plugin/pb`, a protobuf
+  **the device gateway's own gRPC service** (a device-plugin protobuf
   service riding *over* the go-plugin-negotiated connection), not a
   go-plugin fork API — go-plugin (fork or upstream) has no opinion on
   those method names. That contract is already captured as an ordinary
@@ -486,16 +492,17 @@ moot:
   unresolved item (process-group-wide kill, fork commits 4/10) is stated
   as an explicit open question in Requirements for Styx, naming exactly
   what would resolve it — a decision to fold `Setpgid`/group-kill into
-  the lifecycle/teardown work speculatively, or confirmation from eqp-hub's device-plugin
-  roadmap that no planned driver will ever shell out to a subprocess.
+  the lifecycle/teardown work speculatively, or confirmation from the
+  device gateway's device-plugin roadmap that no planned driver will ever
+  shell out to a subprocess.
 
 ## Open questions
 
 - Should `internal/lifecycle.Spawn` set `Setpgid` and have
   `Teardown`'s SIGKILL fallback target the process group rather than the
-  single PID, given the fork's `8bf442e`/`ed7ada5` precedent, even though
-  no current eqp-hub device plugin forks subprocesses at runtime? Resolves
-  via either an explicit decision when that work is implemented, or a check
-  of eqp-hub's device-plugin roadmap/backlog for any planned driver that
-  shells out to a helper process (e.g. a serial-bridge or vendor CLI
-  wrapper).
+  single PID, given the fork's `8bf442e`/`ed7ada5` precedent, even though no
+  current device-gateway device plugin forks subprocesses at runtime?
+  Resolves via either an explicit decision when that work is implemented, or
+  a check of the device gateway's device-plugin roadmap/backlog for any
+  planned driver that shells out to a helper process (e.g. a serial-bridge
+  or vendor CLI wrapper).

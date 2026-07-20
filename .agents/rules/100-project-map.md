@@ -13,9 +13,9 @@ not a claim about what `ls` shows today — always check reality first.
   extremely strong, documented reason.
 - **Plugin package fetching stays host-side, not a Styx concern:**
   `PluginSpec` takes a local binary path and an optional SHA-256 hash only.
-  Don't add a fetch-by-name/version abstraction to `styx` — that's eqp-hub's
-  `PackageStore`/`Fetcher`, deliberately kept out of this module (see the
-  design doc's Non-Goals section).
+  Don't add a fetch-by-name/version abstraction to `styx` — that's the
+  reference consumer's own package store/fetcher, deliberately kept out of
+  this module (see the design doc's Non-Goals section).
 - **Lint:** pinned via `.golangci.yml` + `.linter.go.mod` (`make lint`) — see
   [500](500-validation-and-workflow.md) and [700](700-go-after-write.md).
 - **CI/VCS:** GitHub; use `gh`. No workflow files exist yet.

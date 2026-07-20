@@ -572,7 +572,7 @@ travels with the frame, addable later with no wire change) is preserved.
 
 **Controller-authorized deviation (trace is a negotiated feature).** The design's
 observability section (§21: *"Trace context rides the descriptor's reserved trace
-field … so eqp-hub can add OTel later without wire changes"*, design line ~646)
+field … so the device gateway can add OTel later without wire changes"*, design line ~646)
 frames trace context as an always-available base capability. This document instead
 makes `trace` a **negotiated feature**, symmetric with `checksum` and
 `compression` (§5 `allowed_flags`): the `TRACE_PRESENT` bit MAY be set only when
@@ -1836,8 +1836,9 @@ per actual large transfer (transient UDS memory) yet needs no ABI surface — it
 supersedes Path 3's out-of-band spill, which required a negotiated flag bit and
 frame-referenced handle. Path 1 (a large top class permanently sized into every
 region) remains simplest when large messages are *common* rather than rare;
-eqp-hub's bulk-read pattern (large, occasional device reads) is exactly the "rare
-giant" shape Path 4 targets. This is guidance for the M3 decision, not a v1
+the device gateway's bulk-read pattern (large, occasional device reads) is
+exactly the "rare giant" shape Path 4 targets. This is guidance for the M3
+decision, not a v1
 commitment.
 
 **RSS ratcheting (implementation note, not ABI).** Under the v1 seal set there is
