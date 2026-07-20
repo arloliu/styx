@@ -9,20 +9,35 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// declaredFDCount extracts the fd-count field from a fd-bearing message
-// kind. AttachRegion is currently the only such kind; a message kind with
-// no fd-count field passed here is a programmer error (panics — this is an
-// internal package invariant, never reachable from untrusted input: a
-// caller only ever routes a message through SendFDs/RecvFDs once it
-// already knows, from the protocol's own lifecycle-state table in
-// legal.go, that the kind carries fds).
-func declaredFDCount(msg *controlpb.ControlMessage) uint32 {
+// recvDeclaredFDCount extracts the fd-count field from a fd-bearing message
+// kind, reporting ok=false for any kind that has no such field:
+// AttachRegion carries the live region, and SaveState/Restore carry a
+// hot-reload snapshot memfd in each direction. A receiver cannot know a
+// datagram's kind until it has already read it, so this must answer for
+// arbitrary peer-chosen bodies instead of asserting.
+func recvDeclaredFDCount(msg *controlpb.ControlMessage) (uint32, bool) {
 	switch body := msg.GetBody().(type) {
 	case *controlpb.ControlMessage_AttachRegion:
-		return body.AttachRegion.GetFdCount()
+		return body.AttachRegion.GetFdCount(), true
+	case *controlpb.ControlMessage_SaveState:
+		return body.SaveState.GetSnapshotFdCount(), true
+	case *controlpb.ControlMessage_Restore:
+		return body.Restore.GetSnapshotFdCount(), true
 	default:
+		return 0, false
+	}
+}
+
+// declaredFDCount is recvDeclaredFDCount for the send path, where the
+// message was built by this process: a kind with no fd-count field is a
+// programmer error there, never untrusted input, so it asserts.
+func declaredFDCount(msg *controlpb.ControlMessage) uint32 {
+	count, ok := recvDeclaredFDCount(msg)
+	if !ok {
 		panic(fmt.Sprintf("control: declaredFDCount: message kind %T has no fd-count field", msg.GetBody()))
 	}
+
+	return count
 }
 
 // parseRights extracts every fd carried across one or more SCM_RIGHTS
@@ -150,8 +165,20 @@ func (c *Conn) RecvFDs(ctx context.Context, maxFDs int) (*controlpb.ControlMessa
 		return nil, nil, fmt.Errorf("control: unmarshal: %w", err)
 	}
 
+	// A peer chooses which body it sends, so a kind with no fd-count field
+	// arriving here is untrusted input, not a caller bug: reject it as a
+	// protocol violation rather than asserting on it the way SendFDs does for
+	// a message this process built itself.
+	declared, ok := recvDeclaredFDCount(msg)
+	if !ok {
+		closeAll(fds)
+
+		return nil, nil, fmt.Errorf("control: message kind %T carries no fds: %w",
+			msg.GetBody(), ErrProtocolViolation)
+	}
+
 	//nolint:gosec // len(fds) is bounded by maxFDs, never near uint32's range
-	if declared := declaredFDCount(msg); declared != uint32(len(fds)) {
+	if declared != uint32(len(fds)) {
 		closeAll(fds)
 
 		return nil, nil, fmt.Errorf("control: declared fd_count %d != received fd count %d: %w",

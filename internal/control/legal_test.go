@@ -27,6 +27,8 @@ var allKinds = map[string]control.MessageKind{
 	"Shutdown":        control.KindShutdown,
 	"ShutdownAck":     control.KindShutdownAck,
 	"Poisoned":        control.KindPoisoned,
+	"Restore":         control.KindRestore,
+	"RestoreAck":      control.KindRestoreAck,
 }
 
 // legalKindsByState is the expected legal set per the per-lifecycle-state
@@ -38,6 +40,7 @@ var legalKindsByState = map[string][]string{
 	"Serving":      {"Heartbeat", "HeartbeatAck", "Drain", "SaveState", "SaveStateAck", "Shutdown", "Poisoned"},
 	"Draining":     {"DrainAck", "Resume", "ResumeAck", "SaveState", "SaveStateAck", "Shutdown", "Poisoned"},
 	"ShuttingDown": {"ShutdownAck", "Poisoned"},
+	"Restoring":    {"Restore", "RestoreAck"},
 }
 
 var allStates = map[string]control.LifecycleState{
@@ -46,6 +49,7 @@ var allStates = map[string]control.LifecycleState{
 	"Serving":      control.StateServing,
 	"Draining":     control.StateDraining,
 	"ShuttingDown": control.StateShuttingDown,
+	"Restoring":    control.StateRestoring,
 }
 
 // Test Legal reporting the exact per-lifecycle-state legal-message table,
@@ -121,6 +125,12 @@ func newMessageForKind(kind control.MessageKind) *controlpb.ControlMessage {
 		}
 	case control.KindPoisoned:
 		return &controlpb.ControlMessage{Body: &controlpb.ControlMessage_Poisoned{Poisoned: &controlpb.Poisoned{}}}
+	case control.KindRestore:
+		return &controlpb.ControlMessage{Body: &controlpb.ControlMessage_Restore{Restore: &controlpb.Restore{}}}
+	case control.KindRestoreAck:
+		return &controlpb.ControlMessage{
+			Body: &controlpb.ControlMessage_RestoreAck{RestoreAck: &controlpb.RestoreAck{}},
+		}
 	default:
 		return &controlpb.ControlMessage{}
 	}

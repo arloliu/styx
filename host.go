@@ -332,12 +332,18 @@ func (h *Host) publish(e Event) {
 // Ready after a restart, so a caller holding that pointer transparently
 // sees the new instance. The returned ReadyHooks are internal/supervisor's
 // caller-specific Teardown callbacks (StopAdmission/FailInFlight/
-// JoinGoroutines) for tearing this exact wiring back down — the invariant
-// that a successor is never promoted Ready while its predecessor is still
-// alive or unreaped is guaranteed by internal/supervisor.Supervisor.Run
-// itself: it never spawns a new instance (and so never calls this again)
-// until the previous one's Teardown, built from the ReadyHooks returned
-// here, has fully completed.
+// JoinGoroutines) for tearing this exact wiring back down.
+//
+// On a crash-restart, a successor is never promoted Ready while its
+// predecessor is still alive or unreaped — internal/supervisor.Supervisor.Run
+// never spawns a new instance (and so never calls this again) until the
+// previous one's Teardown, built from the ReadyHooks returned here, has
+// fully completed. A hot-reload promotion does not go through that
+// machinery: it swaps cc's routing to the successor's state and only
+// afterward tears the predecessor down, so a predecessor's Teardown can run
+// after a later generation already owns cc's routing. StopAdmission
+// therefore checks ownership before acting (see its own comment below)
+// rather than assuming it is always the most recent instance.
 func wireConnState(cc *ClientConn, inst supervisor.Instance) supervisor.ReadyHooks {
 	state := &connState{
 		table:        rpcruntime.NewTable(inst.Generation),
@@ -346,13 +352,26 @@ func wireConnState(cc *ClientConn, inst supervisor.Instance) supervisor.ReadyHoo
 		readLoopDone: make(chan struct{}),
 	}
 	cc.state.Store(state)
+	cc.admission.Open()
 	go func() {
 		defer close(state.readLoopDone)
 		runReadLoop(state)
 	}()
 
 	return supervisor.ReadyHooks{
-		StopAdmission: func() { cc.state.Store(nil) },
+		// CompareAndSwap only tears down routing this exact instance still
+		// owns: on a plain crash-restart cc.state still holds state, so the
+		// swap succeeds and this behaves as an unconditional close always
+		// did. After a hot-reload has promoted a later generation, cc.state
+		// holds the successor's state instead, the swap fails, and this
+		// becomes a no-op — a predecessor's teardown must never close
+		// admission or null out routing out from under a successor that is
+		// already serving.
+		StopAdmission: func() {
+			if cc.state.CompareAndSwap(state, nil) {
+				cc.admission.Close()
+			}
+		},
 		// Same split-by-dispatch-state reasoning as the earlier teardown
 		// wiring: a call whose request frame was never
 		// published is provably not-dispatched (retryable); a published

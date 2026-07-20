@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/arloliu/styx/codec"
+	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/transport"
 	"google.golang.org/protobuf/proto"
@@ -21,6 +22,13 @@ import (
 type ClientConn struct {
 	name  string
 	state atomic.Pointer[connState] // nil until a plugin instance is live; Invoke reports ErrPluginUnavailable
+	// admission is the hot-reload cutoff switch. A reload closes it before
+	// draining the running instance and reopens it once either the successor
+	// is routing or the original instance has confirmed it is unfrozen, so a
+	// call is never admitted into a half-frozen plugin. It is separate from
+	// state because a cutoff is temporary and reversible, whereas a nil state
+	// means there is no instance at all.
+	admission lifecycle.AdmissionGate
 }
 
 // connState is one generation of a ClientConn's live wiring: the request
@@ -52,6 +60,7 @@ func newClientConn(name string, table *rpcruntime.Table, tr transport.Transport,
 	c := &ClientConn{name: name}
 	state := &connState{table: table, tr: tr, codec: cdc, readLoopDone: make(chan struct{})}
 	c.state.Store(state)
+	c.admission.Open()
 	go func() {
 		defer close(state.readLoopDone)
 		runReadLoop(state)
@@ -228,6 +237,14 @@ func (c *ClientConn) Invoke(ctx context.Context, service, method string, req, re
 	state := c.state.Load()
 	if state == nil {
 		return ErrPluginUnavailable
+	}
+
+	// The cutoff phase of a hot-reload closes admission before the running
+	// instance freezes. Refusing here - before the call is ever submitted to
+	// the Table or published to the transport - is what makes the refusal
+	// provably not-dispatched, and so safely retryable.
+	if !c.admission.IsOpen() {
+		return ErrDrained
 	}
 
 	if err := ctx.Err(); err != nil {

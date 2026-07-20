@@ -21,6 +21,8 @@ message ControlMessage {
     Shutdown shutdown = 15;
     ShutdownAck shutdown_ack = 16;
     Poisoned poisoned = 17;
+    Restore restore = 18;
+    RestoreAck restore_ack = 19;
   }
 }
 
@@ -112,3 +114,19 @@ message Shutdown { int64 deadline_unix_nano = 1; }
 message ShutdownAck {}
 
 message Poisoned { string reason = 1; }
+
+// Restore carries a snapshot the host has already verified (full seal set,
+// declared length, checksum) to a freshly spawned instance, with the sealed
+// memfd attached via SCM_RIGHTS. Host->plugin only.
+message Restore {
+  uint32 snapshot_fd_count = 1; // always 1: the sealed snapshot memfd
+  uint64 declared_length = 2;
+  uint32 format_version = 3;
+}
+
+// RestoreAck is the new instance's readiness reply. ready == false aborts
+// the reload, and reason says why.
+message RestoreAck {
+  bool ready = 1;
+  string reason = 2; // populated iff ready == false
+}

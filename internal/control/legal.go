@@ -27,6 +27,8 @@ const (
 	KindShutdown
 	KindShutdownAck
 	KindPoisoned
+	KindRestore
+	KindRestoreAck
 )
 
 // LifecycleState is the coarse control-plane state each side tracks to
@@ -39,6 +41,14 @@ const (
 	StateServing
 	StateDraining
 	StateShuttingDown
+	// StateRestoring is the freshly spawned successor's state during a
+	// hot-reload's restore-and-validate phase: it has finished handshake and
+	// attach but is not yet promoted, so the only traffic it may exchange is
+	// the snapshot delivery itself. Restore/RestoreAck are legal here and
+	// nowhere else — a Restore arriving in StateServing would mean the host
+	// tried to reset an already-promoted instance's state underneath live
+	// calls.
+	StateRestoring
 )
 
 // ReplyDeadlines is the per-message-type reply deadline. Drain and
@@ -69,7 +79,8 @@ var ErrProtocolViolation = errors.New("control: protocol violation")
 // SaveState/Ack, Shutdown, and Poisoned are legal in StateServing;
 // DrainAck, Resume/ResumeAck, SaveState/Ack, Shutdown, and Poisoned are
 // legal in StateDraining; only ShutdownAck and Poisoned are legal in
-// StateShuttingDown.
+// StateShuttingDown; only Restore and RestoreAck are legal in
+// StateRestoring.
 var legalByState = map[LifecycleState]map[MessageKind]bool{
 	StateHandshaking: {
 		KindHello:    true,
@@ -100,6 +111,10 @@ var legalByState = map[LifecycleState]map[MessageKind]bool{
 	StateShuttingDown: {
 		KindShutdownAck: true,
 		KindPoisoned:    true,
+	},
+	StateRestoring: {
+		KindRestore:    true,
+		KindRestoreAck: true,
 	},
 }
 
@@ -137,6 +152,10 @@ func KindOf(msg *controlpb.ControlMessage) (MessageKind, bool) {
 		return KindShutdownAck, true
 	case *controlpb.ControlMessage_Poisoned:
 		return KindPoisoned, true
+	case *controlpb.ControlMessage_Restore:
+		return KindRestore, true
+	case *controlpb.ControlMessage_RestoreAck:
+		return KindRestoreAck, true
 	default:
 		return 0, false
 	}
