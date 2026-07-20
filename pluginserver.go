@@ -31,8 +31,9 @@ const controlChildFD = 3
 // transport, runs the serving loop, and exits when the host disconnects or
 // sends Shutdown.
 type PluginServer struct {
-	mu       sync.Mutex
-	services map[uint64]registeredService // keyed by ServiceID
+	mu          sync.Mutex
+	services    map[uint64]registeredService // keyed by ServiceID
+	reloadHooks lifecycle.PluginReloadHooks  // populated by reload_hooks.go's Register* methods
 }
 
 // registeredService pairs one RegisterService call's desc and impl for

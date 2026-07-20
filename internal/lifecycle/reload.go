@@ -2,7 +2,6 @@ package lifecycle
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -10,22 +9,16 @@ import (
 
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/control/controlpb"
+	"github.com/arloliu/styx/internal/shm"
 	"golang.org/x/sys/unix"
 )
 
-// snapshotSeals is the full seal set a snapshot memfd must already carry
-// when it arrives. Unlike the live shared-memory region, a snapshot is
-// immutable by contract: a producer that could still write to, grow, or
-// shrink it after handing it over could change the bytes out from under the
-// host between verification and restore, so anything short of the complete
-// set is a protocol violation rather than a warning.
-const snapshotSeals = unix.F_SEAL_WRITE | unix.F_SEAL_GROW | unix.F_SEAL_SHRINK | unix.F_SEAL_SEAL
-
-// maxSnapshotBytes bounds a snapshot the host is willing to map. The
-// declared length arrives from the plugin, which is the untrusted side of
-// this boundary, so it is validated against a fixed ceiling before it is
-// ever used as a mapping length.
-const maxSnapshotBytes = 1 << 30 // 1 GiB
+// maxSnapshotBytes is a lifecycle-local alias for shm.MaxSnapshotBytes: the
+// snapshot size ceiling is a property of the snapshot artifact itself
+// (internal/shm owns the canonical verifier that enforces it), not of this
+// package, but export_test.go's MaxSnapshotBytes re-export reads this
+// unexported name from within the lifecycle package.
+const maxSnapshotBytes = shm.MaxSnapshotBytes
 
 // ErrReloadCrashEquivalent marks a reload that could not be rolled back
 // because the old instance stopped answering: it was told to freeze and can
@@ -353,71 +346,31 @@ func (s *snapshot) close() {
 }
 
 // verifySnapshot independently checks everything the host must not take on
-// trust from the producer — the complete seal set, the declared length
-// against the memfd's real size, and a length within maxSnapshotBytes — then
-// maps the snapshot read-only to compute its checksum. It never trusts
-// declaredLength as a mapping length: the mapping is sized from the fstat
-// result, which the kernel reports and the seals have frozen.
+// trust from the producer, delegating the seal-set/length/size checks and
+// the checksum computation to shm.VerifySealedSnapshot — the same verifier
+// the freshly spawned successor runs on its own end of a reload, so the two
+// walls can never drift into disagreeing about what counts as a valid
+// snapshot. The host has no further use for the mapping once it has the
+// checksum (it only ever forwards the fd on to the successor), so it unmaps
+// immediately rather than holding it for the rest of the phase.
 func verifySnapshot(fd int, declaredLength uint64, formatVersion uint32) (*snapshot, error) {
-	seals, err := unix.FcntlInt(uintptr(fd), unix.F_GET_SEALS, 0)
+	data, checksum, err := shm.VerifySealedSnapshot(fd, declaredLength)
 	if err != nil {
-		return nil, fmt.Errorf("lifecycle: reload: read snapshot seals: %w", err)
-	}
-	if seals&snapshotSeals != snapshotSeals {
-		return nil, fmt.Errorf("lifecycle: reload: snapshot seals %#x missing %#x: %w",
-			seals, snapshotSeals&^seals, ErrSnapshotRejected)
-	}
+		if errors.Is(err, shm.ErrUnsealedSnapshot) ||
+			errors.Is(err, shm.ErrSnapshotLengthMismatch) ||
+			errors.Is(err, shm.ErrSnapshotTooLarge) {
+			return nil, fmt.Errorf("lifecycle: reload: %w: %w", err, ErrSnapshotRejected)
+		}
 
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return nil, fmt.Errorf("lifecycle: reload: stat snapshot: %w", err)
+		return nil, fmt.Errorf("lifecycle: reload: verify snapshot: %w", err)
 	}
-
-	//nolint:gosec // st.Size is a file size the kernel reports; it is never negative here.
-	actual := uint64(st.Size)
-	if actual != declaredLength {
-		return nil, fmt.Errorf("lifecycle: reload: snapshot declared %d bytes but is %d: %w",
-			declaredLength, actual, ErrSnapshotRejected)
-	}
-	if actual > maxSnapshotBytes {
-		return nil, fmt.Errorf("lifecycle: reload: snapshot of %d bytes exceeds the %d byte limit: %w",
-			actual, maxSnapshotBytes, ErrSnapshotRejected)
+	if len(data) > 0 {
+		if err := unix.Munmap(data); err != nil {
+			return nil, fmt.Errorf("lifecycle: reload: unmap verified snapshot: %w", err)
+		}
 	}
 
-	sum, err := checksumFD(fd, actual)
-	if err != nil {
-		return nil, err
-	}
-
-	return &snapshot{fd: fd, declaredLength: declaredLength, formatVersion: formatVersion, checksum: sum}, nil
-}
-
-// checksumFD maps size bytes of fd read-only and returns their SHA-256. The
-// mapping is read-only because the host never needs to write a snapshot, and
-// a read-only mapping cannot become the route by which a host bug corrupts
-// one.
-func checksumFD(fd int, size uint64) ([]byte, error) {
-	if size == 0 {
-		sum := sha256.Sum256(nil)
-
-		return sum[:], nil
-	}
-	if size > maxSnapshotBytes {
-		// verifySnapshot already rejected anything this large; re-checking here
-		// keeps the narrowing below provably in range at this call site too.
-		return nil, fmt.Errorf("lifecycle: reload: snapshot of %d bytes exceeds the %d byte limit: %w",
-			size, maxSnapshotBytes, ErrSnapshotRejected)
-	}
-
-	data, err := unix.Mmap(fd, 0, int(size), unix.PROT_READ, unix.MAP_SHARED)
-	if err != nil {
-		return nil, fmt.Errorf("lifecycle: reload: map snapshot: %w", err)
-	}
-	defer func() { _ = unix.Munmap(data) }()
-
-	sum := sha256.Sum256(data)
-
-	return sum[:], nil
+	return &snapshot{fd: fd, declaredLength: declaredLength, formatVersion: formatVersion, checksum: checksum[:]}, nil
 }
 
 // closeFDs closes every fd in fds, ignoring individual close errors — used
