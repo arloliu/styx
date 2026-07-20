@@ -85,6 +85,35 @@ func cgroupCPUQuotaVia(read cpuMaxReader) (float64, bool) {
 	return ratio, class == quotaLimited && exact
 }
 
+// CgroupCPUUnconstrained reports whether this process's cgroup ancestry is
+// PROVABLY free of any CPU bandwidth limit: every level cleanly resolved (a
+// readable canonical "max", or a benign absence) with no finite quota anywhere.
+// It is the fail-closed counterpart to CgroupCPUQuota and certifies the ABSENCE
+// of a limit, so it returns false not only for a finite quota but also for any
+// unconfirmable ancestry -- an unreadable level, a malformed cpu.max, an
+// unresolved /proc/self/cgroup path, or a finite-but-inexact ratio. Anything it
+// cannot prove unlimited it reports as false.
+//
+// Exported so a caller that must run ONLY when the CPU scheduler is genuinely
+// unconstrained -- e.g. a benchmark's "default" regime guard, the mirror of the
+// CgroupCPUQuota check a "cgroup2cpu" regime guard uses -- can refuse to proceed
+// on an uncertifiable quota rather than silently mislabel a constrained run as
+// unconstrained. Note that CgroupCPUQuota returning ok=false does NOT imply this
+// returns true: ok=false spans confirmed-unlimited AND unconfirmable states,
+// and only the confirmed-unlimited subset certifies here.
+func CgroupCPUUnconstrained() bool {
+	return cgroupCPUUnconstrainedVia(readFileNoFail)
+}
+
+// cgroupCPUUnconstrainedVia is the reader-injected core of
+// CgroupCPUUnconstrained, factored out for the same synthetic-path testability
+// as cgroupCPUQuotaVia.
+func cgroupCPUUnconstrainedVia(read cpuMaxReader) bool {
+	_, class, exact := resolveCPUQuota(read)
+
+	return class == quotaUnlimited && exact
+}
+
 // resolveCPUQuota walks this process's full cgroup ancestry -- from its own
 // cgroup path up to and including cgroupRoot -- reading cpu.max at every
 // level via read, and classifies the effective CFS CPU bandwidth limit as a

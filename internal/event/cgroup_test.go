@@ -660,3 +660,48 @@ func TestResolveCPUQuota_StrictParse_FailsClosed(t *testing.T) {
 		require.InDelta(t, 1.5, gotQuota, 1e-9)
 	})
 }
+
+// TestCgroupCPUUnconstrained certifies the ABSENCE of a CPU limit, the
+// fail-closed mirror of cgroupCPUQuotaVia's certification of a finite one: it
+// returns true only for a fully-readable, no-finite-quota ancestry, and false
+// for a finite quota, an unreadable/unknown level, or a finite-but-inexact
+// ratio. This is the property a "default" regime guard relies on to refuse a
+// silently-constrained run.
+func TestCgroupCPUUnconstrained(t *testing.T) {
+	t.Run("all_clean_max_or_absent_is_unconstrained", func(t *testing.T) {
+		fs := fakeCgroupFS{
+			"/proc/self/cgroup":          {content: "0::/a/b\n"},
+			"/sys/fs/cgroup/a/b/cpu.max": {content: "max 100000\n"},
+			// /sys/fs/cgroup/a/cpu.max and /sys/fs/cgroup/cpu.max absent -> ENOENT
+		}
+		require.True(t, cgroupCPUUnconstrainedVia(fs.read),
+			"a fully-readable ancestry with no finite quota is provably unconstrained")
+	})
+
+	t.Run("finite_quota_is_not_unconstrained", func(t *testing.T) {
+		fs := fakeCgroupFS{
+			"/proc/self/cgroup":        {content: "0::/a\n"},
+			"/sys/fs/cgroup/a/cpu.max": {content: "200000 100000\n"}, // 2.0 CPU
+		}
+		require.False(t, cgroupCPUUnconstrainedVia(fs.read), "a finite quota is not unconstrained")
+	})
+
+	t.Run("unreadable_level_fails_closed_to_not_unconstrained", func(t *testing.T) {
+		fs := fakeCgroupFS{
+			"/proc/self/cgroup":          {content: "0::/a/b\n"},
+			"/sys/fs/cgroup/a/b/cpu.max": {content: "max 100000\n"},
+			"/sys/fs/cgroup/a/cpu.max":   {err: unix.EACCES}, // real error -> Unknown
+		}
+		require.False(t, cgroupCPUUnconstrainedVia(fs.read),
+			"an unconfirmable ancestry must fail closed to not-unconstrained")
+	})
+
+	t.Run("inexact_finite_is_not_unconstrained", func(t *testing.T) {
+		fs := fakeCgroupFS{
+			"/proc/self/cgroup":          {content: "0::/a/b\n"},
+			"/sys/fs/cgroup/a/b/cpu.max": {content: "200000 100000\n"}, // finite
+			"/sys/fs/cgroup/a/cpu.max":   {err: unix.EIO},              // unreadable ancestor -> inexact
+		}
+		require.False(t, cgroupCPUUnconstrainedVia(fs.read), "a finite-but-inexact quota is not unconstrained")
+	})
+}

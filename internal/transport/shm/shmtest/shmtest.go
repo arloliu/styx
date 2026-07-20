@@ -120,6 +120,21 @@ func (p *Pair) Close() error {
 	return errors.Join(p.Host.Close(), p.Plugin.Close(), p.hpEFD.Close(), p.phEFD.Close(), p.region.Close())
 }
 
+// WakeupSyscalls returns the total eventfd read(2)/write(2) syscalls both
+// ends of the pair have performed so far: the sum of both cross-wired
+// eventfds' EventFD.SyscallCount(). It is the wakeup_syscalls_per_op metric
+// the benchmark suite samples before and after a timed latency run -- and,
+// because both eventfds live in this process, it counts the FULL round trip
+// (both park/wake halves), not just the host half the two-process spike
+// harness could observe. Spin-loop iterations that catch a signal without
+// touching the eventfd are not counted (event.EventFD.SyscallCount's own
+// contract): a near-zero value means the hybrid waiter is spinning through
+// the wakeup, a value near 2 means every call took the full park -> eventfd
+// -> wake path.
+func (p *Pair) WakeupSyscalls() uint64 {
+	return p.hpEFD.SyscallCount() + p.phEFD.SyscallCount()
+}
+
 // NewInProcessPair builds one memfd region using the default,
 // large-payload-capable geometry (defaultLayout) at the given generation and
 // attaches a host and a plugin transport.Transport to it with cross-wired
