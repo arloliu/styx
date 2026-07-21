@@ -53,7 +53,10 @@ func (h *Host) DroppedInformationalEventCounts() []uint64 {
 // ToControlServiceRequirements re-exports toControlServiceRequirements for
 // host_test (external test package): the pure PluginSpec.Services ->
 // internal/supervisor.Config.Services translation, exercised directly
-// here without needing a real spawn.
+// here without needing a real spawn. The case-only difference from the
+// unexported original is the intended re-export pattern, not a naming accident.
+//
+//nolint:revive // confusing-naming: intentional case-only re-export, see doc above
 func ToControlServiceRequirements(reqs []ServiceRequirement) []control.ServiceRequirement {
 	return toControlServiceRequirements(reqs)
 }
@@ -62,7 +65,10 @@ func ToControlServiceRequirements(reqs []ServiceRequirement) []control.ServiceRe
 // (external test package): pluginHandshake's rejection-ack reason
 // selection, exercised directly here since pluginHandshake itself cannot
 // be driven without a real spawned child (see pluginserver_test.go's own
-// doc).
+// doc). The case-only difference from the unexported original is the intended
+// re-export pattern, not a naming accident.
+//
+//nolint:revive // confusing-naming: intentional case-only re-export, see doc above
 func IncompatibleReason(err error) string {
 	return incompatibleReason(err)
 }

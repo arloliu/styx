@@ -211,6 +211,42 @@ func TestTransport_SendRecv_RoundTripsUnaryFrame_BetweenTwoAttachedEnds(t *testi
 	}
 }
 
+// Test that the five STREAM_* kinds round-trip host->plugin over the real
+// region, carrying the stream control word in the descriptor's reserved word
+// (offset 56, stream-protocol.md §2.1/§2.2). The transport is stream-unaware:
+// the payload-bearing kinds ride the data lane, STREAM_ACK is descriptor-only on
+// the lifecycle lane, and every one carries its control word verbatim. Run with
+// -race.
+func TestTransport_SendRecv_RoundTripsStreamingFrames_WithControlWord(t *testing.T) {
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+	t.Run("STREAM_MSG carries payload and its sequence number", func(t *testing.T) {
+		want := transport.Frame{
+			CallID: 7, Kind: transport.FrameStreamMsg, Service: 1, Method: 2,
+			Budget: 5 * time.Millisecond, Control: 3, Payload: []byte("streamed"),
+		}
+		require.NoError(t, ep.host.Send(t.Context(), want))
+		got, err := ep.plugin.Recv(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, transport.FrameStreamMsg, got.Kind)
+		require.Equal(t, uint64(7), got.CallID)
+		require.Equal(t, uint64(3), got.Control, "STREAM_MSG's sequence number must survive the round trip")
+		require.Equal(t, want.Payload, got.Payload)
+	})
+
+	t.Run("STREAM_ACK is descriptor-only and carries its cumulative ack", func(t *testing.T) {
+		require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
+			CallID: 7, Kind: transport.FrameStreamAck, Control: 8,
+		}))
+		got, err := ep.plugin.Recv(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, transport.FrameStreamAck, got.Kind)
+		require.Equal(t, uint64(7), got.CallID)
+		require.Equal(t, uint64(8), got.Control, "STREAM_ACK's cumulative ack count must survive the round trip")
+		require.Empty(t, got.Payload)
+	})
+}
+
 // Test that Recv discards a descriptor whose generation does not match the
 // region generation, skipping it without reading its (garbage) arena slab, then
 // delivers the next valid frame and counts the discard (shm-abi.md §15).

@@ -24,9 +24,9 @@ func newInProcessTransportPairForTest(t *testing.T) (a, b transport.Transport) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	require.NoError(t, err)
 
-	a, err = transport.NewUDSTransport(fds[0])
+	a, err = transport.NewUDSTransport(fds[0], false)
 	require.NoError(t, err)
-	b, err = transport.NewUDSTransport(fds[1])
+	b, err = transport.NewUDSTransport(fds[1], false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
 
@@ -103,9 +103,9 @@ func TestClientConn_ReadLoop_SurvivesMalformedStatusFrame_ThenCompletesNextCall(
 	// Given: a raw socketpair so the test can inject bytes the client reads.
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	require.NoError(t, err)
-	clientTr, err := transport.NewUDSTransport(fds[0])
+	clientTr, err := transport.NewUDSTransport(fds[0], false)
 	require.NoError(t, err)
-	pluginTr, err := transport.NewUDSTransport(fds[1])
+	pluginTr, err := transport.NewUDSTransport(fds[1], false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = clientTr.Close(); _ = pluginTr.Close() })
 

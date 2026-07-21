@@ -243,6 +243,98 @@ func (panicOnPushRing) Push(ring.Descriptor) error {
 func (panicOnPushRing) Tail() uint64 { return 0 }
 func (panicOnPushRing) Len() uint64  { return 0 }
 
+// wakeBurstRing drives the two blocking-wake burst tests. It records every push
+// attempt — successful lifecycle publishes and, when dataStuck, rejected data
+// attempts — in one ordered log, so a test can measure the longest run of
+// consecutive lifecycle publishes between data attempts. Every lifecycle (CANCEL)
+// push waits on release and signals reached, so a test can park the writer
+// mid-publish and load a whole lifecycle burst into the buffered queue before the
+// drain resumes. Data pushes never gate; when dataStuck, each is rejected with
+// ring.ErrFull so its intent parks in the stuck carry and every later retry
+// re-attempts (and re-records) the push. The tests prove run reached the target
+// wake select through the writer's onBlock hook, not through this ring.
+type wakeBurstRing struct {
+	mu        sync.Mutex
+	log       []ring.Descriptor
+	reached   chan struct{}
+	release   chan struct{}
+	dataStuck bool
+}
+
+func (r *wakeBurstRing) Push(d ring.Descriptor) error {
+	if d.Kind() == ring.KindCancel {
+		select {
+		case r.reached <- struct{}{}:
+		default:
+		}
+		<-r.release
+
+		r.mu.Lock()
+		r.log = append(r.log, d)
+		r.mu.Unlock()
+
+		return nil
+	}
+
+	r.mu.Lock()
+	r.log = append(r.log, d)
+	r.mu.Unlock()
+	if r.dataStuck {
+		return ring.ErrFull
+	}
+
+	return nil
+}
+
+func (r *wakeBurstRing) snapshot() []ring.Descriptor {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out := make([]ring.Descriptor, len(r.log))
+	copy(out, r.log)
+
+	return out
+}
+
+func (r *wakeBurstRing) Tail() uint64 { return 0 }
+func (r *wakeBurstRing) Len() uint64  { return 0 }
+
+// maxLifecycleRun returns the longest run of consecutive CANCEL (lifecycle)
+// descriptors in a push log, so a test can assert no run exceeds B. A data
+// push attempt (KindUnaryReq) breaks a run — that is the "data was attempted"
+// boundary the bounded burst exists to guarantee.
+func maxLifecycleRun(ds []ring.Descriptor) int {
+	best, run := 0, 0
+	for _, d := range ds {
+		if d.Kind() == ring.KindCancel {
+			run++
+			if run > best {
+				best = run
+			}
+		} else {
+			run = 0
+		}
+	}
+
+	return best
+}
+
+// kindsOf renders a push log as a compact kind sequence ("C" for a lifecycle
+// CANCEL, "D" for a data attempt), so a failing burst assertion shows the exact
+// publish order instead of opaque descriptors.
+func kindsOf(ds []ring.Descriptor) string {
+	out := make([]byte, 0, len(ds))
+	for _, d := range ds {
+		if d.Kind() == ring.KindCancel {
+			out = append(out, 'C')
+		} else {
+			out = append(out, 'D')
+		}
+	}
+
+	return string(out)
+}
+
 // allocFreeArena is a payloadArena double that always serves the same fixed
 // slab handle from Alloc and records every handle passed to Free, so a test
 // can assert a rolled-back admission frees exactly the slab it allocated
@@ -482,57 +574,109 @@ func TestWriter_ResumesStuckData_OnRetrySignal(t *testing.T) {
 	require.Equal(t, uint64(7), pushed[0].CallID())
 }
 
-// Test that submit returns on the caller's context, not by hanging on a stalled
-// writer (design §19: waiting callers block on their own context, never a writer
-// lock).
-func TestWriter_Submit_ReturnsOnCallerCtxCancel_NotWriterLock(t *testing.T) {
-	t.Run("stalled writer: submit returns on ctx cancel", func(t *testing.T) {
-		// Given a constructed-but-not-running writer, so a submitted intent's
-		// completion never arrives.
-		w := newWriterFromParts(&recordRing{}, noArena{}, 1, 1, admitBlock)
+// Test the lifecycle lane's non-abandonable-after-enqueue contract (LS1,
+// stream-protocol.md §5.1): once a lifecycle intent is enqueued, submit returns
+// ONLY on the writer's report for that intent — a caller's context cancel does
+// NOT unblock it early. The report is what releases the RPC runtime's per-stream
+// lifecycle token, so abandoning after enqueue would let two lifecycle intents
+// exist for one call, breaking the ABI's aggregate invariant. RED against the
+// old two-case submit (which returned on ctx cancel); GREEN against the
+// lane-split submit.
+func TestWriter_Submit_Lifecycle_NonAbandonableAfterEnqueue(t *testing.T) {
+	// Given a running writer gated mid-emit, so the submitted lifecycle intent is
+	// enqueued and dequeued but not yet reported.
+	g := &gateRing{reached: make(chan struct{}, 1), release: make(chan struct{})}
+	w := newWriterFromParts(g, noArena{}, 2, 2, admitBlock)
+	w.start()
+	t.Cleanup(w.stop)
 
-		ctx, cancel := context.WithCancel(t.Context())
-		result := make(chan error, 1)
-		go func() {
-			result <- w.submit(ctx, cancelFrame(1), laneLifecycle)
-		}()
+	// Release the gate at most once, and always by cleanup, so a failed assertion
+	// cannot leave the writer wedged in the gated Push (which would hang stop).
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(g.release) }) }
+	t.Cleanup(releaseGate)
 
-		// When the caller's context is canceled.
-		cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		result <- w.submit(ctx, cancelFrame(1), laneLifecycle)
+	}()
 
-		// Then submit returns promptly with the caller's context error.
-		require.ErrorIs(t, recvWithin(t, result, "submit did not return on ctx cancel"), context.Canceled)
-	})
+	// The writer has dequeued the intent and is blocked mid-emit inside the gated
+	// Push; the submitter is parked on the report.
+	<-g.reached
 
-	t.Run("running writer: caller abandons, later report drops harmlessly", func(t *testing.T) {
-		// Given a running writer gated mid-emit, so the intent is dequeued but not yet
-		// reported when the caller abandons — the report races an abandoned caller.
-		g := &gateRing{reached: make(chan struct{}, 1), release: make(chan struct{})}
-		w := newWriterFromParts(g, noArena{}, 2, 2, admitBlock)
-		w.start()
-		t.Cleanup(w.stop)
+	// When the caller's context is canceled.
+	cancel()
 
-		ctx, cancel := context.WithCancel(t.Context())
-		result := make(chan error, 1)
-		go func() {
-			result <- w.submit(ctx, cancelFrame(1), laneLifecycle)
-		}()
+	// Then submit does NOT return early: the cancel must not unblock it while the
+	// report is still pending (the old two-case select would return here).
+	select {
+	case err := <-result:
+		t.Fatalf("lifecycle submit returned on ctx cancel before the writer's report: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
 
-		// The writer has dequeued the intent and is blocked mid-emit; the caller is
-		// parked on {done, ctx}. Cancel so the caller abandons before the writer
-		// reports.
-		<-g.reached
-		cancel()
-		require.ErrorIs(t,
-			recvWithin(t, result, "abandoning caller did not return on ctx cancel"), context.Canceled)
+	// And once the writer's report arrives (the gate releases and the CANCEL
+	// publishes), submit returns that report — success, not the context error.
+	releaseGate()
+	require.NoError(t, recvWithin(t, result, "lifecycle submit did not return on the writer's report"))
+}
 
-		// Release the gated emit: the writer reports into the abandoned cap-1 done,
-		// which cannot block it.
-		close(g.release)
+// Test that a DATA-lane submission still returns on the caller's context after
+// enqueue, not by hanging on a stalled writer (design §19; §4.5 retains
+// abandon-on-cancel on the data lane, which LS1 changes only for lifecycle). The
+// data lane's regression guard for the LS1 split.
+func TestWriter_Submit_Data_ReturnsOnCallerCtxCancel(t *testing.T) {
+	// Given a constructed-but-not-running writer, so an enqueued data intent's
+	// completion never arrives.
+	w := newWriterFromParts(&recordRing{}, noArena{}, 1, 1, admitBlock)
 
-		// The writer is not wedged: a subsequent intent is still served.
-		require.NoError(t, w.submit(t.Context(), cancelFrame(2), laneLifecycle))
-	})
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		result <- w.submit(ctx, dataReqFrame(1), laneData)
+	}()
+
+	// When the caller's context is canceled.
+	cancel()
+
+	// Then submit returns promptly with the caller's context error.
+	require.ErrorIs(t, recvWithin(t, result, "data submit did not return on ctx cancel"), context.Canceled)
+}
+
+// Test the lifecycle lane's all-or-nothing pre-enqueue guarantee (LS2,
+// stream-protocol.md §5.1): a lifecycle submission that returns without
+// enqueuing its intent publishes nothing for that submission. Submitting with an
+// already-canceled context onto a full lifecycle queue returns the context error
+// from enqueue itself, and the intent never reaches the writer — only the
+// intent that was already queued is ever published.
+func TestWriter_Submit_Lifecycle_AllOrNothingBeforeEnqueue(t *testing.T) {
+	// Given a not-yet-running writer whose lifecycle queue (cap 1) is already full.
+	rr := &recordRing{}
+	w := newWriterFromParts(rr, noArena{}, 1, 1, admitBlock)
+	occupant := cancelIntent(1)
+	w.lifecycleQueue <- occupant
+
+	// When submitting a second lifecycle frame under an already-canceled context.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := w.submit(ctx, cancelFrame(2), laneLifecycle)
+
+	// Then submit returns the context error (from enqueue, before any send).
+	require.ErrorIs(t, err, context.Canceled)
+
+	// And the rejected submission never entered the queue: only the pre-existing
+	// occupant is there, so the writer can only ever publish that one. Draining
+	// the queue proves the second intent is absent.
+	require.Len(t, w.lifecycleQueue, 1, "the canceled submission must not have enqueued")
+	got := <-w.lifecycleQueue
+	require.Equal(t, uint64(1), got.frame.CallID, "only the pre-existing occupant is queued")
+
+	// The writer publishes nothing on its own for the rejected submission.
+	w.start()
+	t.Cleanup(w.stop)
+	require.Empty(t, rr.snapshot(), "no intent is published for a submission that never enqueued")
 }
 
 // Test both admission modes for a full data-submission queue (design §19): reject
@@ -642,22 +786,27 @@ func TestWriter_LifecycleLane_NoDeadlockUnderRandomBurst(t *testing.T) {
 	}
 }
 
-// Test that lifecycle intents make bounded progress ahead of a data backlog. A
-// batch of data intents is enqueued first, then a batch of CANCELs behind them,
-// before the writer starts — so every CANCEL is provably enqueued behind the whole
-// data backlog. The writer's strict lifecycle-first drain (design §12) then
-// publishes every CANCEL before any of that data: the lag is zero, never the whole
-// backlog. Randomized sizes; run at -count=1000 -race. This fails for a data-first
-// scheduler that drains the finite burst before serving lifecycle.
-func TestWriter_LifecycleLane_BoundedProgressAheadOfDataBacklog(t *testing.T) {
-	dataN := 50 + rand.IntN(150)
-	cancelN := 5 + rand.IntN(25)
+// Test the bounded-burst rule B = 4 (stream-protocol.md §5.2/§5.3): with a
+// continuously non-empty lifecycle queue AND ready data, the writer publishes at
+// most B consecutive lifecycle intents before it attempts exactly one data
+// intent, so a hot lifecycle lane cannot starve data. A backlog of CANCELs and
+// data is enqueued before the writer starts, making the drain order
+// deterministic: the queues are buffered and each select prefers its ready case,
+// so the published sequence is fixed.
+//
+// The assertion pins the bound precisely: the first data descriptor appears at
+// index B, preceded by exactly B CANCELs. This FAILS against an unbounded-drain
+// mutation (all CANCELs would publish first, so the first data would be at index
+// cancelN) and against any other burst bound (B = 1 would put it at index 1).
+func TestWriter_LifecycleLane_BoundedBurstBeforeDataAttempt(t *testing.T) {
+	const cancelN = 9 // > B, so the burst is bounded before the queue empties
+	const dataN = 3   // enough data to be interleaved across turns
 
 	rr := &recordRing{}
 	w := newWriterFromParts(rr, noArena{}, dataN, cancelN, admitBlock)
 
-	// Enqueue the whole data backlog first, then the CANCELs behind it, before the
-	// writer starts, so the data is provably enqueued before every CANCEL.
+	// Enqueue both lanes before the writer starts. Data frames are empty-payload
+	// (no slab, noArena is never touched), so a data attempt always publishes.
 	for k := range dataN {
 		w.dataQueue <- dataIntent(uint64(k))
 	}
@@ -673,19 +822,200 @@ func TestWriter_LifecycleLane_BoundedProgressAheadOfDataBacklog(t *testing.T) {
 	t.Cleanup(w.stop)
 
 	for k := range cancelN {
-		require.NoError(t,
-			recvWithin(t, cancelDone[k], "a lifecycle intent was starved behind the data backlog"))
+		require.NoError(t, recvWithin(t, cancelDone[k], "a lifecycle intent was starved"))
 	}
 
-	// Then every CANCEL descriptor is published ahead of the data enqueued before
-	// it: the first cancelN pushes are all CANCELs, with no data interleaved. A
-	// data-first scheduler would place a data descriptor among these positions.
+	// Then the first B pushes are CANCELs and the (B+1)-th push is a data intent:
+	// data was attempted after exactly B consecutive lifecycle publishes.
 	pushed := rr.snapshot()
-	require.GreaterOrEqual(t, len(pushed), cancelN)
-	for k := range cancelN {
-		require.Equal(t, ring.KindCancel, pushed[k].Kind(),
-			"a data descriptor preceded a CANCEL that was enqueued behind a data backlog")
+	require.GreaterOrEqual(t, len(pushed), lifecycleBurstBound+1)
+	for k := range lifecycleBurstBound {
+		require.Equalf(t, ring.KindCancel, pushed[k].Kind(),
+			"push %d must be a lifecycle intent within the first burst", k)
 	}
+	require.Equal(t, ring.KindUnaryReq, pushed[lifecycleBurstBound].Kind(),
+		"a data intent must be attempted after exactly B consecutive lifecycle publishes")
+
+	// And no run of consecutive lifecycle publishes anywhere exceeds B, so data is
+	// never starved for longer than one bounded burst.
+	run := 0
+	for _, d := range pushed {
+		if d.Kind() == ring.KindCancel {
+			run++
+			require.LessOrEqualf(t, run, lifecycleBurstBound,
+				"a run of %d consecutive lifecycle publishes exceeds B = %d", run, lifecycleBurstBound)
+		} else {
+			run = 0
+		}
+	}
+}
+
+// Test the bounded-burst rule B = 4 (stream-protocol.md §5.2/§5.3) on the path
+// the preloaded burst test cannot reach: the writer blocked in its IDLE wake
+// select with an empty lifecycle queue, then woken by a burst. A wake that
+// publishes its received intent outside the burst counter would emit one
+// uncounted publish and then a fresh counted burst of B — five consecutive
+// lifecycle publishes before data is attempted. The gated ring parks the writer
+// mid-publish so the whole burst is buffered before the drain resumes, making the
+// count deterministic. RED (a run of B+1) against a wake that publishes in the
+// select; GREEN (a run of exactly B) once the wake stages its intent for the
+// counted turn.
+func TestWriter_LifecycleBurst_BoundedFromIdleWake(t *testing.T) {
+	const burstN = lifecycleBurstBound + 1 // one more than B, so an uncounted wake publish shows as a B+1 run
+
+	r := &wakeBurstRing{
+		reached: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	w := newWriterFromParts(r, noArena{}, 2, burstN, admitBlock)
+
+	// Observe when run parks on a wake select. A coalescing non-blocking send keeps
+	// the hook from ever blocking run, so run stays free to reach its shutdown drain
+	// at cleanup; the buffer holds the first park, which is the one this test forces.
+	blocked := make(chan blockSite, 1)
+	w.onBlock = func(s blockSite) {
+		select {
+		case blocked <- s:
+		default:
+		}
+	}
+
+	// Prime one data turn BEFORE start, so run's very first blocking select is the
+	// idle wake with both queues empty — not a pre-prime idle park. run's Step 2
+	// publishes this data intent (its push is not gated: only CANCEL pushes gate),
+	// then Step 3 parks in the idle select, which is the first onBlock call.
+	primeD := dataIntent(1)
+	w.dataQueue <- primeD
+	w.start()
+	t.Cleanup(w.stop)
+
+	// Release the gate at most once, and always by cleanup, so a failed assertion
+	// cannot leave the writer wedged in the gated push (which would hang stop).
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(r.release) }) }
+	t.Cleanup(releaseGate)
+
+	// Prove run has parked in the idle wake select: only then is a lifecycle intent
+	// guaranteed to arrive via that select rather than being drained in a counted
+	// Step 1 burst. Reaching the idle park implies Step 2 already published primeD.
+	require.Equal(t, blockIdle, <-blocked, "run did not park in the idle wake select")
+	require.NoError(t, recvWithin(t, primeD.done, "priming data intent was not published"))
+
+	// The writer is parked in the idle wake select. The first lifecycle intent wakes
+	// it via that select; it publishes (or stages then publishes) and blocks inside
+	// the gated ring push.
+	cancels := make([]intent, burstN)
+	cancels[0] = cancelIntent(1)
+	w.lifecycleQueue <- cancels[0]
+
+	// The writer is now parked mid-publish and cannot drain, so load the rest of
+	// the burst and one data intent: the whole burst is available the instant the
+	// drain resumes, and the data attempt marks the "data got a turn" boundary that
+	// splits the burst.
+	<-r.reached
+	for k := 1; k < burstN; k++ {
+		cancels[k] = cancelIntent(uint64(1 + k))
+		w.lifecycleQueue <- cancels[k]
+	}
+	boundaryD := dataIntent(100)
+	w.dataQueue <- boundaryD
+
+	// When the drain resumes and works through the burst, then attempts data.
+	releaseGate()
+
+	for k := range burstN {
+		require.NoError(t, recvWithin(t, cancels[k].done, "a lifecycle intent in the idle-wake burst was starved"))
+	}
+	require.NoError(t, recvWithin(t, boundaryD.done, "data was never attempted after the idle-wake lifecycle burst"))
+
+	// Then no run of consecutive lifecycle publishes before a data attempt exceeds B.
+	pushed := r.snapshot()
+	require.LessOrEqualf(t, maxLifecycleRun(pushed), lifecycleBurstBound,
+		"idle wake published more than B = %d consecutive lifecycle intents before attempting data: %v",
+		lifecycleBurstBound, kindsOf(pushed))
+}
+
+// Test the bounded-burst rule B = 4 on the second blocking-wake path: the writer
+// blocked in its STUCK-CARRY wake select (a data intent parked on backpressure,
+// lifecycle queue empty), then woken by a burst. As with the idle wake, a wake
+// that publishes its received intent outside the burst counter yields B+1
+// consecutive lifecycle publishes before the next data attempt. The exhausted-ring
+// data intent stays stuck and re-attempts (recording a data push) each turn, so
+// the attempts appear in the log and break the lifecycle runs. RED (a run of B+1)
+// against a wake that publishes in the select; GREEN (a run of exactly B) once the
+// wake stages its intent for the counted turn.
+func TestWriter_LifecycleBurst_BoundedFromStuckCarryWake(t *testing.T) {
+	const burstN = lifecycleBurstBound + 1
+
+	r := &wakeBurstRing{
+		reached:   make(chan struct{}, 1),
+		release:   make(chan struct{}),
+		dataStuck: true, // data pushes are rejected with ErrFull, so the data intent parks in the stuck carry
+	}
+	w := newWriterFromParts(r, noArena{}, 2, burstN, admitBlock)
+
+	// Observe when run parks on a wake select (coalescing, so the hook never blocks
+	// run — see the idle-wake test for why that matters at cleanup).
+	blocked := make(chan blockSite, 1)
+	w.onBlock = func(s blockSite) {
+		select {
+		case blocked <- s:
+		default:
+		}
+	}
+
+	// Park a data intent in the stuck carry BEFORE start: run's Step 2 dequeues it,
+	// its push is rejected with ErrFull, so run sets it aside and parks in the
+	// stuck-carry wake select — the first onBlock call, with the lifecycle queue
+	// still empty.
+	dataI := dataIntent(100)
+	w.dataQueue <- dataI
+	w.start()
+	t.Cleanup(w.stop)
+
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(r.release) }) }
+	t.Cleanup(releaseGate)
+
+	// Prove run installed the stuck carry AND parked in the stuck-carry wake select:
+	// only then is a lifecycle intent guaranteed to arrive via that select rather
+	// than a counted Step 1 burst.
+	require.Equal(t, blockStuckCarry, <-blocked, "run did not park in the stuck-carry wake select")
+
+	// Wake the stuck-carry select with the first lifecycle intent; it publishes (or
+	// stages then publishes) and blocks in the gated ring push.
+	cancels := make([]intent, burstN)
+	cancels[0] = cancelIntent(1)
+	w.lifecycleQueue <- cancels[0]
+
+	// Parked mid-publish: load the rest of the burst so the full burst is buffered
+	// before the drain resumes.
+	<-r.reached
+	for k := 1; k < burstN; k++ {
+		cancels[k] = cancelIntent(uint64(1 + k))
+		w.lifecycleQueue <- cancels[k]
+	}
+
+	// When the drain resumes and works through the burst, re-attempting the stuck
+	// data intent once per turn.
+	releaseGate()
+
+	for k := range burstN {
+		require.NoError(t, recvWithin(t, cancels[k].done, "a lifecycle intent in the stuck-carry burst was starved"))
+	}
+
+	// The data intent stays stuck (ErrFull forever); cleanup's stop drains it. Its
+	// per-turn re-attempts are recorded, so they break the lifecycle runs in the log.
+	select {
+	case <-dataI.done:
+		t.Fatal("data intent should remain stuck on a full ring window")
+	default:
+	}
+
+	pushed := r.snapshot()
+	require.LessOrEqualf(t, maxLifecycleRun(pushed), lifecycleBurstBound,
+		"stuck-carry wake published more than B = %d consecutive lifecycle intents before attempting data: %v",
+		lifecycleBurstBound, kindsOf(pushed))
 }
 
 // Test that a payload-bearing data intent is stamped from its slab handle and the
@@ -743,6 +1073,56 @@ func TestWriter_StampsCancelDescriptor_AsDescriptorOnly(t *testing.T) {
 	require.Equal(t, uint64(0), d.AllocSeq())
 	require.Equal(t, uint32(0), d.Generation())
 	require.Equal(t, uint16(0), d.Flags())
+}
+
+// Test that the stream control word is stamped into the descriptor's reserved
+// word (offset 56, stream-protocol.md §2.2), and that a non-stream frame leaves
+// it 0 — the structural way shm-abi.md's "reserved MUST be 0 unless the feature
+// was negotiated" is satisfied, with no explicit gate (a unary/cancel Control is
+// always 0).
+func TestWriter_StampsControlWord_IntoReserved(t *testing.T) {
+	w := newWriterFromParts(&recordRing{}, noArena{}, 1, 1, admitBlock)
+
+	t.Run("unary frame with zero Control leaves reserved 0", func(t *testing.T) {
+		d, st := w.build(intent{
+			frame: transport.Frame{CallID: 1, Kind: transport.FrameUnaryResp},
+			lane:  laneData,
+			done:  make(chan error, 1),
+		})
+		require.Equal(t, buildOK, st)
+		require.Zero(t, d.Reserved(), "a non-stream frame's reserved word must be 0")
+	})
+
+	t.Run("cancel frame with zero Control leaves reserved 0", func(t *testing.T) {
+		d, st := w.build(cancelIntent(2))
+		require.Equal(t, buildOK, st)
+		require.Zero(t, d.Reserved(), "a unary CANCEL's reserved word must be 0")
+	})
+
+	t.Run("descriptor-only STREAM_ACK carries its control word", func(t *testing.T) {
+		d, st := w.build(intent{
+			frame: transport.Frame{CallID: 3, Kind: transport.FrameStreamAck, Control: 42},
+			lane:  laneLifecycle,
+			done:  make(chan error, 1),
+		})
+		require.Equal(t, buildOK, st)
+		require.Equal(t, ring.KindStreamAck, d.Kind())
+		require.Equal(t, uint64(42), d.Reserved(), "STREAM_ACK's cumulative ack count rides in reserved")
+	})
+
+	t.Run("payload-bearing STREAM_MSG carries its sequence number", func(t *testing.T) {
+		sa := &stubArena{offset: 4096, generation: 1, sequence: 5}
+		wp := newWriterFromParts(&recordRing{}, sa, 1, 1, admitBlock)
+		wp.gen = 1
+		d, st := wp.build(intent{
+			frame: transport.Frame{CallID: 4, Kind: transport.FrameStreamMsg, Control: 7, Payload: []byte("m")},
+			lane:  laneData,
+			done:  make(chan error, 1),
+		})
+		require.Equal(t, buildOK, st)
+		require.Equal(t, ring.KindStreamMsg, d.Kind())
+		require.Equal(t, uint64(7), d.Reserved(), "STREAM_MSG's sequence number rides in reserved")
+	})
 }
 
 // Test that an empty-payload data frame allocates no slab and keeps the "no slab"
@@ -891,6 +1271,100 @@ func TestWriter_RejectsOversizePayload_AtBuild(t *testing.T) {
 	// Then it is a terminal reject, before any allocation.
 	require.Equal(t, buildFailed, st)
 	require.ErrorIs(t, <-i.done, transport.ErrPayloadTooLarge)
+}
+
+// Test LS1's shutdown-liveness safety net (stream-protocol.md §5.1). LS1 removed
+// the ctx.Done() case from a lifecycle submit, so once enqueued the ONLY thing
+// that releases the submitter is the writer's report. This pins that a lifecycle
+// intent provably sitting on the queue, un-dequeued, when the writer stops is
+// still reported: the wait returns rather than hanging, and a canceled caller
+// context does NOT unblock it early. The writer is gated mid-publish of a prior
+// lifecycle intent, so the intent under test stays enqueued and un-dequeued; its
+// enqueue is proven complete by splitting submit's two phases (no queue poll), and
+// shutdown is closed BEFORE the gate is released, so the report is driven by the
+// stop/drain path rather than an ordinary pre-shutdown publication.
+//
+// The returned value is the writer's report. The writer publishes a still-queued
+// lifecycle intent in its bounded burst (run's Step 1) before it ever reaches the
+// shutdown drain, so here the report is a successful publish (nil), not ErrClosed:
+// drainAndStop's ErrClosed is the fallback for intents the burst never reaches —
+// the set-aside data carry (see TestWriter_Submit_ReturnsErrClosed_OnStop) and a
+// lifecycle intent enqueued only after the writer already parked on shutdown.
+// Either way every pending intent is reported, which is the liveness guarantee.
+// What this test forbids is the two unsafe outcomes LS1 could have introduced: a
+// hang, or a return of the caller's context error.
+func TestWriter_Submit_Lifecycle_ReportedAtStop_NotAbandoned(t *testing.T) {
+	g := &gateRing{reached: make(chan struct{}, 1), release: make(chan struct{})}
+	w := newWriterFromParts(g, noArena{}, 4, 4, admitBlock)
+	w.start()
+
+	// Release the gate at most once, and always by cleanup, so a failed assertion
+	// cannot leave the writer wedged in the gated push (which would hang stop).
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(g.release) }) }
+	t.Cleanup(releaseGate)
+
+	// A prior lifecycle intent the writer dequeues and blocks publishing, so the
+	// writer is busy in the gated push and cannot drain the queue — the intent under
+	// test therefore stays enqueued and un-dequeued for the rest of the test.
+	first := cancelIntent(1)
+	w.lifecycleQueue <- first
+	<-g.reached
+
+	// The intent under test. Its two submit phases are split so the enqueue is
+	// observable — a poll-free proof that it is enqueued before the context is
+	// canceled (which the ctx-cancel assertion below requires, since enqueue's own
+	// select would otherwise race the canceled context). The wait that follows is
+	// exactly submit's lifecycle path: return ONLY on the writer's report, with no
+	// context case and no timer (see submit).
+	ctx, cancel := context.WithCancel(t.Context())
+	i2 := cancelIntent(2)
+	enqueued := make(chan error, 1)
+	result := make(chan error, 1)
+	go func() {
+		if err := w.enqueue(ctx, i2, laneLifecycle); err != nil {
+			enqueued <- err
+
+			return
+		}
+		close(enqueued)
+		result <- <-i2.done // LS1: return ONLY on the writer's report
+	}()
+	require.NoError(t, recvWithin(t, enqueued, "the lifecycle intent under test was never enqueued"),
+		"the intent under test must enqueue before the context is canceled")
+
+	// Canceling the caller's context must NOT unblock the LS1 wait (non-abandonable):
+	// only the writer's report may. The wait has no context case, exactly as submit's
+	// lifecycle path — so the intent stays enqueued and un-dequeued while the writer
+	// is wedged in the gated push.
+	cancel()
+	select {
+	case err := <-result:
+		t.Fatalf("lifecycle wait returned on ctx cancel before the writer's report: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Close shutdown BEFORE releasing the gate, so the intent under test is drained
+	// under a shutdown that is provably already in effect — its completion is driven
+	// by the stop/drain path, not by an ordinary pre-shutdown publication. stop
+	// closes shutdown first, then blocks until run drains and returns; the writer is
+	// still wedged in the gated push, so run cannot drain until the gate releases.
+	go w.stop()
+	<-w.shutdown // stop has closed shutdown; only now release the gate
+
+	releaseGate()
+
+	// Then the wait returns the writer's report — never hanging, never the caller's
+	// context error. A stopped writer reports every pending intent: a successful
+	// publish (nil), if run's bounded burst republishes the still-queued intent
+	// before it observes shutdown, or transport.ErrClosed for an intent the drain
+	// reaches first.
+	err := recvWithin(t, result, "lifecycle wait hung at stop instead of being reported")
+	require.NotErrorIs(t, err, context.Canceled,
+		"a stopped writer must report the intent, not surface the caller's canceled context")
+	if err != nil {
+		require.ErrorIs(t, err, transport.ErrClosed, "the only non-nil report at stop is ErrClosed")
+	}
 }
 
 // Test that a submission still pending at shutdown is drained with

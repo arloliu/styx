@@ -371,7 +371,12 @@ func (s *PluginServer) pluginAttach(ctx context.Context, conn *control.Conn) (tr
 		return nil, err
 	}
 
-	tr, err := transport.NewUDSTransport(dataFD)
+	// The negotiated tuple is resolved in pluginHandshake and not threaded to
+	// this attach step, so the acknowledged streaming state is not in scope
+	// here; pass false until the tuple reaches construction. streaming is not a
+	// negotiable feature under layout_version 1, so the host derives false too
+	// and the two header shapes still agree (stream-protocol.md §2.4).
+	tr, err := transport.NewUDSTransport(dataFD, false)
 	if err != nil {
 		_ = unix.Close(dataFD)
 

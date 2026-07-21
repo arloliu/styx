@@ -164,6 +164,15 @@ type writer struct {
 	// synchronization; it is reset at the top of every build.
 	pendingSlab slabRef
 
+	// onBlock is a test-only observation hook: when non-nil, run calls it with the
+	// blockSite of a wake select immediately before parking on that select, so a
+	// test can prove run reached a specific intermediate state before delivering a
+	// burst rather than racing to reach it. It is nil in every production build
+	// (neither newWriterFromParts nor newRegionWriter sets it), so the guarded call
+	// is a no-op that leaves run's control flow unchanged; a test installs it
+	// directly on the constructed writer. It must not block run indefinitely.
+	onBlock func(blockSite)
+
 	// closeMu guards the closed flag and, held for read across an enqueue, forms
 	// the barrier stop waits on: stop takes the write lock only after closing
 	// shutdown, so every in-flight enqueue has finished and no new one can start
@@ -252,9 +261,16 @@ func (w *writer) start() {
 	go w.run()
 }
 
-// stop shuts the writer down and blocks until its goroutine has drained every
-// pending intent (each reported with transport.ErrClosed) and returned. It is
-// safe to call more than once, but only after start. The close ordering is what
+// stop shuts the writer down and blocks until its goroutine has reported every
+// pending intent and returned. Every pending intent is reported exactly once,
+// but not uniformly with transport.ErrClosed: run's bounded lifecycle burst
+// (Step 1) can still PUBLISH a queued lifecycle intent — reporting it nil —
+// before run observes shutdown, so a lifecycle intent the drain reaches first is
+// published (nil) and only the intents the drain cannot publish (the set-aside
+// data carry, and any intent still queued when run reaches a shutdown select)
+// are failed with transport.ErrClosed. What holds uniformly is that no pending
+// intent is left to hang. It is safe to call more than once, but only after
+// start. The close ordering is what
 // makes the drain race-free: closing shutdown first unblocks any enqueue parked
 // on a full queue, so taking the write lock cannot deadlock; once the write lock
 // is held no enqueue is in flight and none can start, so run's final drain sees a
@@ -270,17 +286,38 @@ func (w *writer) stop() {
 	<-w.stopped
 }
 
-// submit queues frame on lane l and waits for the writer's result or the caller's
-// context, whichever comes first (design §19: a waiting caller blocks on its own
-// context, never a writer lock). A canceled or expired caller returns its context
-// error; the writer may still emit the abandoned intent, which is harmless. For a
-// full data queue, submit blocks or returns ErrBackpressure per the writer's
-// admission mode; the lifecycle lane never returns ErrBackpressure.
+// submit queues frame on lane l and waits for the writer's result. The
+// post-enqueue wait differs by lane (stream-protocol.md §5.1):
+//
+//   - Data lane: waits for the writer's report or the caller's context,
+//     whichever comes first (design §19). A canceled or expired caller returns
+//     its context error; the writer may still emit the abandoned intent, which
+//     is harmless on this lane — §4.5 makes acceptance final and disposes of the
+//     residue as an ordinary late frame.
+//   - Lifecycle lane (LS1): once enqueued, the submission returns ONLY on the
+//     writer's report for that intent — no context case, no timer. The report is
+//     what releases the RPC runtime's per-stream lifecycle token, so a caller
+//     abandoning after enqueue would release the token while its intent was still
+//     queued, letting a second lifecycle intent (a handed-off CANCEL or a fresh
+//     ACK) exist for one call — breaking the ABI's aggregate invariant. The wait
+//     still terminates: the writer reports every pending intent — never
+//     abandoning it, never surfacing the caller's context error. At shutdown that
+//     report is either a successful publish (nil), if run's bounded burst reaches
+//     the intent before it observes shutdown, or transport.ErrClosed if the drain
+//     cannot publish it (see stop).
+//
+// For a full data queue, submit blocks or returns ErrBackpressure per the
+// writer's admission mode; the lifecycle lane never returns ErrBackpressure.
 func (w *writer) submit(ctx context.Context, frame transport.Frame, l lane) error {
 	i := intent{frame: frame, lane: l, wire: wirePayload(frame), done: make(chan error, 1)}
 
 	if err := w.enqueue(ctx, i, l); err != nil {
 		return err
+	}
+
+	if l == laneLifecycle {
+		// (LS1): non-abandonable after enqueue — wait on the report alone.
+		return <-i.done
 	}
 
 	select {
@@ -294,6 +331,17 @@ func (w *writer) submit(ctx context.Context, frame transport.Frame, l lane) erro
 // enqueue places i on its lane's queue, honoring the admission mode and the close
 // protocol. It holds the read lock across the send so stop's write lock (taken
 // only after shutdown is closed) waits for it, keeping run's drain race-free.
+//
+// All-or-nothing invariant (LS2, stream-protocol.md §5.1): every return path
+// that is not the `case q <- i:` arm — a context error, w.shutdown closing, or
+// the reject-mode default — provably did NOT push i onto the queue, because
+// exactly one case of a select fires. So a submission that returns an error has
+// published no intent, and none ever will be. This is load-bearing for the
+// lifecycle lane: it is what lets a failed lifecycle submission release its
+// per-stream token without stranding a queued intent behind it. Do not
+// restructure this so any error path can coexist with a completed send (e.g. a
+// send followed by a separate context check), which would silently reintroduce a
+// send-then-also-return-error race.
 func (w *writer) enqueue(ctx context.Context, i intent, l lane) error {
 	w.closeMu.RLock()
 	defer w.closeMu.RUnlock()
@@ -333,49 +381,123 @@ func (w *writer) enqueue(ctx context.Context, i intent, l lane) error {
 	}
 }
 
-// run is the single writer goroutine's loop. Each turn it drains pending
-// lifecycle intents first (strict priority, design §12), then retries any
-// set-aside data intent with a single non-blocking attempt, then waits for more
-// work. The main three-way select picks uniformly at random, so a lifecycle
-// intent that becomes ready after the top-of-loop drain but alongside a ready
-// data case can be preceded by exactly one non-blocking data op: the §12
-// guarantee is that lifecycle is never blocked or starved, not that no data ever
-// precedes it, and one non-blocking op is the bound. While a data intent is stuck
-// it neither pulls more data (which would exceed the queue bound) nor blocks on
-// data-lane progress: it waits only for a lifecycle intent, the retry seam, or
-// shutdown, so a CANCEL always preempts the backpressure. Reclaiming a slab does
-// not by itself resume the stuck data: the consumer→producer "space-available"
-// wake is not wired for this milestone (shm-abi.md §11/§12 specify only
-// producer→consumer wakes) and the retry seam has no production caller yet, so
-// absent further lifecycle traffic the set-aside intent resumes at shutdown.
+// lifecycleBurstBound is B (stream-protocol.md §5.2/§5.3): the writer publishes
+// at most this many consecutive lifecycle intents per turn before attempting
+// exactly one data intent, so a hot stream's STREAM_ACK traffic on the lifecycle
+// lane cannot starve data (design §12). It bounds the data side's worst-case
+// per-turn wait at four descriptor-only publishes; it is deliberately not
+// derived from the stream count.
+const lifecycleBurstBound = 4
+
+// blockSite names the blocking select run is about to park on, reported through
+// the test-only onBlock observation hook so a test can prove run reached a
+// specific wake state before it delivers a burst. It has no production meaning:
+// onBlock is nil in every production build (see the field's doc).
+type blockSite uint8
+
+const (
+	// blockIdle is the wake select run parks on with no data set aside and the
+	// lifecycle queue empty (run's final select).
+	blockIdle blockSite = iota
+	// blockStuckCarry is the wake select run parks on while a data intent is set
+	// aside on backpressure and the lifecycle queue is empty (run's stuck select).
+	blockStuckCarry
+)
+
+// run is the single writer goroutine's loop. Each turn (stream-protocol.md §5.3):
+// (1) publish at most B lifecycle intents in queue order while the queue is
+// non-empty (strict lifecycle-over-data priority, design §12, bounded at B so
+// ACK traffic cannot starve data); (2) attempt exactly one data intent
+// non-blocking — retry the set-aside carry, or dequeue one fresh data intent;
+// (3) if the lifecycle queue is still non-empty, proceed directly to the next
+// turn rather than sleeping, so the burst never strands lifecycle intents past
+// the fourth. The writer blocks only when it has nothing to do. While a data
+// intent is stuck it neither pulls more data (which would exceed the queue
+// bound) nor blocks on data-lane progress: it waits only for a lifecycle intent,
+// the retry seam, or shutdown, so lifecycle always preempts the backpressure.
+// Reclaiming a slab does not by itself resume the stuck data: the
+// consumer→producer "space-available" wake is not wired for this milestone
+// (shm-abi.md §11/§12 specify only producer→consumer wakes) and the retry seam
+// has no production caller yet, so absent further lifecycle traffic the set-aside
+// intent resumes at shutdown.
 func (w *writer) run() {
 	var stuck *carry
 
+	// staged holds a lifecycle intent a blocking wake select received. The wake
+	// does not publish it there — that publish would be outside Step 1's B counter,
+	// so a burst arriving while the writer was blocked could publish B+1 consecutive
+	// lifecycle intents before data got a turn (stream-protocol.md §5.3). Instead the
+	// wake stages the intent and loops, and Step 1 publishes it as the first COUNTED
+	// intent of the next turn, capping consecutive lifecycle publishes at B on every
+	// path. A value plus a bool (not a pointer to the select case variable, which is
+	// reused) keeps the staged intent safe to carry across the loop.
+	var staged intent
+	var haveStaged bool
+
 	for {
-		// Strict lifecycle priority: emit one pending lifecycle intent and restart
-		// the loop before touching data or retrying stuck data (design §12).
-		select {
-		case i := <-w.lifecycleQueue:
-			w.emitLifecycle(i)
-
-			continue
-		default:
+		// Step 1: bounded lifecycle burst — at most B consecutive publishes, in
+		// queue order while non-empty. A staged wake intent publishes first and
+		// counts toward B. Non-blocking (default ends the burst on an empty queue);
+		// shutdown is caught by the blocking selects below, after this drain
+		// publishes what is already queued.
+		burst := 0
+		if haveStaged {
+			w.emitLifecycle(staged)
+			staged = intent{}
+			haveStaged = false
+			burst++
 		}
-
-		// One non-blocking retry of the set-aside data intent, then fall through:
-		// never spin on data-lane backpressure while lifecycle may pend (design §12).
-		if stuck != nil && w.place(stuck) == emitDone {
-			stuck = nil
-		}
-
-		if stuck != nil {
+	drain:
+		for burst < lifecycleBurstBound {
 			select {
 			case i := <-w.lifecycleQueue:
 				w.emitLifecycle(i)
+				burst++
+			default:
+				break drain
+			}
+		}
+
+		// Step 2: exactly one non-blocking data attempt. Retry the set-aside carry
+		// if present; otherwise dequeue one fresh data intent. Never block on
+		// data-lane resources here — a fresh dequeue is what keeps data from
+		// starving when lifecycle is continuously non-empty (step 3 loops).
+		if stuck != nil {
+			if w.place(stuck) == emitDone {
+				stuck = nil
+			}
+		} else {
+			select {
+			case i := <-w.dataQueue:
+				if c := w.emit(i); c != nil {
+					stuck = c
+				}
+			default:
+			}
+		}
+
+		// Step 3: a turn ending with lifecycle still pending MUST proceed directly
+		// to the next turn, never sleep (§5.3), so data keeps getting its one
+		// attempt per turn while lifecycle drains. Only with the lifecycle queue
+		// empty does the writer block for the next work item.
+		if len(w.lifecycleQueue) > 0 {
+			continue
+		}
+
+		if stuck != nil {
+			if w.onBlock != nil {
+				w.onBlock(blockStuckCarry)
+			}
+			select {
+			case i := <-w.lifecycleQueue:
+				// Stage, do not publish here: the next turn's Step 1 emits it as a
+				// counted intent so the burst bound holds across this wake.
+				staged = i
+				haveStaged = true
 			case <-w.retry:
-				// Space may have freed; loop back so the top-of-loop single
-				// non-blocking place retry re-attempts the set-aside intent.
-				// Lifecycle still preempts; shutdown still drains.
+				// Space may have freed; loop back so step 2's non-blocking place
+				// retry re-attempts the set-aside intent. Lifecycle still preempts;
+				// shutdown still drains.
 			case <-w.shutdown:
 				w.drainAndStop(stuck)
 
@@ -385,9 +507,15 @@ func (w *writer) run() {
 			continue
 		}
 
+		if w.onBlock != nil {
+			w.onBlock(blockIdle)
+		}
 		select {
 		case i := <-w.lifecycleQueue:
-			w.emitLifecycle(i)
+			// Stage, do not publish here: the next turn's Step 1 emits it as a
+			// counted intent so the burst bound holds across this wake.
+			staged = i
+			haveStaged = true
 		case i := <-w.dataQueue:
 			if c := w.emit(i); c != nil {
 				stuck = c
@@ -587,6 +715,12 @@ func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 	// empty-payload frames, which allocate no slab and so would otherwise ship a
 	// generation of 0 and be discarded by the consumer as stale.
 	d.SetGeneration(w.gen)
+	// Stamp the reserved word with the frame's stream control word (offset 56,
+	// stream-protocol.md §2.2). Control is 0 for every unary kind and every
+	// non-stream frame, so reserved stays 0 on them — this satisfies shm-abi.md's
+	// "MUST be 0 unless the governing feature was negotiated" structurally, with
+	// no explicit gate. It is stamped for descriptor-only and payload frames alike.
+	d.SetReserved(i.frame.Control)
 
 	if descriptorOnly {
 		// Descriptor-only frame (CANCEL): no slab, no service/method/budget, no

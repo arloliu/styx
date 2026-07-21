@@ -741,7 +741,7 @@ func (s *Supervisor) handshakeAndAttach(
 			tuple.Transport, tuple.Codec)
 	}
 
-	return s.attach(ctx, conn, generation)
+	return s.attach(ctx, conn, generation, tuple.Features["streaming"])
 }
 
 // attach performs the host side of AttachRegion -> AttachRegionAck: it
@@ -750,9 +750,11 @@ func (s *Supervisor) handshakeAndAttach(
 // host-side fd in a uds Transport. generation is stamped on the
 // AttachRegion message as a fresh per-restart region generation (for now,
 // a fresh transport socketpair each time; the generation number itself
-// only gains meaning once SHM support lands).
+// only gains meaning once SHM support lands). streaming is the acknowledged
+// state of the streaming feature from the negotiated tuple, fixing the uds
+// header shape for the connection (stream-protocol.md §2.4).
 func (s *Supervisor) attach(
-	ctx context.Context, conn *control.Conn, generation uint64,
+	ctx context.Context, conn *control.Conn, generation uint64, streaming bool,
 ) (tr transport.Transport, err error) {
 	pair, perr := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if perr != nil {
@@ -786,7 +788,7 @@ func (s *Supervisor) attach(
 		return nil, fmt.Errorf("supervisor: handshake: recv AttachRegionAck: %w", aerr)
 	}
 
-	tr, terr := transport.NewUDSTransport(hostFD)
+	tr, terr := transport.NewUDSTransport(hostFD, streaming)
 	if terr != nil {
 		return nil, fmt.Errorf("supervisor: handshake: wrap data-plane transport: %w", terr)
 	}

@@ -18,8 +18,8 @@ import (
 var ErrBackpressure = errors.New("shm: submission queue full")
 
 // errUnsupportedKind fails an intent whose frame kind is not one this writer
-// emits under layout_version = 1 (only the four live kinds mapKind accepts).
-// Reaching it is an in-process caller bug, not a peer fault, so the writer
+// emits under layout_version = 1 (an unassigned byte outside the kinds mapKind
+// accepts). Reaching it is an in-process caller bug, not a peer fault, so the writer
 // surfaces it on the intent's completion channel rather than poisoning the
 // region — poisoning is the consumer's response to a bad received frame
 // (shm-abi.md §5/§16), never the producer's response to its own malformed
@@ -27,10 +27,10 @@ var ErrBackpressure = errors.New("shm: submission queue full")
 var errUnsupportedKind = errors.New("shm: unsupported frame kind")
 
 // errLaneKindMismatch fails an intent queued on the wrong lane for its kind: the
-// lifecycle lane carries only the descriptor-only CANCEL, and the data lane only
-// the payload-bearing unary kinds (design §12; shm-abi.md §5 descriptor-only
-// kinds). A mismatch is an in-process caller bug, surfaced on the intent's
-// completion channel, never poisoned.
+// lifecycle lane carries only the descriptor-only kinds (CANCEL, STREAM_ACK),
+// and the data lane only the payload-bearing kinds (design §12; shm-abi.md §5
+// descriptor-only kinds; stream-protocol.md §2.1). A mismatch is an in-process
+// caller bug, surfaced on the intent's completion channel, never poisoned.
 var errLaneKindMismatch = errors.New("shm: frame kind not valid for its lane")
 
 // errUnknownLane fails an intent carrying a lane value outside the two the writer
@@ -47,12 +47,13 @@ var errUnknownLane = errors.New("shm: unknown lane")
 type lane uint8
 
 const (
-	// laneData carries the payload-bearing unary kinds. Data admission is bounded
-	// (design §19); a full data queue is backpressure.
+	// laneData carries the payload-bearing kinds: the unary kinds and the four
+	// payload-bearing streaming kinds (STREAM_OPEN/MSG/CLOSE/ERR). Data admission
+	// is bounded (design §19); a full data queue is backpressure.
 	laneData lane = iota
-	// laneLifecycle carries the descriptor-only CANCEL. It has a reserved ring
-	// budget (shm-abi.md §18) and is never starved by data (design §12); it never
-	// returns ErrBackpressure.
+	// laneLifecycle carries the descriptor-only kinds: CANCEL and STREAM_ACK
+	// (stream-protocol.md §2.1). It has a reserved ring budget (shm-abi.md §18)
+	// and is never starved by data (design §12); it never returns ErrBackpressure.
 	laneLifecycle
 )
 
@@ -93,10 +94,14 @@ type intent struct {
 // mapKind maps a transport frame kind to its ring descriptor kind and reports
 // whether the kind is descriptor-only (carries no payload slab). It maps through
 // an explicit switch rather than a numeric cast: the two enumerations coincide by
-// the ABI (shm-abi.md §5), but an explicit map fails closed on any kind this
-// writer does not emit under layout_version = 1 instead of silently forwarding a
-// stale or out-of-range value. Only the four live kinds are accepted; the
-// reserved streaming kinds and any out-of-range byte yield errUnsupportedKind.
+// the ABI (shm-abi.md §5), but an explicit map fails closed on any out-of-range
+// byte this writer does not emit under layout_version = 1 instead of silently
+// forwarding a stale value.
+//
+// STREAM_ACK is descriptor-only (a lifecycle credit return, like CANCEL); the
+// other four streaming kinds are payload-bearing data frames
+// (stream-protocol.md §2.1/§2.3). Only an unassigned byte yields
+// errUnsupportedKind.
 func mapKind(k transport.FrameKind) (rk ring.FrameKind, descriptorOnly bool, err error) {
 	switch k {
 	case transport.FrameUnaryReq:
@@ -107,6 +112,16 @@ func mapKind(k transport.FrameKind) (rk ring.FrameKind, descriptorOnly bool, err
 		return ring.KindUnaryErr, false, nil
 	case transport.FrameCancel:
 		return ring.KindCancel, true, nil
+	case transport.FrameStreamOpen:
+		return ring.KindStreamOpen, false, nil
+	case transport.FrameStreamMsg:
+		return ring.KindStreamMsg, false, nil
+	case transport.FrameStreamAck:
+		return ring.KindStreamAck, true, nil
+	case transport.FrameStreamClose:
+		return ring.KindStreamClose, false, nil
+	case transport.FrameStreamErr:
+		return ring.KindStreamErr, false, nil
 	default:
 		return 0, false, errUnsupportedKind
 	}

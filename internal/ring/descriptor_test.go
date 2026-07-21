@@ -139,6 +139,23 @@ func TestDescriptor_Reserved_StaysZeroAcrossAllSetters(t *testing.T) {
 	}
 }
 
+// Test that the reserved word at offset 56 round-trips through SetReserved and
+// Reserved as a little-endian uint64, and that a fresh descriptor reads 0
+// (shm-abi.md §4). This is the write/read primitive the streaming control word
+// rides on (stream-protocol.md §2.2).
+func TestDescriptor_Reserved_RoundTrips(t *testing.T) {
+	// Given a fresh descriptor: the reserved word reads 0.
+	var d Descriptor
+	require.Zero(t, d.Reserved(), "a fresh descriptor's reserved word must be 0")
+
+	// When a value is stored and read back.
+	d.SetReserved(0x0102030405060708)
+
+	// Then it round-trips and is encoded little-endian at offset 56.
+	require.Equal(t, uint64(0x0102030405060708), d.Reserved())
+	require.Equal(t, uint64(0x0102030405060708), binary.LittleEndian.Uint64(d.raw[reservedOffset:]))
+}
+
 // Test that KindWord exposes the full 16-bit kind field so a would-be validator
 // can see the reserved high byte a corrupt peer may have set, while Kind still
 // decodes only the low-byte FrameKind (shm-abi.md §4/§5, high byte reserved 0).

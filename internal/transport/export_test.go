@@ -24,9 +24,10 @@ func (t *UDSTransport) WriteRawBodyUnchecked(ctx context.Context, f Frame, body 
 // a test declare a payload length independent of an actual payload's
 // size (e.g. a huge declared length backed by zero sent bytes), to
 // exercise Recv's before-allocation bounds check without needing the
-// peer to genuinely send MaxFrameSize+1 bytes.
-func EncodeHeaderForTest(f Frame, payloadLen uint32) []byte {
-	return encodeHeader(f, payloadLen)
+// peer to genuinely send MaxFrameSize+1 bytes. streaming selects the header
+// shape, matching the transport the bytes are written to.
+func EncodeHeaderForTest(f Frame, payloadLen uint32, streaming bool) []byte {
+	return encodeHeader(f, payloadLen, streaming)
 }
 
 // FD exposes the underlying fd for transport_test's white-box wire-level

@@ -13,10 +13,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// headerSize is the fixed wire header preceding every Frame's Payload:
-// 4-byte big-endian uint32 payload length + 8-byte CallID + 1-byte Kind +
-// 8-byte Service + 8-byte Method + 8-byte Budget-as-int64-nanoseconds.
+// headerSize is the fixed wire header preceding every Frame's Payload when the
+// streaming feature was not negotiated: 4-byte big-endian uint32 payload length
+// + 8-byte CallID + 1-byte Kind + 8-byte Service + 8-byte Method + 8-byte
+// Budget-as-int64-nanoseconds. All big-endian (stream-protocol.md §2.4).
 const headerSize = 4 + 8 + 1 + 8 + 8 + 8
+
+// controlWordSize is the width of the stream control word appended to the header
+// when the streaming feature was negotiated, making a 45-byte header
+// (stream-protocol.md §2.2/§2.4). The word itself is little-endian — unlike the
+// big-endian rest of the header — following the control word's ABI byte order
+// (shm-abi.md §4: reserved is a little-endian uint64).
+const controlWordSize = 8
 
 // pollInterval bounds how long a single blocking read(2)/write(2) waits
 // before UDSTransport rechecks ctx: unlike internal/control.Conn (whose
@@ -43,23 +51,47 @@ var _ Transport = (*UDSTransport)(nil)
 // reader goroutine per Transport, and this package does not invent a
 // multi-reader contract Transport's interface doc never promises.
 type UDSTransport struct {
-	fd        int
+	fd int
+	// streaming is fixed at construction from the acknowledged compatibility
+	// tuple and never re-derived per call: it selects the header shape (37 or 45
+	// bytes) for the whole connection, so two frames on one connection can never
+	// disagree about how many bytes to read (stream-protocol.md §2.4). A 45-byte
+	// header on a non-streaming peer would silently desynchronize its framing on
+	// the first frame.
+	streaming bool
 	writeMu   sync.Mutex
 	closed    atomic.Bool
 	closeOnce sync.Once
 }
 
+// headerLen is this connection's fixed wire-header length: 45 bytes when the
+// streaming feature was negotiated (the base header plus the 8-byte control
+// word), 37 bytes otherwise (stream-protocol.md §2.4).
+func (t *UDSTransport) headerLen() int {
+	if t.streaming {
+		return headerSize + controlWordSize
+	}
+
+	return headerSize
+}
+
 // NewUDSTransport wraps fd, an already-connected SOCK_STREAM socket (the
 // data-plane socketpair attached during handshake, distinct from the
 // control-plane SOCK_SEQPACKET socket used for setup), in a Transport that
-// frames each Frame with a fixed 37-byte header (4-byte big-endian
-// uint32 total payload length + 8-byte CallID + 1-byte Kind + 8-byte
-// Service + 8-byte Method + 8-byte Budget-as-int64-nanoseconds) followed
-// by Payload. fd must already be CLOEXEC; NewUDSTransport does not set it
+// frames each Frame with a fixed header (4-byte big-endian uint32 total
+// payload length + 8-byte CallID + 1-byte Kind + 8-byte Service + 8-byte
+// Method + 8-byte Budget-as-int64-nanoseconds) followed by Payload.
+//
+// streaming is the acknowledged state of the streaming feature from the
+// negotiated compatibility tuple, and it fixes the header shape for the whole
+// connection: 37 bytes when absent, 45 bytes (with the 8-byte little-endian
+// stream control word appended) when present (stream-protocol.md §2.4). Both
+// sides derive it from the same tuple, so they never disagree about how many
+// bytes to read. fd must already be CLOEXEC; NewUDSTransport does not set it
 // (that's the caller's responsibility at the point fd was created/received).
 // Returns an error if fd is not a SOCK_STREAM socket, catching a
 // wrong-socket-type caller mistake before any Frame is ever attempted on it.
-func NewUDSTransport(fd int) (*UDSTransport, error) {
+func NewUDSTransport(fd int, streaming bool) (*UDSTransport, error) {
 	sockType, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
 	if err != nil {
 		return nil, fmt.Errorf("transport: fd %d: getsockopt(SO_TYPE): %w", fd, err)
@@ -69,11 +101,12 @@ func NewUDSTransport(fd int) (*UDSTransport, error) {
 		return nil, fmt.Errorf("transport: fd %d: expected SOCK_STREAM, got socket type %d", fd, sockType)
 	}
 
-	return &UDSTransport{fd: fd}, nil
+	return &UDSTransport{fd: fd, streaming: streaming}, nil
 }
 
-// Send blocks until f is fully written or ctx is done. It rejects
-// reserved streaming Kinds and oversized Payloads before writing any
+// Send blocks until f is fully written or ctx is done. It carries every
+// implemented Kind, including the five streaming kinds, and rejects only an
+// unimplemented/out-of-range Kind or an oversized Payload before writing any
 // byte of the frame.
 //
 // Mid-frame abort sacrifices the connection, by design (poison, don't
@@ -137,12 +170,12 @@ func (t *UDSTransport) Recv(ctx context.Context) (Frame, error) {
 
 	r := &fdReader{t: t, ctx: ctx}
 
-	header := make([]byte, headerSize)
+	header := make([]byte, t.headerLen())
 	if _, err := io.ReadFull(r, header); err != nil {
 		return Frame{}, t.abortFrame(err, r.started)
 	}
 
-	f, payloadLen := decodeHeader(header)
+	f, payloadLen := decodeHeader(header, t.streaming)
 
 	// Bounds-check the declared length against MaxFrameSize BEFORE
 	// allocating (or reading) a single payload byte: a corrupt or
@@ -256,7 +289,7 @@ func (t *UDSTransport) Close() error {
 // mid-frame one (see Send's doc and abortFrame).
 func (t *UDSTransport) writeFrame(ctx context.Context, f Frame, body []byte) error {
 	//nolint:gosec // len(body) already bounds-checked <= MaxFrameSize by Send.
-	header := encodeHeader(f, uint32(len(body)))
+	header := encodeHeader(f, uint32(len(body)), t.streaming)
 
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
@@ -513,12 +546,20 @@ func DecodeStatus(body []byte) (*FrameStatus, error) {
 }
 
 // encodeHeader serializes f's fields (except Payload) plus an explicit
-// payloadLen into a fresh headerSize-byte buffer. payloadLen is taken
-// separately from len(f.Payload) so test code can construct a header
-// declaring a length its actual payload doesn't match (see
-// export_test.go), independent of the caller's own bounds-checking.
-func encodeHeader(f Frame, payloadLen uint32) []byte {
-	buf := make([]byte, headerSize)
+// payloadLen into a fresh header buffer. payloadLen is taken separately from
+// len(f.Payload) so test code can construct a header declaring a length its
+// actual payload doesn't match (see export_test.go), independent of the
+// caller's own bounds-checking. When streaming is set the buffer is 45 bytes:
+// the same 37 big-endian bytes followed by the 8-byte little-endian stream
+// control word (stream-protocol.md §2.4). When streaming is absent the word is
+// neither written nor reserved, so the bytes are byte-identical to a
+// non-streaming peer's.
+func encodeHeader(f Frame, payloadLen uint32, streaming bool) []byte {
+	size := headerSize
+	if streaming {
+		size += controlWordSize
+	}
+	buf := make([]byte, size)
 	binary.BigEndian.PutUint32(buf[0:4], payloadLen)
 	binary.BigEndian.PutUint64(buf[4:12], f.CallID)
 	buf[12] = byte(f.Kind)
@@ -526,15 +567,19 @@ func encodeHeader(f Frame, payloadLen uint32) []byte {
 	binary.BigEndian.PutUint64(buf[21:29], f.Method)
 	//nolint:gosec // int64->uint64 is a lossless bit-pattern round-trip, undone by decodeHeader's matching cast
 	binary.BigEndian.PutUint64(buf[29:37], uint64(int64(f.Budget)))
+	if streaming {
+		binary.LittleEndian.PutUint64(buf[headerSize:headerSize+controlWordSize], f.Control)
+	}
 
 	return buf
 }
 
-// decodeHeader parses a headerSize-byte buffer produced by encodeHeader.
-// Callers (Recv only) must pass exactly headerSize bytes, as guaranteed
-// by io.ReadFull(r, make([]byte, headerSize)) — an internal invariant,
-// not re-validated here.
-func decodeHeader(buf []byte) (Frame, uint32) {
+// decodeHeader parses a header buffer produced by encodeHeader. Callers (Recv
+// only) must pass exactly the connection's header length — 37 bytes, or 45 when
+// streaming — as guaranteed by io.ReadFull(r, make([]byte, t.headerLen())): an
+// internal invariant, not re-validated here. When streaming is set the trailing
+// 8 little-endian bytes decode into Frame.Control; when absent Control stays 0.
+func decodeHeader(buf []byte, streaming bool) (Frame, uint32) {
 	payloadLen := binary.BigEndian.Uint32(buf[0:4])
 	//nolint:gosec // round-trips encodeHeader's uint64(int64(...)) cast, lossless
 	budgetNanos := int64(binary.BigEndian.Uint64(buf[29:37]))
@@ -544,6 +589,9 @@ func decodeHeader(buf []byte) (Frame, uint32) {
 		Service: binary.BigEndian.Uint64(buf[13:21]),
 		Method:  binary.BigEndian.Uint64(buf[21:29]),
 		Budget:  time.Duration(budgetNanos),
+	}
+	if streaming {
+		f.Control = binary.LittleEndian.Uint64(buf[headerSize : headerSize+controlWordSize])
 	}
 
 	return f, payloadLen

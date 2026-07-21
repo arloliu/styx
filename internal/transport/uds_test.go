@@ -16,11 +16,21 @@ import (
 
 func newTestTransportPair(t *testing.T) (a, b *transport.UDSTransport) {
 	t.Helper()
+
+	return newTransportPairStreaming(t, false)
+}
+
+// newTransportPairStreaming builds a connected uds transport pair with both ends
+// on the same header shape (37-byte when streaming is false, 45-byte when true),
+// mirroring how both sides derive the shape from one negotiated tuple
+// (stream-protocol.md §2.4).
+func newTransportPairStreaming(t *testing.T, streaming bool) (a, b *transport.UDSTransport) {
+	t.Helper()
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	require.NoError(t, err)
-	a, err = transport.NewUDSTransport(fds[0])
+	a, err = transport.NewUDSTransport(fds[0], streaming)
 	require.NoError(t, err)
-	b, err = transport.NewUDSTransport(fds[1])
+	b, err = transport.NewUDSTransport(fds[1], streaming)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
 
@@ -83,12 +93,14 @@ func TestUDSTransport_Send_RejectsOversizedPayload(t *testing.T) {
 	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
 }
 
-// Test UDSTransport rejecting reserved streaming frame kinds that are
-// not implemented yet
-func TestUDSTransport_Send_RejectsStreamingFrameKinds(t *testing.T) {
+// Test UDSTransport rejecting an out-of-range frame kind (a corrupt or foreign
+// peer's unassigned byte). The five streaming kinds are now carried, so a
+// genuinely unassigned value — one past FrameUnaryErr — is what must still be
+// rejected.
+func TestUDSTransport_Send_RejectsUnimplementedFrameKind(t *testing.T) {
 	// Given
 	a, _ := newTestTransportPair(t)
-	f := transport.Frame{CallID: 1, Kind: transport.FrameKind(3)} // first reserved value
+	f := transport.Frame{CallID: 1, Kind: transport.FrameKind(9)} // one past FrameUnaryErr (8)
 
 	// When
 	err := a.Send(t.Context(), f)
@@ -97,14 +109,14 @@ func TestUDSTransport_Send_RejectsStreamingFrameKinds(t *testing.T) {
 	require.ErrorIs(t, err, transport.ErrUnimplementedFrameKind)
 }
 
-// Test UDSTransport.Recv independently rejecting a reserved streaming frame
-// kind that reached the wire (bypassing Send's own guard via the
-// export_test.go test-only WriteFrameUnchecked), proving Recv enforces the
-// same rule rather than relying solely on Send never producing one.
-func TestUDSTransport_Recv_RejectsStreamingFrameKinds(t *testing.T) {
+// Test UDSTransport.Recv independently rejecting an out-of-range frame kind
+// that reached the wire (bypassing Send's own guard via the export_test.go
+// test-only WriteFrameUnchecked), proving Recv enforces the same rule rather
+// than relying solely on Send never producing one.
+func TestUDSTransport_Recv_RejectsUnimplementedFrameKind(t *testing.T) {
 	// Given
 	a, b := newTestTransportPair(t)
-	f := transport.Frame{CallID: 1, Kind: transport.FrameKind(3)}
+	f := transport.Frame{CallID: 1, Kind: transport.FrameKind(9)}
 
 	// When
 	err := a.WriteFrameUnchecked(t.Context(), f)
@@ -115,14 +127,13 @@ func TestUDSTransport_Recv_RejectsStreamingFrameKinds(t *testing.T) {
 	require.ErrorIs(t, err, transport.ErrUnimplementedFrameKind)
 }
 
-// Test UDSTransport.Recv draining a rejected streaming frame's declared
-// payload so the next Recv on the same connection still gets a clean frame,
-// instead of misreading the drained frame's payload bytes as the next
-// frame's header.
-func TestUDSTransport_Recv_DrainsPayload_AfterRejectingStreamingFrameKind(t *testing.T) {
+// Test UDSTransport.Recv draining a rejected frame's declared payload so the
+// next Recv on the same connection still gets a clean frame, instead of
+// misreading the drained frame's payload bytes as the next frame's header.
+func TestUDSTransport_Recv_DrainsPayload_AfterRejectingUnimplementedFrameKind(t *testing.T) {
 	// Given
 	a, b := newTestTransportPair(t)
-	rejected := transport.Frame{CallID: 1, Kind: transport.FrameKind(3), Payload: []byte("stream-payload")}
+	rejected := transport.Frame{CallID: 1, Kind: transport.FrameKind(9), Payload: []byte("bad-payload")}
 	next := transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq, Payload: []byte("next")}
 
 	// When
@@ -139,6 +150,72 @@ func TestUDSTransport_Recv_DrainsPayload_AfterRejectingStreamingFrameKind(t *tes
 	require.Equal(t, next.Payload, got.Payload)
 }
 
+// Test that a streaming-negotiated transport pair round-trips each of the five
+// STREAM_* kinds carrying a non-zero control word, byte-identical on Recv
+// (stream-protocol.md §2.1/§2.2/§2.4). The transport is stream-unaware; it
+// simply ferries the kind, payload, and control word.
+func TestUDSTransport_SendRecv_RoundTripsStreamingFrames_WithControlWord(t *testing.T) {
+	a, b := newTransportPairStreaming(t, true)
+
+	cases := []struct {
+		name    string
+		kind    transport.FrameKind
+		control uint64
+		payload []byte
+	}{
+		{"open", transport.FrameStreamOpen, 4, []byte("open-req")},
+		{"msg", transport.FrameStreamMsg, 1, []byte("msg-1")},
+		{"ack", transport.FrameStreamAck, 8, nil},
+		{"close", transport.FrameStreamClose, 5, []byte("trailer")},
+		{"err", transport.FrameStreamErr, 0, []byte("status")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := transport.Frame{CallID: 7, Kind: tc.kind, Control: tc.control, Payload: tc.payload}
+
+			require.NoError(t, a.Send(t.Context(), f))
+			got, err := b.Recv(t.Context())
+
+			require.NoError(t, err)
+			require.Equal(t, tc.kind, got.Kind)
+			require.Equal(t, uint64(7), got.CallID)
+			require.Equal(t, tc.control, got.Control)
+			require.Equal(t, tc.payload, got.Payload)
+		})
+	}
+}
+
+// Test the header-shape contract's two ends (stream-protocol.md §2.4). A
+// streaming-absent transport writes a 37-byte header byte-identical to the
+// pre-streaming wire and reads Control back as 0; its bytes never grow to 45.
+// A streaming-present transport writes 45 and carries the control word.
+func TestUDSTransport_HeaderShape_MatchesNegotiatedStreaming(t *testing.T) {
+	t.Run("streaming absent: 37-byte header, Control dropped to 0", func(t *testing.T) {
+		a, b := newTransportPairStreaming(t, false)
+		// A control word set by the caller is simply not carried when streaming
+		// is absent (§2.4: the omitted word carries no information there).
+		f := transport.Frame{CallID: 3, Kind: transport.FrameUnaryReq, Control: 99, Payload: []byte("x")}
+
+		require.NoError(t, a.Send(t.Context(), f))
+		got, err := b.Recv(t.Context())
+		require.NoError(t, err)
+		require.Zero(t, got.Control, "streaming-absent Recv must read Control as 0")
+		require.Equal(t, f.Payload, got.Payload)
+	})
+
+	t.Run("streaming absent: wire bytes are byte-identical to the pre-streaming header", func(t *testing.T) {
+		f := transport.Frame{CallID: 3, Kind: transport.FrameUnaryReq, Control: 99}
+		absent := transport.EncodeHeaderForTest(f, 1, false)
+		present := transport.EncodeHeaderForTest(f, 1, true)
+
+		require.Len(t, absent, 37, "streaming-absent header must stay 37 bytes")
+		require.Len(t, present, 45, "streaming-present header must be 45 bytes")
+		// The first 37 bytes are identical regardless of streaming; only the
+		// present shape appends the 8-byte control word.
+		require.Equal(t, present[:37], absent, "the base 37 bytes must not drift with streaming")
+	})
+}
+
 // Test UDSTransport.Recv rejecting a declared payload length above
 // MaxFrameSize before reading (or allocating for) any payload bytes, so a
 // corrupt/oversized length prefix can never drive an oversized allocation
@@ -147,7 +224,7 @@ func TestUDSTransport_Recv_RejectsOversizedDeclaredLength_BeforeReadingPayload(t
 	// Given
 	a, b := newTestTransportPair(t)
 	oversizedFrame := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq}
-	header := transport.EncodeHeaderForTest(oversizedFrame, transport.MaxFrameSize+1)
+	header := transport.EncodeHeaderForTest(oversizedFrame, transport.MaxFrameSize+1, false)
 	_, err := unix.Write(a.FD(), header)
 	require.NoError(t, err)
 
@@ -268,7 +345,7 @@ func TestUDSTransport_Recv_PoisonsTransport_WhenDeadlineFiresMidFrame(t *testing
 	a, b := newTestTransportPair(t)
 	payload := make([]byte, 1<<20)
 	stalledFrame := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq}
-	header := transport.EncodeHeaderForTest(stalledFrame, uint32(len(payload)))
+	header := transport.EncodeHeaderForTest(stalledFrame, uint32(len(payload)), false)
 	_, err := unix.Write(a.FD(), header)
 	require.NoError(t, err)
 	_, err = unix.Write(a.FD(), payload[:100]) // partial payload; the rest never arrives
@@ -606,7 +683,7 @@ func TestNewUDSTransport_ReturnsError_WhenFDIsNotSockStream(t *testing.T) {
 	t.Cleanup(func() { _ = unix.Close(fds[0]); _ = unix.Close(fds[1]) })
 
 	// When
-	tr, err := transport.NewUDSTransport(fds[0])
+	tr, err := transport.NewUDSTransport(fds[0], false)
 
 	// Then
 	require.Error(t, err)

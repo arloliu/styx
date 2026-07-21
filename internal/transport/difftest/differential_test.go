@@ -601,9 +601,9 @@ func newUDSPairForTest(t *testing.T) (client, server transport.Transport) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	require.NoError(t, err)
 
-	client, err = transport.NewUDSTransport(fds[0])
+	client, err = transport.NewUDSTransport(fds[0], false)
 	require.NoError(t, err)
-	server, err = transport.NewUDSTransport(fds[1])
+	server, err = transport.NewUDSTransport(fds[1], false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
 

@@ -550,13 +550,13 @@ func newUDSSession(b *testing.B, mode clientMode) *session {
 	if err != nil {
 		b.Fatalf("uds socketpair: %v", err)
 	}
-	hostTr, err := transport.NewUDSTransport(fds[0])
+	hostTr, err := transport.NewUDSTransport(fds[0], false)
 	if err != nil {
 		_ = unix.Close(fds[0])
 		_ = unix.Close(fds[1])
 		b.Fatalf("wrap host uds transport: %v", err)
 	}
-	pluginTr, err := transport.NewUDSTransport(fds[1])
+	pluginTr, err := transport.NewUDSTransport(fds[1], false)
 	if err != nil {
 		_ = hostTr.Close()
 		_ = unix.Close(fds[1])

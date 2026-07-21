@@ -256,7 +256,7 @@ func runOverUDS(ctx context.Context, w Workload) ([]Result, error) {
 		return nil, fmt.Errorf("uds socketpair: %w", err)
 	}
 
-	clientTr, err := transport.NewUDSTransport(fds[0])
+	clientTr, err := transport.NewUDSTransport(fds[0], false)
 	if err != nil {
 		_ = unix.Close(fds[0])
 		_ = unix.Close(fds[1])
@@ -265,7 +265,7 @@ func runOverUDS(ctx context.Context, w Workload) ([]Result, error) {
 	}
 	defer func() { _ = clientTr.Close() }()
 
-	serverTr, err := transport.NewUDSTransport(fds[1])
+	serverTr, err := transport.NewUDSTransport(fds[1], false)
 	if err != nil {
 		_ = unix.Close(fds[1])
 

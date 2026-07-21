@@ -22,6 +22,11 @@ func TestMapKind_MapsLiveKinds(t *testing.T) {
 		{"unary response", transport.FrameUnaryResp, ring.KindUnaryResp, false},
 		{"unary error", transport.FrameUnaryErr, ring.KindUnaryErr, false},
 		{"cancel", transport.FrameCancel, ring.KindCancel, true},
+		{"stream open", transport.FrameStreamOpen, ring.KindStreamOpen, false},
+		{"stream msg", transport.FrameStreamMsg, ring.KindStreamMsg, false},
+		{"stream ack", transport.FrameStreamAck, ring.KindStreamAck, true},
+		{"stream close", transport.FrameStreamClose, ring.KindStreamClose, false},
+		{"stream err", transport.FrameStreamErr, ring.KindStreamErr, false},
 	}
 
 	for _, tc := range cases {
@@ -40,7 +45,8 @@ func TestMapKind_MapsLiveKinds(t *testing.T) {
 // Test that mapKind fails closed on a kind this writer does not emit under
 // layout_version = 1, rather than forwarding an out-of-range value.
 func TestMapKind_RejectsUnsupportedKind(t *testing.T) {
-	// Given a kind outside the four live kinds (a reserved/unassigned byte).
+	// Given a kind outside the nine live kinds 0-8 (kind 9 is the first
+	// reserved/unassigned byte).
 	const unassigned = transport.FrameKind(9)
 
 	// When

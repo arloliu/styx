@@ -190,6 +190,17 @@ func (d *Descriptor) SetGeneration(v uint32) {
 	binary.LittleEndian.PutUint32(d.raw[generationOffset:], v)
 }
 
+// Reserved returns the reserved word (shm-abi.md §4, offset 56): a little-endian
+// uint64 the ring never interprets. It is ignored on read in v1 and MUST be 0
+// unless a governing feature was negotiated (shm-abi.md §5/§19); the consumer
+// that negotiated such a feature reads it here.
+func (d *Descriptor) Reserved() uint64 { return binary.LittleEndian.Uint64(d.raw[reservedOffset:]) }
+
+// SetReserved stores the reserved word verbatim. The ring imposes no
+// feature-scoping of its own; a producer that has not negotiated the governing
+// feature MUST leave this 0 (shm-abi.md §4/§19).
+func (d *Descriptor) SetReserved(v uint64) { binary.LittleEndian.PutUint64(d.raw[reservedOffset:], v) }
+
 // PayloadInBounds reports whether this descriptor's payload span
 // [payload_offset, payload_offset+payload_length) fits within size bytes,
 // computed in uint64 so a crafted uint32 offset+length from the untrusted peer

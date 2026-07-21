@@ -14,9 +14,12 @@ import (
 // Send before any write with a typed error.
 const MaxFrameSize = 1 << 20 // 1 MiB, matching the largest benchmark payload size
 
-// ErrUnimplementedFrameKind is returned by Send/Recv for any of the
-// reserved Stream* kinds, which are not implemented yet.
-var ErrUnimplementedFrameKind = errors.New("transport: streaming frame kinds are not yet implemented")
+// ErrUnimplementedFrameKind is returned by Send/Recv for a frame kind this
+// transport does not carry under layout_version 1: an out-of-range byte a
+// corrupt or foreign peer might put on the wire. The unary kinds, Cancel, and
+// the five Stream* kinds are all carried, so this signals a genuinely
+// unassigned value, not streaming.
+var ErrUnimplementedFrameKind = errors.New("transport: unimplemented frame kind")
 
 // ErrPayloadTooLarge is returned by Send (before any write) when a
 // Frame's Payload exceeds MaxFrameSize, and by Recv when a peer's
@@ -40,11 +43,11 @@ var ErrMalformedStatusFrame = errors.New("transport: malformed status frame body
 // this contract.
 var ErrClosed = errors.New("transport: closed")
 
-// FrameKind identifies a Frame's role. Only the unary kinds and Cancel are
-// implemented today — streaming support will reuse the same descriptor
-// path when it lands; the Stream* values are reserved now so their wire
-// values never change later; Send/Recv reject them with
-// ErrUnimplementedFrameKind until streaming is implemented.
+// FrameKind identifies a Frame's role. The unary kinds, Cancel, and the five
+// Stream* kinds are all carried by both transports; the transport stays
+// stream-unaware and moves a Stream* frame exactly like any other single Frame
+// (stream assembly lives entirely in internal/rpcruntime). The Stream* wire
+// values are frozen (3..7, shm-abi.md §5) so they never change later.
 type FrameKind uint8
 
 const (
@@ -52,15 +55,15 @@ const (
 	FrameUnaryResp                  // UNARY_RESP
 	FrameCancel                     // CANCEL
 
-	// Reserved for future streaming support — values fixed now (3..7),
-	// unimplemented until the stream protocol is built.
-	// FrameUnaryErr MUST stay after this block so these five keep their
-	// wire values.
-	frameStreamOpen  // STREAM_OPEN
-	frameStreamMsg   // STREAM_MSG
-	frameStreamAck   // STREAM_ACK
-	frameStreamClose // STREAM_CLOSE
-	frameStreamErr   // STREAM_ERR
+	// The five streaming kinds, wire values frozen now (3..7, shm-abi.md §5).
+	// FrameUnaryErr MUST stay after this block so these five keep their wire
+	// values. The transport carries them but never interprets a stream; see the
+	// Control field for the per-kind stream control word (stream-protocol.md §2.2).
+	FrameStreamOpen  // STREAM_OPEN
+	FrameStreamMsg   // STREAM_MSG
+	FrameStreamAck   // STREAM_ACK
+	FrameStreamClose // STREAM_CLOSE
+	FrameStreamErr   // STREAM_ERR
 
 	// FrameUnaryErr (value 8) is the error-response kind: an error response
 	// carries a status payload (code, message, details) instead of a normal
@@ -87,11 +90,20 @@ type FrameStatus struct {
 }
 
 // Frame is the only message unit Transport moves. CallID is shared by
-// unary calls and (once streaming is added) streams; Service/Method are
-// the FNV-64 IDs the generated code embeds; Budget is the remaining-
-// duration deadline (deadlines travel as remaining budget, never
-// wall-clock). Exactly one of Payload/Status is ever set: Status only for
-// FrameUnaryErr, Payload for the data-bearing kinds.
+// unary calls and streams; Service/Method are the FNV-64 IDs the generated
+// code embeds; Budget is the remaining-duration deadline (deadlines travel
+// as remaining budget, never wall-clock). Exactly one of Payload/Status is
+// ever set: Status only for FrameUnaryErr, Payload for the data-bearing kinds.
+//
+// Control carries the stream control word (stream-protocol.md §2.2/§2.3): a
+// sequence number, cumulative ack count, credit proposal, or teardown
+// discriminant, depending on kind. It is kind-scoped and defaults to zero —
+// zero for every unary kind, every non-stream frame, and a unary CANCEL;
+// non-zero only on a streaming frame or a stream-teardown CANCEL. The transport
+// never interprets Control; it copies it verbatim to and from the wire. Whether
+// it reaches the wire at all is feature-scoped: shm always carries it in the
+// descriptor's reserved word (offset 56), while uds carries it only when the
+// streaming feature was negotiated (§2.4).
 type Frame struct {
 	CallID  uint64
 	Kind    FrameKind
@@ -100,6 +112,7 @@ type Frame struct {
 	Budget  time.Duration
 	Payload []byte
 	Status  *FrameStatus
+	Control uint64
 }
 
 // Transport is the message-oriented data-plane abstraction both the uds
@@ -121,22 +134,21 @@ type Transport interface {
 	Close() error
 }
 
-// checkImplementedKind returns nil for the four kinds Send/Recv currently
-// implement (FrameUnaryReq, FrameUnaryResp, FrameCancel, FrameUnaryErr) and
-// ErrUnimplementedFrameKind for anything else — the five reserved Stream*
-// values by name (so removing/renaming one is a compile error here, not a
-// silently-widened range check) and any other out-of-range byte a
-// corrupt/foreign peer might put on the wire. The frameStream* case is kept
-// explicit (rather than merged into default) precisely for that
-// compile-error property.
+// checkImplementedKind returns nil for the nine kinds Send/Recv carry
+// (FrameUnaryReq, FrameUnaryResp, FrameCancel, FrameUnaryErr, and the five
+// Stream* kinds) and ErrUnimplementedFrameKind for any other out-of-range byte
+// a corrupt or foreign peer might put on the wire. The Stream* case is kept
+// explicit (rather than merged into the nil-returning line's neighbors or into
+// default) so removing/renaming one is a compile error here, not a
+// silently-widened range check.
 //
 //nolint:revive // identical-switch-branches: see doc above
 func checkImplementedKind(k FrameKind) error {
 	switch k {
 	case FrameUnaryReq, FrameUnaryResp, FrameCancel, FrameUnaryErr:
 		return nil
-	case frameStreamOpen, frameStreamMsg, frameStreamAck, frameStreamClose, frameStreamErr:
-		return ErrUnimplementedFrameKind
+	case FrameStreamOpen, FrameStreamMsg, FrameStreamAck, FrameStreamClose, FrameStreamErr:
+		return nil
 	default:
 		return ErrUnimplementedFrameKind
 	}

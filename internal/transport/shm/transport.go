@@ -437,7 +437,7 @@ func (t *Transport) Send(ctx context.Context, f transport.Frame) error {
 	}
 
 	l := laneData
-	if f.Kind == transport.FrameCancel {
+	if f.Kind == transport.FrameCancel || f.Kind == transport.FrameStreamAck {
 		l = laneLifecycle
 	}
 
@@ -623,7 +623,11 @@ func classifyDescriptorOnly(d ring.Descriptor, tk transport.FrameKind) (transpor
 		return transport.Frame{}, false, errBadFrame
 	}
 
-	return transport.Frame{CallID: d.CallID(), Kind: tk}, true, nil
+	// Carry the reserved word verbatim as the stream control word (offset 56,
+	// stream-protocol.md §2.2): a STREAM_ACK's cumulative ack count, a stream
+	// CANCEL's teardown discriminant, or 0 for a unary CANCEL. The transport
+	// never interprets it.
+	return transport.Frame{CallID: d.CallID(), Kind: tk, Control: d.Reserved()}, true, nil
 }
 
 // classifyPayload validates a payload frame's §9 slab-presence and geometry
@@ -711,6 +715,10 @@ func decodedFrame(d ring.Descriptor, tk transport.FrameKind, payload []byte) (tr
 		Service: d.ServiceID(),
 		Method:  d.MethodID(),
 		Budget:  time.Duration(d.BudgetNS()),
+		// The reserved word carries the stream control word verbatim (offset 56,
+		// stream-protocol.md §2.2): a STREAM_MSG sequence number, a STREAM_OPEN
+		// credit proposal, and so on. It reads back 0 on every non-stream frame.
+		Control: d.Reserved(),
 	}
 
 	if tk == transport.FrameUnaryErr {
@@ -814,12 +822,14 @@ func (t *Transport) Close() error {
 }
 
 // unmapKind maps a ring descriptor kind back to its transport frame kind and
-// reports whether it is descriptor-only, failing closed on any kind this
-// transport does not handle under layout_version = 1 (shm-abi.md §5). The
-// reserved streaming kinds and any unassigned value report ok=false, which the
-// caller treats as a conformance fault.
-//
-//nolint:revive // identical stream/default branches kept explicit for the compile-error property
+// reports whether it is descriptor-only, failing closed on any unassigned kind
+// this transport does not handle under layout_version = 1 (shm-abi.md §5). The
+// five STREAM_* kinds classify unconditionally — they are valid frozen-value
+// kinds (stream-protocol.md §2.1); a STREAM_* frame for an unknown or closed
+// stream is disposed above the transport by the RPC runtime, not poisoned here.
+// STREAM_ACK is descriptor-only (like CANCEL); the other four are
+// payload-bearing. Only a genuinely out-of-range byte reports ok=false, which
+// the caller treats as a conformance fault.
 func unmapKind(k ring.FrameKind) (tk transport.FrameKind, descriptorOnly, ok bool) {
 	switch k {
 	case ring.KindUnaryReq:
@@ -830,10 +840,16 @@ func unmapKind(k ring.FrameKind) (tk transport.FrameKind, descriptorOnly, ok boo
 		return transport.FrameUnaryErr, false, true
 	case ring.KindCancel:
 		return transport.FrameCancel, true, true
-	case ring.KindStreamOpen, ring.KindStreamMsg, ring.KindStreamAck, ring.KindStreamClose, ring.KindStreamErr:
-		// Reserved for streaming; not handled under layout_version = 1, so a
-		// received stream frame is a conformance fault, like any unassigned kind.
-		return 0, false, false
+	case ring.KindStreamOpen:
+		return transport.FrameStreamOpen, false, true
+	case ring.KindStreamMsg:
+		return transport.FrameStreamMsg, false, true
+	case ring.KindStreamAck:
+		return transport.FrameStreamAck, true, true
+	case ring.KindStreamClose:
+		return transport.FrameStreamClose, false, true
+	case ring.KindStreamErr:
+		return transport.FrameStreamErr, false, true
 	default:
 		return 0, false, false
 	}
