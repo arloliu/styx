@@ -368,6 +368,37 @@ func TestSHM_FrameUnaryErr_CarriesStatus_CodeMessageDetails(t *testing.T) {
 	require.Nil(t, f.Payload)
 }
 
+// Test that a FrameStreamErr's Status round-trips over the shm data plane
+// exactly as a FrameUnaryErr's does: STREAM_ERR's payload is a status body
+// encoded the same way (stream-protocol.md §2.3). The control word round-trips
+// via the descriptor's reserved word.
+func TestSHM_FrameStreamErr_CarriesStatus_CodeMessageDetails(t *testing.T) {
+	// Given a host and plugin attached to one region.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	want := &transport.FrameStatus{
+		Code:    0xFFFFFF05, // StatusCodeStreamDeadlineExceeded
+		Message: "deadline exceeded",
+		Details: [][]byte{[]byte("detail-one"), []byte("detail-two")},
+	}
+
+	// When a FrameStreamErr carrying that status is sent and received.
+	require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
+		CallID: 5, Kind: transport.FrameStreamErr, Control: 99, Status: want,
+	}))
+	f, err := ep.plugin.Recv(t.Context())
+
+	// Then the received frame carries the same status, field by field, no
+	// payload, and the control word intact.
+	require.NoError(t, err)
+	require.Equal(t, transport.FrameStreamErr, f.Kind)
+	require.Equal(t, uint64(99), f.Control)
+	require.NotNil(t, f.Status)
+	require.Equal(t, want.Code, f.Status.Code)
+	require.Equal(t, want.Message, f.Status.Message)
+	require.Equal(t, want.Details, f.Status.Details)
+	require.Nil(t, f.Payload)
+}
+
 // Test that a FrameUnaryErr whose Status is zero-value (nil or an empty
 // *FrameStatus) still round-trips to a non-nil all-zero *FrameStatus, matching
 // what UDS produces for the same sent frame -- neither side special-cases a

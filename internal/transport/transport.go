@@ -77,12 +77,12 @@ const (
 	FrameUnaryErr
 )
 
-// FrameStatus is the application/framework error carried by a FrameUnaryErr
-// (code, message, details). It is transport-owned
+// FrameStatus is the application/framework error carried by a FrameUnaryErr or
+// a FrameStreamErr (code, message, details). It is transport-owned
 // and transport-agnostic: internal/rpcruntime.Status and styx.Status mirror
 // its shape, and the styx package converts between them at its boundary. A
-// FrameUnaryErr always sets Status and leaves Payload nil; every other kind
-// leaves Status nil.
+// FrameUnaryErr and a FrameStreamErr always set Status and leave Payload nil;
+// every other kind leaves Status nil.
 type FrameStatus struct {
 	Code    uint32
 	Message string
@@ -93,7 +93,8 @@ type FrameStatus struct {
 // unary calls and streams; Service/Method are the FNV-64 IDs the generated
 // code embeds; Budget is the remaining-duration deadline (deadlines travel
 // as remaining budget, never wall-clock). Exactly one of Payload/Status is
-// ever set: Status only for FrameUnaryErr, Payload for the data-bearing kinds.
+// ever set: Status only for the two status-bearing kinds (FrameUnaryErr and
+// FrameStreamErr, see CarriesStatusBody), Payload for the data-bearing kinds.
 //
 // Control carries the stream control word (stream-protocol.md §2.2/§2.3): a
 // sequence number, cumulative ack count, credit proposal, or teardown
@@ -152,4 +153,14 @@ func checkImplementedKind(k FrameKind) error {
 	default:
 		return ErrUnimplementedFrameKind
 	}
+}
+
+// CarriesStatusBody reports whether a frame kind stores an encoded FrameStatus
+// in its body region in place of a raw Payload. Two kinds do: FrameUnaryErr and
+// FrameStreamErr, whose payload is a status body encoded exactly as UNARY_ERR's
+// (stream-protocol.md §2.3). Both the uds and shm transports classify with this
+// one predicate so EncodeStatus/DecodeStatus is applied identically regardless
+// of which transport carries the frame — the status codec is never forked.
+func CarriesStatusBody(k FrameKind) bool {
+	return k == FrameUnaryErr || k == FrameStreamErr
 }

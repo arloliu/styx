@@ -78,7 +78,7 @@ type intent struct {
 	frame transport.Frame
 	lane  lane
 	// wire is the frame's pre-encoded wire payload -- its Payload, or a
-	// FrameUnaryErr's EncodeStatus(Status) -- snapshotted at submit so the
+	// status-bearing frame's EncodeStatus(Status) -- snapshotted at submit so the
 	// bytes the writer stamps are exactly the bytes admission validated and
 	// cannot change if the caller mutates the frame after Send returns. nil
 	// for a directly-constructed intent (test seams), which build falls back

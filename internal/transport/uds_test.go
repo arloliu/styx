@@ -150,10 +150,12 @@ func TestUDSTransport_Recv_DrainsPayload_AfterRejectingUnimplementedFrameKind(t 
 	require.Equal(t, next.Payload, got.Payload)
 }
 
-// Test that a streaming-negotiated transport pair round-trips each of the five
-// STREAM_* kinds carrying a non-zero control word, byte-identical on Recv
-// (stream-protocol.md §2.1/§2.2/§2.4). The transport is stream-unaware; it
-// simply ferries the kind, payload, and control word.
+// Test that a streaming-negotiated transport pair round-trips the four
+// payload-bearing STREAM_* kinds carrying a non-zero control word,
+// byte-identical on Recv (stream-protocol.md §2.1/§2.2/§2.4). The transport is
+// stream-unaware; it simply ferries the kind, payload, and control word.
+// STREAM_ERR is status-bearing (its payload is a status body, §2.3) and is
+// covered by TestUDSTransport_SendRecv_RoundTripsStreamErrStatusFrame instead.
 func TestUDSTransport_SendRecv_RoundTripsStreamingFrames_WithControlWord(t *testing.T) {
 	a, b := newTransportPairStreaming(t, true)
 
@@ -167,7 +169,6 @@ func TestUDSTransport_SendRecv_RoundTripsStreamingFrames_WithControlWord(t *test
 		{"msg", transport.FrameStreamMsg, 1, []byte("msg-1")},
 		{"ack", transport.FrameStreamAck, 8, nil},
 		{"close", transport.FrameStreamClose, 5, []byte("trailer")},
-		{"err", transport.FrameStreamErr, 0, []byte("status")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -565,6 +566,38 @@ func TestUDSTransport_SendRecv_RoundTripsStatusFrame(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, transport.FrameUnaryErr, got.Kind)
 	require.Equal(t, f.CallID, got.CallID)
+	require.Nil(t, got.Payload)
+	require.NotNil(t, got.Status)
+	require.Equal(t, f.Status.Code, got.Status.Code)
+	require.Equal(t, f.Status.Message, got.Status.Message)
+	require.Equal(t, f.Status.Details, got.Status.Details)
+}
+
+// Test UDSTransport round-tripping a FrameStreamErr and reconstructing its
+// Status (code, message, details) intact, exactly as a FrameUnaryErr does — a
+// STREAM_ERR's payload is a status body encoded the same way (stream-protocol.md
+// §2.3). The control word round-trips too on a streaming connection.
+func TestUDSTransport_SendRecv_RoundTripsStreamErrStatusFrame(t *testing.T) {
+	// Given a streaming pair (STREAM_ERR only exists on a streaming connection).
+	a, b := newTransportPairStreaming(t, true)
+	f := transport.Frame{
+		CallID: 42, Kind: transport.FrameStreamErr, Control: 7,
+		Status: &transport.FrameStatus{
+			Code:    0xFFFFFF04, // StatusCodeStreamCanceled
+			Message: "canceled",
+			Details: [][]byte{[]byte("d1"), {}, []byte("d3")},
+		},
+	}
+
+	// When
+	require.NoError(t, a.Send(t.Context(), f))
+	got, err := b.Recv(t.Context())
+
+	// Then the status body survives, Payload stays nil, and Control round-trips.
+	require.NoError(t, err)
+	require.Equal(t, transport.FrameStreamErr, got.Kind)
+	require.Equal(t, f.CallID, got.CallID)
+	require.Equal(t, uint64(7), got.Control)
 	require.Nil(t, got.Payload)
 	require.NotNil(t, got.Status)
 	require.Equal(t, f.Status.Code, got.Status.Code)

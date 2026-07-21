@@ -127,7 +127,8 @@ func (t *UDSTransport) Send(ctx context.Context, f Frame) error {
 	}
 
 	// body is the wire bytes following the header: the raw Payload for the
-	// data-bearing kinds, or the encoded Status for a FrameUnaryErr. Either
+	// data-bearing kinds, or the encoded Status for a status-bearing kind
+	// (FrameUnaryErr/FrameStreamErr). Either
 	// way it is bounded by the same MaxFrameSize check, so a status whose
 	// message/details would overflow the frame is rejected before any
 	// write, exactly like an oversized payload.
@@ -215,11 +216,11 @@ func (t *UDSTransport) Recv(ctx context.Context) (Frame, error) {
 		}
 	}
 
-	// A FrameUnaryErr carries an encoded Status in the body region, not a
-	// raw payload. The body is fully consumed by now, so a malformed status
-	// leaves the stream synchronized — reject only this frame, don't poison
-	// the connection (contrast the mid-frame aborts above).
-	if f.Kind == FrameUnaryErr {
+	// A FrameUnaryErr or FrameStreamErr carries an encoded Status in the body
+	// region, not a raw payload. The body is fully consumed by now, so a
+	// malformed status leaves the stream synchronized — reject only this frame,
+	// don't poison the connection (contrast the mid-frame aborts above).
+	if CarriesStatusBody(f.Kind) {
 		status, err := DecodeStatus(body)
 		if err != nil {
 			return Frame{}, err
@@ -428,11 +429,11 @@ func (r *fdReader) Read(p []byte) (int, error) {
 const statusHeadSize = 4 + 4 + 4
 
 // frameBody returns the wire bytes that follow f's header: the encoded
-// Status for a FrameUnaryErr, or the raw Payload for every other kind. It
-// never errors — status encoding is a pure serialization — so both Send
-// (bounds check) and writeFrame can call it.
+// Status for a status-bearing kind (FrameUnaryErr/FrameStreamErr), or the raw
+// Payload for every other kind. It never errors — status encoding is a pure
+// serialization — so both Send (bounds check) and writeFrame can call it.
 func frameBody(f Frame) []byte {
-	if f.Kind == FrameUnaryErr {
+	if CarriesStatusBody(f.Kind) {
 		return EncodeStatus(f.Status)
 	}
 

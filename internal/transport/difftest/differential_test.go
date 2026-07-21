@@ -724,3 +724,54 @@ func requireResultsEqual(t *testing.T, uds, shm []Result) {
 	reason, agree := resultsDiverge(uds, shm)
 	require.True(t, agree, "%s", reason)
 }
+
+// Test that a FrameStreamErr carrying a status body round-trips identically over
+// the uds and shm transports (stream-protocol.md §2.3: STREAM_ERR's payload is a
+// status body encoded exactly as UNARY_ERR's). Both transports must agree, field
+// for field, on the decoded status and control word — the differential guarantee
+// the shared transport.EncodeStatus/DecodeStatus codec exists to provide.
+func TestRunDifferential_FrameStreamErrStatus_AgreesAcrossTransports(t *testing.T) {
+	sent := transport.Frame{
+		CallID: 77, Kind: transport.FrameStreamErr, Control: 3,
+		Status: &transport.FrameStatus{
+			Code:    0xFFFFFF04, // StatusCodeStreamCanceled
+			Message: "stream canceled",
+			Details: [][]byte{[]byte("why"), {}, []byte("more")},
+		},
+	}
+
+	// uds: build a streaming pair so the control word rides the header too.
+	udsFds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	udsA, err := transport.NewUDSTransport(udsFds[0], true)
+	require.NoError(t, err)
+	udsB, err := transport.NewUDSTransport(udsFds[1], true)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = udsA.Close(); _ = udsB.Close() })
+
+	require.NoError(t, udsA.Send(t.Context(), sent))
+	udsGot, err := udsB.Recv(t.Context())
+	require.NoError(t, err)
+
+	// shm: the in-process pair used by RunDifferential's own runOverSHM.
+	pair, err := shmtest.NewInProcessPair(1, shmtest.DefaultConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pair.Close() })
+
+	require.NoError(t, pair.Host.Send(t.Context(), sent))
+	shmGot, err := pair.Plugin.Recv(t.Context())
+	require.NoError(t, err)
+
+	// Both transports must reconstruct the identical frame.
+	for _, got := range []transport.Frame{udsGot, shmGot} {
+		require.Equal(t, transport.FrameStreamErr, got.Kind)
+		require.Equal(t, sent.CallID, got.CallID)
+		require.Equal(t, sent.Control, got.Control)
+		require.Nil(t, got.Payload)
+		require.NotNil(t, got.Status)
+	}
+	require.Equal(t, udsGot.Status, shmGot.Status, "uds and shm must agree on the decoded status")
+	require.Equal(t, sent.Status.Code, shmGot.Status.Code)
+	require.Equal(t, sent.Status.Message, shmGot.Status.Message)
+	require.Equal(t, sent.Status.Details, shmGot.Status.Details)
+}

@@ -748,8 +748,9 @@ func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 		// checksum feature is negotiated the frame instead falls through to
 		// stampPayload, which stores a CRC32C(empty) trailer (stored_length == 4)
 		// and sets CRC32C_PRESENT, so every data frame is uniformly checksummed.
-		// A FrameUnaryErr never reaches this branch: EncodeStatus always returns
-		// at least statusHeadSize bytes, so its wire payload is never empty.
+		// A status-bearing frame (FrameUnaryErr/FrameStreamErr) never reaches this
+		// branch: EncodeStatus always returns at least statusHeadSize bytes, so its
+		// wire payload is never empty.
 		return d, buildOK
 	}
 
@@ -757,13 +758,15 @@ func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 }
 
 // wirePayload returns the bytes a frame stores in its slab: the encoded
-// Status for a FrameUnaryErr (shm-abi.md UNARY_ERR carries a status payload
-// in place of a normal one), or the raw Payload for every other kind.
-// transport.EncodeStatus never returns an empty slice (a nil status still
-// encodes to the statusHeadSize-byte all-zero head), so a FrameUnaryErr
-// always has a non-empty wire payload and therefore always allocates a slab.
+// Status for a status-bearing kind (FrameUnaryErr/FrameStreamErr; shm-abi.md
+// UNARY_ERR carries a status payload in place of a normal one, and STREAM_ERR's
+// payload is a status body encoded the same way, stream-protocol.md §2.3), or
+// the raw Payload for every other kind. transport.EncodeStatus never returns an
+// empty slice (a nil status still encodes to the statusHeadSize-byte all-zero
+// head), so a status-bearing frame always has a non-empty wire payload and
+// therefore always allocates a slab.
 func wirePayload(f transport.Frame) []byte {
-	if f.Kind == transport.FrameUnaryErr {
+	if transport.CarriesStatusBody(f.Kind) {
 		return transport.EncodeStatus(f.Status)
 	}
 

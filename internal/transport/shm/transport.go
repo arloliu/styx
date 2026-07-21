@@ -427,10 +427,11 @@ func (t *Transport) Send(ctx context.Context, f transport.Frame) error {
 		return err
 	}
 	// Admission must validate the frame's actual wire bytes, not its Payload
-	// field: a FrameUnaryErr's real bytes are its encoded Status, produced
-	// later by the writer from Status rather than Payload. wirePayload is the
-	// same pure function submit's snapshot uses (see intent.wire), so the
-	// bytes validated here and the bytes eventually stamped are identical.
+	// field: a status-bearing frame's (FrameUnaryErr/FrameStreamErr) real bytes
+	// are its encoded Status, produced later by the writer from Status rather than
+	// Payload. wirePayload is the same pure function submit's snapshot uses (see
+	// intent.wire), so the bytes validated here and the bytes eventually stamped
+	// are identical.
 	wire := wirePayload(f)
 	if len(wire) > int(t.maxPayload) || len(wire) > transport.MaxFrameSize {
 		return transport.ErrPayloadTooLarge
@@ -701,13 +702,15 @@ func (t *Transport) classifyPayload(d ring.Descriptor, tk transport.FrameKind) (
 }
 
 // decodedFrame assembles the delivered transport.Frame from a validated
-// descriptor and its copied payload (shm-abi.md §4/§5). For a FrameUnaryErr,
-// payload is the encoded Status (its wire payload, shm-abi.md UNARY_ERR): it
-// is decoded into Frame.Status and Frame.Payload is left nil, symmetric to
-// what UDS produces. A FrameUnaryErr whose payload does not decode is a
-// conformance fault, not a deliverable frame -- the error is returned so the
-// caller can route it through the same poison path as any other malformed
-// descriptor, rather than delivering a Frame with a nil Status.
+// descriptor and its copied payload (shm-abi.md §4/§5). For a status-bearing
+// kind (FrameUnaryErr/FrameStreamErr), payload is the encoded Status (its wire
+// payload, shm-abi.md UNARY_ERR; STREAM_ERR carries the same status body,
+// stream-protocol.md §2.3): it is decoded into Frame.Status and Frame.Payload
+// is left nil, symmetric to what UDS produces. A status-bearing frame whose
+// payload does not decode is a conformance fault, not a deliverable frame -- the
+// error is returned so the caller can route it through the same poison path as
+// any other malformed descriptor, rather than delivering a Frame with a nil
+// Status.
 func decodedFrame(d ring.Descriptor, tk transport.FrameKind, payload []byte) (transport.Frame, error) {
 	f := transport.Frame{
 		CallID:  d.CallID(),
@@ -721,7 +724,7 @@ func decodedFrame(d ring.Descriptor, tk transport.FrameKind, payload []byte) (tr
 		Control: d.Reserved(),
 	}
 
-	if tk == transport.FrameUnaryErr {
+	if transport.CarriesStatusBody(tk) {
 		status, err := transport.DecodeStatus(payload)
 		if err != nil {
 			return transport.Frame{}, err
