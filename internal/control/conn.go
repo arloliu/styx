@@ -50,7 +50,39 @@ type Conn struct {
 	fd         int
 	generation uint64
 	corrID     atomic.Uint64
+	sendProbe  concurrencyProbe // send-direction contract observer (Send + SendFDs)
+	recvProbe  concurrencyProbe // recv-direction contract observer (Recv + RecvFDs)
 }
+
+// concurrencyProbe latches whether more than one operation was ever in flight
+// at once in a single direction (send or recv) on a Conn. The Conn contract
+// permits at most one in-flight Send and one in-flight Recv; a caller that
+// multiplexes both directions over one Conn (the plugin serving loop pausing
+// its heartbeat sender around a reload's Sends) can prove it upholds that here.
+// enter/leave never affect behavior — they only bump a counter and latch a
+// flag — so this is safe to leave always-on over the (non-hot) control plane.
+type concurrencyProbe struct {
+	inFlight   atomic.Int32
+	overlapped atomic.Bool
+}
+
+func (p *concurrencyProbe) enter() {
+	if p.inFlight.Add(1) > 1 {
+		p.overlapped.Store(true)
+	}
+}
+
+func (p *concurrencyProbe) leave() { p.inFlight.Add(-1) }
+
+// SendOverlapped reports whether two Send-direction operations (Send or
+// SendFDs) were ever simultaneously in flight on this Conn — a violation of
+// its one-in-flight-Send contract. Test observability only.
+func (c *Conn) SendOverlapped() bool { return c.sendProbe.overlapped.Load() }
+
+// RecvOverlapped reports whether two Recv-direction operations (Recv or
+// RecvFDs) were ever simultaneously in flight on this Conn — a violation of
+// its one-in-flight-Recv contract. Test observability only.
+func (c *Conn) RecvOverlapped() bool { return c.recvProbe.overlapped.Load() }
 
 // NewConn wraps fd, an already-connected SOCK_SEQPACKET socket, generation
 // is the current region generation stamped on every outgoing message.
@@ -68,6 +100,9 @@ func (c *Conn) NextCorrelationID() uint64 {
 // and writes it as a single seqpacket datagram. Returns an error wrapping
 // ErrProtocolViolation if the marshaled size is >= MaxMessageSize.
 func (c *Conn) Send(ctx context.Context, msg *controlpb.ControlMessage) error {
+	c.sendProbe.enter()
+	defer c.sendProbe.leave()
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -106,6 +141,9 @@ func (c *Conn) Send(ctx context.Context, msg *controlpb.ControlMessage) error {
 // data was truncated) is reported as ErrProtocolViolation, not a partial
 // message — RecvFDs applies the same treatment for fd-bearing messages.
 func (c *Conn) Recv(ctx context.Context) (*controlpb.ControlMessage, error) {
+	c.recvProbe.enter()
+	defer c.recvProbe.leave()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

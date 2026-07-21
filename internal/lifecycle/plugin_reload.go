@@ -52,9 +52,34 @@ type PluginReloadHooks struct {
 	Restorer StateRestorer // nil if the plugin declares no state
 }
 
+// ReloadOutcome tells ServeReload's caller what happened to this instance so
+// the serving loop can act: a rolled-back reload keeps serving (and must
+// heartbeat again), a retired one proceeds to shutdown. The zero value is
+// ReloadRetired so that any error path — where the outcome is not meaningful
+// — defaults to the safe "stop serving" side rather than resuming a possibly
+// broken instance.
+type ReloadOutcome int
+
+const (
+	// ReloadRetired means the reload succeeded and the host tore this
+	// instance down (the connection ended without a Resume): the serving loop
+	// proceeds to shutdown. It is also the value returned alongside any error,
+	// where the outcome itself carries no meaning.
+	ReloadRetired ReloadOutcome = iota
+	// ReloadRolledBack means the host rolled the reload back: mutators were
+	// restarted and Resume acked, so this instance keeps serving and must
+	// resume heartbeating.
+	ReloadRolledBack
+)
+
 // ServeReload runs one hot-reload pass of the plugin-side control-message
 // loop on conn, starting from control.StateServing (the state the plugin is
 // in while normal RPC traffic flows).
+//
+// It returns ReloadRolledBack when the host rolled the reload back (this
+// instance resumed and keeps serving) and ReloadRetired when a successful
+// reload retired it (the connection ended) or when it returns a non-nil
+// error (the outcome is not meaningful on the error path).
 //
 // On Drain it freezes every hooks.Mutators entry in registration order,
 // then replies DrainAck. Only freezing and that reply are bound by Drain's
@@ -78,12 +103,14 @@ type PluginReloadHooks struct {
 //     back — because it refused the snapshot, hit a failure of its own, or
 //     any other phase failed downstream. Every hooks.Mutators entry is
 //     restarted, in registration order, before ResumeAck goes back and
-//     ServeReload returns nil: the reload failed, this instance keeps
-//     serving.
-//   - the connection ending (a closed conn, or ctx being done) instead of
-//     either reply: a *successful* reload, where the host tears the old
-//     instance down without ever sending Resume. This is not an error —
-//     ServeReload returns nil.
+//     ServeReload returns (ReloadRolledBack, nil): the reload failed, this
+//     instance keeps serving.
+//   - a Shutdown, or the connection ending (a closed conn, or ctx being
+//     done), instead of either reply: a *successful* reload, where the host
+//     tears the old instance down without ever sending Resume. Teardown sends
+//     a real Shutdown to the retiring instance before closing (see
+//     internal/lifecycle/teardown.go), so both forms mean the same thing.
+//     This is not an error — ServeReload returns (ReloadRetired, nil).
 //
 // A failure on this side while producing the snapshot (hooks.Saver.SaveState
 // or shm.BuildSnapshot returning an error) never reaches the wire, but the
@@ -97,26 +124,39 @@ type PluginReloadHooks struct {
 // violation and is returned as an error wrapping control.ErrProtocolViolation.
 // Any receive failure that is not the connection cleanly ending or ctx
 // being done is likewise returned, wrapped, rather than treated as success.
-func ServeReload(ctx context.Context, conn *control.Conn, hooks PluginReloadHooks) error {
+func ServeReload(ctx context.Context, conn *control.Conn, hooks PluginReloadHooks) (ReloadOutcome, error) {
 	drainMsg, err := recvExpected(ctx, conn, control.StateServing, control.KindDrain)
 	if err != nil {
-		return fmt.Errorf("lifecycle: reload: await Drain: %w", err)
+		return ReloadRetired, fmt.Errorf("lifecycle: reload: await Drain: %w", err)
 	}
 
+	return ServeReloadAfterDrain(ctx, conn, drainMsg, hooks)
+}
+
+// ServeReloadAfterDrain runs the reload pass whose Drain has already been
+// received: drainMsg is that Drain. It exists because the plugin's serving
+// loop must itself read the control conn to tell a Drain from a Shutdown, and
+// control.Conn permits one in-flight Recv — so the loop cannot let ServeReload
+// read the Drain a second time. ServeReload is the entry point that reads the
+// Drain and then calls this; both are identical from the Drain onward, and the
+// full behavior is documented on ServeReload.
+func ServeReloadAfterDrain(
+	ctx context.Context, conn *control.Conn, drainMsg *controlpb.ControlMessage, hooks PluginReloadHooks,
+) (ReloadOutcome, error) {
 	deadline := time.Unix(0, drainMsg.GetDrain().GetDeadlineUnixNano())
 	dctx, cancel := context.WithDeadline(ctx, deadline)
 
 	if err := freezeMutators(dctx, hooks.Mutators); err != nil {
 		cancel()
 
-		return err
+		return ReloadRetired, err
 	}
 
 	drainAck := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_DrainAck{DrainAck: &controlpb.DrainAck{}}}
 	sendErr := conn.Send(dctx, drainAck)
 	cancel()
 	if sendErr != nil {
-		return fmt.Errorf("lifecycle: reload: send DrainAck: %w", sendErr)
+		return ReloadRetired, fmt.Errorf("lifecycle: reload: send DrainAck: %w", sendErr)
 	}
 
 	// Everything from here on runs under the parent ctx, not dctx: the drain
@@ -155,7 +195,7 @@ func resumeMutators(ctx context.Context, mutators []Mutator) error {
 // waits for the host's reply. A failure building the payload never reaches
 // the wire, so it routes into waiting for the host's own Resume instead of
 // returning an error — see ServeReload's doc.
-func runSnapshotPhase(ctx context.Context, conn *control.Conn, hooks PluginReloadHooks) error {
+func runSnapshotPhase(ctx context.Context, conn *control.Conn, hooks PluginReloadHooks) (ReloadOutcome, error) {
 	payload, err := loadStatePayload(ctx, hooks.Saver)
 	if err != nil {
 		return awaitResumeOrExit(ctx, conn, hooks.Mutators)
@@ -175,7 +215,7 @@ func runSnapshotPhase(ctx context.Context, conn *control.Conn, hooks PluginReloa
 		}},
 	}
 	if err := conn.SendFDs(ctx, msg, []int{fd}); err != nil {
-		return fmt.Errorf("lifecycle: reload: send SaveState: %w", err)
+		return ReloadRetired, fmt.Errorf("lifecycle: reload: send SaveState: %w", err)
 	}
 
 	return awaitSaveStateOutcome(ctx, conn, hooks.Mutators)
@@ -202,13 +242,13 @@ func loadStatePayload(ctx context.Context, saver StateSaver) ([]byte, error) {
 // hands off to awaitResumeOrExit for the next phase's outcome; Resume means
 // the host is rolling back before ever acking the snapshot, handled exactly
 // like a Resume arriving later. Anything else is a protocol violation.
-func awaitSaveStateOutcome(ctx context.Context, conn *control.Conn, mutators []Mutator) error {
+func awaitSaveStateOutcome(ctx context.Context, conn *control.Conn, mutators []Mutator) (ReloadOutcome, error) {
 	kind, ended, err := recvDuringReload(ctx, conn)
 	if err != nil {
-		return err
+		return ReloadRetired, err
 	}
 	if ended {
-		return nil
+		return ReloadRetired, nil
 	}
 
 	//exhaustive:ignore -- only the two replies SaveState can legally receive
@@ -220,51 +260,67 @@ func awaitSaveStateOutcome(ctx context.Context, conn *control.Conn, mutators []M
 	case control.KindResume:
 		return handleResume(ctx, conn, mutators)
 	default:
-		return fmt.Errorf("lifecycle: reload: await SaveStateAck: unexpected message: %w", control.ErrProtocolViolation)
+		return ReloadRetired,
+			fmt.Errorf("lifecycle: reload: await SaveStateAck: unexpected message: %w", control.ErrProtocolViolation)
 	}
 }
 
 // awaitResumeOrExit waits for the outcome ServeReload's doc describes:
-// Resume (restart mutators, ack) or the connection ending (return nil, the
-// successful-reload exit). Anything else is a protocol violation.
-func awaitResumeOrExit(ctx context.Context, conn *control.Conn, mutators []Mutator) error {
+// Resume (restart mutators, ack) or retirement — a Shutdown, or the
+// connection ending (return nil, the successful-reload exit). Anything else
+// is a protocol violation.
+func awaitResumeOrExit(ctx context.Context, conn *control.Conn, mutators []Mutator) (ReloadOutcome, error) {
 	kind, ended, err := recvDuringReload(ctx, conn)
 	if err != nil {
-		return err
+		return ReloadRetired, err
 	}
 	if ended {
-		return nil
+		return ReloadRetired, nil
 	}
 
-	if kind != control.KindResume {
-		return fmt.Errorf("lifecycle: reload: await Resume: unexpected message: %w", control.ErrProtocolViolation)
+	//exhaustive:ignore -- only Resume and Shutdown are acted on here; every
+	// other legal-in-StateDraining kind is a protocol violation at this point.
+	switch kind {
+	case control.KindResume:
+		return handleResume(ctx, conn, mutators)
+	case control.KindShutdown:
+		// A successful reload: the host promoted the successor and now retires
+		// this instance, which teardown does by sending a real Shutdown before
+		// closing the connection (see internal/lifecycle/teardown.go). That is a
+		// clean retirement — identical to the body-less close recvDuringReload
+		// already reports via ended — not a protocol violation. The serving
+		// loop's ShutdownAck is sent from runServingControl on this outcome.
+		return ReloadRetired, nil
+	default:
+		return ReloadRetired, fmt.Errorf(
+			"lifecycle: reload: await Resume: unexpected message: %w",
+			control.ErrProtocolViolation,
+		)
 	}
-
-	return handleResume(ctx, conn, mutators)
 }
 
 // handleResume restarts every mutator in registration order and sends
 // ResumeAck — the plugin's side of a rollback, whichever wait Resume arrived
 // during.
-func handleResume(ctx context.Context, conn *control.Conn, mutators []Mutator) error {
+func handleResume(ctx context.Context, conn *control.Conn, mutators []Mutator) (ReloadOutcome, error) {
 	if err := resumeMutators(ctx, mutators); err != nil {
-		return err
+		return ReloadRetired, err
 	}
 
 	resumeAck := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_ResumeAck{ResumeAck: &controlpb.ResumeAck{}}}
 	if err := conn.Send(ctx, resumeAck); err != nil {
-		return fmt.Errorf("lifecycle: reload: send ResumeAck: %w", err)
+		return ReloadRetired, fmt.Errorf("lifecycle: reload: send ResumeAck: %w", err)
 	}
 
-	return nil
+	return ReloadRolledBack, nil
 }
 
 // recvDuringReload receives the next control message and classifies the
 // outcome for the two post-DrainAck waits above: a legal-in-StateDraining
 // message (kind, ended=false); a clean end that is not an error (ended=true)
 // — either the host closing its end (the body-less-message convention
-// Conn.Recv's own doc and AwaitHostDisconnect both use for a closed
-// SOCK_SEQPACKET peer) or ctx itself being done; or a genuine receive
+// Conn.Recv's own doc uses for a closed SOCK_SEQPACKET peer) or ctx itself
+// being done; or a genuine receive
 // failure, returned wrapped rather than swallowed. A socket error, a
 // truncated datagram, or a decode failure is not the peer going away
 // cleanly, and reporting one as a successful reload would hide a real fault

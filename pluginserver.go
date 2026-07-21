@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -109,6 +110,36 @@ func (s *PluginServer) serve(ctx context.Context) error {
 		return fmt.Errorf("styx: serve: attach: %w", err)
 	}
 
+	err = s.runServing(ctx, conn, tr)
+	_ = conn.Close()
+
+	return err
+}
+
+// runServing runs the plugin's serving phase over an already-handshaken,
+// already-attached control conn and data-plane transport tr. It owns tr's
+// stop/join for the whole phase and never closes conn (serve does that last).
+//
+// A hot-reload successor (lifecycle.ReloadSuccessorEnv set) restores its
+// predecessor's state via lifecycle.ServeRestore BEFORE the data-plane reader
+// is even launched: the plugin must not trust the host (the untrusted peer) to
+// hold RPC traffic back, so restore must complete before any serving loop can
+// dispatch a frame. A first-start plugin has no snapshot coming and skips
+// restore entirely — it must never block waiting for a Restore that will not
+// arrive.
+//
+// It returns nil when the host shut the plugin down gracefully or a successful
+// reload retired it (exit 0), and a non-nil error on disconnect/crash or a
+// protocol violation (exit 1).
+func (s *PluginServer) runServing(ctx context.Context, conn *control.Conn, tr transport.Transport) error {
+	if isReloadSuccessor() {
+		if err := lifecycle.ServeRestore(ctx, conn, s.reloadHooks.Restorer); err != nil {
+			_ = tr.Close()
+
+			return fmt.Errorf("styx: serve: restore: %w", err)
+		}
+	}
+
 	dispatcher := rpcruntime.NewDispatcher()
 	s.mu.Lock()
 	for _, rs := range s.services {
@@ -117,52 +148,148 @@ func (s *PluginServer) serve(ctx context.Context) error {
 	s.mu.Unlock()
 
 	// Serving reader loop (data plane). Its only stop/join owner is this
-	// function: closing tr below unblocks its Recv.
+	// function: closing tr below unblocks its Recv. For a successor the restore
+	// above has already completed, so this reader cannot dispatch a frame ahead
+	// of the restore; for a first-start plugin there is no restore to precede.
 	readDone := make(chan struct{})
 	go func() {
 		defer close(readDone)
 		runServeLoop(ctx, tr, dispatcher)
 	}()
 
-	// Heartbeat sender (control plane): a dedicated goroutine
-	// sending periodic Heartbeat messages for as long as serving lasts —
-	// the plugin-side origin internal/supervisor.Supervisor's heartbeatLoop
-	// consumes. It only ever calls conn.Send, never conn.Recv:
-	// lifecycle.AwaitHostDisconnect below remains the SOLE reader of conn
-	// during serving (the one-in-flight-Recv contract), and this
-	// goroutine is fully stopped and joined (stopHeartbeat/heartbeatDone)
-	// before the ShutdownAck Send after it, so the two Sends can never run
-	// concurrently (control.Conn's one-in-flight-Send contract).
-	stopHeartbeat := make(chan struct{})
-	heartbeatDone := make(chan struct{})
-	go func() {
-		defer close(heartbeatDone)
-		runHeartbeatSender(ctx, conn, stopHeartbeat)
-	}()
+	// Drive the control plane until this instance is done serving: the
+	// heartbeat sender and the reload/shutdown dispatch loop.
+	ctrlErr := s.runServingControl(ctx, conn)
 
-	// Block until the host sends Shutdown (nil) or disconnects/crashes (err).
-	disconnectErr := lifecycle.AwaitHostDisconnect(ctx, conn)
+	// Stop serving and release the data-plane transport: closing tr unblocks+
+	// joins the serving loop. The control socket is closed by serve, last.
+	_ = tr.Close()
+	<-readDone
 
-	close(stopHeartbeat)
-	<-heartbeatDone
+	return ctrlErr
+}
 
-	// Graceful shutdown: acknowledge over the still-open control socket
-	// before tearing down. Best-effort — the host gates its reap on process
-	// exit, not on reading this ack.
-	if disconnectErr == nil {
+// runServingControl runs the plugin's control-plane serving phase on conn: it
+// starts the heartbeat sender, runs the control dispatch loop, tears the
+// heartbeat sender down, and — on a graceful shutdown or a completed reload —
+// sends a best-effort ShutdownAck. A successor's predecessor-state restore has
+// already happened in runServing, before the data-plane reader launched, so it
+// is not repeated here.
+//
+// It returns nil when the host shut the plugin down gracefully or a
+// successful reload retired it (the process should exit 0), and a non-nil
+// error on a host crash/disconnect or a protocol violation (exit 1).
+func (s *PluginServer) runServingControl(ctx context.Context, conn *control.Conn) error {
+	// The heartbeat sender is the only other goroutine that Sends on conn.
+	// control.Conn permits one in-flight Send, and a reload's ServeReload also
+	// Sends on conn, so the dispatch loop pauses this sender for the duration
+	// of a reload exchange and stop() joins it before the ShutdownAck below —
+	// the two Senders never overlap.
+	hb := newHeartbeatSender(conn, heartbeatInterval())
+	hb.start(ctx)
+
+	err := s.dispatchControl(ctx, conn, hb)
+
+	hb.stop()
+
+	if err == nil {
+		// Graceful shutdown, or a completed reload retirement whose host has
+		// already gone (this send then fails silently). Best-effort — the host
+		// gates its reap on process exit, not on reading this ack.
 		ackMsg := &controlpb.ControlMessage{
 			Body: &controlpb.ControlMessage_ShutdownAck{ShutdownAck: &controlpb.ShutdownAck{}},
 		}
 		_ = sendControl(ctx, conn, ackMsg, control.ReplyDeadlines[control.KindShutdown])
 	}
 
-	// Stop serving and release everything: close the data-plane transport to
-	// unblock+join the serving loop, then close the control socket last.
-	_ = tr.Close()
-	<-readDone
-	_ = conn.Close()
+	return err
+}
 
-	return disconnectErr
+// dispatchControl is the sole reader of conn during serving: control.Conn
+// permits one in-flight Recv, so exactly one goroutine — this one — ever
+// receives, and the reload it dispatches to (lifecycle.ServeReload) runs
+// inline here, never on a second goroutine. It handles:
+//
+//   - Shutdown — graceful shutdown: return nil so the caller acks and exits 0.
+//   - Drain — a live reload: quiesce the heartbeat sender, run ServeReload,
+//     then resume serving (rollback) or return nil to shut down (retirement).
+//   - a body-less datagram / receive error — the host is gone: return the
+//     error (or io.EOF) so the caller tears down and exits 1.
+//
+// Heartbeat acks and any other legal-in-serving message are ignored, exactly
+// as the passive disconnect wait did before reload dispatch existed.
+func (s *PluginServer) dispatchControl(ctx context.Context, conn *control.Conn, hb *heartbeatSender) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		msg, err := conn.Recv(ctx)
+		if err != nil {
+			return err // EOF / peer close / recv error: host is gone.
+		}
+
+		kind, ok := control.KindOf(msg)
+		if !ok {
+			// A body-less datagram is how a closed SOCK_SEQPACKET peer reports
+			// EOF: recvmsg returns zero bytes, unmarshaling to an empty message.
+			return io.EOF
+		}
+
+		//exhaustive:ignore -- only Shutdown and Drain are acted on; every other
+		// kind (heartbeat acks, and anything else legal while serving) is
+		// deliberately ignored, so it falls to default and keeps the loop reading.
+		switch kind {
+		case control.KindShutdown:
+			return nil // graceful shutdown; caller acks + tears down + exits 0.
+		case control.KindDrain:
+			retire, err := s.handleReload(ctx, conn, hb, msg)
+			if err != nil {
+				return err
+			}
+			if retire {
+				return nil // successful reload; this instance is retired, exit 0.
+			}
+			// Rolled back: heartbeats resumed in handleReload; keep serving.
+		default:
+		}
+	}
+}
+
+// handleReload runs one hot-reload exchange in place of passive serving,
+// starting from a Drain the dispatch loop has already received (drainMsg) — it
+// must not be read again, since control.Conn permits one in-flight Recv and
+// this reader goroutine is the only reader. It quiesces the heartbeat sender
+// first (control.Conn permits one in-flight Send too, and the reload Sends
+// DrainAck/SaveState/ResumeAck on this same conn), runs the reload inline on
+// this goroutine, and reports whether the reload retired this instance
+// (retire=true, proceed to shutdown) or was rolled back (retire=false,
+// heartbeats resumed, keep serving).
+func (s *PluginServer) handleReload(
+	ctx context.Context, conn *control.Conn, hb *heartbeatSender, drainMsg *controlpb.ControlMessage,
+) (retire bool, err error) {
+	hb.pause()
+
+	outcome, err := lifecycle.ServeReloadAfterDrain(ctx, conn, drainMsg, s.reloadHooks)
+	if err != nil {
+		return false, err
+	}
+
+	if outcome == lifecycle.ReloadRolledBack {
+		hb.resume()
+
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// isReloadSuccessor reports whether this process was spawned as a hot-reload
+// successor, signaled by a non-empty lifecycle.ReloadSuccessorEnv in the
+// environment. A successor restores predecessor state before serving; a
+// first-start plugin (the variable unset) does not.
+func isReloadSuccessor() bool {
+	return os.Getenv(lifecycle.ReloadSuccessorEnv) != ""
 }
 
 // pluginHandshake performs the plugin side of Hello -> HelloAck: it reads the
@@ -336,24 +463,39 @@ func heartbeatInterval() time.Duration {
 	return supervisor.DefaultHeartbeatInterval
 }
 
-// runHeartbeatSender sends a Heartbeat message immediately (so the host's
-// very first receive window does not need to wait out a full interval)
-// and then on every tick of heartbeatInterval, until stop is closed or ctx
-// is done. Every field but Sequence is zero-valued: there is no real SHM
-// ring yet, so progress counters are trivially zero over the current uds
-// transport, and an all-zero sample only ever degrades
-// internal/supervisor.Classify to plain liveness (HealthOK — no queued
-// work is ever reported, so neither wedged branch can fire). A failed
-// Send is not itself fatal here — it
-// most commonly means the host already went away, which
-// lifecycle.AwaitHostDisconnect (running concurrently) will detect and
-// report through its own, authoritative path.
-func runHeartbeatSender(ctx context.Context, conn *control.Conn, stop <-chan struct{}) {
-	ticker := time.NewTicker(heartbeatInterval())
-	defer ticker.Stop()
+// heartbeatSender owns the control-plane heartbeat goroutine: it sends a
+// Heartbeat immediately (so the host's first receive window need not wait out
+// a full interval) and then on every tick of its interval. Every field but
+// Sequence is zero-valued: there is no real SHM ring yet, so progress counters
+// are trivially zero over the current uds transport, and an all-zero sample
+// only ever degrades internal/supervisor.Classify to plain liveness (HealthOK
+// — no queued work is ever reported, so neither wedged branch can fire). A
+// failed Send is not itself fatal — it most commonly means the host already
+// went away, which the dispatch loop's own Recv will detect authoritatively.
+//
+// It also supports pause/resume, not just stop-once, because a hot-reload's
+// ServeReload Sends on the same conn and control.Conn permits one in-flight
+// Send: pause blocks until the sender is guaranteed not mid-Send and will not
+// Send again until resume (so a reload's Sends never overlap a heartbeat), and
+// resume restarts ticking after a rollback. A successful reload leaves it
+// paused and lets stop retire it.
+type heartbeatSender struct {
+	interval time.Duration
+	send     func(ctx context.Context) // sends one Heartbeat; captures the conn + Sequence
 
+	pauseReq  chan struct{}
+	pauseAck  chan struct{}
+	resumeReq chan struct{}
+	stopReq   chan struct{}
+	done      chan struct{}
+}
+
+// newHeartbeatSender builds a heartbeatSender that Sends Heartbeat messages on
+// conn at interval. The messages carry a monotonically increasing Sequence and
+// nothing else (see the type doc).
+func newHeartbeatSender(conn *control.Conn, interval time.Duration) *heartbeatSender {
 	var seq uint64
-	send := func() {
+	send := func(ctx context.Context) {
 		seq++
 		msg := &controlpb.ControlMessage{
 			Body: &controlpb.ControlMessage_Heartbeat{Heartbeat: &controlpb.Heartbeat{Sequence: seq}},
@@ -361,16 +503,88 @@ func runHeartbeatSender(ctx context.Context, conn *control.Conn, stop <-chan str
 		_ = sendControl(ctx, conn, msg, control.ReplyDeadlines[control.KindHeartbeat])
 	}
 
-	send()
+	return &heartbeatSender{
+		interval:  interval,
+		send:      send,
+		pauseReq:  make(chan struct{}),
+		pauseAck:  make(chan struct{}),
+		resumeReq: make(chan struct{}),
+		stopReq:   make(chan struct{}),
+		done:      make(chan struct{}),
+	}
+}
+
+// start launches the sender goroutine. Every subsequent pause/resume/stop call
+// must come from a single owner goroutine (the serving dispatch loop); they are
+// never safe to call concurrently with each other.
+func (h *heartbeatSender) start(ctx context.Context) {
+	go h.run(ctx)
+}
+
+// pause blocks until the sender is quiesced: guaranteed not mid-Send and
+// parked until resume. If the sender has already stopped, it is a no-op.
+func (h *heartbeatSender) pause() {
+	select {
+	case h.pauseReq <- struct{}{}:
+		<-h.pauseAck
+	case <-h.done:
+	}
+}
+
+// resume restarts a paused sender's ticking. If the sender has already
+// stopped, it is a no-op. It must only be called after a pause.
+func (h *heartbeatSender) resume() {
+	select {
+	case h.resumeReq <- struct{}{}:
+	case <-h.done:
+	}
+}
+
+// stop ends the sender goroutine and joins it, so no further Send can run —
+// the caller may then safely Send on the same conn itself. It unblocks a
+// paused sender too.
+func (h *heartbeatSender) stop() {
+	close(h.stopReq)
+	<-h.done
+}
+
+// run sends the immediate first beat, then ticks until paused, stopped, or ctx
+// is done. It is the only goroutine that touches send.
+func (h *heartbeatSender) run(ctx context.Context) {
+	defer close(h.done)
+
+	ticker := time.NewTicker(h.interval)
+	defer ticker.Stop()
+
+	h.send(ctx)
 	for {
 		select {
 		case <-ticker.C:
-			send()
-		case <-stop:
+			h.send(ctx)
+		case <-h.pauseReq:
+			if !h.awaitResume(ctx) {
+				return
+			}
+		case <-h.stopReq:
 			return
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// awaitResume acks a pause request and blocks until resume (return true), or a
+// stop/ctx-cancel that ends the sender (return false). Between the ack and the
+// return no beat is ever sent — the quiescence a reload's Sends depend on.
+func (h *heartbeatSender) awaitResume(ctx context.Context) bool {
+	h.pauseAck <- struct{}{}
+	select {
+	case <-h.resumeReq:
+		return true
+	case <-h.stopReq:
+		return false
+	case <-ctx.Done():
+		return false
 	}
 }
 

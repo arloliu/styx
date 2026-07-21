@@ -11,6 +11,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// ReloadSuccessorEnv is the environment variable a host sets on a plugin it
+// spawns as a hot-reload successor (merged onto Spec.Env). When it is present
+// in the process environment, the freshly spawned plugin runs ServeRestore to
+// receive and apply the predecessor's snapshot, and ack readiness, before it
+// begins serving. A first-start plugin never has it set and so must not wait
+// for a Restore that will never arrive. The value is not interpreted — any
+// non-empty value means "spawned as a successor".
+const ReloadSuccessorEnv = "STYX_RELOAD_SUCCESSOR"
+
 // ErrNoRestorerForState marks a snapshot a nil StateRestorer cannot accept:
 // the successor was handed predecessor state but has no way to apply it, so
 // accepting the snapshot would silently discard it.

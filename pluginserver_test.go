@@ -1,12 +1,22 @@
 package styx_test
 
 import (
+	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/internal/control"
-	"github.com/stretchr/testify/require"
+	"github.com/arloliu/styx/internal/control/controlpb"
+	"github.com/arloliu/styx/internal/lifecycle"
+	"github.com/arloliu/styx/internal/shm"
+	"github.com/arloliu/styx/internal/transport"
 )
 
 // Test PluginServer panicking when two registered services share a ServiceID
@@ -88,3 +98,661 @@ func TestIncompatibleReason_FallsBack_ForNonIncompatibleError(t *testing.T) {
 // (TestHost_StartStop_SpawnsReachesReadyAndReaps): it cannot be driven
 // meaningfully in-process because it reads the inherited control fd (fd 3)
 // and calls InstallDeathSignal, both of which require a real spawned child.
+//
+// The serving phase below Serve — the successor restore/data-plane-reader
+// ordering, the reload/shutdown dispatch loop, and heartbeat quiescence — is
+// driven directly through PluginServer.RunServingForTest / RunServingControlForTest
+// over a socketpair control.Conn, with a scripted host, mirroring the in-
+// process harness the lifecycle package's own reload tests use.
+
+// pluginServeHelper bundles the arrange-state for a serving-phase test: a
+// require handle, a fresh PluginServer, and a connected control.Conn pair (the
+// plugin end drives RunServing*ForTest, the host end runs the test script).
+type pluginServeHelper struct {
+	t          *testing.T
+	require    *require.Assertions
+	srv        *styx.PluginServer
+	hostConn   *control.Conn
+	pluginConn *control.Conn
+	pluginFD   int // pluginConn's underlying socket fd, exposed for tests that must
+	// shrink its kernel send buffer to force a genuinely blocking Send (see the
+	// overlap test below) — control.Conn itself has no fd getter.
+}
+
+// setupPluginServeTestHelper builds the harness over a real unix.Socketpair.
+func setupPluginServeTestHelper(t *testing.T) *pluginServeHelper {
+	t.Helper()
+
+	req := require.New(t)
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	req.NoError(err)
+
+	hostConn := control.NewConn(fds[0], 1)
+	pluginConn := control.NewConn(fds[1], 1)
+	t.Cleanup(func() {
+		_ = hostConn.Close()
+		_ = pluginConn.Close()
+	})
+
+	return &pluginServeHelper{
+		t:          t,
+		require:    req,
+		srv:        styx.NewPluginServer(),
+		hostConn:   hostConn,
+		pluginConn: pluginConn,
+		pluginFD:   fds[1],
+	}
+}
+
+// startControl launches RunServingControlForTest on its own goroutine and
+// returns a channel that receives its single result once it returns.
+func (h *pluginServeHelper) startControl() <-chan error {
+	h.t.Helper()
+
+	done := make(chan error, 1)
+	go func() { done <- h.srv.RunServingControlForTest(h.t.Context(), h.pluginConn) }()
+
+	return done
+}
+
+// startServing launches RunServingForTest (the whole serving phase, including
+// the data-plane reader over tr) on its own goroutine.
+func (h *pluginServeHelper) startServing(tr transport.Transport) <-chan error {
+	h.t.Helper()
+
+	done := make(chan error, 1)
+	go func() { done <- h.srv.RunServingForTest(h.t.Context(), h.pluginConn, tr) }()
+
+	return done
+}
+
+// recvSkippingHeartbeats receives the next non-heartbeat control message on the
+// host end, dropping any Heartbeat/HeartbeatAck the sender interleaves (as a
+// real host would). It is for fd-less control messages — the fd-bearing
+// SaveState is received with RecvFDs directly, and no heartbeat ever precedes
+// it since the sender is paused for the whole reload exchange.
+func (h *pluginServeHelper) recvSkippingHeartbeats() (*controlpb.ControlMessage, control.MessageKind) {
+	h.t.Helper()
+
+	for {
+		msg, err := h.hostConn.Recv(h.t.Context())
+		h.require.NoError(err)
+
+		kind, ok := control.KindOf(msg)
+		h.require.True(ok)
+		if kind == control.KindHeartbeat || kind == control.KindHeartbeatAck {
+			continue
+		}
+
+		return msg, kind
+	}
+}
+
+// sendDrain sends a Drain with a generous deadline, opening a reload.
+func (h *pluginServeHelper) sendDrain() {
+	h.t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	msg := &controlpb.ControlMessage{
+		Body: &controlpb.ControlMessage_Drain{Drain: &controlpb.Drain{DeadlineUnixNano: deadline.UnixNano()}},
+	}
+	h.require.NoError(h.hostConn.Send(h.t.Context(), msg))
+}
+
+// recvSaveStateAndAck receives the SaveState message and its fd, verifies the
+// sealed snapshot, and replies SaveStateAck with the host's own checksum,
+// mirroring what a real host's snapshot phase does.
+func (h *pluginServeHelper) recvSaveStateAndAck() {
+	h.t.Helper()
+
+	// The heartbeat sender is paused for the whole reload exchange, so
+	// SaveState — not a heartbeat — is the next fd-bearing datagram.
+	msg, fds, err := h.hostConn.RecvFDs(h.t.Context(), 1)
+	h.require.NoError(err)
+	kind, ok := control.KindOf(msg)
+	h.require.True(ok)
+	h.require.Equal(control.KindSaveState, kind)
+	h.require.Len(fds, 1)
+	fd := fds[0]
+	h.t.Cleanup(func() { _ = unix.Close(fd) })
+
+	_, checksum, err := shm.VerifySealedSnapshot(fd, msg.GetSaveState().GetDeclaredLength())
+	h.require.NoError(err)
+
+	ack := &controlpb.ControlMessage{
+		Body: &controlpb.ControlMessage_SaveStateAck{SaveStateAck: &controlpb.SaveStateAck{Checksum: checksum[:]}},
+	}
+	h.require.NoError(h.hostConn.Send(h.t.Context(), ack))
+}
+
+// sendRestore builds a sealed snapshot for payload and delivers it as a
+// Restore message with the fd attached.
+func (h *pluginServeHelper) sendRestore(payload []byte, formatVersion uint32) {
+	h.t.Helper()
+
+	fd, declaredLen, _, err := shm.BuildSnapshot(payload, shm.MaxSnapshotBytes)
+	h.require.NoError(err)
+	h.t.Cleanup(func() { _ = unix.Close(fd) })
+
+	msg := &controlpb.ControlMessage{
+		Body: &controlpb.ControlMessage_Restore{Restore: &controlpb.Restore{
+			SnapshotFdCount: 1,
+			DeclaredLength:  declaredLen,
+			FormatVersion:   formatVersion,
+		}},
+	}
+	h.require.NoError(h.hostConn.SendFDs(h.t.Context(), msg, []int{fd}))
+}
+
+// shutdownAndExpectAck sends the real Shutdown teardown message the host's own
+// teardown emits (see internal/lifecycle/teardown.go), expects the ShutdownAck,
+// and waits for the serving goroutine to return nil (exit 0).
+func (h *pluginServeHelper) shutdownAndExpectAck(done <-chan error) {
+	h.t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	shutMsg := &controlpb.ControlMessage{
+		Body: &controlpb.ControlMessage_Shutdown{Shutdown: &controlpb.Shutdown{DeadlineUnixNano: deadline.UnixNano()}},
+	}
+	h.require.NoError(h.hostConn.Send(h.t.Context(), shutMsg))
+
+	_, kind := h.recvSkippingHeartbeats()
+	h.require.Equal(control.KindShutdownAck, kind)
+
+	select {
+	case err := <-done:
+		h.require.NoError(err)
+	case <-time.After(5 * time.Second):
+		h.t.Fatal("serving must return after a graceful shutdown")
+	}
+}
+
+// callLog records call names in the order they happened, safe for concurrent
+// use since the reload handlers run on the serving goroutine while the test
+// drives the host end.
+type callLog struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (l *callLog) add(name string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = append(l.calls, name)
+}
+
+func (l *callLog) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return append([]string(nil), l.calls...)
+}
+
+// loggingMutator records "<name>:freeze" / "<name>:resume" to a shared log.
+type loggingMutator struct {
+	name string
+	log  *callLog
+}
+
+func (m *loggingMutator) Freeze(context.Context) error {
+	m.log.add(m.name + ":freeze")
+
+	return nil
+}
+
+func (m *loggingMutator) Resume(context.Context) error {
+	m.log.add(m.name + ":resume")
+
+	return nil
+}
+
+// fakeStateSaver returns a fixed payload from SaveState after an optional
+// delay standing in for slow snapshot work.
+type fakeStateSaver struct {
+	payload []byte
+	delay   time.Duration
+}
+
+func (s *fakeStateSaver) SaveState(context.Context) ([]byte, error) {
+	if s.delay > 0 {
+		time.Sleep(s.delay)
+	}
+
+	return s.payload, nil
+}
+
+// fakeStateRestorer records whether RestoreState ran. The field is written on
+// the serving goroutine and read from the test goroutine after a socket round
+// trip, so it is atomic (the race detector cannot see the happens-before edge
+// the socket creates).
+type fakeStateRestorer struct {
+	called atomic.Bool
+}
+
+func (r *fakeStateRestorer) RestoreState(context.Context, uint32, []byte) error {
+	r.called.Store(true)
+
+	return nil
+}
+
+// gateStateRestorer records that RestoreState ran and marks restoreDone when
+// it returns, so a paired gateTransport can observe whether the data-plane
+// reader was launched before or after the restore completed. RestoreState
+// blocks between recording entry (closing entered) and returning (waiting on
+// release) so a test can hold the restore window open on demand: rather than
+// trusting that an early-launched reader goroutine happens to lose the
+// scheduling race before restore naturally returns, the test gets to decide
+// exactly how long the window stays open before checking whether the reader
+// has already started inside it.
+type gateStateRestorer struct {
+	restoreDone *atomic.Bool
+	called      atomic.Bool
+	entered     chan struct{}
+	release     chan struct{}
+}
+
+func newGateStateRestorer(restoreDone *atomic.Bool) *gateStateRestorer {
+	return &gateStateRestorer{
+		restoreDone: restoreDone,
+		entered:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+}
+
+func (r *gateStateRestorer) RestoreState(ctx context.Context, _ uint32, _ []byte) error {
+	r.called.Store(true)
+	close(r.entered)
+
+	select {
+	case <-r.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	r.restoreDone.Store(true)
+
+	return nil
+}
+
+// gateTransport is a data-plane transport stand-in that records, on its very
+// first Recv, whether the successor restore had already completed
+// (restoreDone). runServeLoop calls Recv as its first action, so this proves
+// whether the serving reader was launched before or after the restore
+// returned. Recv then blocks until Close. Send is a no-op; no frame is ever
+// dispatched through it — the transport exists only to observe reader start
+// ordering.
+type gateTransport struct {
+	restoreDone            *atomic.Bool
+	recved                 chan struct{} // closed once Recv has been entered
+	firstRecv              sync.Once
+	restoreDoneAtFirstRecv atomic.Bool
+	release                chan struct{} // closed by Close to unblock Recv
+	closeOnce              sync.Once
+}
+
+func newGateTransport(restoreDone *atomic.Bool) *gateTransport {
+	return &gateTransport{
+		restoreDone: restoreDone,
+		recved:      make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+}
+
+func (g *gateTransport) Recv(ctx context.Context) (transport.Frame, error) {
+	g.firstRecv.Do(func() {
+		g.restoreDoneAtFirstRecv.Store(g.restoreDone.Load())
+		close(g.recved)
+	})
+
+	select {
+	case <-g.release:
+		return transport.Frame{}, transport.ErrClosed
+	case <-ctx.Done():
+		return transport.Frame{}, ctx.Err()
+	}
+}
+
+func (g *gateTransport) Send(context.Context, transport.Frame) error { return nil }
+
+func (g *gateTransport) Close() error {
+	g.closeOnce.Do(func() { close(g.release) })
+
+	return nil
+}
+
+// Test the serving dispatch loop routing a Drain to the reload handlers —
+// freezing mutators and sending DrainAck — and returning nil once a successful
+// reload retires the instance via a body-less peer close (the ended path).
+func TestPluginServer_DispatchDrainToReloadAndRetire_OnPeerClose(t *testing.T) {
+	// Given
+	h := setupPluginServeTestHelper(t)
+	t.Setenv(styx.HeartbeatIntervalEnv, "1h") // leave only the immediate beat
+	log := &callLog{}
+	h.srv.RegisterMutator(&loggingMutator{name: "only", log: log})
+	done := h.startControl()
+
+	// When: the host drives a reload through to a successful retirement.
+	h.sendDrain()
+	_, kind := h.recvSkippingHeartbeats()
+	h.require.Equal(control.KindDrainAck, kind)
+	h.require.Equal([]string{"only:freeze"}, log.snapshot(),
+		"Drain must dispatch to the reload handlers and freeze the mutator before DrainAck")
+
+	h.recvSaveStateAndAck()
+	h.require.NoError(h.hostConn.Close()) // host tears the old instance down by closing
+
+	// Then
+	select {
+	case err := <-done:
+		h.require.NoError(err, "a completed reload retires the instance and exits 0")
+	case <-time.After(5 * time.Second):
+		t.Fatal("serving must return once a successful reload retires the instance")
+	}
+}
+
+// Test a successful reload retiring the instance cleanly on the host's REAL
+// Shutdown teardown message (not a peer close): the retiring plugin, parked
+// awaiting the reload outcome, must treat Shutdown as a clean retirement, ack
+// it, and return nil (exit 0) — never reject it as a protocol violation. This
+// exercises internal/lifecycle/teardown.go's actual wire behavior, which sends
+// a Shutdown to the retiring instance before closing.
+func TestPluginServer_RetireCleanly_OnShutdownTeardownAfterSaveStateAck(t *testing.T) {
+	// Given
+	h := setupPluginServeTestHelper(t)
+	t.Setenv(styx.HeartbeatIntervalEnv, "1h") // leave only the immediate beat
+	log := &callLog{}
+	h.srv.RegisterMutator(&loggingMutator{name: "only", log: log})
+	done := h.startControl()
+
+	// When: the host drives a reload, acks the snapshot, then retires the
+	// instance with the real Shutdown teardown message.
+	h.sendDrain()
+	_, kind := h.recvSkippingHeartbeats()
+	h.require.Equal(control.KindDrainAck, kind)
+	h.require.Equal([]string{"only:freeze"}, log.snapshot())
+
+	h.recvSaveStateAndAck()
+
+	// Then: the plugin acks the Shutdown and the serving goroutine returns nil.
+	h.shutdownAndExpectAck(done)
+}
+
+// Test the serving loop resuming both mutators and heartbeats, and continuing
+// to serve, when the host rolls a reload back with a Resume.
+func TestPluginServer_ResumeServingAndHeartbeats_OnReloadRollback(t *testing.T) {
+	// Given: a short interval so a resumed heartbeat is observable quickly.
+	h := setupPluginServeTestHelper(t)
+	t.Setenv(styx.HeartbeatIntervalEnv, "20ms")
+	log := &callLog{}
+	h.srv.RegisterMutator(&loggingMutator{name: "only", log: log})
+	done := h.startControl()
+
+	// When: the host opens a reload, then rolls it back instead of acking.
+	h.sendDrain()
+	_, kind := h.recvSkippingHeartbeats()
+	h.require.Equal(control.KindDrainAck, kind)
+
+	// SaveState is fd-bearing and the sender is paused, so no heartbeat
+	// precedes it: receive it directly.
+	saveMsg, fds, err := h.hostConn.RecvFDs(t.Context(), 1)
+	h.require.NoError(err)
+	saveKind, ok := control.KindOf(saveMsg)
+	h.require.True(ok)
+	h.require.Equal(control.KindSaveState, saveKind)
+	for _, fd := range fds {
+		_ = unix.Close(fd)
+	}
+
+	resumeMsg := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_Resume{Resume: &controlpb.Resume{}}}
+	h.require.NoError(h.hostConn.Send(t.Context(), resumeMsg))
+	_, kind = h.recvSkippingHeartbeats()
+	h.require.Equal(control.KindResumeAck, kind)
+
+	// Then: the mutator resumed, and heartbeats resume — the very next message
+	// after ResumeAck is a Heartbeat (only the heartbeat sender writes now).
+	h.require.Equal([]string{"only:freeze", "only:resume"}, log.snapshot())
+
+	waitCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	beat, err := h.hostConn.Recv(waitCtx)
+	h.require.NoError(err, "heartbeats must resume after a rollback")
+	beatKind, ok := control.KindOf(beat)
+	h.require.True(ok)
+	h.require.Equal(control.KindHeartbeat, beatKind, "the resumed instance must heartbeat again")
+
+	// The rolled-back instance keeps serving and shuts down gracefully.
+	h.shutdownAndExpectAck(done)
+}
+
+// Test the serving loop acknowledging a graceful Shutdown and returning nil.
+func TestPluginServer_ShutdownGracefully_OnHostShutdown(t *testing.T) {
+	// Given
+	h := setupPluginServeTestHelper(t)
+	t.Setenv(styx.HeartbeatIntervalEnv, "1h")
+	done := h.startControl()
+
+	// When / Then
+	h.shutdownAndExpectAck(done)
+}
+
+// Test the serving loop returning an error when the host disconnects (the
+// process must exit non-zero rather than treat a crash as a clean stop).
+func TestPluginServer_ReturnError_WhenHostDisconnects(t *testing.T) {
+	// Given
+	h := setupPluginServeTestHelper(t)
+	t.Setenv(styx.HeartbeatIntervalEnv, "1h")
+	done := h.startControl()
+
+	// When: the host closes its end without a graceful Shutdown.
+	h.require.NoError(h.hostConn.Close())
+
+	// Then
+	select {
+	case err := <-done:
+		h.require.Error(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("serving must return an error when the host disconnects")
+	}
+}
+
+// Test the heartbeat sender staying silent for the whole reload exchange: with
+// a slow snapshot and a fast heartbeat interval, no heartbeat may land between
+// DrainAck and SaveState — the two Senders on the one control conn never
+// overlap.
+func TestPluginServer_QuiesceHeartbeat_WhileReloadSends(t *testing.T) {
+	// Given: SaveState takes ~200ms while heartbeats would otherwise fire every
+	// 2ms, so a broken pause would put dozens of beats between DrainAck and
+	// SaveState.
+	h := setupPluginServeTestHelper(t)
+	t.Setenv(styx.HeartbeatIntervalEnv, "2ms")
+	h.srv.RegisterStateSaver(&fakeStateSaver{payload: []byte("state"), delay: 200 * time.Millisecond})
+	done := h.startControl()
+
+	// When
+	h.sendDrain()
+	_, kind := h.recvSkippingHeartbeats()
+	h.require.Equal(control.KindDrainAck, kind)
+
+	// Then: the very next datagram — nothing skipped — is SaveState. A broken
+	// pause would instead deliver a heartbeat here, which RecvFDs rejects as
+	// carrying no fds, so either way an overlapping Send fails this assertion.
+	msg, fds, err := h.hostConn.RecvFDs(t.Context(), 1)
+	h.require.NoError(err,
+		"no heartbeat may be sent between DrainAck and SaveState during a reload")
+	nextKind, ok := control.KindOf(msg)
+	h.require.True(ok)
+	h.require.Equal(control.KindSaveState, nextKind,
+		"no heartbeat may be sent between DrainAck and SaveState during a reload")
+	for _, fd := range fds {
+		_ = unix.Close(fd)
+	}
+
+	h.require.NoError(h.hostConn.Close()) // retire the instance
+	h.require.NoError(<-done)
+}
+
+// Test that no two Send-direction (or Recv-direction) operations are ever
+// simultaneously in flight on the plugin's control conn across a reload — the
+// heartbeat-in-flight-at-reload-start boundary specifically.
+//
+// The window this pins: the plugin conn's own kernel send buffer is shrunk to
+// its minimum (SO_SNDBUF=1, rounded up by the kernel) and the host never
+// drains it until after Drain is sent, so a fast (1ms) heartbeat cadence
+// fills it and genuinely blocks a heartbeat mid-Send — the sender goroutine
+// is parked inside Conn.Send's Sendmsg syscall, not idle at its select loop.
+// A correct pause() cannot return while that Send is still blocked (the
+// sender can't reach the select statement that would consume the pause
+// request), so the reload's own first Send (DrainAck) is only ever attempted
+// once the blocked heartbeat has completed and the sender is quiesced: the
+// two Sends can never overlap. A broken pause returns immediately regardless,
+// so DrainAck's Send is attempted — and enters — while the heartbeat's Send
+// is still blocked, which the Conn's own contract observer latches. The two
+// time.Sleep calls below give this window comfortable, deterministic
+// headroom rather than trusting relative goroutine scheduling: nothing drains
+// the buffer during either wait (the host reads nothing until
+// recvSkippingHeartbeats), so waiting longer only strengthens the guarantee.
+func TestPluginServer_NeverOverlapsControlSends_AcrossReloadBoundary(t *testing.T) {
+	// Given
+	h := setupPluginServeTestHelper(t)
+	h.require.NoError(unix.SetsockoptInt(h.pluginFD, unix.SOL_SOCKET, unix.SO_SNDBUF, 1))
+	t.Setenv(styx.HeartbeatIntervalEnv, "1ms")
+	h.srv.RegisterMutator(&loggingMutator{name: "only", log: &callLog{}})
+	h.srv.RegisterStateSaver(&fakeStateSaver{payload: []byte("state")})
+	done := h.startControl()
+
+	// When: let the undrained heartbeat sender fill the shrunk send buffer
+	// and block mid-Send on an actual heartbeat.
+	time.Sleep(100 * time.Millisecond)
+
+	h.sendDrain()
+
+	// Give the dispatch goroutine (Freeze, then DrainAck's Send) a comfortable
+	// window to run — it does no syscalls of its own before attempting
+	// DrainAck's Send, so this easily outlasts it — before this test starts
+	// draining the buffer.
+	time.Sleep(50 * time.Millisecond)
+
+	_, kind := h.recvSkippingHeartbeats()
+	h.require.Equal(control.KindDrainAck, kind)
+
+	// Then: by now the blocked-heartbeat/DrainAck window has already closed
+	// one way or the other — the latch is monotonic, so checking here is
+	// exactly as valid as checking after the whole reload completes.
+	h.require.False(h.pluginConn.SendOverlapped(),
+		"two Send-direction ops overlapped on the control conn during a reload")
+
+	// And: drive the rest of the reload to retirement and re-check both
+	// directions across the full boundary.
+	h.recvSaveStateAndAck()
+	h.shutdownAndExpectAck(done)
+
+	h.require.False(h.pluginConn.SendOverlapped(),
+		"two Send-direction ops overlapped on the control conn during a reload")
+	h.require.False(h.pluginConn.RecvOverlapped(),
+		"two Recv-direction ops overlapped on the control conn during a reload")
+}
+
+// Test a successor plugin restoring predecessor state before its data-plane
+// reader is launched: the RestoreAck is the first control message the host
+// sees (ahead of any heartbeat), and the data-plane reader's first Recv does
+// not happen until the restore has returned — a frame could never be
+// dispatched ahead of the restore.
+//
+// The window this pins: RestoreState is held open (via gateStateRestorer's
+// entered/release gate) from the moment it is entered until this test
+// explicitly releases it. Under the correct ordering the reader-launch
+// statement is sequenced strictly after ServeRestore returns, so while
+// RestoreState is held open the reader goroutine cannot even exist yet —
+// tr.recved firing during that window is possible only if the reader was
+// launched ahead of restore. Waiting out a generous, fixed window here
+// (rather than trusting whatever the scheduler happens to do) is what makes
+// this deterministic: a prematurely launched reader only needs one scheduler
+// quantum to reach its first Recv, so 200ms is not a guess at total ordering
+// time, only comfortable headroom for that one quantum.
+func TestPluginServer_RestoreBeforeDataPlaneReader_WhenSpawnedAsSuccessor(t *testing.T) {
+	// Given
+	h := setupPluginServeTestHelper(t)
+	t.Setenv(styx.HeartbeatIntervalEnv, "1h") // leave ordering crisp
+	t.Setenv(lifecycle.ReloadSuccessorEnv, "1")
+	var restoreDone atomic.Bool
+	tr := newGateTransport(&restoreDone)
+	restorer := newGateStateRestorer(&restoreDone)
+	h.srv.RegisterStateRestorer(restorer)
+	done := h.startServing(tr)
+
+	// When: the host delivers the snapshot; RestoreState blocks as soon as it
+	// is entered, holding the restore window open until this test releases it.
+	h.sendRestore([]byte("device gateway session state"), 3)
+
+	select {
+	case <-restorer.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RestoreState was never called")
+	}
+
+	// Then: while restore is still in flight, the data-plane reader must not
+	// have started.
+	select {
+	case <-tr.recved:
+		t.Fatal("the data-plane reader started before the successor restore returned")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(restorer.release)
+
+	// And: only once restore is released does RestoreAck follow, and the
+	// data-plane reader observably starts after restore returned.
+	reply, err := h.hostConn.Recv(t.Context())
+	h.require.NoError(err)
+	kind, ok := control.KindOf(reply)
+	h.require.True(ok)
+	h.require.Equal(control.KindRestoreAck, kind, "a successor must restore before it heartbeats or serves")
+	h.require.True(reply.GetRestoreAck().GetReady())
+	h.require.True(restorer.called.Load())
+
+	select {
+	case <-tr.recved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the data-plane reader never started")
+	}
+	h.require.True(tr.restoreDoneAtFirstRecv.Load(),
+		"the data-plane reader must not start until the successor restore has returned")
+
+	h.shutdownAndExpectAck(done)
+}
+
+// Test a first-start plugin serving immediately, without waiting for a Restore
+// that will never arrive: with no successor env signal, a heartbeat is the
+// first control message the host sees, the restorer is never consulted, and the
+// data-plane reader starts right away.
+func TestPluginServer_ServeWithoutRestore_WhenNotSuccessor(t *testing.T) {
+	// Given: the successor signal explicitly unset (guarding against a real env
+	// var leaking in).
+	h := setupPluginServeTestHelper(t)
+	t.Setenv(styx.HeartbeatIntervalEnv, "20ms")
+	t.Setenv(lifecycle.ReloadSuccessorEnv, "")
+	var restoreDone atomic.Bool
+	tr := newGateTransport(&restoreDone)
+	restorer := &fakeStateRestorer{}
+	h.srv.RegisterStateRestorer(restorer)
+	done := h.startServing(tr)
+
+	// When / Then: a heartbeat arrives without any Restore exchange.
+	waitCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	msg, err := h.hostConn.Recv(waitCtx)
+	h.require.NoError(err)
+	kind, ok := control.KindOf(msg)
+	h.require.True(ok)
+	h.require.Equal(control.KindHeartbeat, kind, "a first-start plugin must serve without waiting for a Restore")
+	h.require.False(restorer.called.Load(), "the restorer must never run for a first-start plugin")
+
+	// And: the data-plane reader starts immediately (no restore to wait on).
+	select {
+	case <-tr.recved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the data-plane reader never started for a first-start plugin")
+	}
+
+	h.shutdownAndExpectAck(done)
+}

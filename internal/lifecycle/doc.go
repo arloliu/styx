@@ -1,9 +1,8 @@
 // Package lifecycle implements the process-level primitives of host- and
 // plugin-side lifecycle: spawning a plugin child with a sanitized
 // environment and the inherited control fd (Spawn), the plugin's
-// "never outlive the host" death-signal bootstrap (InstallDeathSignal), host-
-// disconnect detection during serving (AwaitHostDisconnect), and the
-// normative 6-step teardown state machine (Teardown) whose ordering — stop
+// "never outlive the host" death-signal bootstrap (InstallDeathSignal), and
+// the normative 6-step teardown state machine (Teardown) whose ordering — stop
 // admission, fail in-flight, join goroutines, unmap, terminate-and-reap,
 // close fds — is fixed and never reordered.
 //

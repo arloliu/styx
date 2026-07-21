@@ -485,7 +485,7 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, conn *control.Conn) (sto
 
 		kind, ok := control.KindOf(msg)
 		if !ok {
-			return false, io.EOF // body-less datagram: the plugin closed its end (see AwaitHostDisconnect).
+			return false, io.EOF // body-less datagram: the plugin's control dispatch loop exited, closing its end.
 		}
 		if kind != control.KindHeartbeat {
 			continue // nothing else is currently expected from the plugin during serving.

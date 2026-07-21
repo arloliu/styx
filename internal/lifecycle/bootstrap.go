@@ -1,11 +1,8 @@
 package lifecycle
 
 import (
-	"context"
-	"io"
 	"os"
 
-	"github.com/arloliu/styx/internal/control"
 	"golang.org/x/sys/unix"
 )
 
@@ -62,56 +59,4 @@ func InstallDeathSignal() {
 // reparenting to init is already caught by the mismatch (1 != the host's pid).
 func orphaned(currentPPID, originalPPID int) bool {
 	return currentPPID != originalPPID
-}
-
-// AwaitHostDisconnect drives the plugin's control socket during the serving
-// phase and blocks until the host connection ends, returning what ended it:
-//
-//   - nil — the host sent a graceful Shutdown message. The caller
-//     (PluginServer.Serve) is responsible for acknowledging it, running any
-//     cleanup, and exiting 0.
-//   - a non-nil error — the host process crashed or closed its end (control
-//     socket EOF), or ctx was canceled. The caller runs cleanup and exits.
-//
-// It is the single reader of conn during serving: control.Conn permits only
-// one in-flight Recv, so there is exactly one control-message loop, and this
-// is it. Currently the only control message the host itself sends after
-// handshake is Shutdown (from Host.Stop's teardown) or nothing at all (a
-// crash, seen as EOF); the host's HeartbeatAck replies (to the plugin's own
-// periodic Heartbeat sends — see pluginserver.go's runHeartbeatSender) also
-// arrive here and are likewise ignored — the plugin does not itself need to
-// observe the host's acks, only send the heartbeats.
-//
-// NOTE (deviation from the brief's godoc sketch): the brief described a
-// separate "ordinary control-message loop" handling Shutdown while this
-// function only detected EOF. control.Conn's one-in-flight-Recv contract
-// makes two concurrent control readers illegal, so the two are folded into
-// this single loop; the graceful-vs-crash distinction is carried by the
-// nil-vs-error return instead of by a separately-canceled ctx.
-func AwaitHostDisconnect(ctx context.Context, conn *control.Conn) error {
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		msg, err := conn.Recv(ctx)
-		if err != nil {
-			return err // EOF / peer close / recv error: host is gone.
-		}
-
-		kind, ok := control.KindOf(msg)
-		if !ok {
-			// An empty datagram is how a closed SOCK_SEQPACKET peer reports
-			// EOF: recvmsg returns zero bytes, which unmarshals to a
-			// body-less ControlMessage. Treat it as host disconnect.
-			return io.EOF
-		}
-
-		if kind == control.KindShutdown {
-			return nil // graceful shutdown; caller acks + cleans up + exits 0.
-		}
-
-		// Any other kind (e.g. a future heartbeat) is currently ignored — keep
-		// reading until Shutdown or disconnect.
-	}
 }

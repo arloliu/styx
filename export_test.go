@@ -1,6 +1,35 @@
 package styx
 
-import "github.com/arloliu/styx/internal/control"
+import (
+	"context"
+
+	"github.com/arloliu/styx/internal/control"
+	"github.com/arloliu/styx/internal/transport"
+)
+
+// HeartbeatIntervalEnv re-exports heartbeatIntervalEnv so pluginserver_test
+// (external test package) can shorten or lengthen the heartbeat send interval
+// to make the serving-control dispatch tests deterministic.
+const HeartbeatIntervalEnv = heartbeatIntervalEnv
+
+// RunServingControlForTest re-exports runServingControl for pluginserver_test
+// (external test package): it drives the plugin's control-plane serving phase
+// (successor restore, heartbeats, and the reload/shutdown dispatch loop) over a
+// caller-supplied control.Conn, so the reload wiring can be exercised in-process
+// against a scripted host without a real spawned child.
+func (s *PluginServer) RunServingControlForTest(ctx context.Context, conn *control.Conn) error {
+	return s.runServingControl(ctx, conn)
+}
+
+// RunServingForTest re-exports runServing for pluginserver_test (external test
+// package): it drives the whole serving phase — the successor restore, the
+// data-plane reader launch, and the control-plane serving loop — over a
+// caller-supplied control.Conn and data-plane Transport, so the ordering
+// between a successor's restore and the data-plane reader can be exercised
+// in-process without a real spawned child.
+func (s *PluginServer) RunServingForTest(ctx context.Context, conn *control.Conn, tr transport.Transport) error {
+	return s.runServing(ctx, conn, tr)
+}
 
 // DroppedInformationalEventCounts re-exports h.bus's informational-event
 // drop counters for host_test (external test package): it lets a test

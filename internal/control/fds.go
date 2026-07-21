@@ -118,6 +118,9 @@ func (c *Conn) SendFDs(ctx context.Context, msg *controlpb.ControlMessage, fds [
 // child. MSG_CMSG_CLOEXEC closes that window entirely, with no ForkLock
 // needed.
 func (c *Conn) RecvFDs(ctx context.Context, maxFDs int) (*controlpb.ControlMessage, []int, error) {
+	c.recvProbe.enter()
+	defer c.recvProbe.leave()
+
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -201,6 +204,9 @@ func (c *Conn) RecvFDs(ctx context.Context, maxFDs int) (*controlpb.ControlMessa
 //
 //nolint:revive // see doc above
 func (c *Conn) sendFDsUnchecked(ctx context.Context, msg *controlpb.ControlMessage, fds []int) error {
+	c.sendProbe.enter()
+	defer c.sendProbe.leave()
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}

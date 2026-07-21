@@ -117,13 +117,38 @@ func newReloadConnPair(t *testing.T) (hostConn, pluginConn *control.Conn) {
 	return hostConn, pluginConn
 }
 
+// reloadResult pairs ServeReload's outcome and error for the tests that
+// assert on which outcome a completed reload produced.
+type reloadResult struct {
+	outcome lifecycle.ReloadOutcome
+	err     error
+}
+
 // runServeReload launches ServeReload on its own goroutine and returns a
-// channel that receives its single result once it returns.
+// channel that receives its error once it returns. Tests that also assert
+// the ReloadOutcome use runServeReloadResult instead.
 func runServeReload(t *testing.T, conn *control.Conn, hooks lifecycle.PluginReloadHooks) <-chan error {
 	t.Helper()
 
 	done := make(chan error, 1)
-	go func() { done <- lifecycle.ServeReload(t.Context(), conn, hooks) }()
+	go func() {
+		_, err := lifecycle.ServeReload(t.Context(), conn, hooks)
+		done <- err
+	}()
+
+	return done
+}
+
+// runServeReloadResult launches ServeReload on its own goroutine and returns
+// a channel that receives both its outcome and error.
+func runServeReloadResult(t *testing.T, conn *control.Conn, hooks lifecycle.PluginReloadHooks) <-chan reloadResult {
+	t.Helper()
+
+	done := make(chan reloadResult, 1)
+	go func() {
+		outcome, err := lifecycle.ServeReload(t.Context(), conn, hooks)
+		done <- reloadResult{outcome: outcome, err: err}
+	}()
 
 	return done
 }
@@ -364,7 +389,7 @@ func TestServeReload_ResumeMutatorsInOrder_WhenHostSendsResumeInsteadOfSaveState
 			&loggingMutator{name: "second", log: log},
 		},
 	}
-	done := runServeReload(t, pluginConn, hooks)
+	done := runServeReloadResult(t, pluginConn, hooks)
 
 	sendDrain(t, hostConn)
 	_, err := hostConn.Recv(t.Context()) // DrainAck
@@ -385,7 +410,10 @@ func TestServeReload_ResumeMutatorsInOrder_WhenHostSendsResumeInsteadOfSaveState
 	require.Equal(t, control.KindResumeAck, kind)
 	require.Equal(t, []string{"first:freeze", "second:freeze", "first:resume", "second:resume"}, log.snapshot(),
 		"both mutators must be resumed, in registration order, before ResumeAck is observable")
-	require.NoError(t, <-done)
+	res := <-done
+	require.NoError(t, res.err)
+	require.Equal(t, lifecycle.ReloadRolledBack, res.outcome,
+		"a rollback must report ReloadRolledBack so the serve loop keeps serving")
 }
 
 // Test ServeReload waiting for and handling the host's Resume, rather than
@@ -430,7 +458,7 @@ func TestServeReload_WaitForHostResume_WhenSaveStateFails(t *testing.T) {
 func TestServeReload_ReturnNil_WhenConnectionEndsWithoutResume(t *testing.T) {
 	// Given
 	hostConn, pluginConn := newReloadConnPair(t)
-	done := runServeReload(t, pluginConn, lifecycle.PluginReloadHooks{})
+	done := runServeReloadResult(t, pluginConn, lifecycle.PluginReloadHooks{})
 
 	sendDrain(t, hostConn)
 	_, err := hostConn.Recv(t.Context()) // DrainAck
@@ -447,8 +475,10 @@ func TestServeReload_ReturnNil_WhenConnectionEndsWithoutResume(t *testing.T) {
 
 	// Then
 	select {
-	case err := <-done:
-		require.NoError(t, err)
+	case res := <-done:
+		require.NoError(t, res.err)
+		require.Equal(t, lifecycle.ReloadRetired, res.outcome,
+			"a successful reload must report ReloadRetired so the serve loop shuts down")
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServeReload must not block forever waiting for a Resume that will never arrive")
 	}
