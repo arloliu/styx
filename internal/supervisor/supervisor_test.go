@@ -178,7 +178,7 @@ func TestSupervisor_StaysHealthy_PastMissedHeartbeatsWindow_WithRealHeartbeatSen
 	runDone := make(chan struct{})
 	go func() { defer close(runDone); sup.Run(ctx) }()
 
-	requireEventOfKind(t, ch, supervisor.EventReady, 5*time.Second)
+	requireEventOfKind(t, ch, supervisor.EventReady)
 
 	// When: observe for several MissedHeartbeats x interval windows —
 	// long enough that a plugin NOT actually sending heartbeats would
@@ -351,7 +351,7 @@ func TestSupervisor_Stop_DuringBackoff_ReturnsPromptly(t *testing.T) {
 
 	// When: wait for the first Restarting event (confirms we are inside the
 	// minute-long backoff sleep), then Stop.
-	requireEventOfKind(t, ch, supervisor.EventRestarting, 5*time.Second)
+	requireEventOfKind(t, ch, supervisor.EventRestarting)
 
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- sup.Stop(t.Context()) }()
@@ -386,13 +386,13 @@ func requireEvent(t *testing.T, ch <-chan supervisor.Event) supervisor.Event {
 	}
 }
 
-// requireEventOfKind drains ch until it observes kind, failing on timeout.
-// No caller uses the observed event itself (only that kind eventually
-// arrived), so this reports nothing back.
-func requireEventOfKind(t *testing.T, ch <-chan supervisor.Event, kind supervisor.EventKind, timeout time.Duration) {
+// requireEventOfKind drains ch until it observes kind, failing if it does not
+// arrive within a generous fixed bound. No caller uses the observed event
+// itself (only that kind eventually arrived), so this reports nothing back.
+func requireEventOfKind(t *testing.T, ch <-chan supervisor.Event, kind supervisor.EventKind) {
 	t.Helper()
 
-	deadline := time.After(timeout)
+	deadline := time.After(5 * time.Second)
 	for {
 		select {
 		case ev := <-ch:
@@ -665,4 +665,70 @@ func TestSupervisor_ShortCircuitsToGaveUp_WithZeroRestarts_OnHandshakeIncompatib
 		t.Fatalf("unexpected event after GaveUp: %+v", ev)
 	case <-time.After(50 * time.Millisecond):
 	}
+}
+
+// Test that only a reload successor's spawn spec carries
+// lifecycle.ReloadSuccessorEnv: a first-start or crash-restart spawn must
+// never carry it, since such a plugin waits on a Restore that will never
+// arrive if it thinks it is one.
+func TestSupervisor_SpecForSpawn_AppendsReloadSuccessorEnv_OnlyForReloadSuccessor(t *testing.T) {
+	cases := []struct {
+		name            string
+		reloadSuccessor bool
+		wantVar         bool
+	}{
+		{name: "reload successor", reloadSuccessor: true, wantVar: true},
+		{name: "first-start or crash-restart", reloadSuccessor: false, wantVar: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			cfg := supervisor.Config{Spec: lifecycle.Spec{Path: "/unused", Env: []string{"FOO=bar"}}}
+			sup := supervisor.New(cfg, supervisor.NewEventBus())
+
+			// When
+			spec := sup.SpecForSpawnForTest(tc.reloadSuccessor)
+
+			// Then
+			wantVar := lifecycle.ReloadSuccessorEnv + "=1"
+			if tc.wantVar {
+				require.Contains(t, spec.Env, wantVar)
+			} else {
+				require.NotContains(t, spec.Env, wantVar)
+			}
+			require.Contains(t, spec.Env, "FOO=bar", "the base spec's own env entries must survive either way")
+		})
+	}
+}
+
+// Test that building a reload successor's spec never mutates the base spec's
+// env in place: a reload must not permanently alter the base spec that a
+// later crash-restart reuses.
+func TestSupervisor_SpecForSpawn_NeverMutatesBaseSpecEnv_ForReloadSuccessor(t *testing.T) {
+	// Given: a base env slice with spare capacity, so an in-place append (the
+	// bug this guards against) would silently write into its backing array
+	// without needing to reallocate, and would therefore be invisible to a
+	// check that only compares len/values through the original slice header.
+	baseEnv := make([]string, 1, 4)
+	baseEnv[0] = "FOO=bar"
+	cfg := supervisor.Config{Spec: lifecycle.Spec{Path: "/unused", Env: baseEnv}}
+	sup := supervisor.New(cfg, supervisor.NewEventBus())
+
+	// When: two reload-successor specs are built from the same base spec.
+	first := sup.SpecForSpawnForTest(true)
+	second := sup.SpecForSpawnForTest(true)
+
+	// Then: both successor specs carry the var alongside the base entry.
+	wantVar := lifecycle.ReloadSuccessorEnv + "=1"
+	require.Equal(t, []string{"FOO=bar", wantVar}, first.Env)
+	require.Equal(t, []string{"FOO=bar", wantVar}, second.Env)
+
+	// And: the base slice is untouched, including the capacity slot an
+	// in-place append would have clobbered — re-slicing past its own length
+	// into that spare capacity must still read the zero value, not the var.
+	require.Equal(t, []string{"FOO=bar"}, baseEnv)
+	require.Equal(t, 4, cap(baseEnv), "the base slice's capacity must be unchanged")
+	require.Empty(t, baseEnv[:2][1],
+		"an in-place append would have written the var into the base slice's spare capacity")
 }

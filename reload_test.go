@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/arloliu/styx/codec"
+	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/stretchr/testify/require"
@@ -204,4 +205,37 @@ func TestHost_ReturnErrPluginUnavailable_WhenReloadingUnknownPlugin(t *testing.T
 
 	// Then
 	require.ErrorIs(t, err, ErrPluginUnavailable)
+}
+
+// Test Reload translating a stopped/gave-up supervisor's internal sentinel to
+// the public ErrPluginUnavailable, rather than leaking the internal one.
+func TestHost_ReturnErrPluginUnavailable_WhenReloadingGaveUpPlugin(t *testing.T) {
+	// Given: a supervisor that has already given up (its serving loop stopped)
+	// but is still registered on the Host, as it stays until Host.Stop. Its
+	// Reload reports the internal supervisor.ErrReloadUnavailable sentinel.
+	bus := supervisor.NewEventBus()
+	gate := &lifecycle.AdmissionGate{}
+	sup := supervisor.New(supervisor.Config{
+		Spec:      lifecycle.Spec{Path: "/nonexistent/styx-test-plugin-binary"},
+		Restart:   supervisor.RestartPolicy{Max: 0},
+		Admission: gate,
+	}, bus)
+
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(context.Background()) }()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("supervisor did not give up on a bad spawn")
+	}
+
+	h := NewHost(HostConfig{})
+	h.AddRuntimeForTest("device-gateway", sup)
+
+	// When
+	err := h.Reload(t.Context(), "device-gateway")
+
+	// Then: the caller sees the public sentinel, never the internal one.
+	require.ErrorIs(t, err, ErrPluginUnavailable)
+	require.NotErrorIs(t, err, supervisor.ErrReloadUnavailable)
 }

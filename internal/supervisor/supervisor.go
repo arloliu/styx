@@ -161,16 +161,38 @@ type Config struct {
 	// whole Run call's lifetime restarts.
 	ResetWindow time.Duration
 
-	// OnReady is called once per successfully attached instance. A
-	// successor is never promoted Ready while its predecessor is still
-	// alive and unreaped — Run never spawns a new instance until the
-	// previous one's Teardown has fully completed, so OnReady is never
-	// called again for a new instance while a prior one's hooks are still
-	// live. It hands back
+	// Admission is the routing target's admission gate — the same gate a
+	// caller's data path checks before submitting a call. Reload's five-phase
+	// transaction closes it at cutoff and reopens it on promote or rollback, so
+	// no call is ever admitted into a half-frozen plugin. The styx layer owns
+	// the gate (it lives on the ClientConn) and passes a pointer to it here;
+	// internal/supervisor never imports styx. Reload requires it: a Supervisor
+	// created with a nil Admission cannot hot-reload.
+	Admission *lifecycle.AdmissionGate
+
+	// ReloadDeadlines bounds each waiting phase of a hot-reload. The zero value
+	// falls back to lifecycle.DefaultPhaseDeadlines, whose DrainAck/Snapshot
+	// match the control protocol's own reply deadlines for those messages.
+	ReloadDeadlines lifecycle.PhaseDeadlines
+
+	// OnReady is called once per successfully attached instance. It hands back
 	// the live wiring the caller needs to route RPCs, and must return the
 	// hooks Supervisor uses to tear that wiring back down. OnReady may be
 	// nil (every hook then defaults to a no-op) — internal/supervisor's
 	// own tests use this: they only care about the event stream.
+	//
+	// On a crash-restart a successor is never promoted Ready while its
+	// predecessor is still alive and unreaped: Run never spawns a new instance
+	// until the previous one's Teardown has fully completed, so OnReady is not
+	// called again while a prior instance's hooks are still live.
+	//
+	// A hot-reload is the deliberate exception. Its transaction promotes the
+	// successor (calling OnReady for it) and only afterward tears the
+	// predecessor down, so a predecessor's teardown hooks can still run after
+	// OnReady has installed the successor. The hooks returned here must
+	// therefore only undo routing this exact instance still owns and become a
+	// no-op once a later generation owns it, or a retired predecessor's
+	// teardown would tear routing out from under the successor now serving.
 	OnReady func(Instance) ReadyHooks
 }
 
@@ -203,6 +225,25 @@ type Supervisor struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+
+	// reloadCh carries a Reload request to the heartbeat loop, which is the
+	// sole owner of the live control.Conn and so the only goroutine that may
+	// drive the reload transaction on it. Buffered by one so Reload can hand
+	// off without rendezvous; the loop picks the request up between receives,
+	// mirroring how stopCh is observed.
+	reloadCh chan reloadRequest
+
+	// spawn produces one live instance (spawn + stdio capture + handshake and
+	// attach), ready to be promoted. It is a field so tests can substitute an
+	// in-process instance for a real child process; New wires it to
+	// newLiveInstance. reloadSuccessor is true only for a hot-reload's
+	// successor spawn, never for a first-start or crash-restart spawn.
+	spawn func(handshakeCtx, lifeCtx context.Context, generation uint64, reloadSuccessor bool) (*liveInstance, error)
+
+	// generation is the monotonic per-instance generation counter. It is
+	// touched only on Run's own goroutine (Run's loop and the reload it runs
+	// inline on the heartbeat loop), so it needs no synchronization.
+	generation uint64
 }
 
 // New creates a Supervisor. Run must be called (typically in its own
@@ -210,12 +251,16 @@ type Supervisor struct {
 func New(cfg Config, bus *EventBus) *Supervisor {
 	applyDefaults(&cfg)
 
-	return &Supervisor{
-		cfg:    cfg,
-		bus:    bus,
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
+	s := &Supervisor{
+		cfg:      cfg,
+		bus:      bus,
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
+		reloadCh: make(chan reloadRequest, 1),
 	}
+	s.spawn = s.newLiveInstance
+
+	return s
 }
 
 // Run drives the supervised plugin until ctx is canceled, Stop is called,
@@ -225,7 +270,6 @@ func New(cfg Config, bus *EventBus) *Supervisor {
 func (s *Supervisor) Run(ctx context.Context) {
 	defer close(s.doneCh)
 
-	var generation uint64
 	restartsUsed := 0
 
 	for {
@@ -233,7 +277,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 			return
 		}
 
-		generation++
+		generation := s.nextGeneration()
 		s.publish(Event{Kind: EventStarting, Time: time.Now()})
 
 		readySince, terminal, crashErr := s.runOneInstance(ctx, generation)
@@ -364,16 +408,49 @@ func timeSinceOrZero(t time.Time) time.Duration {
 	return time.Since(t)
 }
 
+// liveInstance is one running plugin generation the heartbeat loop
+// supervises: the control.Conn the loop owns exclusively, plus the two
+// closures that install and destroy the instance's styx-side routing. A
+// successful hot-reload replaces the loop's current liveInstance with the
+// promoted successor in place, so the Supervisor keeps supervising across a
+// reload without Run restarting anything.
+type liveInstance struct {
+	conn       *control.Conn
+	generation uint64
+	stderrTail *tailSink
+
+	// promote installs this instance as the routing target — it runs
+	// Config.OnReady (the supervisor's only seam into the styx layer) and
+	// returns the teardown hooks that OnReady handed back. It is the styx-side
+	// half of hot-reload's promote phase; the caller records the result in
+	// hooks. For the first instance the serving loop calls it directly; for a
+	// reload successor the transaction calls it as its promote step.
+	promote func() ReadyHooks
+	// hooks are the teardown callbacks promote returned, read by teardown.
+	hooks ReadyHooks
+	// teardown drains and reaps this instance via the normative
+	// internal/lifecycle.Teardown machine, returning the reaped process state
+	// (nil if the reap did not complete) and Teardown.Run's own error. A
+	// post-promote teardown fault (e.g. a join timeout) still reaps the
+	// process, so the reaped state is valid alongside a non-nil error; the
+	// reload path surfaces that error to its caller.
+	teardown func(ctx context.Context, shutdownDeadline time.Duration) (*os.ProcessState, error)
+}
+
 // runOneInstance spawns, handshakes, and (if attach succeeds) serves one
 // instance until it ends — by handshake/attach failure, a detected crash
 // (EOF on the control conn), missed heartbeats past MissedHeartbeats, a
-// Classify-wedged verdict, ctx cancellation, or Stop(). It always tears
-// the instance down before returning — via the simpler Kill+Close abort
-// path pre-attach (mirroring styx/host.go's abortStartup: there is no live
-// ClientConn to fail-in-flight or join yet), or the full
-// internal/lifecycle.Teardown machine post-attach — so the next loop
-// iteration's spawn never races a still-live predecessor: a successor is
-// never promoted Ready while its predecessor is still alive and unreaped.
+// Classify-wedged verdict, ctx cancellation, or Stop(). A successful
+// hot-reload replaces the instance it serves in place, so a single
+// runOneInstance call can outlive several plugin generations; only a crash,
+// a wedge, ctx, or Stop ends it. It always tears the current instance down
+// before returning — via the simpler Kill+Close abort path pre-attach
+// (mirroring styx/host.go's abortStartup: there is no live ClientConn to
+// fail-in-flight or join yet), or the full internal/lifecycle.Teardown
+// machine post-attach — so the next Run iteration's spawn never races a
+// still-live predecessor: a successor is never promoted Ready while its
+// predecessor is still alive and unreaped, and a reload's own predecessor is
+// reaped by the transaction before the reload is done.
 //
 // terminal reports whether Run should stop entirely (ctx canceled or
 // Stop() called) rather than evaluate a restart; crashErr is always
@@ -381,23 +458,86 @@ func timeSinceOrZero(t time.Time) time.Duration {
 func (s *Supervisor) runOneInstance(
 	ctx context.Context, generation uint64,
 ) (readySince time.Time, terminal bool, crashErr error) {
+	cur, err := s.spawn(ctx, ctx, generation, false)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+
+	cur.hooks = cur.promote()
+
+	readyAt := time.Now()
+	s.publish(Event{Kind: EventReady, Time: readyAt})
+
+	stopped, endErr := s.heartbeatLoop(ctx, &cur)
+
+	// On this restart path the crash reason (endErr) is the caller-facing
+	// outcome; a teardown fault of an already-ending instance is not itself a
+	// restart trigger, so its error is not surfaced here.
+	reaped, _ := cur.teardown(ctx, control.ReplyDeadlines[control.KindShutdown])
+
+	if stopped {
+		return readyAt, true, nil
+	}
+
+	exitStatus, known := exitStatusFromState(reaped)
+
+	return readyAt, false, crashReason(cur.stderrTail, endErr, exitStatus, known)
+}
+
+// specForSpawn builds the lifecycle.Spec to spawn with: s.cfg.Spec verbatim
+// (plus CaptureStdio) for a first-start or crash-restart instance, or a copy
+// carrying lifecycle.ReloadSuccessorEnv for a reload successor — the signal
+// the plugin side uses to run ServeRestore instead of serving immediately.
+// It never mutates s.cfg.Spec.Env in place: a reload must not permanently
+// alter the base spec that a later crash-restart reuses, so a successor's
+// env is built on a freshly allocated copy.
+func (s *Supervisor) specForSpawn(reloadSuccessor bool) lifecycle.Spec {
 	spec := s.cfg.Spec
 	spec.CaptureStdio = true
+	if !reloadSuccessor {
+		return spec
+	}
+
+	env := make([]string, len(spec.Env), len(spec.Env)+1)
+	copy(env, spec.Env)
+	env = append(env, lifecycle.ReloadSuccessorEnv+"=1")
+	spec.Env = env
+
+	return spec
+}
+
+// newLiveInstance spawns a plugin process, starts stdio capture, and drives
+// the host side of the handshake and data-plane attach. It does NOT promote
+// the instance — the caller decides when routing is installed (the first
+// instance right away; a reload successor during the transaction's promote
+// phase). On any pre-attach failure it takes the Kill+Close abort path and
+// returns the crash reason.
+//
+// handshakeCtx bounds the spawn/handshake exchange; lifeCtx bounds the stdio
+// capture goroutine for the instance's whole serving life. They differ only
+// for a reload successor, whose handshake is bounded by the reload's own
+// context while its capture must outlive that reload and run until the
+// instance is eventually torn down. reloadSuccessor is true only for that
+// reload-successor spawn; see specForSpawn.
+func (s *Supervisor) newLiveInstance(
+	handshakeCtx, lifeCtx context.Context, generation uint64, reloadSuccessor bool,
+) (*liveInstance, error) {
+	spec := s.specForSpawn(reloadSuccessor)
 
 	proc, err := lifecycle.Spawn(spec)
 	if err != nil {
-		return time.Time{}, false, fmt.Errorf("supervisor: spawn: %w", err)
+		return nil, fmt.Errorf("supervisor: spawn: %w", err)
 	}
 
 	conn := control.NewConn(proc.ControlFD, generation)
 
 	stderrTail := newTailSink(stderrTailLines)
 	capture := NewStdioCapture(proc.Stdout, proc.Stderr, stderrTail, maxCapturedLineBytes, capturedBufferLines)
-	captureCtx, cancelCapture := context.WithCancel(ctx)
+	captureCtx, cancelCapture := context.WithCancel(lifeCtx)
 	captureDone := make(chan struct{})
 	go func() { defer close(captureDone); capture.Run(captureCtx) }()
 
-	tr, hsErr := s.handshakeAndAttach(ctx, conn, generation)
+	tr, hsErr := s.handshakeAndAttach(handshakeCtx, conn, generation)
 	if hsErr != nil {
 		cancelCapture()
 		state, _ := proc.Kill()
@@ -406,55 +546,67 @@ func (s *Supervisor) runOneInstance(
 
 		exitStatus, exitStatusKnown := exitStatusFromState(state)
 
-		return time.Time{}, false, crashReason(stderrTail, hsErr, exitStatus, exitStatusKnown)
+		return nil, crashReason(stderrTail, hsErr, exitStatus, exitStatusKnown)
 	}
 
-	var hooks ReadyHooks
-	if s.cfg.OnReady != nil {
-		hooks = s.cfg.OnReady(Instance{Process: proc, ControlConn: conn, Transport: tr, Generation: generation})
+	li := &liveInstance{conn: conn, generation: generation, stderrTail: stderrTail}
+	li.promote = func() ReadyHooks {
+		if s.cfg.OnReady == nil {
+			return ReadyHooks{}
+		}
+
+		return s.cfg.OnReady(Instance{Process: proc, ControlConn: conn, Transport: tr, Generation: generation})
+	}
+	li.teardown = func(tctx context.Context, shutdownDeadline time.Duration) (*os.ProcessState, error) {
+		cancelCapture()
+
+		td := &lifecycle.Teardown{
+			StopAdmission:    noopIfNil(li.hooks.StopAdmission),
+			FailInFlight:     noopErrIfNil(li.hooks.FailInFlight),
+			JoinGoroutines:   noopIfNil(li.hooks.JoinGoroutines),
+			Unmap:            func() {},
+			Process:          proc,
+			ControlConn:      conn,
+			ShutdownDeadline: shutdownDeadline,
+			CloseFDs: func() {
+				_ = conn.Close()
+				closeStdio(proc)
+			},
+		}
+		err := td.Run(tctx)
+		<-captureDone
+
+		return td.Reaped, err
 	}
 
-	readyAt := time.Now()
-	s.publish(Event{Kind: EventReady, Time: readyAt})
-
-	stopped, endErr := s.heartbeatLoop(ctx, conn)
-
-	cancelCapture()
-
-	td := &lifecycle.Teardown{
-		StopAdmission:    noopIfNil(hooks.StopAdmission),
-		FailInFlight:     noopErrIfNil(hooks.FailInFlight),
-		JoinGoroutines:   noopIfNil(hooks.JoinGoroutines),
-		Unmap:            func() {},
-		Process:          proc,
-		ControlConn:      conn,
-		ShutdownDeadline: control.ReplyDeadlines[control.KindShutdown],
-		CloseFDs: func() {
-			_ = conn.Close()
-			closeStdio(proc)
-		},
-	}
-	_ = td.Run(ctx)
-	<-captureDone
-
-	if stopped {
-		return readyAt, true, nil
-	}
-
-	exitStatus, known := exitStatusFromState(td.Reaped)
-
-	return readyAt, false, crashReason(stderrTail, endErr, exitStatus, known)
+	return li, nil
 }
 
-// heartbeatLoop is the single control-loop goroutine that owns conn for
-// the rest of this instance's life (control.Conn's one-Send-one-Recv
-// contract: exactly one reader). Each iteration waits up to HeartbeatInterval for
-// the plugin's next Heartbeat, acknowledges it, and classifies health
-// against the previous sample; it returns once the plugin is judged
-// unhealthy (missed heartbeats or Classify-wedged), the connection is
-// lost (crash), or ctx/Stop ends the instance deliberately (stopped=true,
-// endErr=nil).
-func (s *Supervisor) heartbeatLoop(ctx context.Context, conn *control.Conn) (stopped bool, endErr error) {
+// nextGeneration returns the next monotonic instance generation. It runs only
+// on Run's goroutine (Run's restart loop and the reload the heartbeat loop
+// runs inline), so no synchronization is needed.
+func (s *Supervisor) nextGeneration() uint64 {
+	s.generation++
+
+	return s.generation
+}
+
+// heartbeatLoop is the single control-loop goroutine that owns the current
+// instance's conn for the rest of that instance's life (control.Conn's
+// one-Send-one-Recv contract: exactly one reader). Each iteration waits up to
+// HeartbeatInterval for the plugin's next Heartbeat, services any pending
+// reload, acknowledges the heartbeat, and classifies health against the
+// previous sample; it returns once the plugin is judged unhealthy (missed
+// heartbeats or Classify-wedged), the connection is lost (crash), or ctx/Stop
+// ends the instance deliberately (stopped=true, endErr=nil).
+//
+// current is a pointer to the loop's current instance so a successful reload
+// can swap it in place: after a reload the loop keeps running against the
+// successor's conn. Because the reload transaction runs inline here, on this
+// same goroutine, its Sends and Recvs on the conn never interleave with the
+// loop's own Recv — the one-owner invariant holds by construction, not by a
+// lock.
+func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) (stopped bool, endErr error) {
 	missed := 0
 	var prev *HeartbeatSample
 
@@ -463,12 +615,19 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, conn *control.Conn) (sto
 			return true, nil
 		}
 
+		conn := (*current).conn
 		rctx, cancel := context.WithTimeout(ctx, s.cfg.HeartbeatInterval)
 		msg, err := conn.Recv(rctx)
 		cancel()
 
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
+				// A reload is deliberately NOT serviced here: a reload drains the
+				// plugin, and a plugin that has not sent a heartbeat this interval
+				// is not one to start a drain exchange with. It is serviced only
+				// at a received heartbeat (below), where withholding that
+				// heartbeat's ack keeps a well-behaved plugin from racing another
+				// heartbeat into the transaction's strict receive.
 				missed++
 				if missed >= s.cfg.MissedHeartbeats {
 					reason := fmt.Errorf("supervisor: missed %d consecutive heartbeats", missed)
@@ -491,19 +650,47 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, conn *control.Conn) (sto
 			continue // nothing else is currently expected from the plugin during serving.
 		}
 
+		sample := heartbeatSampleFromMessage(msg.GetHeartbeat(), time.Now())
+
+		// A reload is serviced here, after this heartbeat is received but
+		// before it is acknowledged. A real reload leaves this heartbeat
+		// deliberately unacked: the drain phase the reload sends next is legal
+		// only in StateDraining, where a Heartbeat is not, so a heartbeat still
+		// in flight would fail the transaction's strict receive. Withholding
+		// the ack keeps a well-behaved plugin from sending its next heartbeat
+		// until the reload has finished and the loop resumes acking.
+		switch outcome, reloadErr := s.serviceReload(ctx, current); outcome {
+		case reloadCrashEquivalent:
+			// Rollback could not resume the frozen old instance and left
+			// admission closed; it can never serve a call again. End the loop
+			// with that crash error so Run runs the normal teardown/restart
+			// path, which spawns a fresh instance and reopens admission.
+			return false, reloadErr
+		case reloadServiced:
+			// A real reload ran and (on success) swapped in the successor;
+			// reset health and withhold this heartbeat's ack.
+			missed, prev = 0, nil
+
+			continue
+		case reloadNone, reloadNoop:
+			// No heartbeat was consumed by a reload — none was pending, or an
+			// already-canceled request was declined as a no-op — so this
+			// heartbeat must be acked normally to keep a healthy plugin's
+			// cadence from stalling.
+		}
+
 		missed = 0
-		cur := heartbeatSampleFromMessage(msg.GetHeartbeat(), time.Now())
-		_ = ackHeartbeat(ctx, conn, cur.Sequence) // best-effort; a lost ack does not itself end the instance.
+		_ = ackHeartbeat(ctx, conn, sample.Sequence) // best-effort; a lost ack does not itself end the instance.
 
 		if prev != nil {
-			class := Classify(*prev, cur, s.cfg.WedgeWindow, defaultHighWaterBytes, defaultHighWaterInflight)
+			class := Classify(*prev, sample, s.cfg.WedgeWindow, defaultHighWaterBytes, defaultHighWaterInflight)
 			if class == HealthWedged {
 				s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: errWedged})
 
 				return false, errWedged
 			}
 		}
-		prev = &cur
+		prev = &sample
 	}
 }
 

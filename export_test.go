@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/arloliu/styx/internal/control"
+	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/transport"
 )
 
@@ -29,6 +30,16 @@ func (s *PluginServer) RunServingControlForTest(ctx context.Context, conn *contr
 // in-process without a real spawned child.
 func (s *PluginServer) RunServingForTest(ctx context.Context, conn *control.Conn, tr transport.Transport) error {
 	return s.runServing(ctx, conn, tr)
+}
+
+// AddRuntimeForTest registers a pluginRuntime backed by sup under name, the way
+// startOne does after a successful start, so a test can drive Host.Reload
+// against a supervisor in a chosen state (e.g. one that has already given up)
+// without spawning a real child process.
+func (h *Host) AddRuntimeForTest(name string, sup *supervisor.Supervisor) {
+	h.mu.Lock()
+	h.runtimes = append(h.runtimes, &pluginRuntime{name: name, sup: sup})
+	h.mu.Unlock()
 }
 
 // DroppedInformationalEventCounts re-exports h.bus's informational-event

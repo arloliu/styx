@@ -4,38 +4,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"github.com/arloliu/styx/internal/supervisor"
 )
 
-// errNoInstanceHandover is returned for a plugin that is running but whose
-// supervisor cannot yet hand its live control connection to a reload. One
-// goroutine owns that connection for an instance's whole life, because
-// control.Conn allows only one in-flight Send and one in-flight Recv; until
-// supervision can pass ownership across for the duration of a reload, the
-// transaction has no connection to drive and the only honest answer is to
-// refuse rather than to race the heartbeat loop for the socket.
-var errNoInstanceHandover = errors.New(
-	"styx: hot-reload cannot start: plugin supervision does not hand over the live control connection")
-
-// Reload does not yet hot-reload a running plugin: for any plugin this Host
-// is currently supervising, it always returns an error wrapping
-// errNoInstanceHandover, because plugin supervision does not yet hand over
-// an instance's live control connection for a reload to drive (see
-// errNoInstanceHandover's own doc for why). Reload returns
-// ErrPluginUnavailable if no plugin of that name is running at all.
+// Reload hot-reloads the named plugin in place: it stops admitting new calls,
+// drains the running instance and takes its sealed, verified state snapshot,
+// restores a freshly spawned instance from it, and atomically swaps routing to
+// that successor — all without restarting supervision. It blocks until the
+// transaction reaches a terminal outcome, and on success until the old
+// instance's teardown-with-reap has completed.
 //
-// The five-phase transaction this method will eventually drive already
-// lives in internal/lifecycle, and the atomic ClientConn routing swap that
-// is its linearization point already exists on this side — see
-// internal/lifecycle.Transaction.Run and (*ClientConn).promote. Reload
-// itself is the piece still missing: once supervision can hand over the
-// live control connection, this method will stop admitting new calls, wait
-// for the running instance to drain and hand over a sealed state snapshot,
-// restore a freshly spawned instance from it, and swap routing to the
-// successor, blocking until that transaction reaches a terminal outcome and,
-// on success, until the old instance's teardown-with-reap has completed. A
-// rolled-back reload will return the reason it aborted, with the named
-// plugin still the instance that was running before the call. None of that
-// is in effect yet; today's only observable behavior is the error above.
+// On success it returns nil and the successor is the instance the named plugin
+// now routes to. On any pre-promote failure the reload has already rolled back
+// — the running instance was resumed and admission reopened — and Reload
+// returns the reason it aborted with that same instance still serving. It
+// returns ErrPluginUnavailable if no plugin of that name is running, and ctx's
+// error (as a styx error) if ctx is done.
+//
+// The five-phase transaction lives in internal/lifecycle and the atomic
+// routing swap is (*ClientConn).promote; the heartbeat loop that owns the
+// live control connection runs the transaction inline on its own goroutine,
+// which is what lets a reload drive that connection without racing the loop.
 func (h *Host) Reload(ctx context.Context, name string) error {
 	if err := ctx.Err(); err != nil {
 		return translateCtxErr(err)
@@ -52,7 +42,24 @@ func (h *Host) Reload(ctx context.Context, name string) error {
 		return fmt.Errorf("styx: reload plugin %q: %w", name, ErrPluginUnavailable)
 	}
 
-	return fmt.Errorf("styx: reload plugin %q: %w", name, errNoInstanceHandover)
+	if err := rt.sup.Reload(ctx); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return translateCtxErr(err)
+		}
+
+		// A Supervisor that has stopped or given up stays registered until
+		// Host.Stop, and reports its internal "no live instance" sentinel. That
+		// is exactly the unavailable-plugin condition Reload's godoc promises,
+		// so translate it to the public sentinel rather than leaking the
+		// internal one.
+		if errors.Is(err, supervisor.ErrReloadUnavailable) {
+			return fmt.Errorf("styx: reload plugin %q: %w", name, ErrPluginUnavailable)
+		}
+
+		return fmt.Errorf("styx: reload plugin %q: %w", name, err)
+	}
+
+	return nil
 }
 
 // runtimeFor returns the pluginRuntime supervising name, or nil if this Host

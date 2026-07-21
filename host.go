@@ -175,7 +175,12 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 		Spec:     lifecycle.Spec{Path: spec.Path, Args: spec.Args, Env: spec.Env},
 		Restart:  spec.Restart,
 		Services: toControlServiceRequirements(spec.Services),
-		OnReady:  func(inst supervisor.Instance) supervisor.ReadyHooks { return wireConnState(cc, inst) },
+		// The reload transaction drives the SAME admission gate a caller's
+		// Invoke checks, so a cutoff a reload begins is the cutoff Invoke
+		// observes. internal/supervisor never names *ClientConn; it holds only
+		// this pointer into cc's own gate.
+		Admission: &cc.admission,
+		OnReady:   func(inst supervisor.Instance) supervisor.ReadyHooks { return wireConnState(cc, inst) },
 	}
 	sup := supervisor.New(cfg, bus)
 
