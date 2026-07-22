@@ -84,6 +84,30 @@ func (c *Conn) SendOverlapped() bool { return c.sendProbe.overlapped.Load() }
 // its one-in-flight-Recv contract. Test observability only.
 func (c *Conn) RecvOverlapped() bool { return c.recvProbe.overlapped.Load() }
 
+// recvmsgSyscall and sendmsgSyscall are seams over the raw syscalls so tests
+// can inject transient errnos; production always uses the unix package.
+var (
+	recvmsgSyscall = unix.Recvmsg
+	sendmsgSyscall = unix.Sendmsg
+)
+
+// recvResult carries the recvmsg outputs callers use; the peer address a
+// connected SOCK_SEQPACKET socket would report is meaningless and dropped.
+type recvResult struct {
+	n, oobn, recvflags int
+}
+
+// rearm re-checks the deadline before an EINTR retry and re-applies the
+// per-syscall socket timeout to the REMAINING budget. It is the guard that
+// keeps a retried syscall inside its absolute deadline: SO_SNDTIMEO/SO_RCVTIMEO
+// is relative to each syscall, so retrying an interrupted syscall with the
+// original timeout would restart the full budget every time — an interrupt
+// storm near expiry could then run the call arbitrarily past its deadline. On
+// each retry rearm returns context.DeadlineExceeded (via setSocketTimeout) once
+// no budget remains, or the context's own error on cancellation, so the retry
+// loop stops promptly instead of reissuing the syscall.
+type rearm func() error
+
 // NewConn wraps fd, an already-connected SOCK_SEQPACKET socket, generation
 // is the current region generation stamped on every outgoing message.
 func NewConn(fd int, generation uint64) *Conn {
@@ -125,7 +149,7 @@ func (c *Conn) Send(ctx context.Context, msg *controlpb.ControlMessage) error {
 		return err
 	}
 
-	if err := unix.Sendmsg(c.fd, data, nil, nil, 0); err != nil {
+	if err := sendmsgRetry(c.fd, data, nil, nil, 0, rearmSend(ctx, c.fd)); err != nil {
 		if _, hasDeadline := ctx.Deadline(); hasDeadline && isTimeoutErrno(err) {
 			return fmt.Errorf("control: sendmsg: %w: %w", context.DeadlineExceeded, err)
 		}
@@ -158,7 +182,7 @@ func (c *Conn) Recv(ctx context.Context) (*controlpb.ControlMessage, error) {
 	// accepted as a full read.
 	buf := make([]byte, MaxMessageSize+1)
 
-	n, _, recvFlags, _, err := unix.Recvmsg(c.fd, buf, nil, 0)
+	res, err := recvmsgRetry(c.fd, buf, nil, 0, rearmRecv(ctx, c.fd))
 	if err != nil {
 		if _, hasDeadline := ctx.Deadline(); hasDeadline && isTimeoutErrno(err) {
 			return nil, fmt.Errorf("control: recvmsg: %w: %w", context.DeadlineExceeded, err)
@@ -167,12 +191,12 @@ func (c *Conn) Recv(ctx context.Context) (*controlpb.ControlMessage, error) {
 		return nil, fmt.Errorf("control: recvmsg: %w", err)
 	}
 
-	if recvFlags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 {
-		return nil, fmt.Errorf("control: truncated datagram (recvflags=%#x): %w", recvFlags, ErrProtocolViolation)
+	if res.recvflags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 {
+		return nil, fmt.Errorf("control: truncated datagram (recvflags=%#x): %w", res.recvflags, ErrProtocolViolation)
 	}
 
 	msg := new(controlpb.ControlMessage)
-	if err := proto.Unmarshal(buf[:n], msg); err != nil {
+	if err := proto.Unmarshal(buf[:res.n], msg); err != nil {
 		return nil, fmt.Errorf("control: unmarshal: %w", err)
 	}
 
@@ -182,6 +206,71 @@ func (c *Conn) Recv(ctx context.Context) (*controlpb.ControlMessage, error) {
 // Close closes the underlying socket fd.
 func (c *Conn) Close() error {
 	return unix.Close(c.fd)
+}
+
+// rearmRecv/rearmSend build the retry guard for the receive/send direction:
+// re-check ctx, then re-arm the direction's socket timeout to what is left of
+// the deadline.
+func rearmRecv(ctx context.Context, fd int) rearm {
+	return func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		return setSocketTimeout(ctx, fd, unix.SO_RCVTIMEO)
+	}
+}
+
+func rearmSend(ctx context.Context, fd int) rearm {
+	return func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		return setSocketTimeout(ctx, fd, unix.SO_SNDTIMEO)
+	}
+}
+
+// recvmsgRetry calls recvmsg, retrying EINTR. A control-socket receive is a
+// blocking protocol step whose cancellation travels through the socket
+// timeout (setSocketTimeout) or peer closure; a signal interrupting the
+// syscall carries no protocol meaning (the Go runtime's preemption signals
+// routinely interrupt it, and SO_RCVTIMEO disables automatic restart), so
+// surfacing EINTR would misreport a scheduler artifact as a connection
+// fault — the supervisor would count it as a plugin crash. Each retry first
+// runs reArm, which re-checks the deadline and re-applies the remaining socket
+// timeout, so a repeated interrupt cannot extend the receive past its absolute
+// deadline (reArm returns context.DeadlineExceeded when none remains).
+func recvmsgRetry(fd int, p, oob []byte, flags int, reArm rearm) (recvResult, error) {
+	for {
+		n, oobn, recvflags, _, err := recvmsgSyscall(fd, p, oob, flags)
+		if err != nil && errors.Is(err, unix.EINTR) {
+			if rerr := reArm(); rerr != nil {
+				return recvResult{}, rerr
+			}
+
+			continue
+		}
+
+		return recvResult{n: n, oobn: oobn, recvflags: recvflags}, err
+	}
+}
+
+// sendmsgRetry calls sendmsg, retrying EINTR — same reasoning as recvmsgRetry,
+// including the reArm deadline guard on every retry.
+func sendmsgRetry(fd int, p, oob []byte, to unix.Sockaddr, flags int, reArm rearm) error {
+	for {
+		err := sendmsgSyscall(fd, p, oob, to, flags)
+		if err != nil && errors.Is(err, unix.EINTR) {
+			if rerr := reArm(); rerr != nil {
+				return rerr
+			}
+
+			continue
+		}
+
+		return err
+	}
 }
 
 // setSocketTimeout sets fd's SO_SNDTIMEO/SO_RCVTIMEO (opt) from ctx's
@@ -194,14 +283,27 @@ func setSocketTimeout(ctx context.Context, fd, opt int) error {
 
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
+		if socketTimeoutObserver != nil {
+			socketTimeoutObserver(remaining)
+		}
 		if remaining <= 0 {
 			return context.DeadlineExceeded
 		}
 		tv = unix.NsecToTimeval(remaining.Nanoseconds())
+	} else if socketTimeoutObserver != nil {
+		socketTimeoutObserver(0)
 	}
 
 	return unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, opt, &tv)
 }
+
+// socketTimeoutObserver, when non-nil, is invoked by setSocketTimeout with the
+// remaining budget it is about to arm the socket timeout to (the no-deadline case
+// reports 0). It is a test-only seam that lets a test count how many times the
+// timeout is (re-)armed and watch the budget shrink across EINTR retries, so
+// removing the per-retry re-arm — while keeping the ctx re-check — is caught by the
+// arming count rather than passing silently. nil in production.
+var socketTimeoutObserver func(remaining time.Duration)
 
 // isTimeoutErrno reports whether err is the errno Sendmsg/Recvmsg return
 // when SO_SNDTIMEO/SO_RCVTIMEO (set by setSocketTimeout) expires: EAGAIN

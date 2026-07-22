@@ -3,6 +3,7 @@ package rpcruntime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -260,7 +261,7 @@ func TestStream_CloseSend_CompletesWhenBothClosed(t *testing.T) {
 	tbl, s, rt := newTestStream(t, StreamConfig{Credits: 4, Deadline: time.Second})
 
 	require.NoError(t, s.SendMsg(t.Context(), []byte("only")))
-	require.NoError(t, s.CloseSend(t.Context()))
+	require.NoError(t, s.CloseSend(t.Context(), nil))
 
 	closeFrame, ok := rt.firstOfKind(transport.FrameStreamClose)
 	require.True(t, ok)
@@ -279,12 +280,77 @@ func TestStream_CloseSend_CompletesWhenBothClosed(t *testing.T) {
 	require.Equal(t, OutcomeCompleted, oc.Code)
 }
 
+// Test that CloseSend rides a response/trailer payload on the STREAM_CLOSE frame
+// for a client-streaming server reply, carrying no service/method routing and
+// the final sequence (stream-protocol.md §6.3). The payload consumes no credit —
+// the receiving side delivers a STREAM_CLOSE-borne payload as an un-credited item
+// (§4.4), already proven by the receive-side tests.
+func TestStream_CloseSend_RidesResponsePayload_OnStreamClose(t *testing.T) {
+	// Given a live stream whose sender has emitted two messages.
+	_, s, rt := newTestStream(t, StreamConfig{Credits: 4, Deadline: time.Second})
+	require.NoError(t, s.SendMsg(t.Context(), []byte("a")))
+	require.NoError(t, s.SendMsg(t.Context(), []byte("b")))
+
+	// When it half-closes with a response payload.
+	require.NoError(t, s.CloseSend(t.Context(), []byte("response")))
+
+	// Then the STREAM_CLOSE carries the payload, the final sequence, and no routing.
+	closeFrame, ok := rt.firstOfKind(transport.FrameStreamClose)
+	require.True(t, ok)
+	require.Equal(t, []byte("response"), closeFrame.Payload, "the response payload rides STREAM_CLOSE (§6.3)")
+	require.Equal(t, uint64(2), closeFrame.Control, "STREAM_CLOSE carries the final sequence (§6.4)")
+	require.Zero(t, closeFrame.Service, "STREAM_CLOSE carries no service routing (§2.3)")
+	require.Zero(t, closeFrame.Method, "STREAM_CLOSE carries no method routing (§2.3)")
+}
+
+// Test that a STREAM_MSG Send failing with the transport-level backpressure
+// sentinel is treated as definitively pre-acceptance: the reserved credit and
+// sequence roll back, the stream stays LIVE, and the sender may retry
+// (stream-protocol.md §4.5). This is the shm reject-mode data-lane backpressure
+// surfaced as transport.ErrBackpressure so this engine classifies it without
+// importing internal/transport/shm.
+func TestStream_SendMsg_RollsBackOnTransportBackpressure(t *testing.T) {
+	// Given a single-credit live stream whose transport rejects the first
+	// STREAM_MSG with the transport backpressure sentinel (wrapped as the shm
+	// transport wraps it), then accepts.
+	rt := &recordingTransport{}
+	var reject atomic.Bool
+	reject.Store(true)
+	rt.fail = func(f transport.Frame) error {
+		if f.Kind == transport.FrameStreamMsg && reject.Load() {
+			return fmt.Errorf("shm: submission queue full: %w", transport.ErrBackpressure)
+		}
+
+		return nil
+	}
+	tbl := NewStreamTable(8, rt)
+	t.Cleanup(func() { _ = tbl.Close() })
+	s, err := tbl.Open(1, ClientStream, StreamConfig{Credits: 1, Deadline: time.Second})
+	require.NoError(t, err)
+	require.True(t, s.Publish())
+
+	// When the first Send hits backpressure.
+	err = s.SendMsg(t.Context(), []byte("a"))
+
+	// Then it surfaces the rollback-eligible sentinel and the stream stays LIVE.
+	require.ErrorIs(t, err, transport.ErrBackpressure)
+	_, terminal := s.Outcome()
+	require.False(t, terminal, "pre-acceptance backpressure does not terminate the stream (§4.5)")
+
+	// And the credit unit and sequence rolled back: the retry reuses sequence 1.
+	reject.Store(false)
+	require.NoError(t, s.SendMsg(t.Context(), []byte("a")))
+	msg, ok := rt.firstOfKind(transport.FrameStreamMsg)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), msg.Control, "the rolled-back sequence is reused: the accepted Send is sequence 1")
+}
+
 // Test that a second CloseSend in the same direction is a local error (§6.5).
 func TestStream_CloseSend_SecondCall_IsError(t *testing.T) {
 	_, s, _ := newTestStream(t, StreamConfig{Credits: 4, Deadline: time.Second})
 
-	require.NoError(t, s.CloseSend(t.Context()))
-	require.ErrorIs(t, s.CloseSend(t.Context()), ErrSendClosed)
+	require.NoError(t, s.CloseSend(t.Context(), nil))
+	require.ErrorIs(t, s.CloseSend(t.Context(), nil), ErrSendClosed)
 }
 
 // Test that RecvMsg drains buffered messages before reporting EOF on completion.
@@ -295,7 +361,7 @@ func TestStream_RecvMsg_DrainsThenEOF(t *testing.T) {
 		CallID: 1, Kind: transport.FrameStreamMsg, Control: 1, Payload: []byte("m1"),
 	}))
 	// Complete the stream by closing both directions.
-	require.NoError(t, s.CloseSend(t.Context()))
+	require.NoError(t, s.CloseSend(t.Context(), nil))
 	require.NoError(t, tbl.Dispatch(
 		transport.Frame{CallID: 1, Kind: transport.FrameStreamClose, Control: 1},
 	))
@@ -542,7 +608,7 @@ func TestStream_StreamClosePayload_DeliveredWithoutConsumingCredit(t *testing.T)
 func TestStream_RecvMsg_DeliversClosePayload_BeforeEOF(t *testing.T) {
 	tbl, s, _ := newTestStream(t, StreamConfig{Credits: 4, Deadline: time.Second})
 
-	require.NoError(t, s.CloseSend(t.Context())) // local half-close, final sequence 0
+	require.NoError(t, s.CloseSend(t.Context(), nil)) // local half-close, final sequence 0
 	require.NoError(t, tbl.Dispatch(transport.Frame{
 		CallID: 1, Kind: transport.FrameStreamClose, Control: 0, Payload: []byte("trailer"),
 	}))
@@ -567,7 +633,7 @@ func TestStream_RecvMsg_NeverDropsPayload_UnderTerminationRace(t *testing.T) {
 		s, err := tbl.Open(i, ClientStream, StreamConfig{Credits: 4, Deadline: time.Second})
 		require.NoError(t, err)
 		require.True(t, s.Publish())
-		require.NoError(t, s.CloseSend(context.Background())) // local half-close; still LIVE
+		require.NoError(t, s.CloseSend(context.Background(), nil)) // local half-close; still LIVE
 
 		var (
 			wg   sync.WaitGroup
@@ -1105,7 +1171,7 @@ func TestStream_CloseSend_PreAcceptanceFailure_ReClosable(t *testing.T) {
 		return nil
 	}
 
-	err := s.CloseSend(t.Context())
+	err := s.CloseSend(t.Context(), nil)
 	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
 	require.Zero(t, s.closeBits.Load()&closeLocalBit, "a pre-acceptance failure commits no close bit")
 	_, terminal := s.Outcome()
@@ -1113,7 +1179,7 @@ func TestStream_CloseSend_PreAcceptanceFailure_ReClosable(t *testing.T) {
 
 	// The transient failure clears; the retry now succeeds and commits the close.
 	rt.fail = nil
-	require.NoError(t, s.CloseSend(t.Context()), "CloseSend is retryable after a pre-acceptance failure")
+	require.NoError(t, s.CloseSend(t.Context(), nil), "CloseSend is retryable after a pre-acceptance failure")
 	require.Equal(t, closeLocalBit, s.closeBits.Load()&closeLocalBit, "the retry commits the local close bit")
 	_, ok := rt.firstOfKind(transport.FrameStreamClose)
 	require.True(t, ok, "the retry emits the STREAM_CLOSE")
@@ -1129,7 +1195,7 @@ func TestStream_CloseSend_HonorsCallerContext(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- s.CloseSend(ctx) }()
+	go func() { errCh <- s.CloseSend(ctx, nil) }()
 
 	select {
 	case <-rt.closeReached:
@@ -1278,17 +1344,18 @@ func (e *blockingEmitTransport) Recv(ctx context.Context) (transport.Frame, erro
 
 func (e *blockingEmitTransport) Close() error { return nil }
 
-// Test that the teardown emitter queue holds S_max+1 entries and drops the
-// overflow, publishing each buffered STREAM_ERR one at a time (stream-protocol.md
-// §9). With the single emitter parked in its first (blocked) Send, the queue
-// fills to capacity; further enqueues drop without blocking; on release exactly
-// capacity+1 are delivered and the overflow is gone.
+// Test that the emitter queue holds 2*S_max+1 entries and drops the overflow,
+// publishing each buffered STREAM_ERR one at a time (stream-protocol.md §9). With
+// the single emitter parked in its first (blocked) Send, the queue fills to
+// capacity with teardown-class jobs (which are admitted whenever the queue is not
+// full); further enqueues drop without blocking; on release exactly capacity+1 are
+// delivered and the overflow is gone.
 func TestStreamTable_Emitter_CapacityAndOverflowDrop(t *testing.T) {
 	et := &blockingEmitTransport{entered: make(chan struct{}), release: make(chan struct{})}
-	tbl := NewStreamTable(4, et) // S_max = 4 -> emit capacity S_max+1 = 5
+	tbl := NewStreamTable(4, et) // S_max = 4 -> emit capacity 2*S_max+1 = 9
 	t.Cleanup(func() { _ = tbl.Close() })
 
-	require.Equal(t, 5, cap(tbl.emitCh), "the emitter queue holds S_max+1 (§9)")
+	require.Equal(t, 9, cap(tbl.emitCh), "the emitter queue holds 2*S_max+1 (§9)")
 
 	s := newStream(tbl, 1, ClientStream, StreamConfig{Credits: 4, Deadline: time.Hour})
 	defer s.cancelCtx()
@@ -1302,8 +1369,9 @@ func TestStreamTable_Emitter_CapacityAndOverflowDrop(t *testing.T) {
 		t.Fatal("the emitter never entered its first STREAM_ERR Send")
 	}
 
-	// Fill the buffer to capacity: all five fit.
-	for range 5 {
+	// Fill the buffer to capacity: all nine fit (teardown emissions are never held
+	// to the rejection reserve).
+	for range 9 {
 		s.emitTeardownErr()
 	}
 	// The queue is full; every further enqueue MUST drop without blocking. If it
@@ -1312,11 +1380,51 @@ func TestStreamTable_Emitter_CapacityAndOverflowDrop(t *testing.T) {
 		s.emitTeardownErr()
 	}
 
-	close(et.release) // the emitter drains the one in-flight plus the five buffered
+	close(et.release) // the emitter drains the one in-flight plus the nine buffered
 
-	require.Eventually(t, func() bool { return et.sent.Load() == 6 }, time.Second, time.Millisecond,
-		"the in-flight job plus S_max+1 buffered are delivered — capacity+1")
-	require.Equal(t, int32(6), et.sent.Load(), "the three overflow enqueues were dropped, never delivered")
+	require.Eventually(t, func() bool { return et.sent.Load() == 10 }, time.Second, time.Millisecond,
+		"the in-flight job plus capacity buffered are delivered — capacity+1")
+	require.Equal(t, int32(10), et.sent.Load(), "the three overflow enqueues were dropped, never delivered")
+}
+
+// Test the emitter's rejection reserve (stream-protocol.md §9): a rejection is
+// admitted only against the budget outside the reserve, so a rejection flood a
+// peer drives cannot crowd out a teardown or handler-error emission. With the
+// single emitter parked in its first blocked Send, the queue is stable, so the
+// admission of each class is observed directly by the queue length.
+func TestStreamTable_EmitReserve_RejectionCannotCrowdOutTeardown(t *testing.T) {
+	et := &blockingEmitTransport{entered: make(chan struct{}), release: make(chan struct{})}
+	tbl := NewStreamTable(4, et) // S_max = 4 -> cap 9, reserve 4, reject budget 5
+	t.Cleanup(func() { _ = tbl.Close() })
+
+	// Park the emitter in its first (blocked) Send so the queue can fill and stay
+	// stable while the assertions read its length.
+	tbl.emitStreamErr(1, &transport.FrameStatus{Code: StatusCodeStreamBackpressure}, true)
+	select {
+	case <-et.entered:
+	case <-time.After(time.Second):
+		t.Fatal("the emitter never entered its first STREAM_ERR Send")
+	}
+
+	// Flood rejections: only the budget (cap - reserve = 5) may queue; the rest are
+	// dropped by the reserve, never admitted.
+	for i := range 20 {
+		tbl.EmitReject(uint64(100+i), StatusCodeStreamBackpressure)
+	}
+	require.Equal(t, cap(tbl.emitCh)-tbl.emitReserve, len(tbl.emitCh),
+		"rejections fill only the budget outside the reserve")
+
+	// A teardown-class emission is admitted into the reserve despite the flood.
+	tbl.emitStreamErr(2, &transport.FrameStatus{Code: StatusCodeStreamCanceled}, false)
+	require.Equal(t, cap(tbl.emitCh)-tbl.emitReserve+1, len(tbl.emitCh),
+		"a teardown emission is admitted into the reserve despite the reject flood")
+
+	// Further rejections stay dropped; the reserve is not theirs to fill.
+	tbl.EmitReject(999, StatusCodeStreamBackpressure)
+	require.Equal(t, cap(tbl.emitCh)-tbl.emitReserve+1, len(tbl.emitCh),
+		"further rejections stay dropped; the reserve stays reachable only by the other classes")
+
+	close(et.release)
 }
 
 // cancelGateTransport blocks the teardown CANCEL Send until released, so a test
@@ -1433,7 +1541,7 @@ func TestStream_CloseSend_ConcurrentCallers_PublishOneClose(t *testing.T) {
 	require.True(t, s.Publish())
 
 	first := make(chan error, 1)
-	go func() { first <- s.CloseSend(t.Context()) }()
+	go func() { first <- s.CloseSend(t.Context(), nil) }()
 	select {
 	case <-g.entered:
 	case <-time.After(2 * time.Second):
@@ -1442,7 +1550,7 @@ func TestStream_CloseSend_ConcurrentCallers_PublishOneClose(t *testing.T) {
 
 	// When: a second CloseSend races while the first is still in flight.
 	second := make(chan error, 1)
-	go func() { second <- s.CloseSend(t.Context()) }()
+	go func() { second <- s.CloseSend(t.Context(), nil) }()
 
 	// The second caller must resolve WITHOUT sending: either it returns at once
 	// (single-owner gate), or — the defect — it too enters the transport Send.
@@ -1549,4 +1657,188 @@ func TestStreamTable_Close_JoinsInFlightTerminalFinisher(t *testing.T) {
 	// join's post-condition.
 	_, present = tbl.Lookup(1)
 	require.False(t, present, "the finisher removed the stream before Close returned")
+}
+
+// owedTeardownGateTransport models the shared-memory two-lane hazard an
+// ambiguous-open teardown faces: the lifecycle CANCEL lane has strict priority over
+// data (shm-abi.md §18), so a teardown CANCEL is published at once, while the paired
+// data-lane STREAM_ERR travels through the single bounded emitter and can be dropped
+// under saturation. It records every accepted frame in order, so a test can prove the
+// CANCEL reached the wire while the data-lane STREAM_ERR did not, and it parks the
+// emitter in its first STREAM_ERR Send so the emitter queue saturates
+// deterministically (gates, never timing).
+type owedTeardownGateTransport struct {
+	mu          sync.Mutex
+	frames      []transport.Frame
+	entered     chan struct{}
+	release     chan struct{}
+	enterOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func (g *owedTeardownGateTransport) Send(_ context.Context, f transport.Frame) error {
+	if f.Kind == transport.FrameStreamErr {
+		blocked := false
+		g.enterOnce.Do(func() { blocked = true })
+		if blocked {
+			close(g.entered)
+			<-g.release // park the single emitter here so its queue saturates
+		}
+	}
+	// The CANCEL lane accepts immediately: it models the strict-priority lifecycle
+	// publication that can precede the still-queued OPEN on the real writer.
+	g.mu.Lock()
+	g.frames = append(g.frames, f)
+	g.mu.Unlock()
+
+	return nil
+}
+
+func (g *owedTeardownGateTransport) Recv(ctx context.Context) (transport.Frame, error) {
+	<-ctx.Done()
+
+	return transport.Frame{}, ctx.Err()
+}
+
+func (g *owedTeardownGateTransport) Close() error { return nil }
+
+func (g *owedTeardownGateTransport) releaseEmitter() { g.releaseOnce.Do(func() { close(g.release) }) }
+
+func (g *owedTeardownGateTransport) kindsFor(callID uint64) []transport.FrameKind {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var out []transport.FrameKind
+	for _, f := range g.frames {
+		if f.CallID == callID {
+			out = append(out, f.Kind)
+		}
+	}
+
+	return out
+}
+
+// Test that an ambiguous-open teardown whose paired data-lane STREAM_ERR is dropped
+// under emitter saturation FAILS THE CONNECTION (stream-protocol.md §9's
+// definitive-publication-failure rule). This is the one class where §9's overflow
+// tolerance does not hold: the STREAM_OPEN is still queued on the data lane, the
+// lifecycle CANCEL has strict priority and can be published BEFORE it (the peer
+// discards a CANCEL for a not-yet-live call ID at §8.1 level 1), so the same-lane
+// STREAM_ERR — FIFO-ordered after the OPEN — is the ONLY frame guaranteed to reach
+// the peer after the OPEN. Dropping it silently would leave a peer-live orphan
+// (§7.4, §9.1). Both the cross-lane order (CANCEL published while the data lane is
+// saturated) and the saturation are forced with gates, never timing. On the code
+// before this fix the STREAM_ERR was handed to the droppable emitter and nothing
+// terminated the connection.
+func TestEmitOwedOpenTeardown_ErrDroppedUnderSaturation_FailsConnection(t *testing.T) {
+	// Given: a table whose emitter is parked and saturated, so any further data-lane
+	// STREAM_ERR is dropped. S_max = 1 gives emit capacity 2*S_max+1 = 3.
+	gt := &owedTeardownGateTransport{entered: make(chan struct{}), release: make(chan struct{})}
+	tbl := NewStreamTable(1, gt)
+	t.Cleanup(func() { gt.releaseEmitter(); _ = tbl.Close() })
+	require.Equal(t, 3, cap(tbl.emitCh), "the emitter queue holds 2*S_max+1 (§9)")
+
+	// A scratch stream drives filler STREAM_ERRs to park and then saturate the emitter.
+	filler := newStream(tbl, 99, ClientStream, StreamConfig{Credits: 1, Deadline: time.Hour})
+	defer filler.cancelCtx()
+	filler.teardownCode.Store(StatusCodeStreamCanceled)
+
+	// The emitter pops the first job and parks in its blocked Send, emptying emitCh.
+	filler.emitTeardownErr()
+	select {
+	case <-gt.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the emitter never entered its first STREAM_ERR Send")
+	}
+	// Fill the queue to capacity with teardown-class jobs (admitted whenever not full),
+	// so the next data-lane STREAM_ERR provably cannot be admitted.
+	for range cap(tbl.emitCh) {
+		filler.emitTeardownErr()
+	}
+
+	// Given: an ambiguous-open stream — SUBMITTED, its OPEN queued on the data lane —
+	// whose locally-initiated terminal wins from SUBMITTED. finishTerminal suppresses
+	// the engine emission (the OPEN's wire status is unknown at SUBMITTED), so the pair
+	// is owed to EmitOwedOpenTeardown.
+	owed := newStream(tbl, 1, ClientStream, StreamConfig{Credits: 1, Deadline: time.Hour})
+	owed.TerminateOpenAmbiguous(context.Canceled)
+	select {
+	case <-owed.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the ambiguous-open stream never reached its terminal outcome")
+	}
+
+	// When: the owed teardown is driven while the data lane is saturated. Its CANCEL is
+	// published on the lifecycle lane (recorded), its paired STREAM_ERR cannot be
+	// admitted to the full emitter queue and is dropped.
+	owed.EmitOwedOpenTeardown()
+
+	// Then: the dropped load-bearing STREAM_ERR fails the connection, so the host tears
+	// it down and the peer's orphaned stream is terminated by the connection failure
+	// (§9). Before the fix the STREAM_ERR was dropped and nothing terminated.
+	select {
+	case <-tbl.Fatal():
+	case <-time.After(3 * time.Second):
+		t.Fatal("a dropped ambiguous-open teardown STREAM_ERR must fail the connection (§9)")
+	}
+	require.ErrorIs(t, tbl.FatalErr(), ErrOwedTeardownDropped,
+		"the fatal cause is the dropped load-bearing teardown STREAM_ERR")
+
+	// Then: the cross-lane hazard is reproduced — the lifecycle CANCEL for the owed call
+	// reached the wire, while its data-lane STREAM_ERR never did (it was dropped).
+	kinds := gt.kindsFor(1)
+	require.Contains(t, kinds, transport.FrameCancel,
+		"the lifecycle CANCEL is published (it can precede the still-queued OPEN)")
+	require.NotContains(t, kinds, transport.FrameStreamErr,
+		"the paired data-lane STREAM_ERR was dropped under saturation — the orphan-making frame")
+}
+
+// Test that an owed-teardown STREAM_ERR dropped WHILE ORDINARY TEARDOWN is already
+// in progress records NO connection-fatal fault (stream-protocol.md §9). Close sets
+// the table's closing state (closed) before its fan-out but cancels connCtx only
+// after the finisher join, so there is a window in which a finisher released by the
+// teardown finds the emitter full and calls failIfConnLive with connCtx still live.
+// A drop there is expected teardown noise, not a data-plane fault: recording it
+// would make owner logic misread an ordinary close as a fatal fault and misfire a
+// restart. The fix makes the liveness check atomic with the closing state (it
+// consults the closed flag, not only connCtx). The beforeFinisherWait hook runs in
+// exactly that window (closed set, connCtx live), so the drop is deterministic —
+// gates, never timing. Mutation proof: dropping the closed-flag check from
+// failIfConnLive records the fatal and fails the FatalErr assertion below.
+func TestStreamTable_OrdinaryTeardown_OwedTeardownDrop_DoesNotRecordFatal(t *testing.T) {
+	// Given: a table whose single emitter is parked and saturated, so any further
+	// data-lane STREAM_ERR is dropped. S_max = 1 → emit capacity 2*S_max+1 = 3.
+	gt := &owedTeardownGateTransport{entered: make(chan struct{}), release: make(chan struct{})}
+	tbl := NewStreamTable(1, gt)
+	require.Equal(t, 3, cap(tbl.emitCh))
+
+	filler := newStream(tbl, 99, ClientStream, StreamConfig{Credits: 1, Deadline: time.Hour})
+	defer filler.cancelCtx()
+	filler.teardownCode.Store(StatusCodeStreamCanceled)
+
+	// The emitter pops the first job and parks in its blocked Send, emptying emitCh.
+	filler.emitTeardownErr()
+	select {
+	case <-gt.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the emitter never entered its first STREAM_ERR Send")
+	}
+	// Fill the queue to capacity, so the next data-lane STREAM_ERR cannot be admitted.
+	for range cap(tbl.emitCh) {
+		filler.emitTeardownErr()
+	}
+
+	// When: an owed-teardown STREAM_ERR is dropped in the teardown window — closed
+	// set, connCtx not yet cancelled. beforeFinisherWait runs there; the drop finds
+	// the emitter full and reaches failIfConnLive. Releasing the emitter only AFTER
+	// the drop keeps the queue full for it and then lets Close's emitter join finish.
+	tbl.beforeFinisherWait = func() {
+		tbl.emitOwedTeardownErr(1, &transport.FrameStatus{Code: StatusCodeStreamCanceled})
+		gt.releaseEmitter()
+	}
+	require.NoError(t, tbl.Close())
+
+	// Then: no connection-fatal fault was recorded — an ordinary close is not a
+	// data-plane fault (stream-protocol.md §9).
+	require.NoError(t, tbl.FatalErr(),
+		"an owed-teardown drop during ordinary teardown must not record a false Fatal")
 }

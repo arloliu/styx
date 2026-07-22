@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/arloliu/styx/codec"
@@ -25,6 +26,12 @@ import (
 // set by lifecycle.Spawn via os/exec ExtraFiles[0].
 const controlChildFD = 3
 
+// controlServePoll bounds one serving-phase control receive so a context
+// cancellation (runServing cancels the serve context when the data plane dies) is
+// observed within this interval rather than only when the next host message
+// arrives. A poll expiry is not a fault; dispatchControl keeps serving.
+const controlServePoll = 50 * time.Millisecond
+
 // PluginServer is the plugin-side counterpart to Host: it owns the
 // control connection, the data-plane Transport, and the
 // internal/rpcruntime.Dispatcher services are registered against. Serve
@@ -35,6 +42,11 @@ type PluginServer struct {
 	mu          sync.Mutex
 	services    map[uint64]registeredService // keyed by ServiceID
 	reloadHooks lifecycle.PluginReloadHooks  // populated by reload_hooks.go's Register* methods
+	// streamHandlers maps a streaming method's FNV-1a-64 service/method hashes to
+	// its registration (declared shape + handler), populated by
+	// RegisterStreamHandler. The serve loop invokes the matching handler when a
+	// STREAM_OPEN is accepted, establishing the stream from the declared shape.
+	streamHandlers map[streamKey]streamHandlerReg
 }
 
 // registeredService pairs one RegisterService call's desc and impl for
@@ -97,20 +109,21 @@ func (s *PluginServer) Serve() error {
 func (s *PluginServer) serve(ctx context.Context) error {
 	conn := control.NewConn(controlChildFD, firstGeneration)
 
-	if err := s.pluginHandshake(ctx, conn); err != nil {
+	streaming, err := s.pluginHandshake(ctx, conn)
+	if err != nil {
 		_ = conn.Close()
 
 		return fmt.Errorf("styx: serve: handshake: %w", err)
 	}
 
-	tr, err := s.pluginAttach(ctx, conn)
+	tr, err := s.pluginAttach(ctx, conn, streaming)
 	if err != nil {
 		_ = conn.Close()
 
 		return fmt.Errorf("styx: serve: attach: %w", err)
 	}
 
-	err = s.runServing(ctx, conn, tr)
+	err = s.runServing(ctx, conn, tr, streaming)
 	_ = conn.Close()
 
 	return err
@@ -131,7 +144,9 @@ func (s *PluginServer) serve(ctx context.Context) error {
 // It returns nil when the host shut the plugin down gracefully or a successful
 // reload retired it (exit 0), and a non-nil error on disconnect/crash or a
 // protocol violation (exit 1).
-func (s *PluginServer) runServing(ctx context.Context, conn *control.Conn, tr transport.Transport) error {
+func (s *PluginServer) runServing(
+	ctx context.Context, conn *control.Conn, tr transport.Transport, streaming bool,
+) error {
 	if isReloadSuccessor() {
 		if err := lifecycle.ServeRestore(ctx, conn, s.reloadHooks.Restorer); err != nil {
 			_ = tr.Close()
@@ -145,29 +160,96 @@ func (s *PluginServer) runServing(ctx context.Context, conn *control.Conn, tr tr
 	for _, rs := range s.services {
 		dispatcher.Register(rs.desc.ServiceID, newServiceHandler(rs, codec.Proto{}))
 	}
+	streamHandlers := make(map[streamKey]streamHandlerReg, len(s.streamHandlers))
+	for k, h := range s.streamHandlers {
+		streamHandlers[k] = h
+	}
 	s.mu.Unlock()
 
+	// The plugin accept half over the same transport, built ONLY when streaming was
+	// negotiated (stream-protocol.md §2.4): it admits inbound STREAM_OPENs, routes
+	// STREAM_* frames, and emits rejection/handler-error STREAM_ERRs through the
+	// connection emitter. When streaming was not negotiated srv stays nil, and the
+	// serve loop poisons on any STREAM_* frame a peer sends (§11.2).
+	var srv *streamServer
+	if streaming {
+		srv = newStreamServer(tr, streamHandlers)
+	}
+
+	// A cancelable context so a data-plane death can stop the control loop below.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// Serving reader loop (data plane). Its only stop/join owner is this
-	// function: closing tr below unblocks its Recv. For a successor the restore
-	// above has already completed, so this reader cannot dispatch a frame ahead
-	// of the restore; for a first-start plugin there is no restore to precede.
+	// function: stopping tr's writer below unblocks its Recv. For a successor the
+	// restore above has already completed, so this reader cannot dispatch a frame
+	// ahead of the restore; for a first-start plugin there is no restore to precede.
 	readDone := make(chan struct{})
+	var readPoisoned atomic.Bool
 	go func() {
 		defer close(readDone)
-		runServeLoop(ctx, tr, dispatcher)
+		if runServeLoop(ctx, tr, dispatcher, srv) != nil {
+			readPoisoned.Store(true)
+		}
 	}()
 
-	// Drive the control plane until this instance is done serving: the
-	// heartbeat sender and the reload/shutdown dispatch loop.
-	ctrlErr := s.runServingControl(ctx, conn)
+	// The control plane runs in its own goroutine so this instance OBSERVES the
+	// data plane's death alongside it (stream-protocol.md §9's poison teardown;
+	// design §9's teardown-for-poison). Parking only on the control loop would let
+	// the plugin keep heartbeating on a dead data plane, so the host supervisor
+	// would never see the fault and never restart it.
+	ctrlDone := make(chan error, 1)
+	go func() { ctrlDone <- s.runServingControl(ctx, conn) }()
 
-	// Stop serving and release the data-plane transport: closing tr unblocks+
-	// joins the serving loop. The control socket is closed by serve, last.
-	_ = tr.Close()
+	var ctrlErr error
+	select {
+	case ctrlErr = <-ctrlDone:
+		// The control plane ended first: graceful shutdown, a completed reload, or
+		// the host going away. The two-phase teardown below stops the reader.
+	case <-readDone:
+		// The data plane's reader exited. A plugin-initiated poison or a
+		// connection-fatal fault must fail this whole instance so the host
+		// supervisor observes the process die and runs its restart policy; a peer
+		// close (the host tearing this instance down) must not — its control loop
+		// will deliver the graceful Shutdown, or the host will reap it.
+		if readPoisoned.Load() || (srv != nil && srv.plane.streams.FatalErr() != nil) {
+			cancel()   // stop the control loop so this instance exits
+			<-ctrlDone // join it; the ctx.Canceled it returns is one WE induced
+			ctrlErr = errServingDataPlaneDied
+		} else {
+			ctrlErr = <-ctrlDone
+		}
+	}
+
+	// Two-phase data-plane teardown (stream-protocol.md §9's join-before-unmap):
+	// stopTransportWriter unblocks + joins the serving loop WITHOUT releasing the
+	// mapped region; srv.teardown then joins the stream finishers (whose lifecycle
+	// Sends now return) and the handler goroutines; releaseTransport frees the
+	// region only after that join. For uds both phases are Close. The control socket
+	// is closed by serve, last.
+	if srv != nil {
+		// Mark the stream table closing before the writer stop, so a stream finisher
+		// the stop releases cannot record a false connection-fatal fault during this
+		// ordinary teardown; a feature-absent server (no table) stops directly.
+		srv.plane.stopWriter()
+	} else {
+		stopTransportWriter(tr)
+	}
 	<-readDone
+	if srv != nil {
+		srv.teardown(ErrPluginUnavailable)
+	}
+	releaseTransport(tr)
 
 	return ctrlErr
 }
+
+// errServingDataPlaneDied is runServing's return when the data plane died under a
+// still-healthy control plane (a plugin-initiated poison or a connection-fatal
+// fault): a non-nil error propagates out of Serve so the process exits non-zero
+// and the host supervisor restarts it (stream-protocol.md §9; design §9's poison
+// teardown).
+var errServingDataPlaneDied = errors.New("styx: serving data plane died")
 
 // runServingControl runs the plugin's control-plane serving phase on conn: it
 // starts the heartbeat sender, runs the control dispatch loop, tears the
@@ -224,8 +306,25 @@ func (s *PluginServer) dispatchControl(ctx context.Context, conn *control.Conn, 
 			return err
 		}
 
-		msg, err := conn.Recv(ctx)
+		// Bound each receive so a context cancellation — runServing cancels ctx when
+		// the data plane dies — is observed within one poll instead of only when the
+		// next host message happens to arrive. A poll expiry is not the host going
+		// away: re-check ctx and keep serving. Mirrors the supervisor heartbeat
+		// loop's own bounded receive.
+		rctx, cancelRecv := context.WithTimeout(ctx, controlServePoll)
+		msg, err := conn.Recv(rctx)
+		cancelRecv()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err() // parent canceled (data plane died / shutdown): stop serving.
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				continue // poll expired without a message; re-check ctx and keep serving.
+			}
+			if errors.Is(err, unix.EINTR) {
+				continue // a signal (Go async preemption) interrupted recvmsg; retry, not a fault.
+			}
+
 			return err // EOF / peer close / recv error: host is gone.
 		}
 
@@ -301,31 +400,37 @@ func isReloadSuccessor() bool {
 // before Serve exits, so the host can translate the failure into a typed
 // *styx.IncompatibleError instead of only observing a connection
 // loss indistinguishable from any other crash.
-func (s *PluginServer) pluginHandshake(ctx context.Context, conn *control.Conn) error {
+func (s *PluginServer) pluginHandshake(ctx context.Context, conn *control.Conn) (streaming bool, err error) {
 	helloMsg, err := recvControl(ctx, conn, control.StateHandshaking, control.KindHello,
 		control.ReplyDeadlines[control.KindHello])
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	hello := helloMsg.GetHello()
 	services := s.serviceVersions()
 
-	tuple, err := control.Negotiate(control.HelloToOffer(hello), m1PluginOffer(), services)
+	offer := s.pluginOffer()
+	tuple, err := control.Negotiate(control.HelloToOffer(hello), offer, services)
 	if err != nil {
 		rejectAck := control.IncompatibleToHelloAck(
-			m1PluginOffer(), services, incompatibleReason(err), hello.GetNonce(),
+			offer, services, incompatibleReason(err), hello.GetNonce(),
 		)
 		rejectMsg := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_HelloAck{HelloAck: rejectAck}}
 		_ = sendControl(ctx, conn, rejectMsg, control.ReplyDeadlines[control.KindHello])
 
-		return err
+		return false, err
 	}
 
 	ack := control.TupleToHelloAck(tuple, hello.GetNonce(), control.PluginIdentity{}, services)
 	ackMsg := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_HelloAck{HelloAck: ack}}
+	if err := sendControl(ctx, conn, ackMsg, control.ReplyDeadlines[control.KindHello]); err != nil {
+		return false, err
+	}
 
-	return sendControl(ctx, conn, ackMsg, control.ReplyDeadlines[control.KindHello])
+	// The acknowledged streaming state fixes the data-plane header shape both
+	// sides derive from the same tuple (stream-protocol.md §2.4).
+	return tuple.Features[featureStreaming], nil
 }
 
 // incompatibleReason extracts the best available reason string from a
@@ -352,7 +457,9 @@ func incompatibleReason(err error) string {
 // pluginAttach performs the plugin side of AttachRegion -> AttachRegionAck:
 // it receives the data-plane fd over the control socket (via SCM_RIGHTS),
 // acknowledges, and wraps the fd in a UDS transport.
-func (s *PluginServer) pluginAttach(ctx context.Context, conn *control.Conn) (transport.Transport, error) {
+func (s *PluginServer) pluginAttach(
+	ctx context.Context, conn *control.Conn, streaming bool,
+) (transport.Transport, error) {
 	_, fds, err := recvControlFDs(ctx, conn, control.StateAttaching, control.KindAttachRegion, 1,
 		control.ReplyDeadlines[control.KindAttachRegion])
 	if err != nil {
@@ -371,12 +478,11 @@ func (s *PluginServer) pluginAttach(ctx context.Context, conn *control.Conn) (tr
 		return nil, err
 	}
 
-	// The negotiated tuple is resolved in pluginHandshake and not threaded to
-	// this attach step, so the acknowledged streaming state is not in scope
-	// here; pass false until the tuple reaches construction. streaming is not a
-	// negotiable feature under layout_version 1, so the host derives false too
-	// and the two header shapes still agree (stream-protocol.md §2.4).
-	tr, err := transport.NewUDSTransport(dataFD, false)
+	// streaming is the acknowledged state pluginHandshake resolved from the
+	// negotiated tuple; it fixes the uds header shape for the whole connection.
+	// The host derives the same value from the same tuple, so the two header
+	// shapes always agree (stream-protocol.md §2.4).
+	tr, err := transport.NewUDSTransport(dataFD, streaming)
 	if err != nil {
 		_ = unix.Close(dataFD)
 
@@ -400,27 +506,73 @@ func (s *PluginServer) serviceVersions() []control.ServiceVersion {
 	return versions
 }
 
-// m1PluginOffer is the plugin's fixed negotiation offer, the plugin-side
-// mirror of internal/supervisor's hostOffer: protocol version 1 only, the
-// uds transport, the proto codec. Service versions are passed to Negotiate
-// separately (Offer.Services is host-only).
+// m1PluginOffer is the plugin's base negotiation offer, the plugin-side mirror of
+// internal/supervisor's hostOffer: protocol version 1 only, the uds transport, the
+// proto codec, and the streaming feature offered as supported (not required).
+// Service versions are passed to Negotiate separately (Offer.Services is
+// host-only). pluginOffer refines the streaming flag's Required bit from what this
+// plugin actually serves.
 func m1PluginOffer() control.Offer {
 	return control.Offer{
 		ProtocolMin: m1ProtocolVersion,
 		ProtocolMax: m1ProtocolVersion,
 		Transports:  []string{transportUDS},
 		Codecs:      []string{codecProto},
+		Features:    []control.FeatureFlag{{Name: featureStreaming}},
 	}
 }
+
+// pluginOffer is this server's negotiation offer, m1PluginOffer with the streaming
+// flag marked REQUIRED when the plugin has registered any stream handler
+// (stream-protocol.md §11.2): a plugin that intends to serve streaming declares the
+// feature required, so a host that cannot stream fails the handshake at startup
+// with ErrIncompatible rather than the incompatibility surfacing only at the first
+// STREAM_OPEN. A plugin with no stream handlers leaves it optional, so it still
+// negotiates unary calls against any peer.
+func (s *PluginServer) pluginOffer() control.Offer {
+	s.mu.Lock()
+	requireStreaming := len(s.streamHandlers) > 0
+	s.mu.Unlock()
+
+	offer := m1PluginOffer()
+	if requireStreaming {
+		for i := range offer.Features {
+			if offer.Features[i].Name == featureStreaming {
+				offer.Features[i].Required = true
+			}
+		}
+	}
+
+	return offer
+}
+
+// errServeLoopPoisoned is runServeLoop's non-nil return when it exited because it
+// poisoned the data plane itself — a conformance violation on a live stream, or a
+// STREAM_* frame with streaming un-negotiated (stream-protocol.md §8.1/§11.2).
+// runServing uses it to tell a self-initiated poison (which must fail the whole
+// instance so the host supervisor restarts it) from a peer close / graceful
+// teardown (which must not).
+var errServeLoopPoisoned = errors.New("styx: serve loop poisoned the data plane")
 
 // runServeLoop reads data-plane frames and dispatches each to the registered
 // handler, sending back any response frame. Dispatch is currently inline
 // (a slow handler blocks the reader); a future concurrent serving loop
-// would hand each Dispatch to its own goroutine and a single writer. It
-// returns when the transport is closed (Serve's
-// teardown) or the host end goes away.
-func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher) {
+// would hand each Dispatch to its own goroutine and a single writer.
+//
+// It returns nil when the transport was closed under it (Serve's teardown, the
+// host going away, or the host poisoning its own end), and errServeLoopPoisoned
+// when it poisoned the data plane itself — the two cases runServing must
+// distinguish (see errServeLoopPoisoned).
+func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher, srv *streamServer) error {
 	for {
+		// Signal an owed drain boundary before blocking on the next Recv, so a stream
+		// frame dispatched earlier is detected drained however many non-stream frames
+		// (a unary request, a lifecycle CANCEL) followed it (stream-protocol.md §4.6).
+		// No-op until routeStreamFrame marks a data frame dispatched.
+		if srv != nil {
+			srv.plane.probeDrain()
+		}
+
 		f, err := tr.Recv(ctx)
 		if err != nil {
 			if isFrameLocalRecvErr(err) {
@@ -432,16 +584,96 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 				continue
 			}
 
-			return
+			if errors.Is(err, transport.ErrPoisoned) {
+				// A torn/invalid inbound frame poisoned the transport: the data plane
+				// desynced under a possibly-healthy control plane. Fail the whole
+				// instance (like a self-initiated conformance poison) so the host
+				// supervisor observes the process die and restarts it (design §9's
+				// poison teardown), rather than parking on the still-live control loop.
+				return errServeLoopPoisoned
+			}
+
+			return nil // peer close / ErrClosed / ctx: not a self-initiated poison
 		}
 
-		recvAt := time.Now()
-		for _, resp := range d.Dispatch(ctx, f, recvAt) {
-			if serr := tr.Send(ctx, resp); serr != nil {
-				return
+		// A STREAM_OPEN is admitted by the accept half; the four STREAM_* data kinds
+		// route to the stream table; a CANCEL is a stream teardown only when its
+		// call ID names a live stream (decided by lookup, not the control value),
+		// otherwise it is a unary cancel; everything else is a unary request.
+		switch {
+		case isStreamKind(f.Kind):
+			if srv == nil {
+				// Feature-absent, fail-closed (stream-protocol.md §11.2): streaming
+				// was not negotiated, so any STREAM_* frame is a conformance
+				// violation. Poison the connection.
+				stopTransportWriter(tr)
+
+				return errServeLoopPoisoned
+			}
+			if derr := routeStreamFrame(srv, f); derr != nil {
+				// A conformance violation on a LIVE stream poisons the connection
+				// (stream-protocol.md §8.1): stopWriter marks the table closing and
+				// stops the writer, tearing the serving loop down WITHOUT releasing the
+				// region; runServing's teardown then joins the finishers before the
+				// region is released. Marking closing before the stop keeps a released
+				// finisher from recording a false Fatal during this teardown.
+				srv.plane.stopWriter()
+
+				return errServeLoopPoisoned
+			}
+		case f.Kind == transport.FrameCancel && srv != nil && srv.plane.streams.HasLiveStream(f.CallID):
+			// A CANCEL naming a live stream is a stream teardown (§9.1); its
+			// discriminant (0 or any non-teardown code) poisons, a legal code
+			// terminates. A CANCEL for any other call ID falls to the unary path.
+			if derr := srv.plane.dispatchStreamFrame(f); derr != nil {
+				// A conformance violation on a LIVE stream poisons the connection: mark
+				// the table closing before the writer stop so a released finisher does
+				// not record a false Fatal during this teardown (§8.1/§9).
+				srv.plane.stopWriter()
+
+				return errServeLoopPoisoned
+			}
+		case f.Kind == transport.FrameCancel && srv == nil && f.Control != 0:
+			// Feature-absent (§11.2): a nonzero control word is illegal on any frame
+			// when streaming was not negotiated. Poison.
+			stopTransportWriter(tr)
+
+			return errServeLoopPoisoned
+		default:
+			recvAt := time.Now()
+			for _, resp := range d.Dispatch(ctx, f, recvAt) {
+				if serr := tr.Send(ctx, resp); serr != nil {
+					if errors.Is(serr, transport.ErrPoisoned) {
+						// A partially-written response frame desynced the data plane: fail
+						// the instance so the supervisor restarts it, rather than treating
+						// the poison as a benign peer close (design §9's poison teardown).
+						return errServeLoopPoisoned
+					}
+
+					return nil // peer close / ErrClosed / ctx: not a self-initiated poison
+				}
 			}
 		}
 	}
+}
+
+// routeStreamFrame routes one inbound STREAM_* frame on the plugin accept side: a
+// STREAM_OPEN to the accept half (which admits or rejects it), and each of the
+// four data kinds to the stream table, marking the §4.6 drain boundary OWED after a
+// dispatched data frame — the serve loop's top-of-iteration probeDrain signals it
+// once the inbound queue empties. A CANCEL never reaches here — the serve loop
+// routes it by call-ID lookup. It returns rpcruntime.ErrStreamConformance for a
+// conformance violation the serve loop poisons the connection on.
+func routeStreamFrame(srv *streamServer, f transport.Frame) error {
+	if f.Kind == transport.FrameStreamOpen {
+		return srv.onStreamOpen(f)
+	}
+	if derr := srv.plane.dispatchStreamFrame(f); derr != nil {
+		return derr
+	}
+	srv.plane.drainOwedMark()
+
+	return nil
 }
 
 // heartbeatIntervalEnv, when set to a value time.ParseDuration accepts,

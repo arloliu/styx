@@ -925,6 +925,92 @@ func TestTransport_Close_BlocksUntilInFlightAccessReleasesTheClosingGate(t *test
 	}
 }
 
+// Test that StopWriter (transport.WriterStopper) performs the frozen §14 shutdown
+// wake — set the shutdown word and write BOTH eventfds — so a Recv parked on the
+// region unblocks and returns transport.ErrClosed (the graceful cause, not
+// ErrPoisoned), WITHOUT unmapping the region, and that a LATER Close still releases
+// the mapping exactly once. This is the release-free prefix the connection-fatal
+// fallback needs: it must make teardown observable while a Recv is still parked
+// (the reader holds the closing gate's read side for its whole call), leaving the
+// mapping valid for the later Close to munmap (shm-abi.md §14/§16). Mutation proof:
+// dropping either eventfd write from PoisonFlag.Shutdown leaves the parked Recv
+// asleep, and this test blocks at the recvDone gate below.
+func TestTransport_StopWriter_WakesParkedRecvWithoutUnmap_ThenCloseReleasesOnce(t *testing.T) {
+	// Given an attached Transport whose region records every munmap.
+	region, err := shm.CreateRegion(roundTripLayout())
+	require.NoError(t, err)
+	inEFD, err := event.NewEventFD()
+	require.NoError(t, err)
+	outEFD, err := event.NewEventFD()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = inEFD.Close()
+		_ = outEFD.Close()
+		_ = region.Close()
+	})
+
+	counting := &countingRegion{}
+	restore := swapAttachSeams(
+		func(fd int, size uint64) (regionHandle, error) {
+			r, e := shm.OpenRegion(fd, size)
+			if e != nil {
+				return nil, e
+			}
+			counting.inner = r
+
+			return counting, nil
+		},
+		attachNewArena, attachNewWriter,
+	)
+	host, err := Attach(AttachParams{
+		RegionFD: region.FD(), ExpectedSize: region.Layout().RegionSize, Role: RoleHost,
+		InboundEFD: inEFD, OutboundEFD: outEFD, Config: validConfig(false),
+	})
+	restore()
+	require.NoError(t, err)
+
+	// Given a Recv parked on the inbound direction with no peer producing.
+	recvDone := make(chan error, 1)
+	go func() {
+		_, e := host.Recv(context.Background())
+		recvDone <- e
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for !host.inboundPark.IsParked() {
+		if time.Now().After(deadline) {
+			t.Fatal("reader did not park; cannot prove StopWriter's §14 wake is what releases it")
+		}
+		runtime.Gosched()
+	}
+	require.Equal(t, int32(0), counting.closes.Load(), "no unmap before StopWriter")
+
+	// When StopWriter runs while that Recv is parked.
+	require.NoError(t, host.StopWriter())
+
+	// Then the parked Recv unblocks and returns the graceful shutdown cause.
+	select {
+	case e := <-recvDone:
+		require.ErrorIs(t, e, transport.ErrClosed)
+		require.NotErrorIs(t, e, ErrPoisoned)
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopWriter did not wake the parked Recv (shm-abi.md §14 shutdown wake)")
+	}
+	// And the region was NOT unmapped, nor the transport marked closed: StopWriter
+	// is release-free.
+	require.Equal(t, int32(0), counting.closes.Load(), "StopWriter must not unmap the region")
+	require.False(t, host.closed, "StopWriter must not mark the transport closed")
+
+	// StopWriter is idempotent (still no unmap).
+	require.NoError(t, host.StopWriter())
+	require.Equal(t, int32(0), counting.closes.Load())
+
+	// When a later Close runs — even repeatedly — it releases the mapping exactly
+	// once, despite StopWriter having already actuated shutdown.
+	require.NoError(t, host.Close())
+	require.NoError(t, host.Close())
+	require.Equal(t, int32(1), counting.closes.Load(), "the later Close unmaps exactly once")
+}
+
 // Test many concurrent Send callers and a single Recv caller (Recv's lastSeen
 // field is owned by exactly one consumer, so only Send is safely
 // multi-caller, per doc.go) racing a Close call on the same Transport, under

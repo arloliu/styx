@@ -7,7 +7,18 @@ import (
 
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/lifecycle"
+	"github.com/arloliu/styx/internal/transport"
 )
+
+// HandshakeAndAttachForTest re-exports handshakeAndAttach for supervisor_test
+// (external test package): it drives the host side of the real Hello/HelloAck and
+// AttachRegion exchange against a scripted plugin conn, so the negotiated streaming
+// flag's flow out of the handshake is exercised without a spawned child.
+func (s *Supervisor) HandshakeAndAttachForTest(
+	ctx context.Context, conn *control.Conn, generation uint64,
+) (transport.Transport, bool, error) {
+	return s.handshakeAndAttach(ctx, conn, generation)
+}
 
 // FakeInstance is a test-built stand-in for one spawned instance: the control
 // conn the heartbeat loop will own, the promote closure that installs routing
@@ -17,6 +28,12 @@ type FakeInstance struct {
 	Conn     *control.Conn
 	Promote  func() ReadyHooks
 	Teardown func(ctx context.Context, shutdownDeadline time.Duration) (*os.ProcessState, error)
+
+	// CaptureNotify, if set, is called during promote with the instance's real
+	// NotifyConnLost closure — the same one the production promote hands the routing
+	// layer. A test uses it to drive a data-plane fault escalation and observe the
+	// heartbeat loop tear the instance down, exactly as the routing layer would.
+	CaptureNotify func(notifyConnLost func())
 }
 
 // FakeSpawn is the shape of a test replacement for the instance-spawn seam.
@@ -38,8 +55,20 @@ func (s *Supervisor) SetSpawnForTest(f FakeSpawn) {
 			return nil, err
 		}
 
-		li := &liveInstance{conn: fake.Conn, generation: generation, stderrTail: newTailSink(1)}
-		li.promote = fake.Promote
+		li := &liveInstance{
+			conn: fake.Conn, generation: generation, stderrTail: newTailSink(1),
+			connLost: make(chan struct{}),
+		}
+		li.promote = func() ReadyHooks {
+			if fake.CaptureNotify != nil {
+				// Mirror the production promote: hand out a NotifyConnLost that closes
+				// this instance's connLost channel, so the heartbeat loop observes a
+				// routing-layer-escalated data-plane fault and ends the instance.
+				fake.CaptureNotify(func() { li.connLostOnce.Do(func() { close(li.connLost) }) })
+			}
+
+			return fake.Promote()
+		}
 		li.teardown = func(ctx context.Context, shutdownDeadline time.Duration) (*os.ProcessState, error) {
 			// Run the same routing-teardown hooks lifecycle.Teardown runs (in the
 			// same order), so a test exercises the real ownership CAS, then hand
@@ -53,6 +82,13 @@ func (s *Supervisor) SetSpawnForTest(f FakeSpawn) {
 
 		return li, nil
 	}
+}
+
+// HostOfferForTest re-exports hostOffer for supervisor_test (external test
+// package): the streaming-required negotiation flag is derived from
+// Config.RequireStreaming, exercised directly here without a real handshake.
+func (s *Supervisor) HostOfferForTest() control.Offer {
+	return s.hostOffer()
 }
 
 // SpecForSpawnForTest re-exports specForSpawn for supervisor_test (external

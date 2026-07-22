@@ -138,6 +138,17 @@ func (t *Table) Generation() uint64 {
 	return t.generation
 }
 
+// NextID allocates a fresh call ID from this table's monotonic, never-reused
+// space WITHOUT registering a call entry. It is the seam the streaming layer
+// uses so a stream's call ID shares the one call-ID space unary calls draw from
+// on a connection generation (transport.Frame's CallID is shared by unary calls
+// and streams). The stream is registered in the StreamTable, not here, so no
+// unary call state is created; the two never collide because they draw the same
+// monotonic counter.
+func (t *Table) NextID() uint64 {
+	return t.nextID.Add(1)
+}
+
 // Reanchor converts a remaining-duration deadline budget, as carried on the
 // wire (a deadline travels as remaining budget rather than an absolute time,
 // and is re-anchored to the receiver's monotonic clock), to an absolute

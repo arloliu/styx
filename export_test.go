@@ -28,8 +28,10 @@ func (s *PluginServer) RunServingControlForTest(ctx context.Context, conn *contr
 // caller-supplied control.Conn and data-plane Transport, so the ordering
 // between a successor's restore and the data-plane reader can be exercised
 // in-process without a real spawned child.
-func (s *PluginServer) RunServingForTest(ctx context.Context, conn *control.Conn, tr transport.Transport) error {
-	return s.runServing(ctx, conn, tr)
+func (s *PluginServer) RunServingForTest(
+	ctx context.Context, conn *control.Conn, tr transport.Transport, streaming bool,
+) error {
+	return s.runServing(ctx, conn, tr, streaming)
 }
 
 // AddRuntimeForTest registers a pluginRuntime backed by sup under name, the way

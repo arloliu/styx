@@ -6,6 +6,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"sync"
+	"sync/atomic"
 
 	"github.com/arloliu/styx/internal/arena"
 	"github.com/arloliu/styx/internal/ring"
@@ -164,14 +165,17 @@ type writer struct {
 	// synchronization; it is reset at the top of every build.
 	pendingSlab slabRef
 
-	// onBlock is a test-only observation hook: when non-nil, run calls it with the
+	// onBlock is a test-only observation hook: when set, run calls it with the
 	// blockSite of a wake select immediately before parking on that select, so a
 	// test can prove run reached a specific intermediate state before delivering a
-	// burst rather than racing to reach it. It is nil in every production build
+	// burst rather than racing to reach it. It is unset in every production build
 	// (neither newWriterFromParts nor newRegionWriter sets it), so the guarded call
-	// is a no-op that leaves run's control flow unchanged; a test installs it
-	// directly on the constructed writer. It must not block run indefinitely.
-	onBlock func(blockSite)
+	// is a no-op that leaves run's control flow unchanged. It is stored through an
+	// atomic pointer so a test can install it after start (the transport starts the
+	// writer in Attach) without racing run's reads at the park points; setOnBlock
+	// before start (the in-package writer tests) works identically. It must not
+	// block run indefinitely.
+	onBlock atomic.Pointer[func(blockSite)]
 
 	// closeMu guards the closed flag and, held for read across an enqueue, forms
 	// the barrier stop waits on: stop takes the write lock only after closing
@@ -259,6 +263,22 @@ func (w *writer) prePublishFault() error {
 // before stop.
 func (w *writer) start() {
 	go w.run()
+}
+
+// setOnBlock installs the test-only park observation hook (see the onBlock
+// field). Safe to call before or after start: the store is atomic, so it never
+// races run's reads at the park points.
+func (w *writer) setOnBlock(fn func(blockSite)) {
+	w.onBlock.Store(&fn)
+}
+
+// notifyBlock reports a park to the installed observation hook, if any. It is a
+// no-op in every production build (onBlock unset), a single atomic load on the
+// cold park path.
+func (w *writer) notifyBlock(s blockSite) {
+	if fn := w.onBlock.Load(); fn != nil {
+		(*fn)(s)
+	}
 }
 
 // stop shuts the writer down and blocks until its goroutine has reported every
@@ -485,9 +505,7 @@ func (w *writer) run() {
 		}
 
 		if stuck != nil {
-			if w.onBlock != nil {
-				w.onBlock(blockStuckCarry)
-			}
+			w.notifyBlock(blockStuckCarry)
 			select {
 			case i := <-w.lifecycleQueue:
 				// Stage, do not publish here: the next turn's Step 1 emits it as a
@@ -507,9 +525,7 @@ func (w *writer) run() {
 			continue
 		}
 
-		if w.onBlock != nil {
-			w.onBlock(blockIdle)
-		}
+		w.notifyBlock(blockIdle)
 		select {
 		case i := <-w.lifecycleQueue:
 			// Stage, do not publish here: the next turn's Step 1 emits it as a

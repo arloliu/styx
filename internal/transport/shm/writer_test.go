@@ -873,12 +873,12 @@ func TestWriter_LifecycleBurst_BoundedFromIdleWake(t *testing.T) {
 	// the hook from ever blocking run, so run stays free to reach its shutdown drain
 	// at cleanup; the buffer holds the first park, which is the one this test forces.
 	blocked := make(chan blockSite, 1)
-	w.onBlock = func(s blockSite) {
+	w.setOnBlock(func(s blockSite) {
 		select {
 		case blocked <- s:
 		default:
 		}
-	}
+	})
 
 	// Prime one data turn BEFORE start, so run's very first blocking select is the
 	// idle wake with both queues empty — not a pre-prime idle park. run's Step 2
@@ -957,12 +957,12 @@ func TestWriter_LifecycleBurst_BoundedFromStuckCarryWake(t *testing.T) {
 	// Observe when run parks on a wake select (coalescing, so the hook never blocks
 	// run — see the idle-wake test for why that matters at cleanup).
 	blocked := make(chan blockSite, 1)
-	w.onBlock = func(s blockSite) {
+	w.setOnBlock(func(s blockSite) {
 		select {
 		case blocked <- s:
 		default:
 		}
-	}
+	})
 
 	// Park a data intent in the stuck carry BEFORE start: run's Step 2 dequeues it,
 	// its push is rejected with ErrFull, so run sets it aside and parks in the

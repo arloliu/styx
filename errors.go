@@ -171,6 +171,14 @@ var (
 	ErrPoisoned          = errors.New("styx: region poisoned")
 	ErrServiceNotFound   = errors.New("styx: service not found")
 	ErrMethodNotFound    = errors.New("styx: method not found")
+	// ErrStreamAlreadyClosed reports that a stream reached its terminal outcome
+	// before OpenStream could hand it back — a fast peer completion won the race
+	// against the opener's own publish step, so there is no usable stream to return.
+	// It is distinct from the peer-error and teardown outcomes, which carry their own
+	// mapped errors; it names specifically the completed-before-use case, which has no
+	// underlying error of its own. It is not retryable by default: the peer already
+	// processed the stream, so reissuing may repeat a side effect.
+	ErrStreamAlreadyClosed = errors.New("styx: stream already closed")
 )
 
 // IsRetryable reports whether err represents a failure the caller may

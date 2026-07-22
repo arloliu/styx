@@ -43,6 +43,29 @@ var ErrMalformedStatusFrame = errors.New("transport: malformed status frame body
 // this contract.
 var ErrClosed = errors.New("transport: closed")
 
+// ErrPoisoned wraps the error a Send/Recv returns when a mid-frame failure
+// forced the transport to poison itself: a torn/partial frame, an invalid
+// declared payload length, or any other abort after some of a frame's bytes had
+// already crossed the socket, which permanently desynchronizes SOCK_STREAM
+// framing (see UDSTransport's "poison, don't repair" policy). The returned error
+// still errors.Is-matches its underlying cause (a ctx error, an IO error, or
+// ErrPayloadTooLarge); ErrPoisoned is layered on so BOTH connection owners — the
+// host read loop and the plugin serve loop — can tell a self-poisoning desync
+// (which must escalate to the supervisor's teardown/restart, design §9's poison
+// teardown) from a benign peer close or a local ErrClosed teardown. A later call
+// on the now-closed transport returns the plain ErrClosed, not this.
+var ErrPoisoned = errors.New("transport: poisoned")
+
+// ErrBackpressure is the transport-level sentinel a Send returns when the
+// underlying data lane is full and rejects the frame before it is accepted — the
+// shm transport's reject-mode submission-queue-full condition surfaced here so a
+// caller can classify it without importing internal/transport/shm. It is a
+// definitively pre-acceptance, rollback-eligible failure (nothing reached the
+// peer), and it is transient framework backpressure the caller may retry. The uds
+// transport blocks rather than rejecting, so it never returns this; only the shm
+// transport in reject mode does.
+var ErrBackpressure = errors.New("transport: backpressure")
+
 // FrameKind identifies a Frame's role. The unary kinds, Cancel, and the five
 // Stream* kinds are all carried by both transports; the transport stays
 // stream-unaware and moves a Stream* frame exactly like any other single Frame
@@ -133,6 +156,91 @@ type Transport interface {
 	// Close releases the transport's underlying resources. Safe to call
 	// more than once.
 	Close() error
+}
+
+// WriterStopper is an optional Transport capability for a transport whose Close
+// releases a memory mapping (the shared-memory data plane). It splits Close into
+// two phases so a connection teardown can stop the outbound writer and unblock a
+// parked Send/Recv BEFORE it joins the stream finishers, then release the mapping
+// (the ordinary Close) only AFTER the join — so a terminal finisher's lifecycle
+// CANCEL Send is never left parked against an already-unmapped region
+// (2026-07-16-styx-design.md's join-before-unmap constraint, stream-protocol.md §9).
+//
+// A transport with no mapping to release (the uds transport) need not implement
+// this: its Close stops the writer and unblocks Send/Recv without unmapping
+// anything, so a single Close is correct in any teardown position and a second
+// Close is a harmless no-op. The connection teardown falls back to Close for such
+// a transport (see the styx package's teardown helpers).
+type WriterStopper interface {
+	// StopWriter stops the outbound writer and unblocks any parked Send and Recv
+	// with ErrClosed, WITHOUT releasing the transport's mapped resources. After it
+	// returns, a Send fails fast (so a finisher's lifecycle Send returns promptly)
+	// and a parked Recv unblocks (so the reader loop exits) while the mapping is
+	// still valid to touch. The mapping is released by a later Close. Idempotent.
+	StopWriter() error
+}
+
+// InboundQueueProber is an optional Transport capability reporting whether more
+// inbound data is currently readable without blocking — the connection reader's
+// drain boundary (stream-protocol.md §4.6). The drain trigger requires "all
+// currently available frames for the stream drained", which a per-frame signal
+// cannot observe: a single Recv yields one frame while more may already be
+// buffered. A reader with this capability signals StreamTable.ReaderDrained only
+// when ReadableNow reports the queue is empty, so a below-threshold ACK never
+// arms while another frame is still available.
+//
+// A transport that cannot answer omits it; the reader then falls back to
+// signaling drain after each frame (a safe over-approximation that may ACK early
+// but never late).
+type InboundQueueProber interface {
+	// ReadableNow reports whether the inbound queue is NOT confirmed empty, as a
+	// snapshot at the instant of the call — the reader signals the drain boundary
+	// (StreamTable.ReaderDrained) only when this returns false. It MUST NOT block.
+	//
+	// It returns false ONLY when it positively confirms the queue is empty (no byte
+	// currently available to Recv without blocking). It returns true when a byte is
+	// available, and — deliberately conservative — also when it cannot confirm
+	// emptiness: a transient interrupt is retried internally, and any other probe
+	// error (including a closed transport) reports true, never false, so an owed
+	// below-threshold ACK is never armed off an unconfirmed-empty queue. The next
+	// Recv surfaces the real condition. "Currently available" means present in the
+	// transport's own inbound buffer or the kernel socket buffer at the instant of
+	// the call — not a promise about future arrivals. It is called only from the
+	// single reader goroutine, between that reader's Recv calls, so it never races
+	// Recv.
+	ReadableNow() bool
+}
+
+// AcceptanceClassifier is an optional Transport capability that classifies a
+// non-nil error THIS transport's Send returned by whether the frame's
+// ACCEPTANCE — and so its eventual publication — is left UNKNOWN. Acceptance is a
+// per-transport notion (the publication boundary, stream-protocol.md §4.5): the
+// same context.DeadlineExceeded means "never accepted, a clean pre-byte abort" on
+// one transport and "accepted, the writer may still publish" on another, so no
+// transport-agnostic predicate over the error value alone can classify it — the
+// classification MUST live on the transport that produced the error.
+//
+// A caller (the streaming host's OpenStream) uses it to decide a STREAM_OPEN's
+// disposition when Send fails: an UNKNOWN result means the peer MAY hold the OPEN, so
+// the stream is live-and-owed the terminal teardown pair; a definitively NEGATIVE
+// result means the failed frame can never later become observable to a peer on a LIVE
+// connection — the transport can prove either that nothing was (or will be) published,
+// or that the only connection any bytes could appear on is already dead — so the
+// stream is discarded and the send error is retryable (stream-protocol.md §7.4). That
+// observability property, not literal "no byte ever crossed", is what the caller
+// relies on: a negative result must never leave a frame a live peer can still act on.
+// A transport that omits this capability is treated conservatively — every Send
+// failure is acceptance-unknown, the spec-safe assumption (an unnecessary teardown
+// CANCEL is discarded by the peer at §8.1 level 1).
+type AcceptanceClassifier interface {
+	// AcceptanceUnknown reports whether err — a non-nil error THIS transport's Send
+	// returned — leaves the frame's acceptance unknown (the frame may have been
+	// accepted and will publish). It returns false ONLY when the failed frame cannot
+	// later become observable to a peer on a live connection: the transport proves
+	// either that nothing was (or will be) published, or that any bytes that did cross
+	// are on a connection already dead. It is called only with a non-nil Send error
+	// from the same transport.
+	AcceptanceUnknown(err error) bool
 }
 
 // checkImplementedKind returns nil for the nine kinds Send/Recv carry

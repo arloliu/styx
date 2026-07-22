@@ -39,6 +39,11 @@ const pollInterval = 50 * time.Millisecond
 
 var _ Transport = (*UDSTransport)(nil)
 
+// peekSyscall is a seam over the non-blocking MSG_PEEK recv the drain probe uses,
+// so a test can inject a transient errno (EINTR) at the probe's own syscall;
+// production always uses the unix package.
+var peekSyscall = unix.Recvmsg
+
 // UDSTransport implements Transport over an already-connected SOCK_STREAM
 // socket. Concurrency contract: writeMu serializes concurrent Send calls
 // so their header+body writes can never interleave. This IS load-bearing:
@@ -139,6 +144,23 @@ func (t *UDSTransport) Send(ctx context.Context, f Frame) error {
 	}
 
 	return t.writeFrame(ctx, f, body)
+}
+
+// AcceptanceUnknown reports whether a failed Send left the frame's acceptance
+// unknown (transport.AcceptanceClassifier). For SOCK_STREAM, acceptance is "a byte
+// reached the socket", and the only outcome a live peer could still act on is a
+// mid-frame abort: Send marks it by poisoning (wrapping ErrPoisoned), because the peer
+// may have the frame's prefix and the framing is now desynced. Every other Send
+// failure is a definitively NEGATIVE result — the frame can never become observable to
+// a LIVE peer. Most wrote nothing: ErrUnimplementedFrameKind or ErrPayloadTooLarge
+// rejected before any write, or a clean pre-byte context abort (started=false,
+// returned un-wrapped). The one case that CAN follow bytes on the wire is a plain
+// ErrClosed when a concurrent external Close wins before abortFrame runs; that is
+// still safe to treat as negative because the socket is already shut down, so no live
+// connection remains on which the peer could act on a partial frame — the observability
+// property, not "no byte crossed", is what makes the disposition correct.
+func (t *UDSTransport) AcceptanceUnknown(err error) bool {
+	return errors.Is(err, ErrPoisoned)
 }
 
 // Recv blocks until a full Frame is available, ctx is done, or the
@@ -248,8 +270,11 @@ func (t *UDSTransport) Recv(ctx context.Context) (Frame, error) {
 //   - Else if started, a partially-transmitted frame has permanently
 //     desynced this connection's SOCK_STREAM framing: there is no way to
 //     resynchronize, so the Transport is poisoned (Close is called on
-//     the caller's behalf) and err itself is returned so this call's
-//     caller sees the real reason.
+//     the caller's behalf) and err is returned wrapped in ErrPoisoned so
+//     this call's caller still sees the real reason (errors.Is against the
+//     underlying cause) AND can observe that the desync poisoned the
+//     connection (errors.Is against ErrPoisoned) — the signal both
+//     connection owners escalate on.
 //   - Else (nothing of this Frame moved yet), it's a clean abort: err is
 //     returned as-is and the Transport remains usable.
 func (t *UDSTransport) abortFrame(err error, started bool) error {
@@ -259,9 +284,52 @@ func (t *UDSTransport) abortFrame(err error, started bool) error {
 
 	if started {
 		_ = t.Close() // idempotent; poisons the connection
+
+		return fmt.Errorf("%w: %w", err, ErrPoisoned)
 	}
 
 	return err
+}
+
+// ReadableNow reports whether this connection's inbound queue is NOT confirmed
+// empty — the reader's drain-boundary probe (stream-protocol.md §4.6), which
+// signals the boundary only on a false return. It does one non-blocking MSG_PEEK
+// recv (which consumes nothing).
+//
+// It returns false ONLY on a positive EAGAIN/EWOULDBLOCK: the queue is confirmed
+// empty, the drain boundary. Every other outcome returns true (not
+// confirmed-empty), deliberately conservative so an owed below-threshold ACK is
+// never armed off an unconfirmed-empty queue:
+//   - a peekable byte (n > 0): more is available;
+//   - a peeked EOF (n == 0, no error): the peer has closed — the next Recv
+//     surfaces io.EOF and the reader tears down, not a drained live queue;
+//   - EINTR: a signal (Go's async preemption) interrupted the peek, not a queue
+//     state — retried in the loop;
+//   - a closed transport or any other recv error: the next Recv surfaces it.
+//
+// It is called only from the single reader goroutine between its Recv calls, so it
+// never races Recv; a concurrent Send holds writeMu and only writes, so it never
+// races this read-side peek.
+func (t *UDSTransport) ReadableNow() bool {
+	if t.closed.Load() {
+		return true // the next Recv surfaces ErrClosed; never confirm drained off a closed probe
+	}
+
+	var b [1]byte
+	for {
+		_, _, _, _, err := peekSyscall(t.fd, b[:], nil, unix.MSG_PEEK|unix.MSG_DONTWAIT)
+		if err == nil {
+			return true // a byte is peekable, or a peer-close EOF is pending: not confirmed-empty
+		}
+		if errors.Is(err, unix.EINTR) {
+			continue // interrupted by a signal; retry — an interrupt is not a queue state
+		}
+		if isTimeoutErrno(err) {
+			return false // EAGAIN/EWOULDBLOCK: the queue is confirmed empty — the drain boundary
+		}
+
+		return true // any other error: unknown; the next Recv surfaces it. Conservative: not drained
+	}
 }
 
 // Close shuts down the socket for both directions before closing its fd,

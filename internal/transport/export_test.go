@@ -1,6 +1,23 @@
 package transport
 
-import "context"
+import (
+	"context"
+
+	"golang.org/x/sys/unix"
+)
+
+// SetPeekSyscallForTest swaps the drain probe's MSG_PEEK syscall seam so a
+// transport_test can inject a transient errno (EINTR) at the probe's own
+// syscall — mirroring the control plane's recvmsg/sendmsg seams — and returns a
+// restore func. Test-only; not part of the package's public API.
+func SetPeekSyscallForTest(
+	fn func(fd int, p, oob []byte, flags int) (int, int, int, unix.Sockaddr, error),
+) (restore func()) {
+	prev := peekSyscall
+	peekSyscall = fn
+
+	return func() { peekSyscall = prev }
+}
 
 // WriteFrameUnchecked re-exports writeFrame for transport_test: it skips
 // Send's Kind/size validation so a test can put a frame Send itself would

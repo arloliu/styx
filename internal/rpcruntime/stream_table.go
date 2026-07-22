@@ -53,14 +53,24 @@ type StreamTable struct {
 	stopOnce  sync.Once
 	dispDone  chan struct{}
 
-	// The connection's single bounded teardown emitter (stream-protocol.md §9):
-	// one goroutine drains emitCh, sending each data-lane teardown STREAM_ERR one
-	// at a time, so a slow data lane can never spawn an unbounded set of blocked
-	// per-emission goroutines. emitCh is bounded and enqueue is non-blocking; an
-	// emission that does not fit is dropped (the paired CANCEL still carries the
-	// outcome). emitDone closes when the emitter goroutine exits.
-	emitCh   chan teardownErrJob
+	// The connection's single bounded emitter (stream-protocol.md §9): one goroutine
+	// drains emitCh, sending each data-lane STREAM_ERR one at a time, so a slow data
+	// lane can never spawn an unbounded set of blocked per-emission goroutines. It
+	// carries all three emission classes — teardown (step 1), rejection (step 1),
+	// and handler-error (step 4) — through this one queue. emitCh is bounded and
+	// enqueue is non-blocking; an emission that does not fit is dropped. A rejection
+	// costs the peer no stream, so it is admitted only against emitReserve's budget
+	// (below), keeping emitReserve entries always reachable by the teardown and
+	// handler-error classes a peer cannot flood. emitDone closes when the emitter
+	// goroutine exits.
+	emitCh   chan emitJob
 	emitDone chan struct{}
+	// emitReserve is the number of emitCh slots reserved for teardown/handler-error
+	// emissions and never usable by a rejection (stream-protocol.md §9's capacity
+	// reserve): a rejection is admitted only while the queue holds fewer than
+	// cap(emitCh) − emitReserve entries. It equals S_max, the number of streams that
+	// can concurrently reach a terminal transition.
+	emitReserve int
 
 	// Connection-fatal signal (stream-protocol.md §9): a definitive publication
 	// failure of a terminal CANCEL closes fatalCh and records fatalErr, so the
@@ -70,6 +80,16 @@ type StreamTable struct {
 	fatalCh   chan struct{}
 	fatalMu   sync.Mutex
 	fatalErr  error
+
+	// drained records that the reader has signaled it drained its inbound transport
+	// queue since the last inbound frame it dispatched (stream-protocol.md §4.6's
+	// drain boundary). ReaderDrained sets it; Dispatch clears it when a new inbound
+	// frame arrives (the queue was not drained after all). A credited delivery
+	// consulted while it is set arms the owed STREAM_ACK even below the count
+	// trigger, closing the gap where the reader signals drain BEFORE the application
+	// consumes the frame (consumed advances only in RecvMsg), so a below-threshold
+	// message delivered after the drain boundary still returns its credit.
+	drained atomic.Bool
 
 	discarded atomic.Uint64 // §8.2 diagnostic counter of late/unknown frames
 
@@ -88,12 +108,16 @@ type StreamTable struct {
 	beforeFinisherDone func()
 }
 
-// teardownErrJob is one queued data-lane teardown STREAM_ERR for the connection
-// emitter to publish (stream-protocol.md §9.1 step 1): the terminating stream's
-// call ID and the teardown status code its paired CANCEL also carries.
-type teardownErrJob struct {
+// emitJob is one queued data-lane STREAM_ERR for the connection emitter to
+// publish (stream-protocol.md §9.1): the call ID and the status body it carries.
+// reject marks the rejection class (a refused STREAM_OPEN that created no stream
+// state, whose rate a peer controls), which is admitted only against the queue's
+// reserve; teardown (step 1) and handler-error (step 4) jobs, each costing the
+// peer a stream, are admitted whenever the queue is not full.
+type emitJob struct {
 	callID uint64
-	code   uint32
+	status *transport.FrameStatus
+	reject bool
 }
 
 // NewStreamTable builds a stream table capped at maxOpenStreams (S_max,
@@ -102,25 +126,33 @@ type teardownErrJob struct {
 // the connection context.
 func NewStreamTable(maxOpenStreams int, tr transport.Transport) *StreamTable {
 	ctx, cancel := context.WithCancel(context.Background())
-	// The teardown-emitter queue holds at least S_max + 1 entries
-	// (stream-protocol.md §9): every concurrently-live stream can reach a terminal
-	// transition at once, and this engine emits only teardown-class STREAM_ERRs.
-	emitCap := maxOpenStreams + 1
+	// The emitter queue reserves S_max slots for the teardown (step 1) and
+	// handler-error (step 4) classes and gives rejections a budget of the same size
+	// on top (stream-protocol.md §9): capacity 2*S_max + 1, reserve S_max. Every
+	// concurrently-live stream can reach a terminal transition at once (S_max of
+	// them), so S_max slots always remain reachable by those classes even while a
+	// peer floods rejections into the remaining budget.
+	reserve := maxOpenStreams
+	if reserve < 0 {
+		reserve = 0
+	}
+	emitCap := 2*maxOpenStreams + 1
 	if emitCap < 1 {
 		emitCap = 1
 	}
 	t := &StreamTable{
-		maxOpen:    maxOpenStreams,
-		tr:         tr,
-		connCtx:    ctx,
-		connCancel: cancel,
-		streams:    make(map[uint64]*Stream),
-		armSignal:  make(chan struct{}, 1),
-		stopCh:     make(chan struct{}),
-		dispDone:   make(chan struct{}),
-		emitCh:     make(chan teardownErrJob, emitCap),
-		emitDone:   make(chan struct{}),
-		fatalCh:    make(chan struct{}),
+		maxOpen:     maxOpenStreams,
+		tr:          tr,
+		connCtx:     ctx,
+		connCancel:  cancel,
+		streams:     make(map[uint64]*Stream),
+		armSignal:   make(chan struct{}, 1),
+		stopCh:      make(chan struct{}),
+		dispDone:    make(chan struct{}),
+		emitCh:      make(chan emitJob, emitCap),
+		emitDone:    make(chan struct{}),
+		emitReserve: reserve,
+		fatalCh:     make(chan struct{}),
 	}
 
 	go t.runAckDispatch()
@@ -143,6 +175,27 @@ func NewStreamTable(maxOpenStreams int, tr transport.Transport) *StreamTable {
 //   - only a genuinely new, well-formed open is subject to the S_max cap (§4.7's
 //     retryable backpressure).
 func (t *StreamTable) Open(callID uint64, side StreamSide, cfg StreamConfig) (*Stream, error) {
+	return t.admitStream(callID, side, cfg, true)
+}
+
+// OpenAccepting admits an accept-side (ServerStream) stream WITHOUT starting its
+// deadline watcher, so the plugin accept path can reach PUBLISHED before a tiny peer
+// budget can win the terminal CAS. The peer's OPEN indisputably arrived, so a
+// deadline that wins from SUBMITTED — before Publish — would be suppressed by
+// finishTerminal and orphan the peer's stream (stream-protocol.md §7.1/§7.4).
+// Deferring the watcher to StartDeadlineWatcher (called after Publish) removes that
+// race; the budget stays anchored to the OPEN's arrival, so the deferral does not
+// extend it. The opener path uses Open, which starts the watcher at admission: an
+// opener is SUBMITTED until OpenStream Publishes after a successful Send, and its own
+// deadline must be able to reap a STREAM_OPEN that never reaches the wire (§7.4).
+func (t *StreamTable) OpenAccepting(callID uint64, cfg StreamConfig) (*Stream, error) {
+	return t.admitStream(callID, ServerStream, cfg, false)
+}
+
+// open is the shared admission path for Open and OpenAccepting. startWatch selects
+// whether the deadline watcher is started at admission (the opener) or deferred to a
+// later StartDeadlineWatcher (the accept path).
+func (t *StreamTable) admitStream(callID uint64, side StreamSide, cfg StreamConfig, startWatch bool) (*Stream, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -164,8 +217,29 @@ func (t *StreamTable) Open(callID uint64, side StreamSide, cfg StreamConfig) (*S
 
 	s := newStream(t, callID, side, cfg)
 	t.streams[callID] = s
+	if startWatch {
+		s.beginDeadlineWatch()
+	}
 
 	return s, nil
+}
+
+// addFinisher registers one out-of-band terminal-teardown finisher (the opener's
+// owed-teardown sender, EmitOwedOpenTeardown) so Close's join waits for it before
+// releasing the transport, mirroring casTerminal's in-CAS Add. It reports false
+// if the table has begun tearing down: the increment is gated on t.closed under
+// the same lock Close sets it with, so it can never Add after Close's finishers
+// join has started (a WaitGroup Add-after-Wait race). A false return means the
+// transport is closing and the deferred CANCEL cannot land, so the caller drops it.
+func (t *StreamTable) addFinisher() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return false
+	}
+	t.finishers.Add(1)
+
+	return true
 }
 
 // Lookup returns the stream for callID, if any.
@@ -175,6 +249,21 @@ func (t *StreamTable) Lookup(callID uint64) (*Stream, bool) {
 	s, ok := t.streams[callID]
 
 	return s, ok
+}
+
+// HasLiveStream reports whether callID currently names a LIVE stream in this
+// table. The reader loop uses it to route an inbound CANCEL by call-ID lookup
+// (stream-protocol.md §9.1): a CANCEL naming a live stream is a stream teardown —
+// its discriminant validated by DispatchTeardownCancel, where a control word of 0
+// or any non-teardown code poisons — while a CANCEL for any other call ID is a
+// unary cancel (or a late/unknown frame). The routing decision therefore never
+// rests on the control value, so a zero-valued teardown CANCEL cannot slip past
+// as a unary cancel. A lookup that races the stream to terminal is harmless:
+// DispatchTeardownCancel re-checks under the lock and discards a terminal ID.
+func (t *StreamTable) HasLiveStream(callID uint64) bool {
+	s, ok := t.Lookup(callID)
+
+	return ok && s.isLive()
 }
 
 // Len returns the number of open streams.
@@ -206,6 +295,10 @@ func (t *StreamTable) remove(callID uint64) {
 // sequence/state anomaly there returns ErrStreamConformance for the reader loop
 // to poison the connection on.
 func (t *StreamTable) Dispatch(f transport.Frame) error {
+	// A frame was available to dispatch, so the reader's inbound queue was not
+	// drained (stream-protocol.md §4.6): clear the drain mark a delivery consults.
+	t.drained.Store(false)
+
 	s, ok := t.Lookup(f.CallID)
 	if !ok {
 		t.discarded.Add(1) // §8.1 level 1: unknown call ID — discard, never blocks
@@ -246,6 +339,50 @@ func (t *StreamTable) Dispatch(f transport.Frame) error {
 	}
 }
 
+// DispatchTeardownCancel routes an inbound stream-teardown CANCEL (a CANCEL whose
+// control word is non-zero) to its stream, validating the teardown discriminant
+// (stream-protocol.md §9.1). Only StatusCodeStreamCanceled and
+// StatusCodeStreamDeadlineExceeded are legal teardown codes on a LIVE stream; any
+// other value — including the coercion of an incompatible/backpressure code into a
+// teardown — is a conformance violation, returned as ErrStreamConformance for the
+// reader loop to poison the connection on. An absent (§8.1 level 1) or terminal
+// (§8.1 level 2) call ID carries no state to violate, so an invalid code there is
+// discarded, exactly as a real STREAM_ERR for such a call ID would be. The
+// live-check, the code validation, and the terminal transition are one atomic step
+// under the stream's stateMu, the same discipline Dispatch follows.
+func (t *StreamTable) DispatchTeardownCancel(callID uint64, code uint32) error {
+	s, ok := t.Lookup(callID)
+	if !ok {
+		t.discarded.Add(1) // §8.1 level 1: unknown call ID — discard
+
+		return nil
+	}
+
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	if !s.isLive() {
+		t.discarded.Add(1) // §8.1 level 2: terminal stream — discard
+
+		return nil
+	}
+
+	switch code {
+	case StatusCodeStreamCanceled:
+		s.terminateLocked(StreamOutcome{Code: OutcomeCanceled, Err: ErrCanceledLocally},
+			streamSubmitted, streamPublished)
+
+		return nil
+	case StatusCodeStreamDeadlineExceeded:
+		s.terminateLocked(StreamOutcome{Code: OutcomeDeadlineExceeded, Err: ErrDeadlineExceeded},
+			streamSubmitted, streamPublished)
+
+		return nil
+	default:
+		return ErrStreamConformance // §9.1: an illegal teardown discriminant on a live stream
+	}
+}
+
 // ReaderDrained is the connection reader's signal that it has no more inbound
 // frames currently available to dispatch — the drain trigger's boundary
 // (stream-protocol.md §4.6). Every LIVE stream still owing credit
@@ -259,6 +396,12 @@ func (t *StreamTable) Dispatch(f transport.Frame) error {
 // that MAY still be emitted — never a new obligation. Wiring the real reader loop
 // to call this at each batch boundary is the connection layer's concern (part ii).
 func (t *StreamTable) ReaderDrained() {
+	// Set the drain mark BEFORE the arm sweep so a delivery that races this call
+	// (the application consumes concurrently on another goroutine) still observes
+	// the boundary and arms itself — the sweep here covers credit already consumed,
+	// the mark covers credit consumed just after. Together they close the ordering
+	// gap between the drain signal and the delivery regardless of which lands first.
+	t.drained.Store(true)
 	for _, s := range t.snapshot() {
 		if s.isLive() && s.recvCredit.pending() {
 			s.arm()
@@ -363,11 +506,72 @@ func (t *StreamTable) runEmitter() {
 			_ = t.tr.Send(t.connCtx, transport.Frame{
 				CallID: job.callID,
 				Kind:   transport.FrameStreamErr,
-				Status: &transport.FrameStatus{Code: job.code},
+				Status: job.status,
 			})
 		case <-t.stopCh:
 			return
 		}
+	}
+}
+
+// emitStreamErr enqueues a teardown (step 1) or handler-error (step 4) STREAM_ERR
+// on the connection's one emitter (stream-protocol.md §9). These classes each cost
+// the peer a stream, so they are admitted whenever the queue is not full; only the
+// rejection class is held to the reserve. Enqueue never blocks; a job that does
+// not fit is dropped (§9 overflow — the paired CANCEL still carries a teardown's
+// outcome, and a definitive CANCEL failure fails the connection).
+func (t *StreamTable) emitStreamErr(callID uint64, status *transport.FrameStatus, reject bool) {
+	t.enqueueEmit(emitJob{callID: callID, status: status, reject: reject})
+}
+
+// emitOwedTeardownErr enqueues the data-lane STREAM_ERR that terminates a peer
+// holding an AMBIGUOUS STREAM_OPEN — the OPEN whose acceptance was unknown at Send
+// and that the writer may still publish (stream-protocol.md §4.5, §7.4). For this one
+// class §9's overflow tolerance does NOT hold, so the frame must land or the
+// connection fails. The tolerance rests on the paired lifecycle CANCEL still
+// terminating the peer; here it cannot be relied on. The OPEN is still queued on the
+// data lane, and the lifecycle lane has strict priority over data (shm-abi.md §18),
+// so the CANCEL can be published BEFORE the OPEN — the peer then discards it for a
+// not-yet-live call ID (§8.1 level 1) and later accepts the OPEN. The same-lane
+// STREAM_ERR, FIFO-ordered after that OPEN, is then the ONLY frame guaranteed to
+// reach the peer after it. Dropping it silently would orphan the peer's stream
+// (§7.4, §9.1), so a drop is a definitive terminal-publication failure and fails the
+// connection, exactly as a definitive CANCEL publication failure does (§9). Both
+// frames of the pair can therefore never be lost together for this class.
+func (t *StreamTable) emitOwedTeardownErr(callID uint64, status *transport.FrameStatus) {
+	if t.enqueueEmit(emitJob{callID: callID, status: status}) {
+		return
+	}
+	t.failIfConnLive(ErrOwedTeardownDropped)
+}
+
+// EmitReject enqueues a rejection STREAM_ERR — a STREAM_OPEN this side refused,
+// creating no stream state (stream-protocol.md §7.4 step 1) — on the connection's
+// one emitter, subject to the rejection reserve: it is admitted only while the
+// queue holds fewer than cap(emitCh) − emitReserve entries, so a rejection flood a
+// peer drives at a rate of its own choosing can never crowd out the teardown and
+// handler-error classes. Non-blocking; a rejection that does not fit is dropped
+// (§9 overflow — the opener's own deadline still reaps a stream whose rejection was
+// dropped).
+func (t *StreamTable) EmitReject(callID uint64, code uint32) {
+	t.emitStreamErr(callID, &transport.FrameStatus{Code: code}, true)
+}
+
+// enqueueEmit performs the non-blocking, reserve-aware enqueue for the connection
+// emitter (stream-protocol.md §9). A rejection is admitted only against the budget
+// outside the reserve; a teardown/handler-error job is admitted whenever the queue
+// is not full. A job that does not fit is dropped. It returns whether the job was
+// admitted, so a caller whose frame is load-bearing (emitOwedTeardownErr) can treat a
+// drop as a definitive publication failure; the droppable classes ignore the result.
+func (t *StreamTable) enqueueEmit(job emitJob) bool {
+	if job.reject && len(t.emitCh) >= cap(t.emitCh)-t.emitReserve {
+		return false // rejection budget exhausted; the reserve stays reachable by the other classes
+	}
+	select {
+	case t.emitCh <- job:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -377,10 +581,57 @@ func (t *StreamTable) runEmitter() {
 // failure, so it is ignored; otherwise the failure is definitive and fails the
 // connection.
 func (t *StreamTable) onCancelPublishFailed(err error) {
+	t.failIfConnLive(err)
+}
+
+// failIfConnLive records err as connection-fatal unless the connection is already
+// closing, where a publication failure is expected and not definitive
+// (stream-protocol.md §9). It backs both definitive terminal-publication failures:
+// a terminal CANCEL that cannot be published, and an ambiguous-open teardown
+// STREAM_ERR that cannot be admitted to the emitter.
+//
+// "Closing" is two signals, either of which suppresses the record: connCtx
+// cancelled (the late phase, set only after the finisher join in Close), and the
+// closed flag (the early phase). The closed flag is what makes the check atomic
+// with the table's closing state: a teardown owner sets it (MarkClosing) BEFORE it
+// stops the transport writer, and Close sets it before FailAll — both strictly
+// before any stop that can release a parked owed finisher on this table. So a
+// finisher released during teardown, whose CANCEL is lost or whose STREAM_ERR
+// finds the emitter full, observes the closing state and does NOT record a false
+// Fatal during an ordinary close. A genuine drop on a LIVE connection sees neither
+// signal (the drop is what triggers the first teardown) and still records, so the
+// fatal watcher's own path is unaffected.
+func (t *StreamTable) failIfConnLive(err error) {
 	if t.connCtx.Err() != nil {
 		return
 	}
+	if t.isClosing() {
+		return
+	}
 	t.failConn(err)
+}
+
+// isClosing reports whether the table has entered its closing state (the closed
+// flag), read under t.mu so it is atomic with the fan-out that sets it.
+func (t *StreamTable) isClosing() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return t.closed
+}
+
+// MarkClosing sets the table's closing state so failIfConnLive stops recording
+// connection-fatal faults, idempotently and under t.mu. A teardown owner calls it
+// BEFORE it stops the transport writer (stream-protocol.md §9's teardown), so a
+// finisher the stop releases — its parked lifecycle Send returning, or its emitter
+// enqueue dropping — cannot record a false Fatal during an ordinary close. Close
+// sets the same flag before its fan-out; both are idempotent, and setting it early
+// only moves the admission-stop boundary earlier, which a racing Open already
+// tolerates.
+func (t *StreamTable) MarkClosing() {
+	t.mu.Lock()
+	t.closed = true
+	t.mu.Unlock()
 }
 
 // failConn records the first connection-fatal cause and closes the fatal signal

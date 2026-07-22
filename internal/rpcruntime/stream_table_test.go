@@ -301,7 +301,7 @@ func TestStreamTable_DiscardSilently_OnTerminalStream(t *testing.T) {
 	st, err := tbl.Open(3, rpcruntime.ClientStream, rpcruntime.StreamConfig{Credits: 4, Deadline: time.Second})
 	require.NoError(t, err)
 
-	require.NoError(t, st.CloseSend(t.Context()))
+	require.NoError(t, st.CloseSend(t.Context(), nil))
 	require.NoError(t, tbl.Dispatch(transport.Frame{CallID: 3, Kind: transport.FrameStreamClose, Control: 0}))
 
 	_, terminal := st.Outcome()
@@ -441,9 +441,12 @@ func TestStreamTable_CancelPublishFailure_FailsConnection(t *testing.T) {
 	tbl := rpcruntime.NewStreamTable(8, ft)
 	t.Cleanup(func() { _ = tbl.Close() })
 
-	// A tiny deadline drives a local teardown, whose CANCEL publish fails.
-	_, err := tbl.Open(1, rpcruntime.ClientStream, rpcruntime.StreamConfig{Credits: 4, Deadline: time.Millisecond})
+	// A published stream with a tiny deadline drives a local teardown, whose CANCEL
+	// publish fails. It must be PUBLISHED — a teardown is owed only once the
+	// STREAM_OPEN reached the transport (§7.4).
+	st, err := tbl.Open(1, rpcruntime.ClientStream, rpcruntime.StreamConfig{Credits: 4, Deadline: time.Millisecond})
 	require.NoError(t, err)
+	require.True(t, st.Publish())
 
 	select {
 	case <-tbl.Fatal():

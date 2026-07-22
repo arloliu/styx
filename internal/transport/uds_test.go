@@ -722,3 +722,153 @@ func TestNewUDSTransport_ReturnsError_WhenFDIsNotSockStream(t *testing.T) {
 	require.Error(t, err)
 	require.Nil(t, tr)
 }
+
+// Test UDSTransport.Recv layering ErrPoisoned onto the error a self-poisoning
+// desync produces (here an oversized declared length discovered after the header
+// was already consumed), so the reader can tell a connection-poisoning desync from
+// a benign peer close while still recovering the underlying cause.
+func TestUDSTransport_Recv_OversizedLength_ObservableAsPoisoned(t *testing.T) {
+	// Given
+	a, b := newTestTransportPair(t)
+	header := transport.EncodeHeaderForTest(
+		transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq}, transport.MaxFrameSize+1, false)
+	_, err := unix.Write(a.FD(), header)
+	require.NoError(t, err)
+
+	// When
+	_, err = b.Recv(t.Context())
+
+	// Then: the original cause is still recoverable, AND the desync is observable.
+	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+	require.ErrorIs(t, err, transport.ErrPoisoned,
+		"a self-poisoning desync must be observable to the reader, not read as a benign close")
+}
+
+// Test UDSTransport.Recv layering ErrPoisoned onto a torn mid-frame read (the peer
+// wrote a full header then only part of the payload, then closed): the connection
+// is desynced and the reader must observe it as poison, not a plain peer close.
+func TestUDSTransport_Recv_TornFrame_ObservableAsPoisoned(t *testing.T) {
+	// Given
+	a, b := newTestTransportPair(t)
+	header := transport.EncodeHeaderForTest(
+		transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq}, 64, false)
+	_, err := unix.Write(a.FD(), header)
+	require.NoError(t, err)
+	_, err = unix.Write(a.FD(), make([]byte, 8)) // only 8 of 64 declared payload bytes
+	require.NoError(t, err)
+	require.NoError(t, a.Close()) // peer closes mid-frame: the rest never arrives
+
+	// When
+	_, err = b.Recv(t.Context())
+
+	// Then
+	require.Error(t, err)
+	require.ErrorIs(t, err, transport.ErrPoisoned,
+		"a torn mid-frame read desyncs the connection and must be observable as poison")
+}
+
+// Test UDSTransport.Send layering ErrPoisoned onto a frame torn by a mid-write
+// cancel (the same abortFrame poison path a torn Recv takes), so a poisoned
+// response Send is observable to the plugin serve loop, not read as a benign close.
+func TestUDSTransport_Send_CanceledMidFrame_ObservableAsPoisoned(t *testing.T) {
+	// Given: shrunk buffers and an unread peer so a large Send necessarily blocks
+	// after the first chunk crosses the wire.
+	a, b := newTestTransportPair(t)
+	require.NoError(t, unix.SetsockoptInt(a.FD(), unix.SOL_SOCKET, unix.SO_SNDBUF, 4096))
+	require.NoError(t, unix.SetsockoptInt(b.FD(), unix.SOL_SOCKET, unix.SO_RCVBUF, 4096))
+	f := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: make([]byte, 1<<20)}
+	ctx, cancel := context.WithCancel(t.Context())
+
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- a.Send(ctx, f) }()
+
+	// When: read one byte from the peer — this blocks until the sender has genuinely
+	// put frame bytes on the wire (started=true), the happens-before that replaces
+	// the timing sleep and gates the cancel on bytes actually in flight. The sender
+	// is then blocked mid-frame; cancel it. The runtime's async preemption interrupts
+	// the blocked write (EINTR), whose loop re-checks ctx and aborts the torn frame —
+	// bounded below, with no sleep.
+	one := make([]byte, 1)
+	_, rerr := unix.Read(b.FD(), one)
+	require.NoError(t, rerr)
+
+	cancel()
+
+	// Then
+	var err error
+	select {
+	case err = <-sendErr:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send did not unblock within 2s of context cancellation")
+	}
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, transport.ErrPoisoned,
+		"a torn mid-frame Send desyncs the connection and must be observable as poison")
+}
+
+// Test that UDSTransport.ReadableNow retries an interrupted MSG_PEEK probe rather
+// than misreading the interrupt as a queue state: a signal (Go's async preemption
+// routinely delivers one) interrupting the peek carries no information about
+// whether the inbound queue drained, so the probe must retry and report the real
+// state — here, a buffered frame is still not-drained across the interrupts.
+func TestUDSTransport_ReadableNow_RetriesInterruptedProbe(t *testing.T) {
+	// Given: a buffered frame, and a probe seam that reports EINTR twice before
+	// delegating to the real MSG_PEEK.
+	a, b := newTestTransportPair(t)
+	require.NoError(t, a.Send(t.Context(),
+		transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: []byte("x")}))
+
+	interruptsLeft, interruptsSeen := 2, 0
+	restore := transport.SetPeekSyscallForTest(
+		func(fd int, p, oob []byte, flags int) (int, int, int, unix.Sockaddr, error) {
+			if interruptsLeft > 0 {
+				interruptsLeft--
+				interruptsSeen++
+
+				return 0, 0, 0, nil, unix.EINTR
+			}
+
+			return unix.Recvmsg(fd, p, oob, flags)
+		})
+	t.Cleanup(restore)
+
+	// When
+	readable := b.ReadableNow()
+
+	// Then: the interrupts were consumed and the real buffered state surfaced.
+	require.Equal(t, 2, interruptsSeen)
+	require.True(t, readable, "a buffered frame is not a drained queue, even across interrupts")
+}
+
+// Test UDSTransport.ReadableNow confirming an empty queue (returns false) ONLY on a
+// genuinely drained socket, and reporting not-drained (true) for a buffered frame,
+// a partial frame, and — conservatively — a closed transport, so the drain probe
+// never signals the boundary off an unconfirmed-empty queue.
+func TestUDSTransport_ReadableNow_ConfirmsEmptyOnlyWhenDrained(t *testing.T) {
+	a, b := newTestTransportPair(t)
+
+	// An empty, open socket is confirmed drained.
+	require.False(t, b.ReadableNow(), "an empty open socket is the drain boundary")
+
+	// A full frame buffered: not drained.
+	require.NoError(t, a.Send(t.Context(),
+		transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: []byte("x")}))
+	require.True(t, b.ReadableNow(), "a buffered frame is not a drained queue")
+
+	// Draining the only frame returns to the confirmed-empty boundary.
+	_, err := b.Recv(t.Context())
+	require.NoError(t, err)
+	require.False(t, b.ReadableNow(), "after draining the only frame the queue is confirmed empty")
+
+	// A partial frame (header bytes only, no full frame available to Recv): its bytes
+	// are present, so the queue is not confirmed empty.
+	hdr := transport.EncodeHeaderForTest(transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq}, 4, false)
+	_, werr := unix.Write(a.FD(), hdr[:10])
+	require.NoError(t, werr)
+	require.True(t, b.ReadableNow(), "a partial frame's bytes are present: not a drained queue")
+
+	// A closed transport reports not-drained (conservative): a drain boundary is
+	// never signaled off a closed probe — the next Recv surfaces ErrClosed instead.
+	require.NoError(t, b.Close())
+	require.True(t, b.ReadableNow(), "a closed transport never reports a confirmed-drained queue")
+}

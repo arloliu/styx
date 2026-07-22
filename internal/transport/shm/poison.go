@@ -162,6 +162,24 @@ func (p *PoisonFlag) Set(cause PoisonCause) bool {
 	return won
 }
 
+// Shutdown performs the shm-abi.md §14 graceful teardown wake: a seq_cst store of
+// shutdown = 1 followed by a write to BOTH per-direction eventfds. It is the
+// poison(cause) helper's unconditional-wake tail WITHOUT the poison CAS, so a
+// consumer parked in either direction — and any future waiter — is released and
+// returns transport.ErrClosed (the graceful cause), never ErrPoisoned. Both
+// eventfds are written, in the same fixed order Set uses, so the wake releases a
+// consumer parked in either direction regardless of which side calls it, closing
+// the "tail stored but never signaled" window (§14/§15). Idempotent and coalesced
+// (event.EventFD is non-semaphore), so a repeated call — or a later poison, or the
+// full teardown store — is harmless. Eventfd write failures are ignored, exactly
+// as in Set: this is a terminal teardown signal with no error channel back, and
+// §14 defines the wake as unconditional, not retryable.
+func (p *PoisonFlag) Shutdown() {
+	atomic.StoreUint32(p.shutdown, 1)
+	_ = p.hpEFD.Write()
+	_ = p.phEFD.Write()
+}
+
 // Check reports whether the region is poisoned and, if so, the recorded
 // cause, via a seq_cst load (shm-abi.md §3/§16).
 func (p *PoisonFlag) Check() (PoisonCause, bool) {

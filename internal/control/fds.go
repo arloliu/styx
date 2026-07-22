@@ -135,7 +135,7 @@ func (c *Conn) RecvFDs(ctx context.Context, maxFDs int) (*controlpb.ControlMessa
 	buf := make([]byte, MaxMessageSize+1)
 	oob := make([]byte, unix.CmsgSpace(maxFDs*4))
 
-	n, oobn, recvFlags, _, err := unix.Recvmsg(c.fd, buf, oob, unix.MSG_CMSG_CLOEXEC)
+	res, err := recvmsgRetry(c.fd, buf, oob, unix.MSG_CMSG_CLOEXEC, rearmRecv(ctx, c.fd))
 	if err != nil {
 		if _, hasDeadline := ctx.Deadline(); hasDeadline && isTimeoutErrno(err) {
 			return nil, nil, fmt.Errorf("control: recvmsg: %w: %w", context.DeadlineExceeded, err)
@@ -148,21 +148,22 @@ func (c *Conn) RecvFDs(ctx context.Context, maxFDs int) (*controlpb.ControlMessa
 	// MSG_CTRUNC the kernel already closed the fds that didn't fit, but
 	// any fd(s) that did fit are ours to close on every rejection path
 	// below.
-	fds, err := parseRights(oob[:oobn])
+	fds, err := parseRights(oob[:res.oobn])
 	if err != nil {
 		closeAll(fds)
 
 		return nil, nil, fmt.Errorf("%w: %w", err, ErrProtocolViolation)
 	}
 
-	if recvFlags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 {
+	if res.recvflags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 {
 		closeAll(fds)
 
-		return nil, nil, fmt.Errorf("control: truncated datagram (recvflags=%#x): %w", recvFlags, ErrProtocolViolation)
+		return nil, nil, fmt.Errorf("control: truncated datagram (recvflags=%#x): %w",
+			res.recvflags, ErrProtocolViolation)
 	}
 
 	msg := new(controlpb.ControlMessage)
-	if err := proto.Unmarshal(buf[:n], msg); err != nil {
+	if err := proto.Unmarshal(buf[:res.n], msg); err != nil {
 		closeAll(fds)
 
 		return nil, nil, fmt.Errorf("control: unmarshal: %w", err)
@@ -234,7 +235,7 @@ func (c *Conn) sendFDsUnchecked(ctx context.Context, msg *controlpb.ControlMessa
 		return err
 	}
 
-	if err := unix.Sendmsg(c.fd, data, oob, nil, 0); err != nil {
+	if err := sendmsgRetry(c.fd, data, oob, nil, 0, rearmSend(ctx, c.fd)); err != nil {
 		if _, hasDeadline := ctx.Deadline(); hasDeadline && isTimeoutErrno(err) {
 			return fmt.Errorf("control: sendmsg: %w: %w", context.DeadlineExceeded, err)
 		}

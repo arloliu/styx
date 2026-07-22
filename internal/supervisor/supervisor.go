@@ -37,6 +37,10 @@ const (
 	m1ProtocolVersion uint32 = 1
 	transportUDS             = "uds"
 	codecProto               = "proto"
+	// featureStreaming is the stable handshake feature-flag name for streaming
+	// RPC (stream-protocol.md §11.1), offered as supported so a streaming-capable
+	// plugin negotiates the streaming header shape.
+	featureStreaming = "streaming"
 )
 
 // DefaultHeartbeatInterval is Config.HeartbeatInterval's default (1s),
@@ -66,6 +70,12 @@ const (
 // errWedged is EventUnhealthy's Err when Classify reports HealthWedged.
 var errWedged = errors.New("supervisor: heartbeat classifier detected a wedged plugin")
 
+// errConnLost is the crash reason when the routing layer escalates a data-plane
+// fault via Instance.NotifyConnLost (a stream conformance poison or a
+// connection-fatal terminal-CANCEL failure): the instance is torn down and the
+// restart policy runs (stream-protocol.md §9; design §9's poison teardown).
+var errConnLost = errors.New("supervisor: connection lost (data-plane fault)")
+
 // Instance is the live wiring of one supervised plugin instance, handed to
 // Config.OnReady once its handshake and data-plane attach complete.
 // internal/supervisor stays free of any styx import (the translate-at-
@@ -77,6 +87,22 @@ type Instance struct {
 	ControlConn *control.Conn
 	Transport   transport.Transport
 	Generation  uint64
+	// Streaming is the acknowledged state of the streaming feature for this
+	// instance's connection, resolved from the negotiated handshake tuple. The
+	// OnReady wiring builds the connection's streaming half only when it is true
+	// (streaming was negotiated), so an un-negotiated connection has no stream plane
+	// and fails a stream open closed (stream-protocol.md §2.4/§11.2).
+	Streaming bool
+
+	// NotifyConnLost escalates a data-plane fault the routing layer detects — a
+	// stream conformance poison, or a connection-fatal terminal-CANCEL publication
+	// failure (stream-protocol.md §9; design §9's poison teardown) — to this
+	// instance's supervisor. The heartbeat loop is watching the control plane and
+	// would not otherwise see a data-plane-only death, so the routing layer calls
+	// this to end the instance and let the restart policy run. It is idempotent and
+	// safe to call from the read-loop goroutine; a nil check guards callers wired
+	// without a supervisor (the in-process unit-test path).
+	NotifyConnLost func()
 }
 
 // ReadyHooks are the caller-supplied callbacks for tearing an Instance's
@@ -152,6 +178,14 @@ type Config struct {
 	// PLUGIN side against its own advertised versions, is what actually
 	// enforces it — this field only supplies the requirement.
 	Services []control.ServiceRequirement
+
+	// RequireStreaming marks the streaming feature required in the host's
+	// handshake offer (stream-protocol.md §11.2): set when the host's generated
+	// client has streaming methods, so a plugin that cannot stream fails the
+	// handshake at startup rather than at the first OpenStream. The styx layer sets
+	// it from a public PluginSpec option; the default (false) offers streaming as
+	// optional.
+	RequireStreaming bool
 
 	// ResetWindow restores the restart budget — the restart policy's reset
 	// window: once an instance has stayed continuously Ready
@@ -419,6 +453,13 @@ type liveInstance struct {
 	generation uint64
 	stderrTail *tailSink
 
+	// connLost is closed by NotifyConnLost when the routing layer detects a
+	// data-plane fault (a conformance poison or a connection-fatal CANCEL failure).
+	// The heartbeat loop observes it and ends this instance so the restart policy
+	// runs — the control plane alone would not see a data-plane-only death.
+	connLost     chan struct{}
+	connLostOnce sync.Once
+
 	// promote installs this instance as the routing target — it runs
 	// Config.OnReady (the supervisor's only seam into the styx layer) and
 	// returns the teardown hooks that OnReady handed back. It is the styx-side
@@ -537,7 +578,7 @@ func (s *Supervisor) newLiveInstance(
 	captureDone := make(chan struct{})
 	go func() { defer close(captureDone); capture.Run(captureCtx) }()
 
-	tr, hsErr := s.handshakeAndAttach(handshakeCtx, conn, generation)
+	tr, streaming, hsErr := s.handshakeAndAttach(handshakeCtx, conn, generation)
 	if hsErr != nil {
 		cancelCapture()
 		state, _ := proc.Kill()
@@ -549,13 +590,19 @@ func (s *Supervisor) newLiveInstance(
 		return nil, crashReason(stderrTail, hsErr, exitStatus, exitStatusKnown)
 	}
 
-	li := &liveInstance{conn: conn, generation: generation, stderrTail: stderrTail}
+	li := &liveInstance{conn: conn, generation: generation, stderrTail: stderrTail, connLost: make(chan struct{})}
 	li.promote = func() ReadyHooks {
 		if s.cfg.OnReady == nil {
 			return ReadyHooks{}
 		}
 
-		return s.cfg.OnReady(Instance{Process: proc, ControlConn: conn, Transport: tr, Generation: generation})
+		return s.cfg.OnReady(Instance{
+			Process: proc, ControlConn: conn, Transport: tr, Generation: generation, Streaming: streaming,
+			// The routing layer calls this to escalate a data-plane fault the
+			// control-watching heartbeat loop cannot see; closing connLost ends this
+			// instance so Run's teardown/restart path runs (stream-protocol.md §9).
+			NotifyConnLost: func() { li.connLostOnce.Do(func() { close(li.connLost) }) },
+		})
 	}
 	li.teardown = func(tctx context.Context, shutdownDeadline time.Duration) (*os.ProcessState, error) {
 		cancelCapture()
@@ -613,6 +660,16 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 	for {
 		if s.stopped() || ctx.Err() != nil {
 			return true, nil
+		}
+
+		// A data-plane fault the routing layer escalated (NotifyConnLost) ends this
+		// instance as a crash so Run's teardown/restart path runs — the control plane
+		// alone cannot observe a data-plane-only death. Checked each iteration; the
+		// bounded receive below wakes the loop within one heartbeat interval.
+		select {
+		case <-(*current).connLost:
+			return false, errConnLost
+		default:
 		}
 
 		conn := (*current).conn
@@ -702,28 +759,28 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 // against its own control.Conn.
 func (s *Supervisor) handshakeAndAttach(
 	ctx context.Context, conn *control.Conn, generation uint64,
-) (transport.Transport, error) {
+) (transport.Transport, bool, error) {
 	nonce, err := randomNonce()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	hello := &controlpb.ControlMessage{
 		Body: &controlpb.ControlMessage_Hello{Hello: control.OfferToHello(s.hostOffer(), nonce)},
 	}
 	if err := sendControl(ctx, conn, hello, control.ReplyDeadlines[control.KindHello]); err != nil {
-		return nil, fmt.Errorf("supervisor: handshake: send Hello: %w", err)
+		return nil, false, fmt.Errorf("supervisor: handshake: send Hello: %w", err)
 	}
 
 	ackMsg, err := recvControl(ctx, conn, control.StateHandshaking, control.KindHelloAck,
 		control.ReplyDeadlines[control.KindHello])
 	if err != nil {
-		return nil, fmt.Errorf("supervisor: handshake: recv HelloAck: %w", err)
+		return nil, false, fmt.Errorf("supervisor: handshake: recv HelloAck: %w", err)
 	}
 
 	ack := ackMsg.GetHelloAck()
 	if verr := control.VerifyNonce(nonce, ack.GetNonce()); verr != nil {
-		return nil, fmt.Errorf("supervisor: handshake: %w", verr)
+		return nil, false, fmt.Errorf("supervisor: handshake: %w", verr)
 	}
 
 	// A rejection reply (control.IncompatibleToHelloAck, sent by
@@ -732,16 +789,21 @@ func (s *Supervisor) handshakeAndAttach(
 	// instead of forcing the host to fall back to an undifferentiated
 	// connection loss below or a bare Reason string.
 	if reason, pluginOffer, rejected := control.HelloAckIncompatible(ack); rejected {
-		return nil, &control.IncompatibleError{HostOffer: s.hostOffer(), PluginOffer: pluginOffer, Reason: reason}
+		return nil, false, &control.IncompatibleError{
+			HostOffer: s.hostOffer(), PluginOffer: pluginOffer, Reason: reason,
+		}
 	}
 
 	tuple := control.HelloAckToTuple(ack)
 	if tuple.Transport != transportUDS || tuple.Codec != codecProto {
-		return nil, fmt.Errorf("supervisor: handshake: negotiated transport=%q codec=%q unsupported",
+		return nil, false, fmt.Errorf("supervisor: handshake: negotiated transport=%q codec=%q unsupported",
 			tuple.Transport, tuple.Codec)
 	}
 
-	return s.attach(ctx, conn, generation, tuple.Features["streaming"])
+	streaming := tuple.Features["streaming"]
+	tr, err := s.attach(ctx, conn, generation, streaming)
+
+	return tr, streaming, err
 }
 
 // attach performs the host side of AttachRegion -> AttachRegionAck: it
@@ -799,13 +861,18 @@ func (s *Supervisor) attach(
 // hostOffer is the host's negotiation offer: the fixed protocol/
 // transport/codec support (the host-side mirror of styx/pluginserver.go's
 // m1PluginOffer) plus Config.Services, this Supervisor's per-service version
-// requirements.
+// requirements. The streaming feature is marked REQUIRED when Config.RequireStreaming
+// is set — a host whose generated client has streaming methods declares the feature
+// required, so a plugin that cannot stream fails the handshake at startup with
+// ErrIncompatible rather than the incompatibility surfacing at the first OpenStream
+// (stream-protocol.md §11.2).
 func (s *Supervisor) hostOffer() control.Offer {
 	return control.Offer{
 		ProtocolMin: m1ProtocolVersion,
 		ProtocolMax: m1ProtocolVersion,
 		Transports:  []string{transportUDS},
 		Codecs:      []string{codecProto},
+		Features:    []control.FeatureFlag{{Name: featureStreaming, Required: s.cfg.RequireStreaming}},
 		Services:    s.cfg.Services,
 	}
 }

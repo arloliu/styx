@@ -66,6 +66,22 @@ type RingPeeker interface {
 // constrained CFS bandwidth quota into a throttle stall.
 type SpinWaiter struct {
 	budget time.Duration // effective, already quota/GOMAXPROCS-adjusted
+
+	// beforeBlock is a process-local, test-only observation hook. When set, Wait
+	// invokes it once per park attempt immediately before efd.Read -- strictly
+	// after the arm (C1) and the arm-path ctx/shutdown/tail re-checks (§11), at
+	// the point the consumer is committed to the blocking read: past that point
+	// the only exit is a real eventfd write or a ctx cancel, never the arm-path
+	// shutdown early-out. It lets a test prove a reader has crossed its final
+	// pre-block shutdown re-check before firing a teardown wake, so removing that
+	// direction's eventfd write strands the reader deterministically. It is NOT
+	// one of the compile-gated §13 litmus checkpoints above (which fire at the
+	// C1..C4 boundaries under the eventhook build tag) and adds no new park-word
+	// state -- the park protocol is unchanged. Unset in every production build: a
+	// single atomic load on the cold path a syscall already dominates. Stored
+	// through an atomic pointer so a test may install it concurrently with the
+	// Wait goroutine, mirroring the writer's onBlock seam.
+	beforeBlock atomic.Pointer[func()]
 }
 
 // Forced-interleaving test seams for the shm-abi.md §13 litmus proof,
@@ -104,6 +120,22 @@ func NewSpinWaiter(configured time.Duration) *SpinWaiter {
 	ratio, class := cgroupCPUQuota()
 
 	return &SpinWaiter{budget: effectiveSpinBudget(configured, runtime.GOMAXPROCS(0), ratio, class)}
+}
+
+// SetBeforeBlockForTest installs fn (see the beforeBlock field), invoked
+// immediately before each blocking eventfd read. Passing nil clears it. Safe to
+// call before or after the Wait goroutine starts: the store is atomic.
+func (w *SpinWaiter) SetBeforeBlockForTest(fn func()) {
+	w.beforeBlock.Store(&fn)
+}
+
+// notifyBeforeBlock invokes the installed pre-block hook, if any. A no-op in
+// every production build (a single atomic load on the cold park path); the
+// nested nil check tolerates a hook cleared by storing a nil func.
+func (w *SpinWaiter) notifyBeforeBlock() {
+	if fn := w.beforeBlock.Load(); fn != nil && *fn != nil {
+		(*fn)()
+	}
 }
 
 // effectiveSpinBudget computes the quota-aware spin budget (binding, non-ABI:
@@ -220,6 +252,12 @@ func (w *SpinWaiter) Wait(
 			state.MarkAwake() // work seen while arming; disarm before returning it
 			return t, nil
 		}
+
+		// Committed to the blocking read: every pre-block exit (ctx, shutdown,
+		// tail) has been evaluated and declined above, so only an eventfd write
+		// or a ctx cancel can release this reader now. The test-only hook (unset
+		// in production) observes exactly this point; see the beforeBlock field.
+		w.notifyBeforeBlock()
 
 		if err := efd.Read(ctx); err != nil {
 			state.MarkAwake()

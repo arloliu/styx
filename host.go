@@ -23,6 +23,10 @@ const (
 	m1ProtocolVersion uint32 = 1
 	transportUDS             = "uds"
 	codecProto               = "proto"
+	// featureStreaming is the stable handshake feature-flag name for streaming
+	// RPC (stream-protocol.md §11.1). Both offers list it as supported; the
+	// acknowledged tuple carries streaming=true only when both sides do.
+	featureStreaming = "streaming"
 )
 
 // HostConfig configures a Host before Start.
@@ -56,6 +60,15 @@ type PluginSpec struct {
 	// naming the offending service. nil (the default) declares no
 	// requirements — every service version is accepted.
 	Services []ServiceRequirement
+
+	// RequireStreaming declares that this Host's client calls streaming methods
+	// on this plugin, so the streaming feature is marked required in the handshake
+	// offer (stream-protocol.md §11.2): a plugin that cannot stream fails the
+	// handshake at startup with *IncompatibleError rather than the incompatibility
+	// surfacing only at the first OpenStream. Generated streaming client code sets
+	// it; the default (false) offers streaming as optional, so a non-streaming
+	// plugin still negotiates unary calls.
+	RequireStreaming bool
 }
 
 // ServiceRequirement is the host's declared acceptable version range for
@@ -172,9 +185,10 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	cc := newUnavailableClientConn(spec.Name)
 	bus := supervisor.NewEventBus()
 	cfg := supervisor.Config{
-		Spec:     lifecycle.Spec{Path: spec.Path, Args: spec.Args, Env: spec.Env},
-		Restart:  spec.Restart,
-		Services: toControlServiceRequirements(spec.Services),
+		Spec:             lifecycle.Spec{Path: spec.Path, Args: spec.Args, Env: spec.Env},
+		Restart:          spec.Restart,
+		Services:         toControlServiceRequirements(spec.Services),
+		RequireStreaming: spec.RequireStreaming,
 		// The reload transaction drives the SAME admission gate a caller's
 		// Invoke checks, so a cutoff a reload begins is the cutoff Invoke
 		// observes. internal/supervisor never names *ClientConn; it holds only
@@ -351,10 +365,18 @@ func (h *Host) publish(e Event) {
 // rather than assuming it is always the most recent instance.
 func wireConnState(cc *ClientConn, inst supervisor.Instance) supervisor.ReadyHooks {
 	state := &connState{
-		table:        rpcruntime.NewTable(inst.Generation),
-		tr:           inst.Transport,
-		codec:        codec.Proto{},
-		readLoopDone: make(chan struct{}),
+		table:          rpcruntime.NewTable(inst.Generation),
+		tr:             inst.Transport,
+		codec:          codec.Proto{},
+		notifyConnLost: inst.NotifyConnLost,
+		readLoopDone:   make(chan struct{}),
+	}
+	// The streaming half exists only when streaming was negotiated for this
+	// connection (stream-protocol.md §2.4): plane iff acknowledged. An
+	// un-negotiated connection leaves streams nil, so OpenStream fails closed with
+	// ErrIncompatible and any inbound STREAM_* frame poisons (§11.2).
+	if inst.Streaming {
+		state.streams = newStreamPlane(inst.Transport)
 	}
 	cc.state.Store(state)
 	cc.admission.Open()
@@ -386,11 +408,27 @@ func wireConnState(cc *ClientConn, inst supervisor.Instance) supervisor.ReadyHoo
 		FailInFlight: func(error) {
 			state.table.FailAll(ErrOutcomeUnknown, ErrPluginUnavailable)
 		},
-		// Closing the transport is what unblocks the read loop's Recv;
-		// there is no separate writer goroutine in this inline-send design.
+		// Two-phase transport teardown (stream-protocol.md §9's join-before-unmap):
+		// stopTransportWriter stops the writer and unblocks the read loop's Recv
+		// WITHOUT releasing the mapped region, so the reader exits and its deferred
+		// streamPlane.teardown joins the stream finishers (whose lifecycle Sends now
+		// return); releaseTransport frees the region only AFTER that join. For uds
+		// both phases are Close (it unmaps nothing); the split matters for shm, and
+		// it is structural via transport.WriterStopper, not a comment. There is no
+		// separate writer goroutine in this inline-send design.
 		JoinGoroutines: func() {
-			_ = state.tr.Close()
+			// A generation with a stream table marks it closing before the writer
+			// stop (state.streams.stopWriter), so a stream finisher the stop releases
+			// cannot record a false connection-fatal fault during this ordinary
+			// teardown; a feature-absent generation has no table and stops the writer
+			// directly.
+			if state.streams != nil {
+				state.streams.stopWriter()
+			} else {
+				stopTransportWriter(state.tr)
+			}
 			<-state.readLoopDone
+			releaseTransport(state.tr)
 		},
 	}
 }

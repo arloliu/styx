@@ -27,8 +27,14 @@ provenance trails. State the current fact, not the process that produced it.
   [600-git-conventions.md](.agents/rules/600-git-conventions.md#no-planreview-jargon)
   for detailed do/don't examples.
 
-A committed spec file *path* is always fine to cite; its internal section
-numbers, round numbers, or open-question numbering are not.
+A committed spec file *path* is always fine to cite; its internal round
+numbers or open-question numbering are not. **Exception — frozen contracts:**
+section numbers of the frozen protocol specs (`docs/specs/stream-protocol.md`,
+`docs/specs/shm-abi.md`) MAY be cited in code comments and docstrings. Those
+documents treat their section numbering as a stable, never-renumbered
+interface, and precise contract references are load-bearing in
+concurrency-critical code. Section numbers of any other document remain
+off-limits.
 
 Styx (module `github.com/arloliu/styx`, final module path) is a
 process-isolated Go plugin framework in the spirit of `hashicorp/go-plugin`, with a

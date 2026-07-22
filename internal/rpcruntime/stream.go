@@ -22,6 +22,32 @@ const (
 	ServerStream
 )
 
+// StreamShape is a stream method's gRPC-shaped direction set (stream-protocol.md
+// §6.3), fixed by the method's generated code on both sides. It is carried
+// explicitly in StreamConfig rather than inferred from the initial request's
+// length: a server-streaming request MAY be zero bytes (§2.3), so payload length
+// cannot distinguish the shapes. Each side sets it from what it knows locally —
+// the opener from the method it is calling, the accepter from the registered
+// handler's declared shape — never from the wire (§7.4); a disagreement is the
+// §7.3 shape-mismatch case, surfaced as a forbidden-direction frame.
+type StreamShape uint8
+
+const (
+	// ClientStreaming is the client-streaming shape: the opener streams
+	// STREAM_MSGs and the single response rides the server's STREAM_CLOSE. It is
+	// the zero value, so a StreamConfig with no shape set is client-streaming.
+	ClientStreaming StreamShape = iota
+	// ServerStreaming is the server-streaming shape: the single request rides
+	// STREAM_OPEN (MAY be zero bytes) and the opener is half-closed-local at
+	// establishment; the server streams STREAM_MSGs (stream-protocol.md §6.3).
+	ServerStreaming
+	// BidiStreaming is the bidirectional shape: both sides stream STREAM_MSGs and
+	// each half-closes independently. Its establishment matches client-streaming
+	// (no implicit half-close); the distinct value lets generated code and any
+	// direction validation name the shape.
+	BidiStreaming
+)
+
 // StreamOutcomeCode is the one terminal state a stream reaches. Exactly one
 // terminal outcome is recorded per stream, first-wins — the same rule the unary
 // request table applies to a call (stream-protocol.md §7.1).
@@ -67,6 +93,22 @@ type StreamConfig struct {
 	Deadline time.Duration
 	Service  uint64
 	Method   uint64
+	// Shape is the method's gRPC-shaped direction set (stream-protocol.md §6.3),
+	// set explicitly by each side from what it knows locally — never inferred from
+	// OpenPayload's length. It is the sole discriminant of server-streaming
+	// establishment: for ServerStreaming the opener is half-closed-local and the
+	// accepter half-closed-remote at establishment, and OpenPayload (which MAY be
+	// empty) is delivered as the single request; for ClientStreaming/BidiStreaming
+	// there is no establishment half-close and OpenPayload is unused.
+	Shape StreamShape
+	// OpenPayload is the single request that rides STREAM_OPEN for a
+	// server-streaming method (stream-protocol.md §6.3): the opener puts it on the
+	// STREAM_OPEN frame, and the accepter delivers it to the handler. It is
+	// meaningful only when Shape is ServerStreaming, where it is delivered even
+	// when empty — a zero-byte request is legal (§2.3) and still establishes the
+	// shape. It consumes no stream credit (§4.4). Unused for the other shapes,
+	// whose first message is a STREAM_MSG.
+	OpenPayload []byte
 }
 
 // Framework-reserved status codes carried on a stream teardown or rejection
@@ -225,6 +267,14 @@ var (
 	// bound (stream-protocol.md §2.3). Rejected before any live state is created;
 	// the host turns it into a STREAM_ERR carrying StatusCodeStreamIncompatible.
 	ErrStreamDeadlineRequired = errors.New("rpcruntime: stream requires a positive deadline")
+	// ErrOwedTeardownDropped is the connection-fatal cause recorded when an
+	// ambiguous-open teardown's load-bearing data-lane STREAM_ERR cannot be admitted
+	// to the bounded emitter (stream-protocol.md §9). For that class the paired
+	// lifecycle CANCEL cannot be relied on to terminate the peer — it may precede the
+	// still-queued OPEN — so the dropped STREAM_ERR is a definitive terminal-publication
+	// failure and the connection is failed, mirroring the rule for a definitive CANCEL
+	// publication failure.
+	ErrOwedTeardownDropped = errors.New("rpcruntime: ambiguous-open teardown STREAM_ERR dropped")
 )
 
 // StreamStatusError wraps the peer status carried by an observed STREAM_ERR that
@@ -284,6 +334,19 @@ type Stream struct {
 	// claims the token, so the ack-dispatch handoff can reconstruct the CANCEL
 	// without a channel (§5.1 step 2). Stable once the phase CAS has landed.
 	teardownCode atomic.Uint32
+
+	// watcherStarted gates the one-time start of the deadline watcher. The opener
+	// path (Open) starts it at admission; the accept path (OpenAccepting) defers it
+	// to StartDeadlineWatcher, called only after Publish, so a peer's already-elapsed
+	// budget cannot win the terminal CAS from SUBMITTED and suppress the teardown
+	// pair (stream-protocol.md §7.1/§7.4). The CAS makes a repeat start a no-op.
+	watcherStarted atomic.Bool
+
+	// owedTeardownEmitted makes EmitOwedOpenTeardown one-shot (stream-protocol.md
+	// §9.1): the first caller CASes it before registering the finisher, and a second
+	// call returns at once — no finisher registration, no terminal-token spin — so a
+	// duplicate handoff can never strand a finisher and hang the table's Close.
+	owedTeardownEmitted atomic.Bool
 
 	// Routing hashes every STREAM_MSG carries (§2.3), stamped by SendMsg. Their
 	// values are supplied by the streaming host at open; zero until then.
@@ -351,6 +414,14 @@ type Stream struct {
 	armLink  *Stream
 	backoff  atomic.Int64 // next STREAM_ACK back-off delay, ns (§4.6)
 
+	// handlerErrStatus is the full status a handler-error termination emits on its
+	// paired data-lane STREAM_ERR (stream-protocol.md §9.1 step 4). It is written
+	// ONLY by the terminal-CAS winner, under stateMu before it leaves the lock (see
+	// TerminateHandlerError), and read only by that same winner in finishTerminal —
+	// so it is single-goroutine per termination, never racing another terminate
+	// path (which leaves it nil and emits no handler-error STREAM_ERR).
+	handlerErrStatus *transport.FrameStatus
+
 	// Terminal delivery. outcome is written once, by the CAS winner, before done
 	// is closed — readers observe it only after done, giving a happens-before.
 	done    chan struct{}
@@ -400,9 +471,70 @@ func newStream(tbl *StreamTable, callID uint64, side StreamSide, cfg StreamConfi
 	s.ctx, s.cancelCtx = context.WithDeadline(context.Background(), s.deadline)
 	s.phase.Store(streamSubmitted)
 
-	go s.watchDeadline()
+	// Server-streaming establishment (stream-protocol.md §6.3): the single request
+	// rides STREAM_OPEN and the client is half-closed-local at establishment, so no
+	// separate client STREAM_CLOSE frame is ever emitted. The engine keys that on
+	// the EXPLICIT shape, never on OpenPayload's length — a zero-byte request is
+	// legal (§2.3) and still establishes the shape:
+	//   - the opener (ClientStream) half-closes its send direction immediately, so
+	//     SendMsg/CloseSend refuse and it emits no STREAM_CLOSE (its client->server
+	//     sequence space is empty);
+	//   - the accepter (ServerStream) observes the request plus an implicit remote
+	//     close: the payload (even when empty) is delivered as an un-credited item
+	//     (§4.4) and the remote half is marked closed so the handler reads the
+	//     request then EOF.
+	if cfg.Shape == ServerStreaming {
+		switch side {
+		case ClientStream:
+			s.closeBits.Store(closeLocalBit)
+			s.sendClosed.Store(true)
+			s.sendCloseState.Store(closeSendClosed)
+		case ServerStream:
+			s.recvCh <- recvItem{payload: cfg.OpenPayload, credited: false}
+			s.closeBits.Store(closeRemoteBit)
+			close(s.recvClosed)
+		}
+	}
 
+	// The deadline watcher is NOT started here: its start is the caller's, so the
+	// accept path can reach PUBLISHED before a tiny peer budget can win the terminal
+	// CAS (stream-protocol.md §7.1/§7.4). The opener path (Open) starts it at
+	// admission; the accept path (OpenAccepting) starts it after Publish.
 	return s
+}
+
+// beginDeadlineWatch starts the stream's deadline watcher exactly once. The
+// budget was anchored to the stream's local clock in newStream, so a late start
+// does not extend it — an already-elapsed budget fires the DEADLINE transition at
+// once, from whatever phase the stream is in when the watcher runs.
+func (s *Stream) beginDeadlineWatch() {
+	if s.watcherStarted.CompareAndSwap(false, true) {
+		go s.watchDeadline()
+	}
+}
+
+// StartDeadlineWatcher starts the deadline watcher for an accept-side stream opened
+// via OpenAccepting, which deferred it (stream-protocol.md §7.1). The accept path
+// calls it only AFTER Publish, so a deadline can win the terminal CAS only from
+// PUBLISHED — where §7.1's full teardown pair is emitted — never from SUBMITTED,
+// where finishTerminal suppresses it and would orphan the peer's OPEN (§7.4). The
+// budget was anchored at newStream (the OPEN's arrival), so a late start does not
+// silently extend the peer's budget: an already-elapsed budget fires the transition
+// at once, now from PUBLISHED. Idempotent.
+func (s *Stream) StartDeadlineWatcher() {
+	s.beginDeadlineWatch()
+}
+
+// WatcherStarted reports whether the deadline watcher has been started
+// (stream-protocol.md §7.1). It exists so the accept path's contract can be observed
+// structurally: a stream admitted via OpenAccepting MUST have NO watcher until
+// StartDeadlineWatcher runs after Publish, so a deadline can win the terminal CAS only
+// from PUBLISHED, never from SUBMITTED where finishTerminal would suppress the teardown
+// and orphan the peer's OPEN (§7.4). A test reads it at the pre-Publish boundary to
+// prove the deferral holds; reverting the deferral (starting the watcher at admission)
+// makes it observably true there.
+func (s *Stream) WatcherStarted() bool {
+	return s.watcherStarted.Load()
 }
 
 // watchDeadline drives the DEADLINE terminal transition when the stream's own
@@ -453,6 +585,17 @@ func (s *Stream) Outcome() (StreamOutcome, bool) {
 	}
 
 	return StreamOutcome{}, false
+}
+
+// Done returns a channel closed once this stream's terminal outcome is FULLY
+// published — the terminal-CAS winner stores the outcome (its code AND its Err)
+// before closing this channel, so a receive here happens-before an Outcome() read
+// that observes the complete outcome, never a code whose Err has not yet been
+// written. OpenStream waits on it when its Publish loses to a terminal transition,
+// so it translates the fully-published outcome rather than the winner's brief
+// code-before-Err window (stream-protocol.md §7.4).
+func (s *Stream) Done() <-chan struct{} {
+	return s.done
 }
 
 // isLive reports whether the phase word is in either live phase.
@@ -591,13 +734,16 @@ func (s *Stream) handleSendErr(callerCtx context.Context, err error, seq uint64)
 
 // isRollbackEligible reports whether a Send error is definitively pre-acceptance
 // (stream-protocol.md §4.5), the only case a reservation may be rolled back. It
-// matches the transport package's own pre-write sentinels. The shm data lane's
-// reject-mode backpressure is also pre-acceptance, but its sentinel lives in
-// internal/transport/shm, which this package must not import — surfacing that as
-// a transport-level error is left to the connection wiring.
+// matches the transport package's own pre-write sentinels, including
+// transport.ErrBackpressure — the reject-mode data-lane backpressure the shm
+// transport surfaces at this level so this package classifies it without
+// importing internal/transport/shm (that sentinel's own package). All three
+// sentinels prove the frame never reached the peer, so the reserved credit unit
+// and sequence number may be rolled back rather than stranded.
 func isRollbackEligible(err error) bool {
 	return errors.Is(err, transport.ErrUnimplementedFrameKind) ||
-		errors.Is(err, transport.ErrPayloadTooLarge)
+		errors.Is(err, transport.ErrPayloadTooLarge) ||
+		errors.Is(err, transport.ErrBackpressure)
 }
 
 // RecvMsg returns the next delivered message, blocking until one arrives, the
@@ -683,6 +829,19 @@ func (s *Stream) onDelivered(credited bool) {
 		return
 	}
 	if s.consumeIfOpen() {
+		s.arm() // count trigger fired (stream-protocol.md §4.6)
+		return
+	}
+	// Drain trigger (stream-protocol.md §4.6): the reader signaled it drained its
+	// inbound queue since the frame this delivery consumed, and credit is still
+	// owed on a live stream — arm the owed STREAM_ACK now even below the count
+	// threshold. This is the delivery-side half of the drain boundary, covering the
+	// case where the reader signals drain BEFORE the application consumes (consumed
+	// advances only here, in RecvMsg); ReaderDrained's own sweep covers the reverse
+	// order. A stream whose remote close was observed owes no new ACK (§6.4);
+	// consumeIfOpen already consumed nothing there, so pending() reflects only
+	// credit owed before the close — an ACK that MAY still be emitted.
+	if s.tbl.drained.Load() && s.isLive() && s.recvCredit.pending() {
 		s.arm()
 	}
 }
@@ -752,9 +911,11 @@ func (s *Stream) recvErr() error {
 // already closed its send half.
 //
 // A server's STREAM_CLOSE for a client-streaming method also carries the single
-// response/trailer payload (§6.3); that payload is supplied by the streaming
-// host, which passes it through a payload parameter this engine-level CloseSend
-// does not yet take. Here CloseSend only closes the direction.
+// response/trailer payload (§6.3): the streaming host passes it through payload,
+// which rides the STREAM_CLOSE frame. It consumes no credit — the receiving side
+// delivers a STREAM_CLOSE-borne payload as an un-credited item (§4.4). A nil
+// payload closes the direction with no trailer, the server-streaming and bidi
+// shape.
 //
 // Publication has a single in-progress owner. A caller claims sendCloseState
 // (idle->publishing) before it may Send, so two concurrent CloseSend callers can
@@ -764,7 +925,7 @@ func (s *Stream) recvErr() error {
 // ErrSendClosed to the loser is correct; a purely SEQUENTIAL retry after a
 // pre-acceptance failure still succeeds, because that failure rolls the state
 // back to idle.
-func (s *Stream) CloseSend(ctx context.Context) error {
+func (s *Stream) CloseSend(ctx context.Context, payload []byte) error {
 	if !s.sendCloseState.CompareAndSwap(closeSendIdle, closeSendPublishing) {
 		return ErrSendClosed // already closed, or another caller owns publication (§6.4/§6.5)
 	}
@@ -779,6 +940,7 @@ func (s *Stream) CloseSend(ctx context.Context) error {
 		CallID:  s.callID,
 		Kind:    transport.FrameStreamClose,
 		Control: finalSeq,
+		Payload: payload,
 	}
 	sendCtx, cancel := s.sendContext(ctx)
 	err := s.tbl.tr.Send(sendCtx, f) // data lane, stream+caller context (§4.5)
@@ -898,14 +1060,131 @@ func (s *Stream) terminate(oc StreamOutcome, teardownCode uint32, locallyInitiat
 	// preserved: the CAS still arbitrates the LIVE->terminal edge first-wins, and
 	// finishTerminal runs the winner's steps in order.
 	s.stateMu.Lock()
-	won := s.casTerminal(oc.Code, teardownCode, from...)
+	won, fromSubmitted := s.casTerminal(oc.Code, teardownCode, from...)
 	s.stateMu.Unlock()
 	if !won {
 		return false
 	}
-	s.finishTerminal(oc, locallyInitiated)
+	s.finishTerminal(oc, locallyInitiated, fromSubmitted)
 
 	return true
+}
+
+// TerminateHandlerError terminates this accept-side stream because its handler
+// returned an error, and — only as the terminal-CAS winner — emits a single
+// data-lane STREAM_ERR carrying status through the connection's one emitter
+// (stream-protocol.md §9.1 step 4). It emits no teardown CANCEL: a handler-error
+// FAILED outcome has no step-1 pair (§7.1). If the stream already terminated (its
+// handler closed it normally, or a peer teardown won the CAS), this is a no-op —
+// the handler error is moot. The winner records handlerErrStatus under stateMu
+// before it leaves the lock, so finishTerminal reads exactly what this winner
+// wrote and no other terminate path ever observes a stale status.
+func (s *Stream) TerminateHandlerError(status *Status) {
+	fs := &transport.FrameStatus{}
+	if status != nil {
+		fs = &transport.FrameStatus{Code: status.Code, Message: status.Message, Details: status.Details}
+	}
+
+	s.stateMu.Lock()
+	won, fromSubmitted := s.casTerminal(OutcomePeerError, 0, streamSubmitted, streamPublished)
+	if won {
+		s.handlerErrStatus = fs
+	}
+	s.stateMu.Unlock()
+	if !won {
+		return
+	}
+
+	oc := StreamOutcome{Code: OutcomePeerError, Err: &StreamStatusError{Status: status}}
+	s.finishTerminal(oc, false, fromSubmitted)
+}
+
+// DiscardBeforePublish terminates a still-SUBMITTED stream whose STREAM_OPEN never
+// reached the peer (a pre-acceptance Send failure), freeing its S_max slot
+// immediately rather than leaving it hidden-SUBMITTED until the deadline watcher
+// reaps it (stream-protocol.md §7.4). Nothing was published, so it is an observed,
+// not locally initiated, termination and emits no teardown frame. It returns
+// whether it won the discard: false means the stream had ALREADY reached a
+// terminal outcome (its deadline, or a peer/crash, won the CAS first), so the
+// caller must surface that outcome instead of the send failure.
+func (s *Stream) DiscardBeforePublish(cause error) bool {
+	return s.terminate(StreamOutcome{Code: OutcomeCrashed, Err: cause}, 0, false, streamSubmitted)
+}
+
+// TerminateOpenAmbiguous drives the locally-initiated terminal transition a
+// STREAM_OPEN owes when its Send returned a PUBLICATION-AMBIGUOUS context error —
+// the transport accepted the intent and may still publish it, so the peer may hold
+// the OPEN (stream-protocol.md §4.5's publication boundary). Per §4.5 line 828 a
+// post-acceptance context error is terminal for the stream: DEADLINE for an expired
+// budget, CANCELED otherwise. The transition is locally initiated, so it records a
+// nonzero teardown code — but it wins from SUBMITTED (the opener has not Published),
+// so finishTerminal suppresses the engine's own emission; the opener then drives the
+// owed pair via EmitOwedOpenTeardown, ordered strictly after the OPEN it sent. If a
+// terminal already won (its own deadline watcher, a fast peer frame that canceled
+// the context), this CAS loses harmlessly and the recorded outcome stands.
+func (s *Stream) TerminateOpenAmbiguous(err error) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		mapDeadlineToTerminal(s)
+
+		return
+	}
+	mapCancelToTerminal(s, ErrCanceledLocally)
+}
+
+// EmitOwedOpenTeardown emits the teardown a stream owes when a locally-initiated
+// terminal (its own deadline, or a cancel) won the phase CAS from SUBMITTED before
+// OpenStream could Publish. The terminal winner emitted no teardown (a SUBMITTED
+// win cannot know the OPEN's wire status, see finishTerminal), yet the peer may be
+// owed the terminal pair (§9.1), so OpenStream — the only party that knows the
+// STREAM_OPEN Send's fate — drives it here, AFTER the stream is terminal.
+//
+// It has two production callers, differing in what is known about the OPEN, but the
+// disposition is the same for both — the CANCEL is ordered strictly after whatever
+// OPEN bytes went out and can never precede them:
+//
+//   - Successful Send, losing Publish: OpenStream's tr.Send(OPEN) returned nil, so
+//     the peer DID observe the OPEN and is owed the terminal pair. This emit is
+//     what discharges that obligation, ordered strictly after the OPEN.
+//   - Acceptance-unknown Send failure: OpenStream's tr.Send(OPEN) failed with an
+//     acceptance-unknown result (the transport's writer may still publish an
+//     enqueued OPEN, §4.5), so peer observation is UNKNOWN. The pair is emitted
+//     anyway because the OPEN may yet land: the CANCEL may precede the still-queued
+//     OPEN (harmless — the peer discards a CANCEL for a not-yet-live call ID at
+//     §8.1 level 1), which is exactly why the same-lane STREAM_ERR below, not the
+//     CANCEL, is the load-bearing terminal frame.
+//
+// Only a locally-initiated terminal owes a teardown; the recorded teardown code
+// is nonzero exactly for those (a fast peer STREAM_ERR/CLOSE or a connection
+// crash records 0 and owes nothing — the peer already sent, or will never see,
+// the terminal). The pair is handed to a detached sender so OpenStream returns
+// within its deadline even if a stuck peer would block the lifecycle Send. For
+// this class the data-lane STREAM_ERR — not the CANCEL — is the load-bearing
+// terminal frame: the OPEN is still queued on the data lane, so the strict-priority
+// lifecycle CANCEL may publish BEFORE it (harmless — the peer discards a CANCEL for
+// a not-yet-live call ID at §8.1 level 1), and the same-lane STREAM_ERR, FIFO-ordered
+// after the OPEN, is the only frame guaranteed to land after it. It is therefore sent
+// through emitOwedTeardownErr, which fails the connection if the emitter drops it
+// (§9), so both frames can never be lost together. The detached sender is
+// finisher-tracked, so a connection teardown still joins it before releasing the
+// transport (§9's join-before-unmap); if the table is already tearing down, the
+// transport is closing and neither frame can land, so it is skipped.
+func (s *Stream) EmitOwedOpenTeardown() {
+	if !s.owedTeardownEmitted.CompareAndSwap(false, true) {
+		return // one-shot: a second call registers no finisher and spins no token (§9.1)
+	}
+	if s.teardownCode.Load() == 0 {
+		return // observed terminal: nothing owed
+	}
+	if !s.tbl.addFinisher() {
+		return // table tearing down: the transport is closing, the pair cannot land
+	}
+	go func() {
+		defer s.tbl.finishers.Done()
+		if s.claimTerminalToken(true) {
+			s.sendTeardownCancel()
+		}
+		s.emitOwedTeardownErr()
+	}()
 }
 
 // terminateLocked is terminate's body for callers that ALREADY hold stateMu:
@@ -917,10 +1196,11 @@ func (s *Stream) terminate(oc StreamOutcome, teardownCode uint32, locallyInitiat
 // termination always arrives through terminate, which releases the lock before
 // the teardown work.
 func (s *Stream) terminateLocked(oc StreamOutcome, from ...int32) {
-	if !s.casTerminal(oc.Code, 0, from...) {
+	won, fromSubmitted := s.casTerminal(oc.Code, 0, from...)
+	if !won {
 		return
 	}
-	s.finishTerminal(oc, false)
+	s.finishTerminal(oc, false, fromSubmitted)
 }
 
 // casTerminal performs stream-protocol.md §7.1's first-wins, never-retrying CAS
@@ -930,7 +1210,7 @@ func (s *Stream) terminateLocked(oc StreamOutcome, from ...int32) {
 // its CANCEL from (§5.1 step 2). It MUST run with stateMu held so the decision is
 // atomic with Dispatch's live-check. It returns whether this caller won the edge;
 // the close bits are a separate word and never lose (§6.1).
-func (s *Stream) casTerminal(code StreamOutcomeCode, teardownCode uint32, from ...int32) bool {
+func (s *Stream) casTerminal(code StreamOutcomeCode, teardownCode uint32, from ...int32) (won, fromSubmitted bool) {
 	target := terminalPhaseFor(code)
 	for _, src := range from {
 		if s.phase.CompareAndSwap(src, target) {
@@ -944,11 +1224,11 @@ func (s *Stream) casTerminal(code StreamOutcomeCode, teardownCode uint32, from .
 			// finisher.
 			s.tbl.finishers.Add(1)
 
-			return true
+			return true, src == streamSubmitted
 		}
 	}
 
-	return false
+	return false, false
 }
 
 // finishTerminal runs the terminal-CAS winner's teardown work in §7.1's order —
@@ -959,15 +1239,36 @@ func (s *Stream) casTerminal(code StreamOutcomeCode, teardownCode uint32, from .
 // on the data-lane frame (§7.1) nor hold stateMu across the synchronous lifecycle
 // Send. Cancelling ctx stops the deadline watcher and aborts any in-flight
 // data-lane Send.
-func (s *Stream) finishTerminal(oc StreamOutcome, locallyInitiated bool) {
+func (s *Stream) finishTerminal(oc StreamOutcome, locallyInitiated, fromSubmitted bool) {
 	defer s.tbl.finishers.Done() // paired with casTerminal's Add; joined by Close
 	s.cancelCtx()
 
-	if s.claimTerminalToken(locallyInitiated) {
-		s.sendTeardownCancel() // synchronous lifecycle submit — safe, the lifecycle lane can't be backpressured (§7.1)
-	}
-	if locallyInitiated {
-		s.emitTeardownErr() // data-lane STREAM_ERR, handed off; the winner MUST NOT wait on it (§7.1)
+	// A terminal that won from SUBMITTED emits NO teardown from here. The engine
+	// cannot know whether an opener's STREAM_OPEN reached the transport while the
+	// stream was SUBMITTED (only OpenStream, which called tr.Send, knows): emitting
+	// a teardown CANCEL now could put it on the wire BEFORE the OPEN, or emit it for
+	// a stream whose OPEN never went out at all (§7.4 — nothing on the wire is
+	// owed nothing). So the winner defers: if the OPEN never reached the transport
+	// the stream is simply discarded (nothing owed); if it did, OpenStream drives
+	// the owed teardown itself (Stream.EmitOwedOpenTeardown), strictly AFTER the
+	// OPEN it already sent, so the CANCEL can never precede the OPEN. An accept-side
+	// stream is always PUBLISHED before its handler runs, so this branch never
+	// suppresses a handler-error STREAM_ERR.
+	if !fromSubmitted {
+		if s.claimTerminalToken(locallyInitiated) {
+			// synchronous lifecycle submit — safe, the lifecycle lane can't be backpressured (§7.1)
+			s.sendTeardownCancel()
+		}
+		switch {
+		case locallyInitiated:
+			s.emitTeardownErr() // data-lane STREAM_ERR, handed off; the winner MUST NOT wait on it (§7.1)
+		case s.handlerErrStatus != nil:
+			// A handler-error termination (§9.1 step 4): emit a single data-lane
+			// STREAM_ERR carrying the handler's full status through the connection's one
+			// emitter, and NO teardown CANCEL (a FAILED outcome has no step-1 pair,
+			// §7.1). The winner MUST NOT wait on the data-lane Send.
+			s.tbl.emitStreamErr(s.callID, s.handlerErrStatus, false)
+		}
 	}
 
 	s.outcome = oc
@@ -1035,10 +1336,17 @@ func (s *Stream) sendTeardownCancel() {
 // STREAM_ERRs (rejection emissions are the connection wiring's concern), so no
 // rejection reserve is needed here.
 func (s *Stream) emitTeardownErr() {
-	select {
-	case s.tbl.emitCh <- teardownErrJob{callID: s.callID, code: s.teardownCode.Load()}:
-	default:
-	}
+	s.tbl.emitStreamErr(s.callID, &transport.FrameStatus{Code: s.teardownCode.Load()}, false)
+}
+
+// emitOwedTeardownErr hands the ambiguous-open teardown's data-lane STREAM_ERR to the
+// connection emitter as the LOAD-BEARING terminal frame (stream-protocol.md §9.1 step
+// 1). It differs from emitTeardownErr only in disposition on overflow: here the paired
+// CANCEL cannot be relied on (it may precede the still-queued OPEN, §8.1 level 1), so a
+// drop is a definitive terminal-publication failure and fails the connection rather
+// than being tolerated. See emitOwedTeardownErr on StreamTable and EmitOwedOpenTeardown.
+func (s *Stream) emitOwedTeardownErr() {
+	s.tbl.emitOwedTeardownErr(s.callID, &transport.FrameStatus{Code: s.teardownCode.Load()})
 }
 
 // serveAck builds and publishes this stream's STREAM_ACK, then resolves the

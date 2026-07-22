@@ -90,6 +90,7 @@ type spawner struct {
 	refuseResume  bool               // when set, the old instance never acks Resume, making rollback crash-equivalent.
 	roleFor       func(int) peerRole // overrides the default index-based role assignment.
 	beforeSend    func(seq uint64)   // if set, each peer calls it before sending a heartbeat, letting a test pace it.
+	captureNotify func(func())       // if set, each instance hands its NotifyConnLost closure here at promote.
 
 	mu              sync.Mutex
 	calls           int
@@ -154,7 +155,9 @@ func (sp *spawner) spawn(
 		return sp.router.onReady(supervisor.Instance{Generation: generation})
 	}
 
-	return &supervisor.FakeInstance{Conn: hostConn, Promote: promote, Teardown: teardown}, nil
+	return &supervisor.FakeInstance{
+		Conn: hostConn, Promote: promote, Teardown: teardown, CaptureNotify: sp.captureNotify,
+	}, nil
 }
 
 // scriptedPeer is the plugin half of the exchange over one control.Conn. It
@@ -431,6 +434,61 @@ func runReloadSupervisor(
 	}
 
 	return sup, ch, cleanup
+}
+
+// Test the routing layer escalating a data-plane fault (NotifyConnLost): the
+// heartbeat loop observes it, ends the instance as a crash, and the restart policy
+// spawns a replacement that reaches Ready — the supervisor-level teardown/restart
+// the callback exists to trigger, not merely the callback being invoked.
+func TestSupervisor_NotifyConnLost_TearsDownAndRestarts(t *testing.T) {
+	admission := &lifecycle.AdmissionGate{}
+	router := &fakeRouter{admission: admission}
+	sp := newSpawner(t, router)
+	// A crash restart is a fresh first-start, not a reload successor, so force every
+	// spawn to a plain heartbeating instance (no Restore handshake) — the replacement
+	// then reaches Ready like the first.
+	sp.roleFor = func(int) peerRole { return roleOld }
+
+	notifyCh := make(chan func(), 4)
+	sp.captureNotify = func(n func()) { notifyCh <- n }
+
+	cfg := reloadConfig(router)
+	cfg.Restart = supervisor.RestartPolicy{Max: 2, Backoff: func(int) time.Duration { return 5 * time.Millisecond }}
+
+	bus := supervisor.NewEventBus()
+	ch, unsub := bus.Subscribe()
+	defer unsub()
+
+	sup := supervisor.New(cfg, bus)
+	sup.SetSpawnForTest(sp.spawn)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// The first instance reaches Ready and hands out its NotifyConnLost.
+	requireEventOfKind(t, ch, supervisor.EventReady)
+	var notify func()
+	select {
+	case notify = <-notifyCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first instance never handed out its NotifyConnLost")
+	}
+
+	// Escalate a data-plane fault the way the routing layer's read loop does.
+	notify()
+
+	// The heartbeat loop observes it and ends the instance, and the policy restarts.
+	requireEventOfKind(t, ch, supervisor.EventRestarting)
+	requireEventOfKind(t, ch, supervisor.EventReady)
+
+	require.NoError(t, sup.Stop(t.Context()))
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Stop")
+	}
 }
 
 // Test a reload promoting the successor, keeping the supervisor supervising the

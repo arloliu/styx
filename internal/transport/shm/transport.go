@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"sync"
 	"sync/atomic"
@@ -186,7 +187,10 @@ type Transport struct {
 	closeErr  error
 }
 
-var _ transport.Transport = (*Transport)(nil)
+var (
+	_ transport.Transport     = (*Transport)(nil)
+	_ transport.WriterStopper = (*Transport)(nil)
+)
 
 // producerSignal runs the §12 producer signal after each publish: it wakes a
 // parked consumer via the outbound eventfd, unless the region is poisoned or
@@ -442,7 +446,36 @@ func (t *Transport) Send(ctx context.Context, f transport.Frame) error {
 		l = laneLifecycle
 	}
 
-	return t.outbound.submit(ctx, f, l)
+	err := t.outbound.submit(ctx, f, l)
+	if errors.Is(err, ErrBackpressure) {
+		// Reject-mode data-lane backpressure is definitively pre-acceptance: the
+		// frame never reached the ring. Surface it as the transport-level sentinel
+		// so a caller (internal/rpcruntime) can classify it as rollback-eligible
+		// without importing this package, while preserving the shm detail for logs.
+		return fmt.Errorf("%w: %w", transport.ErrBackpressure, err)
+	}
+
+	return err
+}
+
+// AcceptanceUnknown reports whether a failed Send left the frame's acceptance
+// unknown (transport.AcceptanceClassifier). On the shared-memory data lane submit
+// enqueues the intent and then waits on the writer's report or the caller's
+// context; nothing consults the context after the enqueue, so a context error
+// CANNOT be proven pre-enqueue, and the writer may still publish an enqueued intent
+// — a context result is "unknown" and the sender MUST assume acceptance
+// (stream-protocol.md §4.5's publication boundary). Every non-context failure is a
+// definitively NEGATIVE result: the frame can never become observable to a live
+// peer. Some are pre-enqueue rejections — a payload over max_payload, a full
+// reject-mode queue (ErrBackpressure), or a closed / poisoned / shut-down region
+// refused at the admission gate. Others surface AFTER enqueue — a pre-publication
+// writer fault or a ring-push error — but the writer reports those only when it wrote
+// NO descriptor to the tail (Ring.Push publishes nothing on error), so nothing was
+// published there either; a shutdown ErrClosed is on an already-dead region. In every
+// case the failed frame cannot later be acted on by a live peer, which is the property
+// the caller relies on.
+func (t *Transport) AcceptanceUnknown(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // Recv waits for inbound work, drains descriptors from the inbound ring in
@@ -786,6 +819,74 @@ func slabInClass(classes []shm.SizeClass, off, storedLen uint64) bool {
 	return true
 }
 
+// StopWriter implements transport.WriterStopper: it stops the outbound writer and
+// performs the frozen shutdown teardown wake — a seq_cst store of shutdown = 1 and
+// a write to BOTH per-direction eventfds (shm-abi.md §14) — WITHOUT unmapping the
+// region. It is the release-free prefix of Close: Close is this stop-and-wake
+// composed with the region release (region.Close's munmap), and a later Close
+// still releases the mapping exactly once (closeOnce). Because it never unmaps, it
+// takes only the closing gate's READ side — the same side a blocking Recv holds
+// for its whole call — so it is callable while a Recv is parked, which is exactly
+// the parked consumer this wake must release: the store + eventfd writes unpark
+// that Recv (and the peer's, via the shared shutdown word and the fixed both-
+// eventfd wake), and it returns transport.ErrClosed. Idempotent; a call after a
+// full Close (region already unmapped) is a no-op, guarded by the closed flag under
+// the read side. The writer join (outbound.stop) runs before the gate, mirroring
+// Close, and drains every queued intent with transport.ErrClosed so a parked
+// lifecycle Send also returns.
+func (t *Transport) StopWriter() error {
+	t.outbound.stop()
+
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+
+	if t.closed {
+		// A full Close already released the mapping; shutdown was actuated there and
+		// the shutdownPtr/region must not be touched again.
+		return nil
+	}
+	// shm-abi.md §14 graceful teardown wake: shutdown = 1 + both eventfds, no poison
+	// cause. The eventfds are the caller's fds, not region-mapped memory, so writing
+	// them is safe without the write side; only the shutdownPtr store touches the
+	// mapping, and the held read side excludes a concurrent munmap.
+	t.poison.Shutdown()
+
+	return nil
+}
+
+// SetInboundBeforeBlockForTest installs fn, invoked each time this transport's
+// inbound Recv consumer is committed to its blocking eventfd read — past the arm
+// and the arm-path ctx/shutdown/tail re-checks (shm-abi.md §11), so the only
+// thing that can release it is that direction's eventfd write (or a ctx cancel).
+// It is test-only observability with no production effect (unset in every normal
+// path) and is stored atomically by the underlying waiter, so it is safe to call
+// after Attach has started the reader. A test uses it to prove a reader has
+// crossed its final pre-block shutdown re-check before actuating a teardown wake,
+// so removing that eventfd write strands the reader deterministically — a
+// stronger gate than an arm-only (StateParked) observation, which a reader can
+// legally pass and then still exit through the arm-path shutdown re-check without
+// blocking.
+func (t *Transport) SetInboundBeforeBlockForTest(fn func()) {
+	t.waiter.SetBeforeBlockForTest(fn)
+}
+
+// SetWriterStuckObserverForTest installs fn, invoked each time this transport's
+// outbound writer parks with a data intent set aside on arena or ring backpressure
+// (the stuck-carry wake state) — the state in which a submitted data frame is
+// enqueued in the writer but cannot publish and, absent lifecycle traffic or a
+// retry signal, stays there until teardown drains it with transport.ErrClosed. It
+// is test-only observability with no production effect (the observer is unset in
+// every normal path) and is stored atomically, so it is safe to call after Attach
+// has started the writer. A test uses it to prove an OPEN is genuinely queued
+// behind a stopped writer, not merely absent.
+func (t *Transport) SetWriterStuckObserverForTest(fn func()) {
+	t.outbound.setOnBlock(func(s blockSite) {
+		if s == blockStuckCarry {
+			fn()
+		}
+	})
+}
+
 // Close performs teardown step 4: it stops the outbound writer (draining
 // pending intents with transport.ErrClosed) and munmaps the region, exactly
 // once even under concurrent or repeated calls (shm-abi.md §16 / design
@@ -793,6 +894,11 @@ func slabInClass(classes []shm.SizeClass, off, storedLen uint64) bool {
 // caller's and are not re-performed here; the region fd the caller passed is
 // closed by the caller after Close returns. The eventfds are the caller's too,
 // so Close does not close them.
+//
+// Close is StopWriter composed with the region release: it repeats the writer
+// stop (idempotent) and, whether or not StopWriter already ran, munmaps the
+// region under the write side. A prior StopWriter leaves shutdown already set,
+// which is harmless (the store is idempotent) and does not change what Close does.
 //
 // closeOnce alone dedupes concurrent/repeated Close calls, but does not by
 // itself exclude a Send/Recv call still touching the mapping when munmap

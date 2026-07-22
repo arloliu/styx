@@ -732,3 +732,34 @@ func TestSupervisor_SpecForSpawn_NeverMutatesBaseSpecEnv_ForReloadSuccessor(t *t
 	require.Empty(t, baseEnv[:2][1],
 		"an in-place append would have written the var into the base slice's spare capacity")
 }
+
+// hostOffer marks the streaming feature required exactly when Config.RequireStreaming
+// is set, so a host whose generated client calls streaming methods fails the
+// handshake against a plugin that cannot stream (stream-protocol.md §11.2).
+func TestHostOffer_RequiresStreaming_FromConfig(t *testing.T) {
+	streamingRequired := func(o control.Offer) bool {
+		for _, f := range o.Features {
+			if f.Name == "streaming" {
+				return f.Required
+			}
+		}
+
+		return false
+	}
+
+	optional := supervisor.New(supervisor.Config{}, supervisor.NewEventBus())
+	require.False(t, streamingRequired(optional.HostOfferForTest()),
+		"streaming is optional by default")
+
+	required := supervisor.New(supervisor.Config{RequireStreaming: true}, supervisor.NewEventBus())
+	require.True(t, streamingRequired(required.HostOfferForTest()),
+		"RequireStreaming marks the streaming feature required")
+
+	// A plugin that does not support streaming fails the handshake against this host.
+	pluginNoStream := control.Offer{
+		ProtocolMin: 1, ProtocolMax: 1,
+		Transports: []string{"uds"}, Codecs: []string{"proto"},
+	}
+	_, err := control.Negotiate(required.HostOfferForTest(), pluginNoStream, nil)
+	require.Error(t, err, "a non-streaming plugin fails the handshake against a streaming-required host")
+}

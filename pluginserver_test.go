@@ -161,7 +161,7 @@ func (h *pluginServeHelper) startServing(tr transport.Transport) <-chan error {
 	h.t.Helper()
 
 	done := make(chan error, 1)
-	go func() { done <- h.srv.RunServingForTest(h.t.Context(), h.pluginConn, tr) }()
+	go func() { done <- h.srv.RunServingForTest(h.t.Context(), h.pluginConn, tr, false) }()
 
 	return done
 }
