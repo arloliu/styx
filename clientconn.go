@@ -165,6 +165,13 @@ func statusFromRPC(s *rpcruntime.Status) error {
 		return ErrMethodNotFound
 	case rpcruntime.StatusCodeInternal:
 		return &Status{Code: CodeInternal, Message: s.Message}
+	case rpcruntime.StatusCodeHandlerPanic:
+		// The plugin recovered a handler panic and replied with the outcome so
+		// this call terminates with a plugin fault rather than vanishing. Only
+		// the recovered value crosses the wire (in Message); the structured
+		// Plugin/Service/Method names are not carried — there is no status
+		// envelope for them, and they are available in the plugin's own logs.
+		return &PluginPanicError{Value: s.Message}
 	}
 
 	details := make([]*anypb.Any, 0, len(s.Details))

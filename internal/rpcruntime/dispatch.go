@@ -18,7 +18,16 @@ import (
 type ServiceHandler interface {
 	// Handle dispatches a single method call by ID, returning either a
 	// successful response payload or a Status describing the failure.
-	Handle(ctx context.Context, methodID uint64, payload []byte) (respPayload []byte, status *Status, err error)
+	//
+	// onHandlerEntry, when non-nil, is called exactly once at the top of the handler
+	// frame — immediately before the application handler runs, after method resolution
+	// and request-decode setup. The serve loop passes the release of its admission read
+	// side here so that read side spans the taint check through handler entry but never
+	// the handler's execution. A refusal that runs no handler (an unknown method) does
+	// not call it; the serve loop releases its read side itself in that case.
+	Handle(
+		ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
+	) (respPayload []byte, status *Status, err error)
 }
 
 // Dispatcher is the plugin-side counterpart to Table: it looks up and invokes the
@@ -124,12 +133,24 @@ func (d *Dispatcher) CloseObligation(callID uint64) {
 //     rule as Table), and returns no Frame.
 //
 // Any other kind is discarded (returns no Frame).
-func (d *Dispatcher) Dispatch(ctx context.Context, f transport.Frame, recvAt time.Time) []transport.Frame {
+//
+// onHandlerEntry, when supplied, is called once at handler entry for a UNARY_REQ —
+// immediately before the application handler runs (see ServiceHandler.Handle). It is
+// optional so callers that do not linearize admission (tests, the differential
+// harness) need not pass one; only the serving loop does, to release its admission
+// read side at handler entry.
+func (d *Dispatcher) Dispatch(
+	ctx context.Context, f transport.Frame, recvAt time.Time, onHandlerEntry ...func(),
+) []transport.Frame {
+	var atHandlerEntry func()
+	if len(onHandlerEntry) > 0 {
+		atHandlerEntry = onHandlerEntry[0]
+	}
 	//exhaustive:ignore -- FrameUnaryResp/FrameUnaryErr flow plugin->host only
 	// and never arrive here; see the doc comment above for the discard rule.
 	switch f.Kind {
 	case transport.FrameUnaryReq:
-		return d.dispatchUnary(ctx, f, recvAt)
+		return d.dispatchUnary(ctx, f, recvAt, atHandlerEntry)
 	case transport.FrameCancel:
 		d.cancel(f.CallID)
 		return nil
@@ -141,7 +162,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, f transport.Frame, recvAt tim
 // dispatchUnary handles a single UNARY_REQ: budget check, handler invocation
 // under a cancelable/deadline-bound ctx tracked in inFlight, post-return budget
 // check, and response-frame construction.
-func (d *Dispatcher) dispatchUnary(ctx context.Context, f transport.Frame, recvAt time.Time) []transport.Frame {
+func (d *Dispatcher) dispatchUnary(
+	ctx context.Context, f transport.Frame, recvAt time.Time, onHandlerEntry func(),
+) []transport.Frame {
 	var deadline time.Time
 	if f.Budget > 0 {
 		deadline = Reanchor(f.Budget, recvAt)
@@ -166,7 +189,7 @@ func (d *Dispatcher) dispatchUnary(ctx context.Context, f transport.Frame, recvA
 	d.trackCall(f.CallID, cancel, recvAt)
 	defer d.untrackCall(f.CallID, cancel)
 
-	payload, status, err := h.Handle(callCtx, f.Method, f.Payload)
+	payload, status, err := h.Handle(callCtx, f.Method, f.Payload, onHandlerEntry)
 
 	if !deadline.IsZero() && !time.Now().Before(deadline) {
 		return nil // budget elapsed during the handler: the plugin checks the budget again after the handler returns.
@@ -238,9 +261,12 @@ func (d *Dispatcher) trackCall(callID uint64, cancel context.CancelFunc, started
 // the response frame is sent by the serve loop after Dispatch returns, so the
 // obligation stays open until the loop closes it — a stuck send after the handler
 // returns is exactly the dispatch stall the obligation makes visible. Reached from
-// dispatchUnary's defer, so a handler panic still releases the lease and in-flight
-// slot; the panic then unwinds to crash the process (restarting the instance), so
-// its still-open obligation is moot.
+// dispatchUnary's defer, so any panic propagating out of h.Handle still releases
+// the lease and in-flight slot before it unwinds. In the serving path the caller
+// recovers a handler panic and returns a status reply instead of letting it
+// unwind here, so this defer's panic case now guards only a residual runtime panic
+// outside the handler frame, which still crashes the process (restarting the
+// instance) and leaves its still-open obligation moot.
 func (d *Dispatcher) untrackCall(callID uint64, cancel context.CancelFunc) {
 	d.mu.Lock()
 	delete(d.inFlight, callID)

@@ -17,8 +17,12 @@ type stubHandler struct {
 }
 
 func (h stubHandler) Handle(
-	ctx context.Context, methodID uint64, payload []byte,
+	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
 ) ([]byte, *rpcruntime.Status, error) {
+	if onHandlerEntry != nil {
+		onHandlerEntry()
+	}
+
 	return h.fn(ctx, methodID, payload)
 }
 

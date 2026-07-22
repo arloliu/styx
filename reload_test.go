@@ -24,8 +24,13 @@ type labelHandler struct {
 }
 
 func (h labelHandler) Handle(
-	_ context.Context, _ uint64, payload []byte,
+	_ context.Context, _ uint64, payload []byte, onHandlerEntry func(),
 ) ([]byte, *rpcruntime.Status, error) {
+	// Honor the handler-entry contract: a non-nil callback runs exactly once before any
+	// handler behavior.
+	if onHandlerEntry != nil {
+		onHandlerEntry()
+	}
 	var req wrapperspb.StringValue
 	if err := h.codec.Unmarshal(payload, &req); err != nil {
 		return nil, nil, err

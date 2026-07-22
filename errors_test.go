@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,6 +23,12 @@ func TestIsRetryable_ClassifiesTaxonomy(t *testing.T) {
 			false,
 		},
 		{"plugin panic", &PluginPanicError{}, false},
+		{"plugin panic wrapped", fmt.Errorf("dispatch: %w", &PluginPanicError{Value: "boom"}), false},
+		{
+			"handler-panic reply reconstructed from the wire",
+			statusFromRPC(&rpcruntime.Status{Code: rpcruntime.StatusCodeHandlerPanic, Message: "boom"}),
+			false,
+		},
 		{"plugin unavailable", ErrPluginUnavailable, true},
 		{"drained", ErrDrained, true},
 		{"backpressure", ErrBackpressure, true},
@@ -43,6 +50,50 @@ func TestIsRetryable_ClassifiesTaxonomy(t *testing.T) {
 			// Then
 			require.Equal(t, tc.retryable, got)
 		})
+	}
+}
+
+// Test a plugin panic classifying non-retryable regardless of the ContinueAfterPanic setting
+func TestIsRetryable_PluginPanic_IndependentOfContinueAfterPanic(t *testing.T) {
+	// Given a plugin fault error and both panic-policy settings. IsRetryable reads
+	// only the error, never a server option, so opting into continued serving
+	// cannot change the panicking call's own retryability.
+	panicErr := &PluginPanicError{Value: "boom"}
+
+	for _, continueAfterPanic := range []bool{false, true} {
+		// Given
+		srv := NewPluginServer()
+		srv.SetContinueAfterPanic(continueAfterPanic)
+
+		// When / Then
+		require.False(t, IsRetryable(panicErr),
+			"a plugin panic is never retryable (ContinueAfterPanic=%t)", continueAfterPanic)
+	}
+}
+
+// Test a retried idempotent attempt's error classifying exactly like any call's
+func TestIsRetryable_RetriedAttempt_ClassifiesLikeOriginalCall(t *testing.T) {
+	// Given an original call and a RetryIdempotent-minted attempt carrying its key.
+	tbl := rpcruntime.NewTable(1)
+	orig := rpcruntime.CallDescriptor{CallID: tbl.NextID(), DedupKey: "k"}
+	retry, err := rpcruntime.RetryIdempotent(t.Context(), tbl, orig)
+	require.NoError(t, err)
+	require.NotEqual(t, orig.CallID, retry.CallID)
+
+	// When / Then: minting a retry attaches no error semantics — each terminal
+	// error a retried call can reach classifies exactly as it would for any call,
+	// because IsRetryable is a pure function of the error, not of the attempt.
+	cases := []struct {
+		name      string
+		err       error
+		retryable bool
+	}{
+		{"crash before dispatch", &PluginCrashError{Dispatched: false}, true},
+		{"outcome unknown", ErrOutcomeUnknown, false},
+		{"plugin panic", &PluginPanicError{}, false},
+	}
+	for _, tc := range cases {
+		require.Equal(t, tc.retryable, IsRetryable(tc.err), tc.name)
 	}
 }
 

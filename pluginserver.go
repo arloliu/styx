@@ -54,6 +54,12 @@ type PluginServer struct {
 	// cadence.
 	metrics         *observe.Dispatcher[observe.MetricsSink]
 	metricsInterval time.Duration
+
+	// continueAfterPanic is the handler-panic policy, set by SetContinueAfterPanic
+	// and read once when each serving session builds its panicController. Default
+	// (false) is the enterprise profile: a handler panic taints the process and
+	// terminates it. See panic_policy.go.
+	continueAfterPanic atomic.Bool
 }
 
 // PluginServerOption configures a PluginServer at construction. The zero-option
@@ -204,11 +210,17 @@ func (s *PluginServer) runServing(
 	// every executing handler's lease.
 	leases := rpcruntime.NewLeaseTable()
 
+	// One handler-panic controller per serving session, snapshotting the server's
+	// policy at session start. The unary dispatcher and the streaming accept half
+	// both record panics through it, and it carries the termination signal a
+	// streaming handler panic raises (see panic_policy.go).
+	panicPolicy := newPanicController(s.continueAfterPanic.Load())
+
 	dispatcher := rpcruntime.NewDispatcher()
 	dispatcher.SetLeaseTable(leases)
 	s.mu.Lock()
 	for _, rs := range s.services {
-		dispatcher.Register(rs.desc.ServiceID, newServiceHandler(rs, codec.Proto{}))
+		dispatcher.Register(rs.desc.ServiceID, newServiceHandler(rs, codec.Proto{}, panicPolicy))
 	}
 	streamHandlers := make(map[streamKey]streamHandlerReg, len(s.streamHandlers))
 	for k, h := range s.streamHandlers {
@@ -224,6 +236,7 @@ func (s *PluginServer) runServing(
 	var srv *streamServer
 	if streaming {
 		srv = newStreamServer(tr, streamHandlers, codec.Proto{}, leases)
+		srv.setPanicController(panicPolicy)
 	}
 
 	// A cancelable context so a data-plane death can stop the control loop below.
@@ -263,7 +276,7 @@ func (s *PluginServer) runServing(
 	var readPoisoned atomic.Bool
 	go func() {
 		defer close(readDone)
-		if runServeLoop(ctx, tr, dispatcher, srv) != nil {
+		if runServeLoop(ctx, tr, dispatcher, srv, panicPolicy) != nil {
 			readPoisoned.Store(true)
 		}
 	}()
@@ -283,11 +296,12 @@ func (s *PluginServer) runServing(
 		// The control plane ended first: graceful shutdown, a completed reload, or
 		// the host going away. The two-phase teardown below stops the reader.
 	case <-readDone:
-		// The data plane's reader exited. A plugin-initiated poison or a
-		// connection-fatal fault must fail this whole instance so the host
-		// supervisor observes the process die and runs its restart policy; a peer
-		// close (the host tearing this instance down) must not — its control loop
-		// will deliver the graceful Shutdown, or the host will reap it.
+		// The data plane's reader exited. A plugin-initiated poison, a
+		// connection-fatal fault, or a recovered unary handler panic under the
+		// default policy must fail this whole instance so the host supervisor
+		// observes the process die and runs its restart policy; a peer close (the
+		// host tearing this instance down) must not — its control loop will deliver
+		// the graceful Shutdown, or the host will reap it.
 		if readPoisoned.Load() || (srv != nil && srv.plane.streams.FatalErr() != nil) {
 			cancel()   // stop the control loop so this instance exits
 			<-ctrlDone // join it; the ctx.Canceled it returns is one WE induced
@@ -295,6 +309,17 @@ func (s *PluginServer) runServing(
 		} else {
 			ctrlErr = <-ctrlDone
 		}
+	case <-panicPolicy.terminateSignal():
+		// A streaming handler panicked under the default policy. Its stream enqueued the
+		// panic outcome on the bounded emitter through the handler-error termination path
+		// — best-effort, since teardown may win before that STREAM_ERR is sent, leaving
+		// the peer bounded by its own stream deadline (stream-protocol.md §9.1/§10.2). Now
+		// stop the control loop so this instance exits and the supervisor restarts it,
+		// exactly like a data-plane death. The two-phase teardown below stops and joins
+		// the still-blocked reader.
+		cancel()
+		<-ctrlDone
+		ctrlErr = errServingDataPlaneDied
 	}
 
 	// Two-phase data-plane teardown (stream-protocol.md §9's join-before-unmap):
@@ -633,16 +658,33 @@ func (s *PluginServer) pluginOffer() control.Offer {
 // teardown (which must not).
 var errServeLoopPoisoned = errors.New("styx: serve loop poisoned the data plane")
 
+// errServeLoopHandlerPanicked is runServeLoop's non-nil return after a handler
+// panicked under the default panic policy: the unary path sends the panicking
+// call its reply and then returns this, while a streaming panic taints from its
+// own goroutine and the reader returns this from its admission fence when it next
+// tries to route a frame — in both cases so runServing terminates the instance and
+// the supervisor restarts it. Like errServeLoopPoisoned it fails the whole
+// instance, but it names the panic-taint case rather than a data-plane poison.
+var errServeLoopHandlerPanicked = errors.New("styx: serve loop terminated after a handler panic")
+
 // runServeLoop reads data-plane frames and dispatches each to the registered
 // handler, sending back any response frame. Dispatch is currently inline
 // (a slow handler blocks the reader); a future concurrent serving loop
 // would hand each Dispatch to its own goroutine and a single writer.
 //
 // It returns nil when the transport was closed under it (Serve's teardown, the
-// host going away, or the host poisoning its own end), and errServeLoopPoisoned
-// when it poisoned the data plane itself — the two cases runServing must
-// distinguish (see errServeLoopPoisoned).
-func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher, srv *streamServer) error {
+// host going away, or the host poisoning its own end), errServeLoopPoisoned when
+// it poisoned the data plane itself, and errServeLoopHandlerPanicked when it
+// terminated the instance after a unary handler panic under the default policy —
+// the cases runServing must distinguish (see each sentinel). panicPolicy carries
+// that policy and may be nil for a caller that does not exercise panic recovery.
+func runServeLoop(
+	ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher, srv *streamServer,
+	panicPolicy *panicController,
+) error {
+	// One releaser for the whole loop: dispatch is inline on this single goroutine, so
+	// the unary admission release is reused per call rather than allocated per request.
+	releaser := newAdmitReleaser(panicPolicy)
 	for {
 		// Signal an owed drain boundary before blocking on the next Recv, so a stream
 		// frame dispatched earlier is detected drained however many non-stream frames
@@ -675,6 +717,24 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 			return nil // peer close / ErrClosed / ctx: not a self-initiated poison
 		}
 
+		// Coarse admission fence: once a recovered handler panic has tainted the session
+		// under the default policy, drop every further frame before routing it into
+		// dispatch. This is the lock-free fast path for an already-established taint — it
+		// fences data and teardown frames for an already-open stream too, which the
+		// production teardown then reaps. It does NOT by itself close the check-to-admission
+		// race for a NEW call: a streaming panic taints from its own handler goroutine and
+		// could store the taint just after this load returns false. That window is closed
+		// per admission by the gated check the admission paths take (routeStreamFrame's
+		// STREAM_OPEN gate; dispatchNonStreamFrame's unary admission gate, held through
+		// handler entry), which linearizes the taint store against the admission. The
+		// unary panic path is unaffected — it sends
+		// its reply and returns its own sentinel from dispatchNonStreamFrame before the loop
+		// reaches this check again. Opted in (ContinueAfterPanic), no taint is ever
+		// recorded, so neither this nor the gated checks ever fire.
+		if panicPolicy != nil && panicPolicy.shouldTerminate() {
+			return errServeLoopHandlerPanicked
+		}
+
 		// A STREAM_OPEN is admitted by the accept half; the four STREAM_* data kinds
 		// route to the stream table; a CANCEL is a stream teardown only when its
 		// call ID names a live stream (decided by lookup, not the control value),
@@ -689,7 +749,14 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 
 				return errServeLoopPoisoned
 			}
-			if derr := routeStreamFrame(srv, f); derr != nil {
+			fenced, derr := routeStreamFrame(srv, f, panicPolicy)
+			if fenced {
+				// A streaming panic tainted the session between the coarse fence above and
+				// this open's gated admission: fence the open and terminate for a controlled
+				// restart, exactly as the coarse fence would have on a later iteration.
+				return errServeLoopHandlerPanicked
+			}
+			if derr != nil {
 				// A conformance violation on a LIVE stream poisons the connection
 				// (stream-protocol.md §8.1): stopWriter marks the table closing and
 				// stops the writer, tearing the serving loop down WITHOUT releasing the
@@ -719,38 +786,142 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 
 			return errServeLoopPoisoned
 		default:
-			recvAt := time.Now()
-			if f.Kind == transport.FrameUnaryReq {
-				// Open the response obligation at consumption, before dispatch, so a
-				// reply owed by a pre-dispatch refusal (an unknown service, which never
-				// acquires a handler lease) or by a stuck post-handler send is visible to
-				// the host as an unleased obligation. The handler's lease joins later
-				// inside Dispatch; the obligation closes below once the reply (or the
-				// decision that none is owed) has reached the transport.
-				d.OpenObligation(f.CallID)
+			stop, err := dispatchNonStreamFrame(ctx, tr, d, f, panicPolicy, releaser)
+			if err != nil {
+				return err
 			}
-			for _, resp := range d.Dispatch(ctx, f, recvAt) {
-				if serr := tr.Send(ctx, resp); serr != nil {
-					if errors.Is(serr, transport.ErrPoisoned) {
-						// A partially-written response frame desynced the data plane: fail
-						// the instance so the supervisor restarts it, rather than treating
-						// the poison as a benign peer close (design §9's poison teardown).
-						return errServeLoopPoisoned
-					}
-
-					return nil // peer close / ErrClosed / ctx: not a self-initiated poison
-				}
-			}
-			if f.Kind == transport.FrameUnaryReq {
-				// The response (or the decision that none is owed) has now been handed to
-				// the transport: close the obligation opened at consumption above. A send
-				// stuck in the loop never reaches here, so a response owed by an
-				// already-returned handler — or by an unknown-service refusal whose reply
-				// send is stuck — stays counted and becomes dispatch-wedged.
-				d.CloseObligation(f.CallID)
+			if stop {
+				return nil // peer close / ErrClosed / ctx: not a self-initiated poison
 			}
 		}
 	}
+}
+
+// admitReleaser drops the unary admission read side exactly once per admitted call.
+// One instance lives for the whole serve loop, which is a single goroutine that
+// dispatches each call inline, so admitting a unary call allocates nothing for its
+// release: arm resets the guard before each dispatch, and entry — a func value bound
+// once at loop start — is the idempotent release the handler wrapper runs at handler
+// entry and the fallbacks reuse. The guard collapses the release-at-handler-entry,
+// the no-handler-entry release, and the deferred unwind fallback into a single
+// endAdmit. This reuse is sound only while dispatch stays inline on the one reader
+// goroutine; a future serving loop that hands each dispatch to its own goroutine
+// would need per-call release state again.
+type admitReleaser struct {
+	pc       *panicController
+	entry    func()
+	released bool
+}
+
+// newAdmitReleaser builds the once-per-serve-loop releaser and binds its entry func
+// once, so no admitted call allocates a release closure of its own.
+func newAdmitReleaser(pc *panicController) *admitReleaser {
+	r := &admitReleaser{pc: pc}
+	r.entry = r.release
+
+	return r
+}
+
+// arm re-enables the release for the next dispatch on this serve goroutine. It runs
+// strictly before that dispatch, so entry — whether it fires at handler entry, on a
+// no-handler-entry path, or from the deferred unwind fallback — acts on the current
+// call's state, never a previous call's.
+func (r *admitReleaser) arm() { r.released = false }
+
+// release drops the admission read side once; later calls within the same dispatch are
+// no-ops, so the handler-entry release, the no-handler-entry release, and the deferred
+// fallback never double-release.
+func (r *admitReleaser) release() {
+	if r.released {
+		return
+	}
+	r.released = true
+	r.pc.endAdmit()
+}
+
+// dispatchNonStreamFrame dispatches one non-stream frame (a unary request or a
+// unary cancel), sends any response, and reports what the serve loop should do
+// next: err non-nil is a return value that fails the instance (a data-plane
+// poison, or a controlled termination after a unary handler panic under the
+// default policy); stop true means return nil (a benign peer close / ErrClosed /
+// ctx during the reply send); both zero means keep serving.
+//
+// releaser is the serve loop's one reusable admission releaser: a unary frame arms
+// it before dispatch and reuses its bound entry func, so admitting a call adds no
+// per-request heap allocation. A non-unary frame takes no read side and never arms
+// or fires it.
+func dispatchNonStreamFrame(
+	ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher, f transport.Frame,
+	panicPolicy *panicController, releaser *admitReleaser,
+) (stop bool, err error) {
+	recvAt := time.Now()
+	isUnaryReq := f.Kind == transport.FrameUnaryReq
+	var onHandlerEntry func()
+	if isUnaryReq {
+		// Take the admission read side across the taint check and the obligation open:
+		// they are one section, so a streaming handler panic's taint store cannot land
+		// between them (see beginAdmit). When the session is already tainted the request is
+		// not admitted — fence it and terminate for a controlled restart, opening no
+		// obligation.
+		//
+		// Open the obligation at consumption, before dispatch, so a reply owed by a
+		// pre-dispatch refusal (an unknown service, which never acquires a handler lease)
+		// or by a stuck post-handler send is visible to the host as an unleased obligation.
+		// The handler's lease joins later inside Dispatch; the obligation closes below once
+		// the reply (or the decision that none is owed) has reached the transport.
+		if !panicPolicy.beginAdmit() {
+			return false, errServeLoopHandlerPanicked
+		}
+		d.OpenObligation(f.CallID)
+		// Arm the release for this call before dispatch, then carry the held read side into
+		// the invocation: the handler wrapper releases it at handler entry, immediately
+		// before the application handler runs, so the read side spans the taint check THROUGH
+		// handler entry but never handler execution. No fresh application handler can begin
+		// after a concurrent streaming panic's taint store returns, yet a long handler never
+		// holds off that store. The deferred release is the unwind safety net: a framework
+		// panic between here and handler entry is unrecovered by policy and crashes the
+		// process, but the read side is still freed on the way out.
+		releaser.arm()
+		onHandlerEntry = releaser.entry
+		defer releaser.entry()
+	}
+	frames := d.Dispatch(ctx, f, recvAt, onHandlerEntry)
+	if isUnaryReq {
+		// Release the read side for every path that reached no handler entry — a call refused
+		// before any handler (unknown service/method, elapsed budget) opens no handler, so its
+		// read side is freed here, before any reply send, and never held across the transport.
+		releaser.entry()
+	}
+	for _, resp := range frames {
+		if serr := tr.Send(ctx, resp); serr != nil {
+			if errors.Is(serr, transport.ErrPoisoned) {
+				// A partially-written response frame desynced the data plane: fail the
+				// instance so the supervisor restarts it, rather than treating the poison
+				// as a benign peer close (design §9's poison teardown).
+				return false, errServeLoopPoisoned
+			}
+
+			return true, nil // peer close / ErrClosed / ctx: not a self-initiated poison
+		}
+	}
+	if f.Kind == transport.FrameUnaryReq {
+		// The response (or the decision that none is owed) has now been handed to the
+		// transport: close the obligation opened at consumption above. A send stuck in
+		// the loop never reaches here, so a response owed by an already-returned
+		// handler — or by an unknown-service refusal whose reply send is stuck — stays
+		// counted and becomes dispatch-wedged.
+		d.CloseObligation(f.CallID)
+	}
+	// A unary handler panicked under the default policy: its panic reply has now
+	// reached the transport (the send loop above completed) and its obligation is
+	// closed, so terminate the instance for a controlled restart. Checking here,
+	// after the reply send, is what guarantees the peer sees the panic outcome
+	// before termination — unlike an unrecovered crash mid-call.
+	if panicPolicy != nil && panicPolicy.shouldTerminate() {
+		return false, errServeLoopHandlerPanicked
+	}
+
+	return false, nil
 }
 
 // routeStreamFrame routes one inbound STREAM_* frame on the plugin accept side: a
@@ -758,18 +929,40 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 // four data kinds to the stream table, marking the §4.6 drain boundary OWED after a
 // dispatched data frame — the serve loop's top-of-iteration probeDrain signals it
 // once the inbound queue empties. A CANCEL never reaches here — the serve loop
-// routes it by call-ID lookup. It returns rpcruntime.ErrStreamConformance for a
-// conformance violation the serve loop poisons the connection on.
-func routeStreamFrame(srv *streamServer, f transport.Frame) error {
+// routes it by call-ID lookup.
+//
+// A STREAM_OPEN is admitted under the panic controller's admission gate, so a
+// streaming handler panic's taint store cannot land between the taint check and the
+// handler launch; when the session is already tainted the open is not admitted and
+// fenced is true, telling the serve loop to terminate for a controlled restart. The
+// four data kinds carry no new admission — they feed an already-admitted stream — so
+// they need no gate; the serve loop's coarse fence already drops them once a taint is
+// established. It returns rpcruntime.ErrStreamConformance for a conformance violation
+// the serve loop poisons the connection on.
+func routeStreamFrame(srv *streamServer, f transport.Frame, pc *panicController) (fenced bool, err error) {
 	if f.Kind == transport.FrameStreamOpen {
-		return srv.onStreamOpen(f)
+		// Hold the read side of the admission gate across the taint check and the whole
+		// of onStreamOpen: onStreamOpen registers the stream and launches its handler on
+		// a separate goroutine (it never runs the handler inline), so the read side is
+		// not held across handler execution and never holds off the taint store for a
+		// handler's duration.
+		if !pc.beginAdmit() {
+			return true, nil
+		}
+		if srv.afterAdmit != nil {
+			srv.afterAdmit(f)
+		}
+		derr := srv.onStreamOpen(f)
+		pc.endAdmit()
+
+		return false, derr
 	}
 	if derr := srv.plane.dispatchStreamFrame(f); derr != nil {
-		return derr
+		return false, derr
 	}
 	srv.plane.drainOwedMark()
 
-	return nil
+	return false, nil
 }
 
 // heartbeatIntervalEnv, when set to a value time.ParseDuration accepts,
@@ -1041,15 +1234,29 @@ type serviceHandler struct {
 	rs      registeredService
 	cdc     codec.Codec
 	methods map[uint64]MethodDesc
+	// panicPolicy carries the serving session's handler-panic policy. Handle
+	// recovers a handler panic through it and replies with the panic outcome; a
+	// nil policy (never the case in a real serving session) keeps the legacy
+	// crash-on-panic behavior.
+	panicPolicy *panicController
+
+	// beforeHandlerEntry, when non-nil, runs at the top of the handler frame — after
+	// the taint check and admission, while the admission read side is still held,
+	// immediately before that read side is released and the application handler runs.
+	// It is a test-only ordering seam that lets a test park the reader inside the held
+	// admission section and store a taint from a concurrent handler panic, to prove
+	// the read side spans admission through handler entry. It is nil in production and
+	// has no runtime cost there.
+	beforeHandlerEntry func(methodID uint64)
 }
 
-func newServiceHandler(rs registeredService, cdc codec.Codec) *serviceHandler {
+func newServiceHandler(rs registeredService, cdc codec.Codec, panicPolicy *panicController) *serviceHandler {
 	methods := make(map[uint64]MethodDesc, len(rs.desc.Methods))
 	for _, m := range rs.desc.Methods {
 		methods[m.MethodID] = m
 	}
 
-	return &serviceHandler{rs: rs, cdc: cdc, methods: methods}
+	return &serviceHandler{rs: rs, cdc: cdc, methods: methods, panicPolicy: panicPolicy}
 }
 
 // Handle resolves methodID, decodes payload, invokes the handler, and returns
@@ -1064,10 +1271,13 @@ func newServiceHandler(rs registeredService, cdc codec.Codec) *serviceHandler {
 //     client's errors.As recovers the same *styx.Status.
 //   - any other handler error, or a codec failure -> Status{CodeInternal}.
 func (h *serviceHandler) Handle(
-	ctx context.Context, methodID uint64, payload []byte,
+	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
 ) ([]byte, *rpcruntime.Status, error) {
 	m, ok := h.methods[methodID]
 	if !ok {
+		// An unknown method runs no handler, so onHandlerEntry is deliberately not
+		// called here — the serve loop releases its admission read side itself for a
+		// refusal that reaches no handler.
 		return nil, &rpcruntime.Status{
 			Code: rpcruntime.StatusCodeMethodNotFound,
 			Message: fmt.Sprintf("method %d not found in %q",
@@ -1076,7 +1286,20 @@ func (h *serviceHandler) Handle(
 	}
 
 	dec := func(msg proto.Message) error { return h.cdc.Unmarshal(payload, msg) }
-	resp, err := m.Handler(h.rs.impl, ctx, dec)
+	resp, recovered, err := h.invokeHandler(ctx, m, dec, onHandlerEntry)
+	if recovered != nil {
+		// The handler panicked and the tight recover boundary caught it. Reply with
+		// the panic outcome so the call terminates as a plugin fault rather than
+		// vanishing, and let the panic policy taint-and-terminate (default) or
+		// continue serving. The panic never unwinds past this point, so the marshal
+		// below and every other runtime frame stay untouched.
+		if h.panicPolicy == nil {
+			panic(recovered) // no serving session policy: preserve crash-on-panic.
+		}
+		h.panicPolicy.recordUnaryPanic()
+
+		return nil, panicStatus(recovered), nil
+	}
 	if err != nil {
 		return nil, statusFromHandlerErr(err), nil
 	}
@@ -1087,6 +1310,35 @@ func (h *serviceHandler) Handle(
 	}
 
 	return out, nil, nil
+}
+
+// invokeHandler calls the user handler under a recover boundary drawn tightly
+// around the handler invocation: a panic inside the handler is caught and
+// returned as recovered (with resp/err then nil), so the caller can reply with
+// the panic outcome and apply the panic policy instead of crashing mid-call. The
+// boundary wraps ONLY the handler call — a panic in the request decode the
+// handler triggers unwinds through the handler and is caught here, but a panic in
+// the response marshal or any other framework frame runs outside this function
+// and still crashes the process, per the runtime-panic rule.
+func (h *serviceHandler) invokeHandler(
+	ctx context.Context, m MethodDesc, dec func(proto.Message) error, onHandlerEntry func(),
+) (resp proto.Message, recovered any, err error) {
+	if h.beforeHandlerEntry != nil {
+		h.beforeHandlerEntry(m.MethodID)
+	}
+	if onHandlerEntry != nil {
+		// Release the admission read side at the top of the handler frame, immediately
+		// before the application handler runs: handler entry is the last action inside the
+		// held admission section, its execution the first outside. The recover below is set
+		// up after this, so a recovered handler panic never needs the read side — it is
+		// already released when recordUnaryPanic and the reply path run.
+		onHandlerEntry()
+	}
+	defer func() { recovered = recover() }()
+
+	resp, err = m.Handler(h.rs.impl, ctx, dec)
+
+	return resp, nil, err
 }
 
 // statusFromHandlerErr maps a handler's returned error to the wire Status.

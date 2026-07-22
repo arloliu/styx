@@ -77,6 +77,17 @@ const (
 	// the client as a terminal outcome rather than a hang.
 	StatusCodeInternal uint32 = 0xFFFFFF03
 
+	// StatusCodeHandlerPanic marks a reply the plugin sends because the handler
+	// panicked and the panic was recovered at the dispatch boundary — the peer
+	// must see the panic outcome as a terminal reply, not a vanished call. The
+	// styx package reconstructs it as a *styx.PluginPanicError carrying the
+	// recovered value from the status Message. It rides both a UNARY_ERR (unary
+	// handler) and a STREAM_ERR (streaming handler); like every code at or above
+	// StatusCodeReservedMin it is framework-owned, so an application status can
+	// never impersonate it. It is a plugin fault and never retryable, exactly
+	// like the *PluginPanicError it reconstructs to.
+	StatusCodeHandlerPanic uint32 = 0xFFFFFF08
+
 	// StatusCodeReservedMin is the lowest framework-reserved status code: any
 	// Status.Code at or above it is framework-owned and never a valid
 	// application code. The styx package clamps an application Status whose

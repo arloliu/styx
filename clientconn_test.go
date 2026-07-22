@@ -40,7 +40,14 @@ type echoHandler struct {
 	codec codec.Codec
 }
 
-func (h echoHandler) Handle(_ context.Context, _ uint64, payload []byte) ([]byte, *rpcruntime.Status, error) {
+func (h echoHandler) Handle(
+	_ context.Context, _ uint64, payload []byte, onHandlerEntry func(),
+) ([]byte, *rpcruntime.Status, error) {
+	// Honor the handler-entry contract: a non-nil callback runs exactly once before any
+	// handler behavior.
+	if onHandlerEntry != nil {
+		onHandlerEntry()
+	}
 	var msg wrapperspb.StringValue
 	if err := h.codec.Unmarshal(payload, &msg); err != nil {
 		return nil, nil, err

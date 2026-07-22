@@ -751,6 +751,27 @@ type streamServer struct {
 	// prove onStreamOpen honors a losing Publish (the handler must not run on a
 	// terminal stream). It is nil in production and has no runtime cost there.
 	beforePublish func(*rpcruntime.Stream)
+
+	// afterAdmit, when non-nil, runs in routeStreamFrame for a STREAM_OPEN after the
+	// gated admission has taken the read side, while it is still held and before
+	// onStreamOpen registers the stream and launches its handler. It is a test-only
+	// ordering seam that lets a test park the reader inside the held read side and store
+	// a taint from a concurrent handler panic, to prove the store cannot complete while
+	// the read side is held. It is nil in production and has no runtime cost there.
+	afterAdmit func(transport.Frame)
+
+	// panicPolicy carries the serving session's handler-panic policy. runHandler
+	// recovers a streaming handler panic through it, terminates that stream with the
+	// panic outcome, and applies the taint-or-continue policy. A nil policy (a caller
+	// that does not exercise panic recovery) keeps the legacy crash-on-panic behavior.
+	panicPolicy *panicController
+}
+
+// setPanicController installs the serving session's handler-panic policy. Like the
+// lease table it is set once at setup, before any stream handler runs; a
+// streamServer with none keeps crashing on a handler panic, as before.
+func (s *streamServer) setPanicController(pc *panicController) {
+	s.panicPolicy = pc
 }
 
 // newStreamServer builds the plugin accept half over tr with the registered
@@ -909,7 +930,26 @@ func (s *streamServer) onStreamOpen(f transport.Frame) error {
 // A handler that already drove the stream terminal (its SendAndClose or a peer
 // teardown won the CAS) makes TerminateHandlerError a no-op.
 func (s *streamServer) runHandler(reg streamHandlerReg, st *rpcruntime.Stream) {
-	err := reg.handler(newServerStream(st, s.codec))
+	recovered, err := s.invokeStreamHandler(reg, newServerStream(st, s.codec))
+	if recovered != nil {
+		// The handler panicked and the tight recover boundary caught it. Terminate
+		// this stream with the panic outcome through the SAME handler-error
+		// termination path a returned error takes (the terminal-CAS winner enqueues the
+		// data-lane STREAM_ERR on the bounded emitter). Its send is best-effort: teardown
+		// may win before it reaches the peer, and the frozen protocol permits dropping a
+		// handler-error STREAM_ERR (stream-protocol.md §9.1/§10.2), so the peer usually
+		// but not always sees a *PluginPanicError rather than a stream that lingers to its
+		// deadline. Then apply the panic policy: under the default it taints the process
+		// and signals controlled termination; opted in, the server keeps serving. The
+		// panic never unwinds past this point.
+		st.TerminateHandlerError(panicStatus(recovered))
+		if s.panicPolicy == nil {
+			panic(recovered) // no serving session policy: preserve crash-on-panic.
+		}
+		s.panicPolicy.recordStreamPanic()
+
+		return
+	}
 	if err == nil {
 		if reg.shape == rpcruntime.ClientStreaming && !st.SendClosed() {
 			st.TerminateHandlerError(&rpcruntime.Status{
@@ -921,6 +961,21 @@ func (s *streamServer) runHandler(reg streamHandlerReg, st *rpcruntime.Stream) {
 		return
 	}
 	st.TerminateHandlerError(statusFromHandlerErr(err))
+}
+
+// invokeStreamHandler calls the streaming handler under a recover boundary drawn
+// tightly around the handler invocation: a panic inside the handler is caught and
+// returned as recovered, so runHandler can terminate the stream with the panic
+// outcome and apply the panic policy instead of crashing the handler goroutine. A
+// panic in the streaming runtime itself (the terminal transition, the emitter)
+// runs outside this function and still crashes the process, per the runtime-panic
+// rule.
+func (s *streamServer) invokeStreamHandler(reg streamHandlerReg, ss *Stream) (recovered any, err error) {
+	defer func() { recovered = recover() }()
+
+	err = reg.handler(ss)
+
+	return nil, err
 }
 
 // teardown fails every accept-side stream and joins the streaming finishers and

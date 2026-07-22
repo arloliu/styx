@@ -58,7 +58,7 @@ func startStreamPluginWithLeases(
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = runServeLoop(context.Background(), pluginTr, d, srv)
+		_ = runServeLoop(context.Background(), pluginTr, d, srv, nil)
 	}()
 	t.Cleanup(func() {
 		_ = pluginTr.Close()
@@ -397,4 +397,22 @@ func TestStreamError_MapsStatusCodesAndSentinels(t *testing.T) {
 		err := StreamError(&rpcruntime.StreamStatusError{Status: &rpcruntime.Status{Code: code}})
 		require.ErrorIs(t, err, want, "status code %#x", code)
 	}
+
+	// The two remaining reserved codes reconstruct to typed errors, not sentinels:
+	// a plugin-side dispatch fault to a *styx.Status{CodeInternal}, and a recovered
+	// handler panic to a *styx.PluginPanicError carrying the recovered value.
+	internalErr := StreamError(&rpcruntime.StreamStatusError{
+		Status: &rpcruntime.Status{Code: rpcruntime.StatusCodeInternal, Message: "boom"},
+	})
+	var status *Status
+	require.ErrorAs(t, internalErr, &status)
+	require.Equal(t, CodeInternal, status.Code)
+
+	panicReply := StreamError(&rpcruntime.StreamStatusError{
+		Status: &rpcruntime.Status{Code: rpcruntime.StatusCodeHandlerPanic, Message: "handler boom"},
+	})
+	var panicErr *PluginPanicError
+	require.ErrorAs(t, panicReply, &panicErr)
+	require.Equal(t, "handler boom", panicErr.Value)
+	require.False(t, IsRetryable(panicReply))
 }

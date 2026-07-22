@@ -209,7 +209,14 @@ type blockingHandler struct {
 	invoked chan struct{}
 }
 
-func (h *blockingHandler) Handle(ctx context.Context, _ uint64, _ []byte) ([]byte, *rpcruntime.Status, error) {
+func (h *blockingHandler) Handle(
+	ctx context.Context, _ uint64, _ []byte, onHandlerEntry func(),
+) ([]byte, *rpcruntime.Status, error) {
+	// Honor the handler-entry contract: a non-nil callback runs exactly once before any
+	// handler behavior.
+	if onHandlerEntry != nil {
+		onHandlerEntry()
+	}
 	close(h.invoked)
 	<-ctx.Done()
 
@@ -333,12 +340,20 @@ func newSpyHandler() *spyHandler {
 // Handle records the call and then defers to scenarioHandler's own
 // Echo/AppError/Slow/not-found behavior, so a spy-served workload behaves
 // identically to one served by the plain scenario dispatcher.
-func (s *spyHandler) Handle(ctx context.Context, methodID uint64, payload []byte) ([]byte, *rpcruntime.Status, error) {
+func (s *spyHandler) Handle(
+	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
+) ([]byte, *rpcruntime.Status, error) {
+	// Honor the handler-entry contract: a non-nil callback runs exactly once at the top of
+	// this handler frame, before any spy behavior. The forwarded scenarioHandler would run
+	// the callback again, so pass nil down to keep it single-invocation.
+	if onHandlerEntry != nil {
+		onHandlerEntry()
+	}
 	s.mu.Lock()
 	s.calls[methodID]++
 	s.mu.Unlock()
 
-	return scenarioHandler{}.Handle(ctx, methodID, payload)
+	return scenarioHandler{}.Handle(ctx, methodID, payload, nil)
 }
 
 // count returns how many times Handle ran for methodID.

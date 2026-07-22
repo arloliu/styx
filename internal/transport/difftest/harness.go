@@ -339,8 +339,13 @@ type scenarioHandler struct{}
 // reports StatusCodeMethodNotFound, exactly as an unregistered method would
 // on a real generated service.
 func (scenarioHandler) Handle(
-	ctx context.Context, methodID uint64, payload []byte,
+	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
 ) ([]byte, *rpcruntime.Status, error) {
+	// Honor the handler-entry contract: a non-nil callback runs exactly once before any
+	// handler behavior, so this double never holds an admission read side across the work.
+	if onHandlerEntry != nil {
+		onHandlerEntry()
+	}
 	switch methodID {
 	case methodEcho:
 		return payload, nil, nil

@@ -47,7 +47,7 @@ func InProcessStreamPairForTest(s *PluginServer) (*ClientConn, func(), error) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = runServeLoop(context.Background(), pluginTr, dispatcher, srv)
+		_ = runServeLoop(context.Background(), pluginTr, dispatcher, srv, nil)
 	}()
 
 	cc := newClientConn("p", rpcruntime.NewTable(firstGeneration), clientTr, codec.Proto{})
@@ -153,6 +153,50 @@ func (h *Host) DroppedInformationalEventCounts() []uint64 {
 //nolint:revive // confusing-naming: intentional case-only re-export, see doc above
 func ToControlServiceRequirements(reqs []ServiceRequirement) []control.ServiceRequirement {
 	return toControlServiceRequirements(reqs)
+}
+
+// tryAdmitReadLock probes the read side of a session's admission gate without
+// blocking, for the admission-linearization captures in panic_policy_test.go. It
+// lives in a _test.go file, so it is invisible to production builds and adds no
+// runtime surface. It reports whether the read side was acquired; on success it
+// releases immediately, because the probe must never keep a read side held.
+//
+// sync.RWMutex.TryRLock returns false while a writer holds or is pending: Lock
+// announces a pending writer by driving readerCount negative, and TryRLock returns
+// false whenever readerCount is negative (Go src/sync/rwmutex.go, and the RWMutex
+// doc: a Lock issued while readers hold the lock blocks new RLock calls until the
+// writer acquires and releases it). So a failed probe is the direct, stable signal
+// that a streaming taint store's write side is pending on this gate.
+func (pc *panicController) tryAdmitReadLock() bool {
+	if pc.admitGate.TryRLock() {
+		pc.admitGate.RUnlock()
+
+		return true
+	}
+
+	return false
+}
+
+// tryAdmitWriteLock probes the write side of a session's admission gate without
+// blocking — the write-side counterpart to tryAdmitReadLock, for the
+// admission-linearization captures in panic_policy_test.go. It lives in a _test.go
+// file, so it is invisible to production builds and adds no runtime surface. It
+// reports whether the write side was acquired; on success it releases immediately,
+// because the probe must never keep a write side held.
+//
+// A sync.RWMutex write lock cannot be taken while any read side is held. So when no
+// taint writer exists yet, a probe that FAILS proves the admission read side is
+// genuinely held right now, and a probe that SUCCEEDS proves it is not — the exact
+// distinction a pre-writer hold-check needs, with no pending writer around to blur
+// held against pending.
+func (pc *panicController) tryAdmitWriteLock() bool {
+	if pc.admitGate.TryLock() {
+		pc.admitGate.Unlock()
+
+		return true
+	}
+
+	return false
 }
 
 // IncompatibleReason re-exports incompatibleReason for pluginserver_test
