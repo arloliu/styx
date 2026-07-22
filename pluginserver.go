@@ -17,6 +17,7 @@ import (
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/transport"
+	"github.com/arloliu/styx/observe"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
@@ -47,6 +48,35 @@ type PluginServer struct {
 	// RegisterStreamHandler. The serve loop invokes the matching handler when a
 	// STREAM_OPEN is accepted, establishing the stream from the declared shape.
 	streamHandlers map[streamKey]streamHandlerReg
+
+	// metrics is the plugin-side MetricsSink dispatcher, or nil when no sink is
+	// configured (the enabled gate). metricsInterval is the periodic reporter's
+	// cadence.
+	metrics         *observe.Dispatcher[observe.MetricsSink]
+	metricsInterval time.Duration
+}
+
+// PluginServerOption configures a PluginServer at construction. The zero-option
+// NewPluginServer() keeps the original behavior — no metrics.
+type PluginServerOption func(*pluginServerConfig)
+
+// pluginServerConfig accumulates the applied PluginServerOptions before
+// NewPluginServer resolves them onto the server.
+type pluginServerConfig struct {
+	metrics  observe.MetricsSink
+	interval time.Duration
+}
+
+// WithMetrics routes the plugin's built-in instrumentation to sink. nil (the
+// default) disables plugin-side metrics entirely.
+func WithMetrics(sink observe.MetricsSink) PluginServerOption {
+	return func(c *pluginServerConfig) { c.metrics = sink }
+}
+
+// WithMetricsInterval sets the periodic reporter's cadence. Zero (the default)
+// uses one second. Ignored when no metrics sink is configured.
+func WithMetricsInterval(d time.Duration) PluginServerOption {
+	return func(c *pluginServerConfig) { c.interval = d }
 }
 
 // registeredService pairs one RegisterService call's desc and impl for
@@ -57,9 +87,23 @@ type registeredService struct {
 }
 
 // NewPluginServer creates a PluginServer. Call RegisterService for each
-// generated service, then Serve.
-func NewPluginServer() *PluginServer {
-	return &PluginServer{services: make(map[uint64]registeredService)}
+// generated service, then Serve. Options are optional; NewPluginServer() with
+// none configures no metrics.
+func NewPluginServer(opts ...PluginServerOption) *PluginServer {
+	cfg := pluginServerConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	s := &PluginServer{
+		services:        make(map[uint64]registeredService),
+		metricsInterval: resolveMetricsInterval(cfg.interval),
+	}
+	if cfg.metrics != nil {
+		s.metrics = observe.NewDispatcher(cfg.metrics, metricsBufferSize)
+	}
+
+	return s
 }
 
 // RegisterService installs desc against impl (the user's service
@@ -186,6 +230,31 @@ func (s *PluginServer) runServing(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Plugin-side observability runs only when a sink is configured: one dispatcher
+	// goroutine plus the cold periodic reporter, both bound to a child context this
+	// phase cancels and joins on return, so no observability goroutine outlives the
+	// serving phase. stopReporter cancels and JOINS the reporter before the transport
+	// is released below, so a capability read can never touch the region
+	// releaseTransport unmaps; the reporter reads cheap snapshots and never wedges,
+	// so that join is unbounded. The dispatcher join stays bounded (a user sink call
+	// wedged inside it can never stall teardown, and the dispatcher touches no
+	// transport state), so it runs in the deferred backstop.
+	stopReporter := func() {}
+	if s.metrics != nil {
+		metricsCtx, metricsCancel := context.WithCancel(ctx)
+		var dispWG, repWG sync.WaitGroup
+		defer func() {
+			metricsCancel()
+			joinBounded(&dispWG, obsShutdownBound)
+		}()
+		var stopOnce sync.Once
+		stopReporter = func() { stopOnce.Do(func() { metricsCancel(); repWG.Wait() }) }
+		dispWG.Add(1)
+		go func() { defer dispWG.Done(); s.metrics.Run(metricsCtx) }()
+		repWG.Add(1)
+		go func() { defer repWG.Done(); s.runMetricsReporter(metricsCtx, tr) }()
+	}
+
 	// Serving reader loop (data plane). Its only stop/join owner is this
 	// function: stopping tr's writer below unblocks its Recv. For a successor the
 	// restore above has already completed, so this reader cannot dispatch a frame
@@ -246,6 +315,9 @@ func (s *PluginServer) runServing(
 	if srv != nil {
 		srv.teardown(ErrPluginUnavailable)
 	}
+	// Join the reporter before releasing the transport, so no capability read can
+	// touch the region releaseTransport unmaps.
+	stopReporter()
 	releaseTransport(tr)
 
 	return ctrlErr

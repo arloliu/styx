@@ -155,6 +155,39 @@ func TestUDSTransport_FrameCounters_AdvanceOnSuccessfulSendRecv(t *testing.T) {
 	require.Equal(t, uint64(1), b.FramesSent())
 }
 
+// Test the byte counters advancing by full wire-frame size (header plus body) on
+// each successful Send and Recv, the authoritative throughput source, and never
+// on a rejected send.
+func TestUDSTransport_ByteCounters_AdvanceByWireSize(t *testing.T) {
+	// Given a non-streaming pair (37-byte header) and a 4-byte payload frame.
+	a, b := newTestTransportPair(t)
+	var bc transport.ByteCounter = a
+	require.Zero(t, bc.BytesSent())
+	require.Zero(t, bc.BytesReceived())
+
+	const header = 37 // non-streaming wire header (stream-protocol.md §2.4)
+	payload := []byte("data")
+	wire := uint64(header + len(payload))
+	f := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: payload}
+
+	// When: a sends one frame and b receives it.
+	require.NoError(t, a.Send(t.Context(), f))
+	got, err := b.Recv(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, payload, got.Payload)
+
+	// Then: sender counted the full wire bytes out, receiver the full wire bytes in.
+	require.Equal(t, wire, a.BytesSent())
+	require.Zero(t, a.BytesReceived())
+	require.Equal(t, wire, b.BytesReceived())
+	require.Zero(t, b.BytesSent())
+
+	// And a rejected (oversized) send moves no bytes.
+	big := transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq, Payload: make([]byte, transport.MaxFrameSize+1)}
+	require.Error(t, a.Send(t.Context(), big))
+	require.Equal(t, wire, a.BytesSent(), "a rejected-before-write send must not advance the byte counter")
+}
+
 // Test ReadableNow probing concurrently with a single reader's Recv being safe: the
 // non-consuming MSG_PEEK probe removes no bytes, so under -race a reader draining a
 // stream of frames while another goroutine hammers ReadableNow sees no data race and

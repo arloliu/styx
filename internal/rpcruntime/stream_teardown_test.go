@@ -208,6 +208,22 @@ func TestStream_ACKOwedCancel_ClosesObligationAtCancelHandoff(t *testing.T) {
 	tbl.SetObligationSink(obl)
 	t.Cleanup(func() { _ = tbl.Close() })
 
+	// Gate the assertion on the emitter's post-delivery accounting, not on the
+	// transport recording the Send: the emitter's close-or-skip obligation decision
+	// runs AFTER Send returns, so observing the recorded STREAM_ERR alone could win
+	// before that decision. The notification is a buffered one-shot, so a completion
+	// that runs before the receiver waits is retained rather than dropped — the
+	// assertion below is deterministic regardless of scheduling. Under an
+	// unconditional-close mutation it fails every run; under the fix it passes every
+	// run.
+	emitAccounted := make(chan struct{}, 1)
+	tbl.afterEmitAccounting = func() {
+		select {
+		case emitAccounted <- struct{}{}:
+		default:
+		}
+	}
+
 	const callID = 88
 	s, err := tbl.OpenAccepting(callID, StreamConfig{Credits: 4, Deadline: time.Second})
 	require.NoError(t, err)
@@ -223,13 +239,18 @@ func TestStream_ACKOwedCancel_ClosesObligationAtCancelHandoff(t *testing.T) {
 	require.Equal(t, tokenCancelOwed, s.token.Load())
 
 	// The terminal also handed the droppable data-lane STREAM_ERR to the connection
-	// emitter. Wait until the emitter has DELIVERED it, then assert the obligation is
-	// still open: the STREAM_ERR is the pair's droppable frame, so its delivery must
-	// not close the obligation while the load-bearing CANCEL is still parked behind
-	// the ack — only the CANCEL's handoff may. (An emitter delivery that closed the
-	// obligation here is exactly the stalled-teardown blindness this pins.)
-	require.Eventually(t, func() bool { return rt.countOfKind(transport.FrameStreamErr) == 1 },
-		time.Second, time.Millisecond, "the emitter delivers the teardown STREAM_ERR")
+	// emitter. Wait until the emitter has run its post-Send close-or-skip decision,
+	// then assert the obligation is still open: the STREAM_ERR is the pair's
+	// droppable frame, so its delivery must not close the obligation while the
+	// load-bearing CANCEL is still parked behind the ack — only the CANCEL's handoff
+	// may. (An emitter delivery that closed the obligation here is exactly the
+	// stalled-teardown blindness this pins.)
+	select {
+	case <-emitAccounted:
+	case <-time.After(time.Second):
+		t.Fatal("the emitter never ran its post-delivery accounting for the teardown STREAM_ERR")
+	}
+	require.Equal(t, 1, rt.countOfKind(transport.FrameStreamErr), "the emitter delivered the teardown STREAM_ERR")
 	require.True(t, obl.isOpen(callID),
 		"the obligation stays open after the STREAM_ERR delivery while the owed CANCEL is still parked")
 

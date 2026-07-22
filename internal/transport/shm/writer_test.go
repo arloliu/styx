@@ -1826,3 +1826,123 @@ func TestWriter_Published_FreesConsumedSlab_AcrossWrapBoundary(t *testing.T) {
 		})
 	}
 }
+
+// Test the reject-mode data lane counting one backpressure edge per TRANSITION
+// into rejection, not one per rejected frame: a run of consecutive rejections is
+// one edge, and only a fresh rejection after an admitted frame cleared the edge
+// counts again. It drives the admission decision directly via enqueue, scripting a
+// full/drained queue, so the transitions are deterministic with no writer
+// goroutine.
+func TestWriter_BackpressureEdge_CountsTransitionsNotRejections(t *testing.T) {
+	// Given a reject-mode writer whose data queue holds exactly one intent.
+	w := newWriterFromParts(&recordRing{}, noArena{}, 1, 1, admitReject)
+	ctx := t.Context()
+
+	// Fill the queue; two consecutive rejections are one episode.
+	w.dataQueue <- dataIntent(1)
+	require.ErrorIs(t, w.enqueue(ctx, dataIntent(2), laneData), ErrBackpressure)
+	require.ErrorIs(t, w.enqueue(ctx, dataIntent(3), laneData), ErrBackpressure)
+	require.Equal(t, uint64(1), w.backpressureEdges(),
+		"a run of consecutive rejections is one transition, not one per frame")
+
+	// Drain one so the next frame is admitted, clearing the edge; the admitted frame
+	// refills the queue.
+	<-w.dataQueue
+	require.NoError(t, w.enqueue(ctx, dataIntent(4), laneData))
+	require.Equal(t, uint64(1), w.backpressureEdges(), "an admitted frame counts no edge")
+
+	// A fresh rejection after the clear is a new transition.
+	require.ErrorIs(t, w.enqueue(ctx, dataIntent(5), laneData), ErrBackpressure)
+	require.ErrorIs(t, w.enqueue(ctx, dataIntent(6), laneData), ErrBackpressure)
+	require.Equal(t, uint64(2), w.backpressureEdges(),
+		"a rejection after an admitted frame is a fresh transition; the run after it is still one")
+}
+
+// Test that concurrent rejecters against a full queue count exactly ONE edge for
+// the single episode they all observe — the interleaving the styx-layer
+// classification could double-count. Because the edge update is made under the
+// same lock that decides admission, no admitter can split the run, and under the
+// race detector this also proves the edge state carries no data race.
+func TestWriter_BackpressureEdge_ConcurrentRejectersCountOneEpisode(t *testing.T) {
+	// Given a reject-mode writer whose data queue is full and never drains.
+	w := newWriterFromParts(&recordRing{}, noArena{}, 1, 1, admitReject)
+	w.dataQueue <- dataIntent(1)
+	ctx := t.Context()
+
+	// When many submitters race to admit into the full queue: every one is rejected.
+	const n = 32
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := range n {
+		go func(id int) {
+			defer wg.Done()
+			require.ErrorIs(t, w.enqueue(ctx, dataIntent(uint64(id+2)), laneData), ErrBackpressure)
+		}(i)
+	}
+	wg.Wait()
+
+	// Then the whole burst is one transition, counted once — never once per rejecter.
+	require.Equal(t, uint64(1), w.backpressureEdges(),
+		"concurrent rejecters of one episode count exactly one edge")
+}
+
+// Test that the backpressure-edge update is ordered under the admission lock: a
+// submitter whose admission decision is parked mid-transition (holding edgeMu)
+// blocks a concurrent submitter's edge update behind it, so a stale decision can
+// never interleave between two rejections and split one episode into two counts.
+// A classifier that runs after the admission returns has a scheduler gap between
+// the decision and its state update in which exactly that interleaving fits; this
+// pins that the gap does not exist at the layer that owns the admission decision.
+func TestWriter_BackpressureEdge_OrdersUnderAdmissionLock(t *testing.T) {
+	// Given a reject-mode writer whose data queue is full, with a hook that parks the
+	// first admission decision inside the edge critical section.
+	w := newWriterFromParts(&recordRing{}, noArena{}, 1, 1, admitReject)
+	w.dataQueue <- dataIntent(1)
+	ctx := t.Context()
+
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	w.edgeHook = func() {
+		once.Do(func() {
+			close(parked)
+			<-release // hold edgeMu across the park
+		})
+	}
+
+	// A first rejection parks holding edgeMu, having counted its transition.
+	go func() { _ = w.enqueue(ctx, dataIntent(2), laneData) }()
+	select {
+	case <-parked:
+	case <-time.After(testTimeout):
+		t.Fatal("the first admission decision never reached the edge critical section")
+	}
+	require.Equal(t, uint64(1), w.backpressureEdges())
+
+	// A second rejection cannot apply its edge update while the first holds the lock.
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		_ = w.enqueue(ctx, dataIntent(3), laneData)
+	}()
+	require.Never(t, func() bool {
+		select {
+		case <-secondDone:
+			return true
+		default:
+			return false
+		}
+	}, 100*time.Millisecond, 5*time.Millisecond,
+		"a concurrent admission decision must block behind the edge lock, not race ahead of the clear")
+
+	// Releasing the first lets the second acquire the lock; it sees the edge already
+	// set (this run is still the same episode) and counts nothing new.
+	close(release)
+	select {
+	case <-secondDone:
+	case <-time.After(testTimeout):
+		t.Fatal("the second admission decision never completed after the first released the lock")
+	}
+	require.Equal(t, uint64(1), w.backpressureEdges(),
+		"two consecutive rejections around one parked decision are exactly one episode")
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -599,6 +600,100 @@ func TestSupervisor_StaysHealthy_WhenDeliveredSequenceGapsAcrossWindow(t *testin
 	// Observe past the gap and into the recovery run with no wedge: the gap cleared the
 	// stall, so the qualifying beats on either side never summed into a full window.
 	requireHealthyForBeats(t, ch, beats, 10)
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// spawnSilentPeer builds an instance-spawn seam whose peer keeps the control conn
+// open and answers a Shutdown but never sends a heartbeat, so the host's
+// heartbeat loop times out every interval and counts a miss. It drives the
+// OnHeartbeatMiss seam deterministically without a real silent child.
+func spawnSilentPeer(t *testing.T) supervisor.FakeSpawn {
+	t.Helper()
+
+	return func(_, _ context.Context, generation uint64, _ bool) (*supervisor.FakeInstance, error) {
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+		require.NoError(t, err)
+		hostConn := control.NewConn(fds[0], generation)
+		peerConn := control.NewConn(fds[1], generation)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer func() { _ = peerConn.Close() }()
+			ctx := context.Background()
+			for {
+				msg, rerr := peerConn.Recv(ctx)
+				if rerr != nil {
+					return
+				}
+				kind, ok := control.KindOf(msg)
+				if !ok {
+					return
+				}
+				if kind == control.KindShutdown {
+					_ = peerConn.Send(ctx, &controlpb.ControlMessage{
+						Body: &controlpb.ControlMessage_ShutdownAck{ShutdownAck: &controlpb.ShutdownAck{}},
+					})
+
+					return
+				}
+			}
+		}()
+
+		teardown := func(context.Context, time.Duration) (*os.ProcessState, error) {
+			_ = hostConn.Close() // EOF on the peer end unblocks and ends the script.
+			<-done
+
+			return nil, nil
+		}
+
+		return &supervisor.FakeInstance{
+			Conn:     hostConn,
+			Promote:  func() supervisor.ReadyHooks { return supervisor.ReadyHooks{} },
+			Teardown: teardown,
+		}, nil
+	}
+}
+
+// Test the supervisor invoking Config.OnHeartbeatMiss once per missed interval,
+// up to the point the missed count reaches MissedHeartbeats and the instance is
+// declared unhealthy.
+func TestSupervisor_CallsOnHeartbeatMiss_PerMissedInterval(t *testing.T) {
+	// Given: a peer that never heartbeats, a short interval, and a miss budget
+	// of 3 with no restarts so the run ends deterministically after one instance.
+	const missBudget = 3
+	bus := supervisor.NewEventBus()
+	ch, unsub := bus.Subscribe()
+	defer unsub()
+
+	var misses atomic.Int64
+	cfg := supervisor.Config{
+		Restart:           supervisor.RestartPolicy{Max: 0},
+		HeartbeatInterval: wiringInterval,
+		MissedHeartbeats:  missBudget,
+		WedgeWindow:       wiringWindow,
+		OnHeartbeatMiss:   func() { misses.Add(1) },
+	}
+	sup := supervisor.New(cfg, bus)
+	sup.SetSpawnForTest(spawnSilentPeer(t))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// When: the instance is declared unhealthy after the miss budget is reached.
+	ev := awaitUnhealthy(t, ch)
+
+	// Then: OnHeartbeatMiss fired once per missed interval, exactly to the budget.
+	require.Contains(t, ev.Err.Error(), "missed")
+	require.Equal(t, int64(missBudget), misses.Load())
 
 	cancel()
 	select {

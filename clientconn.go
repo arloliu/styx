@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/transport"
+	"github.com/arloliu/styx/observe"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 )
@@ -22,6 +24,18 @@ import (
 type ClientConn struct {
 	name  string
 	state atomic.Pointer[connState] // nil until a plugin instance is live; Invoke reports ErrPluginUnavailable
+	// metrics is the host's shared MetricsSink dispatcher, or nil when no sink
+	// is configured. It is the Invoke hot path's enabled gate: a nil pointer
+	// means the disabled path allocates, closes over, and submits nothing.
+	metrics *observe.Dispatcher[observe.MetricsSink]
+	// trReleaseMu orders the periodic reporter's transport-capability reads against
+	// transport release: the reporter holds the read side across a tick's capability
+	// reads, and releaseTransportGuarded takes the write side around the release, so
+	// a capability method can never touch a region the release unmaps (the
+	// join-before-unmap ordering, extended to the observability reader). It is a
+	// cold-path lock: one RLock per reporter tick (default one second) and one Lock
+	// per connection-generation teardown.
+	trReleaseMu sync.RWMutex
 	// admission is the hot-reload cutoff switch. A reload closes it before
 	// draining the running instance and reopens it once either the successor
 	// is routing or the original instance has confirmed it is unfrozen, so a
@@ -425,6 +439,16 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 		budget = time.Until(deadline)
 	}
 
+	// Enabled gate: a nil metrics dispatcher means no sink is configured, so the
+	// hot path below allocates nothing, closes over nothing, and submits nothing
+	// — the disabled path is free. Only when a sink is set do we read the clock
+	// and, at the terminal points, build the one closure a submit costs.
+	m := c.metrics
+	var start time.Time
+	if m != nil {
+		start = time.Now()
+	}
+
 	callID, wait := state.table.Submit(ctx, budget)
 
 	if state.table.Publish(callID) {
@@ -444,6 +468,11 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 		// own deadline timer (inside wait, below) is what actually reaps
 		// it if the peer never responds in time.
 		if sendErr := state.tr.Send(context.Background(), f); sendErr != nil {
+			// Backpressure transitions are counted inside the transport, at the
+			// admission decision point where they can be ordered structurally, and
+			// sampled by the periodic reporter (transport.BackpressureEdgeCounter) —
+			// not classified here, where nothing orders a completion with the
+			// admission decision that produced it.
 			cause := fmt.Errorf("styx: invoke: send request: %w: %w", sendErr, ErrOutcomeUnknown)
 			state.table.OutcomeUnknown(callID, cause)
 		}
@@ -451,7 +480,15 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 
 	result, waitErr := wait(ctx)
 	if waitErr != nil {
+		if m != nil {
+			c.recordAbandoned(m, start, waitErr)
+		}
+
 		return c.abandon(state, callID, waitErr)
+	}
+
+	if m != nil {
+		c.recordCompleted(m, start)
 	}
 
 	return translateResult(result, state.codec, resp)
@@ -471,4 +508,18 @@ func (c *ClientConn) abandon(state *connState, callID uint64, waitErr error) err
 	}
 
 	return translateCtxErr(waitErr)
+}
+
+// releaseTransportGuarded releases tr only once no periodic-reporter capability
+// read of this connection is in flight, so a capability method can never touch a
+// region the release unmaps. It takes trReleaseMu's write side, which the reporter
+// holds for read across each tick's capability reads; a reporter tick already past
+// its reads has released the lock, and one that starts after the write lock is
+// held reads the current (already-swapped or nil) generation, never the transport
+// being released. It is the connection-teardown release path for a generation
+// wired by wireConnState.
+func (c *ClientConn) releaseTransportGuarded(tr transport.Transport) {
+	c.trReleaseMu.Lock()
+	releaseTransport(tr)
+	c.trReleaseMu.Unlock()
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
+	"github.com/arloliu/styx/observe"
 )
 
 // Negotiation constants: a single protocol version over the uds transport
@@ -32,6 +33,27 @@ const (
 // HostConfig configures a Host before Start.
 type HostConfig struct {
 	Plugins []PluginSpec
+
+	// Metrics optionally receives this host's built-in instrumentation for
+	// every plugin it supervises (RPC latency, bytes moved, timeouts,
+	// cancellations, restarts, heartbeat misses, backpressure). One sink covers
+	// all plugins; each signal carries a "plugin" label. nil (the default)
+	// disables host-side metrics entirely — no dispatcher goroutine runs and no
+	// hot path allocates. Passing observe.NoopMetricsSink() enables the
+	// (harmless) machinery with a discarding sink.
+	Metrics observe.MetricsSink
+
+	// Logger optionally receives Styx's structured internal diagnostics — plugin
+	// lifecycle transitions and faults. Delivery goes through the same bounded,
+	// panic-isolated worker as metrics, so a slow or panicking Logger neither
+	// stalls the event relay nor crashes the process. nil (the default) disables
+	// lifecycle logging entirely — no logger goroutine runs.
+	Logger observe.Logger
+
+	// MetricsInterval sets the cadence of the periodic reporter for the
+	// transport-sourced signals (bytes moved, and the shared-memory gauges). Zero
+	// (the default) uses one second. Ignored when Metrics is nil.
+	MetricsInterval time.Duration
 }
 
 // PluginSpec declares one plugin the Host spawns and supervises.
@@ -102,6 +124,20 @@ type Host struct {
 	// events from others, even with an unread Events() channel.
 	bus    *supervisor.Bus[Event]
 	events <-chan Event
+
+	// metricsDisp is the shared MetricsSink dispatcher, or nil when no sink is
+	// configured — the host-wide enabled gate. logDisp is the Logger dispatcher, or
+	// nil when no logger is configured, so lifecycle logging goes through the same
+	// bounded, panic-isolated worker discipline as metrics rather than running the
+	// user Logger synchronously on the event relay. obsCtx/obsCancel bound both
+	// dispatcher goroutines and every per-plugin reporter, all joined (within a
+	// bound) via obsWG on Stop.
+	metricsDisp     *observe.Dispatcher[observe.MetricsSink]
+	logDisp         *observe.Dispatcher[observe.Logger]
+	metricsInterval time.Duration
+	obsCtx          context.Context
+	obsCancel       context.CancelFunc
+	obsWG           sync.WaitGroup
 }
 
 // pluginRuntime is the host-side handle to one supervised plugin: the
@@ -129,12 +165,39 @@ func NewHost(cfg HostConfig) *Host {
 	bus := supervisor.NewBus(hostEventIsCritical)
 	events, _ := bus.Subscribe() // never unsubscribed: this is Events()'s channel for the Host's whole life.
 
-	return &Host{
-		cfg:     cfg,
-		plugins: make(map[string]*ClientConn),
-		bus:     bus,
-		events:  events,
+	h := &Host{
+		cfg:             cfg,
+		plugins:         make(map[string]*ClientConn),
+		bus:             bus,
+		events:          events,
+		metricsInterval: resolveMetricsInterval(cfg.MetricsInterval),
 	}
+
+	// A configured sink and/or logger each runs one dispatcher goroutine for the
+	// host's whole life, stopped by Stop. Neither configured means no goroutine and
+	// no gate cost anywhere. The shared observability context bounds both
+	// dispatchers and every per-plugin reporter.
+	if cfg.Metrics != nil || cfg.Logger != nil {
+		h.obsCtx, h.obsCancel = context.WithCancel(context.Background())
+	}
+	if cfg.Metrics != nil {
+		h.metricsDisp = observe.NewDispatcher(cfg.Metrics, metricsBufferSize)
+		h.obsWG.Add(1)
+		go func() {
+			defer h.obsWG.Done()
+			h.metricsDisp.Run(h.obsCtx)
+		}()
+	}
+	if cfg.Logger != nil {
+		h.logDisp = observe.NewDispatcher(cfg.Logger, logBufferSize)
+		h.obsWG.Add(1)
+		go func() {
+			defer h.obsWG.Done()
+			h.logDisp.Run(h.obsCtx)
+		}()
+	}
+
+	return h
 }
 
 // Start spawns every configured plugin, completes its handshake, and
@@ -183,12 +246,15 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	}
 
 	cc := newUnavailableClientConn(spec.Name)
+	cc.metrics = h.metricsDisp
 	bus := supervisor.NewEventBus()
 	cfg := supervisor.Config{
 		Spec:             lifecycle.Spec{Path: spec.Path, Args: spec.Args, Env: spec.Env},
 		Restart:          spec.Restart,
 		Services:         toControlServiceRequirements(spec.Services),
 		RequireStreaming: spec.RequireStreaming,
+		OnHeartbeatMiss:  h.heartbeatMissHook(spec.Name),
+		OnRestart:        h.restartHook(spec.Name),
 		// The reload transaction drives the SAME admission gate a caller's
 		// Invoke checks, so a cutoff a reload begins is the cutoff Invoke
 		// observes. internal/supervisor never names *ClientConn; it holds only
@@ -241,6 +307,17 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 		name: spec.Name, sup: sup, unsub: unsub, stopRelay: stopRelay, relayDone: relayDone,
 	})
 
+	// The per-plugin periodic reporter runs only when a sink is configured; it is
+	// bound to the host metrics context so Stop joins it. Started only on success,
+	// so a failed start leaves no reporter behind.
+	if h.metricsDisp != nil {
+		h.obsWG.Add(1)
+		go func() {
+			defer h.obsWG.Done()
+			cc.runMetricsReporter(h.obsCtx, h.metricsDisp, h.metricsInterval)
+		}()
+	}
+
 	return nil
 }
 
@@ -259,6 +336,12 @@ func (h *Host) relayEvents(
 		select {
 		case ev := <-events:
 			h.publish(translateEvent(name, ev))
+			// Restart and heartbeat-miss metrics are counted at their authoritative
+			// supervisor seams (OnRestart/OnHeartbeatMiss), not off this
+			// drop-oldest informational relay; logging routes through the bounded,
+			// panic-isolated log dispatcher so a user Logger can never stall or
+			// crash this relay (and the GaveUp delivery below).
+			h.logEvent(name, ev)
 
 			//exhaustive:ignore -- only Ready/GaveUp affect firstOutcome; every
 			// other kind is already handled above via h.publish.
@@ -302,6 +385,16 @@ func (h *Host) Stop(ctx context.Context) error {
 		close(rt.stopRelay)
 		<-rt.relayDone
 		rt.unsub()
+	}
+
+	// Stop the metrics and log dispatchers and every per-plugin reporter, then
+	// join them so no observability goroutine outlives the host. A no-op when
+	// neither a sink nor a logger was configured (obsCancel stays nil). The join is
+	// bounded: a user sink or logger call wedged inside a dispatcher can never
+	// stall Stop past obsShutdownBound (see joinBounded).
+	if h.obsCancel != nil {
+		h.obsCancel()
+		joinBounded(&h.obsWG, obsShutdownBound)
 	}
 
 	return errors.Join(errs...)
@@ -428,7 +521,10 @@ func wireConnState(cc *ClientConn, inst supervisor.Instance) supervisor.ReadyHoo
 				stopTransportWriter(state.tr)
 			}
 			<-state.readLoopDone
-			releaseTransport(state.tr)
+			// Release through the reporter guard so a periodic-reporter capability
+			// read of this generation's transport can never touch the region the
+			// release unmaps (see releaseTransportGuarded).
+			cc.releaseTransportGuarded(state.tr)
 		},
 	}
 }

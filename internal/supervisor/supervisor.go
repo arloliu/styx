@@ -267,6 +267,25 @@ type Config struct {
 	// match the control protocol's own reply deadlines for those messages.
 	ReloadDeadlines lifecycle.PhaseDeadlines
 
+	// OnHeartbeatMiss is called once per missed heartbeat interval — a full
+	// HeartbeatInterval elapsing with no heartbeat received — before the running
+	// missed count is checked against MissedHeartbeats. It is an optional
+	// observability seam owned by this package, so it carries no dependency on the
+	// styx layer's observe hooks (this package must not import styx); the styx
+	// layer adapts it to a metrics submit. It runs on the heartbeat loop
+	// goroutine, a cold path called at most once per interval, so it MUST NOT
+	// block. nil (the default) disables it.
+	OnHeartbeatMiss func()
+
+	// OnRestart is called once at the authoritative restart-decision site — after
+	// a crash is classified restart-eligible and the restart budget is charged,
+	// as the Restarting transition is taken — so a restart is counted exactly once
+	// per decision rather than off the informational, drop-oldest event stream. It
+	// is an optional observability seam owned by this package (no styx dependency);
+	// the styx layer adapts it to a metrics submit. It runs on the Run goroutine, a
+	// cold path, and MUST NOT block. nil (the default) disables it.
+	OnRestart func()
+
 	// OnReady is called once per successfully attached instance. It hands back
 	// the live wiring the caller needs to route RPCs, and must return the
 	// hooks Supervisor uses to tear that wiring back down. OnReady may be
@@ -437,6 +456,9 @@ func (s *Supervisor) Run(ctx context.Context) {
 
 		delay := s.cfg.Restart.Backoff(restartsUsed)
 		restartsUsed++
+		if s.cfg.OnRestart != nil {
+			s.cfg.OnRestart()
+		}
 		s.publish(Event{Kind: EventRestarting, Time: time.Now()})
 
 		if !s.sleep(ctx, delay) {
@@ -777,6 +799,9 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 				// heartbeat's ack keeps a well-behaved plugin from racing another
 				// heartbeat into the transaction's strict receive.
 				missed++
+				if s.cfg.OnHeartbeatMiss != nil {
+					s.cfg.OnHeartbeatMiss()
+				}
 				if missed >= s.cfg.MissedHeartbeats {
 					reason := fmt.Errorf("supervisor: missed %d consecutive heartbeats", missed)
 					s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: reason})

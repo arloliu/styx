@@ -116,6 +116,12 @@ type StreamTable struct {
 	beforeFinisherWait func()
 	afterFinisherWait  func()
 	beforeFinisherDone func()
+	// afterEmitAccounting runs inside runEmitter after a job's Send and its
+	// close-or-skip obligation decision, so a test can observe the emitter's
+	// post-delivery accounting deterministically — the owed-CANCEL proof gates its
+	// obligation assertion on this rather than on the transport recording the Send,
+	// which returns before the close-or-skip decision runs.
+	afterEmitAccounting func()
 }
 
 // emitJob is one queued data-lane STREAM_ERR for the connection emitter to
@@ -579,6 +585,9 @@ func (t *StreamTable) runEmitter() {
 			// releaseAckToken closes it at that CANCEL's handoff (see emitJob).
 			if !job.keepObligation {
 				t.closeObligation(job.callID)
+			}
+			if t.afterEmitAccounting != nil {
+				t.afterEmitAccounting()
 			}
 		case <-t.stopCh:
 			return

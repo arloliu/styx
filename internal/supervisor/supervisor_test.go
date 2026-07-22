@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -287,6 +288,53 @@ func TestSupervisor_RestartsPerPolicy_ThenEmitsGaveUp_WhenMaxExceeded(t *testing
 		t.Fatalf("unexpected event after GaveUp: %+v", ev)
 	case <-time.After(50 * time.Millisecond):
 	}
+}
+
+// Test Config.OnRestart firing exactly once per restart decision, at the same
+// authoritative site as the Restarting transition — so a restart counter built on
+// it counts each decision once, never derived from the drop-oldest event stream.
+func TestSupervisor_CallsOnRestart_PerRestartDecision(t *testing.T) {
+	// Given: a plugin that crashes on every attempt, a policy allowing exactly 2
+	// restarts, and an OnRestart hook that tallies calls.
+	bus := supervisor.NewEventBus()
+	collector := newEventCollector(bus)
+	defer collector.unsub()
+
+	const maxRestarts = 2
+	var restarts atomic.Int64
+	cfg := supervisor.Config{
+		Spec: lifecycle.Spec{Path: fixtureCrashPlugin},
+		Restart: supervisor.RestartPolicy{
+			Max: maxRestarts, Backoff: func(int) time.Duration { return 5 * time.Millisecond },
+		},
+		OnRestart: func() { restarts.Add(1) },
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// When: observe the event stream until GaveUp.
+	seen := collector.awaitKind(t)
+
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after GaveUp")
+	}
+
+	// Then: OnRestart fired once per Restarting decision — same count, and equal to
+	// the policy's Max (each restart consumed exactly one decision before GaveUp).
+	var restartingCount int
+	for _, ev := range seen {
+		if ev.Kind == supervisor.EventRestarting {
+			restartingCount++
+		}
+	}
+	require.Equal(t, maxRestarts, restartingCount, "expected one Restarting per allowed restart")
+	require.Equal(t, int64(restartingCount), restarts.Load(), "OnRestart must fire once per restart decision")
 }
 
 // Test Supervisor making full restart-then-GaveUp progress even with a

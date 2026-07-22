@@ -79,6 +79,13 @@ type UDSTransport struct {
 	// Send/Recv path is negligible.
 	sentCount atomic.Uint64
 	recvCount atomic.Uint64
+
+	// sentBytes and recvBytes are the cumulative wire-byte counters exposed via
+	// ByteCounter (header plus body), advanced at the same chokepoint as the frame
+	// counters and under the same "fully completed only" rule. They are the
+	// authoritative byte-throughput source for the observability reporter.
+	sentBytes atomic.Uint64
+	recvBytes atomic.Uint64
 }
 
 // headerLen is this connection's fixed wire-header length: 45 bytes when the
@@ -159,6 +166,9 @@ func (t *UDSTransport) Send(ctx context.Context, f Frame) error {
 		return err
 	}
 	t.sentCount.Add(1) // a frame that reached the wire in full: produce progress.
+	// its wire bytes (header + body); the sum is bounded by MaxFrameSize, never negative.
+	//nolint:gosec // header + body length is bounded and non-negative.
+	t.sentBytes.Add(uint64(t.headerLen() + len(body)))
 
 	return nil
 }
@@ -170,6 +180,12 @@ func (t *UDSTransport) FramesSent() uint64 { return t.sentCount.Load() }
 // FramesReceived reports the cumulative count of frames fully read off the wire
 // (transport.FrameCounter). See the counter fields' and FrameCounter's docs.
 func (t *UDSTransport) FramesReceived() uint64 { return t.recvCount.Load() }
+
+// BytesSent reports the cumulative wire bytes fully sent (transport.ByteCounter).
+func (t *UDSTransport) BytesSent() uint64 { return t.sentBytes.Load() }
+
+// BytesReceived reports the cumulative wire bytes fully received (transport.ByteCounter).
+func (t *UDSTransport) BytesReceived() uint64 { return t.recvBytes.Load() }
 
 // AcceptanceUnknown reports whether a failed Send left the frame's acceptance
 // unknown (transport.AcceptanceClassifier). For SOCK_STREAM, acceptance is "a byte
@@ -274,12 +290,16 @@ func (t *UDSTransport) Recv(ctx context.Context) (Frame, error) {
 		}
 		f.Status = status
 		t.recvCount.Add(1) // a fully-read frame: consume progress.
+		//nolint:gosec // header + payload length is bounded by MaxFrameSize, non-negative.
+		t.recvBytes.Add(uint64(t.headerLen() + int(payloadLen)))
 
 		return f, nil
 	}
 
 	f.Payload = body
 	t.recvCount.Add(1) // a fully-read frame: consume progress.
+	//nolint:gosec // header + payload length is bounded by MaxFrameSize, non-negative.
+	t.recvBytes.Add(uint64(t.headerLen() + int(payloadLen)))
 
 	return f, nil
 }

@@ -1,0 +1,420 @@
+package styx
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/arloliu/styx/internal/supervisor"
+	"github.com/arloliu/styx/internal/transport"
+	"github.com/arloliu/styx/observe"
+)
+
+// labelPlugin is the metric label key carrying a plugin's name, so one host's
+// single MetricsSink can distinguish the signals of the plugins it supervises.
+const labelPlugin = "plugin"
+
+// metricsBufferSize bounds each MetricsSink dispatcher's pending-event queue.
+// Beyond it the dispatcher drops oldest (counted), so a slow sink never stalls a
+// caller; sized generously because a submit is a cheap channel send and events
+// are low-rate per plugin.
+const metricsBufferSize = 1024
+
+// logBufferSize bounds the Logger dispatcher's pending-event queue. Lifecycle log
+// events are lower-rate than metrics, so a smaller buffer suffices; beyond it the
+// dispatcher drops oldest (counted).
+const logBufferSize = 256
+
+// defaultMetricsInterval is the periodic reporter's default cadence for the
+// accumulate-in-transport-counters-then-report signals (bytes moved, arena
+// utilization, ring depth, wakeup rate).
+const defaultMetricsInterval = time.Second
+
+// obsShutdownBound caps how long a host Close or plugin serve teardown waits to
+// join the observability goroutines. A healthy sink drains and its dispatcher
+// exits far inside this bound, so the join returns at once; the bound exists only
+// so a user sink call wedged inside the dispatcher can never stall shutdown — the
+// invariant that an unread or misbehaving subscription must never stall the
+// supervisor. Past the bound the join proceeds; the dispatcher goroutine wedged in
+// the user call, and the waiter goroutine joinBounded parked on it, both remain
+// alive until that user call finally returns, rather than being joined.
+const obsShutdownBound = 2 * time.Second
+
+// resolveMetricsInterval returns the configured reporter cadence or the default
+// when unset or non-positive.
+func resolveMetricsInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultMetricsInterval
+	}
+
+	return d
+}
+
+// joinBounded waits for wg for up to bound. It bounds host/plugin shutdown against
+// a user sink or logger call wedged inside a dispatcher: such a call cannot be
+// interrupted in Go, so rather than let it stall Close forever the join gives up
+// after bound and proceeds. When it gives up two goroutines outlive the join until
+// the user call returns — the wedged dispatcher goroutine, and the short-lived
+// waiter below that is itself parked in wg.Wait — neither of which touches released
+// transport state. See obsShutdownBound.
+func joinBounded(wg *sync.WaitGroup, bound time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(bound):
+	}
+}
+
+// recordCompleted records a terminal, non-abandoned call's latency (a per-call
+// submit, allowed because the disabled path is free and the enabled path builds
+// at most this one closure). Bytes are NOT recorded here — they are sourced from
+// the transport's own byte counter by the periodic reporter, which sees every
+// byte the connection moves. Only ever called with a non-nil dispatcher (the
+// caller gates on it).
+func (c *ClientConn) recordCompleted(m *observe.Dispatcher[observe.MetricsSink], start time.Time) {
+	latency := time.Since(start)
+	name := c.name
+	m.Submit(func(s observe.MetricsSink) {
+		s.ObserveLatency(observe.MetricRPCLatency, latency, observe.Label{Key: labelPlugin, Value: name})
+	})
+}
+
+// recordAbandoned records a call abandoned locally before a terminal result:
+// its latency, plus a timeout or cancellation counter chosen from waitErr. Both
+// are low-rate per-event signals. Only ever called with a non-nil dispatcher.
+func (c *ClientConn) recordAbandoned(m *observe.Dispatcher[observe.MetricsSink], start time.Time, waitErr error) {
+	latency := time.Since(start)
+	name := c.name
+	metric := observe.MetricCancellation
+	if errors.Is(waitErr, context.DeadlineExceeded) {
+		metric = observe.MetricTimeout
+	}
+	m.Submit(func(s observe.MetricsSink) {
+		s.ObserveLatency(observe.MetricRPCLatency, latency, observe.Label{Key: labelPlugin, Value: name})
+		s.IncrCounter(metric, 1, observe.Label{Key: labelPlugin, Value: name})
+	})
+}
+
+// runMetricsReporter is the per-plugin cold reporter goroutine: at each interval
+// it sources the throughput and shared-memory gauges from the live transport's
+// own counting capabilities — bytes moved as a counter delta, and (when the
+// transport exposes them) arena occupancy, ring depth, and eventfd wakeup rate as
+// gauges. The uds transport exposes only byte counting, so over uds only bytes
+// moved is emitted; the shared-memory-only gauges have no uds source and no value
+// is fabricated for them. It returns when ctx is done.
+func (c *ClientConn) runMetricsReporter(
+	ctx context.Context, m *observe.Dispatcher[observe.MetricsSink], interval time.Duration,
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// The byte and wakeup baselines are keyed to the transport IDENTITY, not to the
+	// magnitude of its counters: on a restart or hot-reload the live transport is
+	// replaced by a fresh instance whose counters start from zero. Inferring that
+	// reset from "the new count is lower than the baseline" undercounts when a fast
+	// successor moves at least the predecessor's baseline before the next tick — the
+	// counters look monotonic across an unrelated pair. Resetting the baselines the
+	// instant the transport pointer changes counts the new generation from zero, so a
+	// fast restart can never alias the predecessor's counter.
+	var lastTr transport.Transport
+	var lastBytes uint64
+	var lastEdges uint64
+	var lastWakeups uint64
+	var haveWakeups bool
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// The capability reads run under the read side of trReleaseMu so a
+			// concurrent connection-generation release (releaseTransportGuarded) cannot
+			// unmap the region mid-read: it waits for this tick's reads to finish.
+			c.trReleaseMu.RLock()
+			tr := c.liveTransport()
+			if tr == nil {
+				c.trReleaseMu.RUnlock()
+
+				continue
+			}
+			if tr != lastTr {
+				// A new connection generation: reset the baselines to this transport's
+				// zero start so the first delta counts the new generation, not a
+				// difference against the predecessor's unrelated counter.
+				lastTr, lastBytes, lastEdges, lastWakeups, haveWakeups = tr, 0, 0, 0, false
+			}
+			lastBytes = c.reportBytesMoved(m, tr, lastBytes)
+			lastEdges = c.reportBackpressureEdges(m, tr, lastEdges)
+			c.reportArenaOccupancy(m, tr)
+			c.reportRingDepth(m, tr)
+			lastWakeups, haveWakeups = c.reportWakeupRate(m, tr, lastWakeups, haveWakeups, interval)
+			c.trReleaseMu.RUnlock()
+		}
+	}
+}
+
+// reportBackpressureEdges submits the counter delta of transitions into transport
+// backpressure since lastEdges, and returns the new baseline. A zero delta submits
+// nothing. Only the shared-memory transport exposes the capability (the uds
+// transport blocks rather than rejecting), so nothing is reported over uds. The
+// baseline is keyed to the transport identity by the caller (it passes lastEdges ==
+// 0 for a fresh transport, so a new connection generation counts from zero); the
+// below-baseline check is only a belt-and-braces guard against a same-instance
+// counter decrease, which never happens for a monotonic counter.
+func (c *ClientConn) reportBackpressureEdges(
+	m *observe.Dispatcher[observe.MetricsSink], tr transport.Transport, lastEdges uint64,
+) uint64 {
+	ec, ok := tr.(transport.BackpressureEdgeCounter)
+	if !ok {
+		return lastEdges
+	}
+
+	cur := ec.BackpressureEdges()
+	delta := cur
+	if cur >= lastEdges {
+		delta = cur - lastEdges
+	}
+	if delta == 0 {
+		return cur
+	}
+
+	name := c.name
+	m.Submit(func(s observe.MetricsSink) {
+		//nolint:gosec // cumulative edge count; a per-interval delta never overflows int64.
+		s.IncrCounter(observe.MetricBackpressureEvent, int64(delta), observe.Label{Key: labelPlugin, Value: name})
+	})
+
+	return cur
+}
+
+// liveTransport returns the live connection generation's transport, or nil when
+// no instance is currently wired (between restarts).
+func (c *ClientConn) liveTransport() transport.Transport {
+	state := c.state.Load()
+	if state == nil {
+		return nil
+	}
+
+	return state.tr
+}
+
+// reportBytesMoved submits the counter delta of total wire bytes the transport
+// has moved (sent plus received) since lastBytes, and returns the new baseline. A
+// zero delta submits nothing. A generation change is handled by the caller keying
+// the baseline to the transport identity (it passes lastBytes == 0 for a fresh
+// transport); the below-baseline check here is only a belt-and-braces guard against
+// a same-instance counter decrease, which never happens for a monotonic counter.
+// The transport is the authoritative byte source, so this includes streaming
+// traffic and requests that timed out or were canceled, not only calls that ran to
+// a normal completion.
+func (c *ClientConn) reportBytesMoved(
+	m *observe.Dispatcher[observe.MetricsSink], tr transport.Transport, lastBytes uint64,
+) uint64 {
+	bc, ok := tr.(transport.ByteCounter)
+	if !ok {
+		return lastBytes
+	}
+
+	cur := bc.BytesSent() + bc.BytesReceived()
+	delta := cur
+	if cur >= lastBytes {
+		delta = cur - lastBytes
+	}
+	if delta == 0 {
+		return cur
+	}
+
+	name := c.name
+	m.Submit(func(s observe.MetricsSink) {
+		//nolint:gosec // cumulative wire bytes; a per-interval delta never overflows int64.
+		s.IncrCounter(observe.MetricBytesMoved, int64(delta), observe.Label{Key: labelPlugin, Value: name})
+	})
+
+	return cur
+}
+
+// reportArenaOccupancy reports the live transport's arena occupancy as a gauge
+// when the transport exposes it. The uds transport does not, so nothing is
+// reported over it — no value is fabricated.
+func (c *ClientConn) reportArenaOccupancy(m *observe.Dispatcher[observe.MetricsSink], tr transport.Transport) {
+	ar, ok := tr.(transport.ArenaOccupancyReporter)
+	if !ok {
+		return
+	}
+
+	occ := float64(ar.ArenaOccupancyBytes())
+	name := c.name
+	m.Submit(func(s observe.MetricsSink) {
+		s.SetGauge(observe.MetricArenaUtilization, occ, observe.Label{Key: labelPlugin, Value: name})
+	})
+}
+
+// reportRingDepth reports the live transport's ring depth as a gauge when the
+// transport exposes it. The uds transport has no ring, so nothing is reported
+// over it — no value is fabricated.
+func (c *ClientConn) reportRingDepth(m *observe.Dispatcher[observe.MetricsSink], tr transport.Transport) {
+	rd, ok := tr.(transport.RingDepthReporter)
+	if !ok {
+		return
+	}
+
+	depth := float64(rd.RingDepth())
+	name := c.name
+	m.Submit(func(s observe.MetricsSink) {
+		s.SetGauge(observe.MetricRingDepth, depth, observe.Label{Key: labelPlugin, Value: name})
+	})
+}
+
+// reportWakeupRate reports the live transport's eventfd wakeup rate as a gauge:
+// the per-interval delta of the cumulative wakeup-syscall count, divided by the
+// interval, in wakeups per second. The uds transport wakes no peer with eventfd
+// and omits the capability, so nothing is reported over it. It returns the new
+// cumulative baseline and whether one is now held (false on the first tick, which
+// establishes the baseline and emits nothing). A count below the baseline is a
+// transport reset and re-establishes the baseline without emitting.
+func (c *ClientConn) reportWakeupRate(
+	m *observe.Dispatcher[observe.MetricsSink], tr transport.Transport,
+	lastWakeups uint64, have bool, interval time.Duration,
+) (uint64, bool) {
+	wc, ok := tr.(transport.WakeupSyscallCounter)
+	if !ok {
+		return lastWakeups, have
+	}
+
+	cur := wc.WakeupSyscalls()
+	if !have || cur < lastWakeups {
+		return cur, true // establish (or re-establish after a reset) the baseline.
+	}
+
+	rate := float64(cur-lastWakeups) / interval.Seconds()
+	name := c.name
+	m.Submit(func(s observe.MetricsSink) {
+		s.SetGauge(observe.MetricWakeupSyscalls, rate, observe.Label{Key: labelPlugin, Value: name})
+	})
+
+	return cur, true
+}
+
+// runMetricsReporter is the plugin-side cold reporter goroutine. It reports the
+// shared-memory gauges the live transport exposes — arena occupancy, ring depth,
+// and eventfd wakeup rate — each as a gauge. The uds serve-path transport exposes
+// none of them, so nothing is reported over it (no value is fabricated). The
+// plugin has no name of its own, so plugin-side signals carry no plugin label. It
+// returns when ctx is done. Only started when s.metrics is non-nil.
+func (s *PluginServer) runMetricsReporter(ctx context.Context, tr transport.Transport) {
+	ticker := time.NewTicker(s.metricsInterval)
+	defer ticker.Stop()
+
+	ar, haveArena := tr.(transport.ArenaOccupancyReporter)
+	rd, haveRing := tr.(transport.RingDepthReporter)
+	ec, haveEdges := tr.(transport.BackpressureEdgeCounter)
+	wc, haveWakeups := tr.(transport.WakeupSyscallCounter)
+	var lastEdges uint64
+	var lastWakeups uint64
+	var haveBaseline bool
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if haveArena {
+				occ := float64(ar.ArenaOccupancyBytes())
+				s.metrics.Submit(func(sink observe.MetricsSink) { sink.SetGauge(observe.MetricArenaUtilization, occ) })
+			}
+			if haveRing {
+				depth := float64(rd.RingDepth())
+				s.metrics.Submit(func(sink observe.MetricsSink) { sink.SetGauge(observe.MetricRingDepth, depth) })
+			}
+			if haveEdges {
+				cur := ec.BackpressureEdges()
+				if delta := cur - lastEdges; cur >= lastEdges && delta != 0 {
+					lastEdges = cur
+					//nolint:gosec // cumulative edge count; a per-interval delta never overflows int64.
+					s.metrics.Submit(func(sink observe.MetricsSink) {
+						sink.IncrCounter(observe.MetricBackpressureEvent, int64(delta))
+					})
+				} else {
+					lastEdges = cur // establish or re-establish (after a reset) the baseline.
+				}
+			}
+			if haveWakeups {
+				cur := wc.WakeupSyscalls()
+				if !haveBaseline || cur < lastWakeups {
+					lastWakeups, haveBaseline = cur, true
+
+					continue
+				}
+				rate := float64(cur-lastWakeups) / s.metricsInterval.Seconds()
+				lastWakeups = cur
+				s.metrics.Submit(func(sink observe.MetricsSink) { sink.SetGauge(observe.MetricWakeupSyscalls, rate) })
+			}
+		}
+	}
+}
+
+// restartHook returns the supervisor's restart-decision observability callback for
+// the named plugin, or nil when no sink is configured (so the supervisor's own nil
+// check skips it). The callback runs on the supervisor Run goroutine at the
+// authoritative restart-decision site — counted exactly once per decision, never
+// derived from the drop-oldest lifecycle event stream — and only submits.
+func (h *Host) restartHook(name string) func() {
+	if h.metricsDisp == nil {
+		return nil
+	}
+
+	return func() {
+		h.metricsDisp.Submit(func(s observe.MetricsSink) {
+			s.IncrCounter(observe.MetricRestart, 1, observe.Label{Key: labelPlugin, Value: name})
+		})
+	}
+}
+
+// heartbeatMissHook returns the supervisor's per-miss observability callback for
+// the named plugin, or nil when no sink is configured (so the supervisor's own
+// nil check skips it). The callback runs on the heartbeat loop, a cold path, and
+// only submits — it never blocks.
+func (h *Host) heartbeatMissHook(name string) func() {
+	if h.metricsDisp == nil {
+		return nil
+	}
+
+	return func() {
+		h.metricsDisp.Submit(func(s observe.MetricsSink) {
+			s.IncrCounter(observe.MetricHeartbeatMiss, 1, observe.Label{Key: labelPlugin, Value: name})
+		})
+	}
+}
+
+// logEvent routes a supervisor lifecycle transition to the host logger — Styx's
+// structured internal-diagnostics seam — through the panic-isolated log
+// dispatcher, so a slow or panicking user Logger can neither stall the event
+// relay (and the GaveUp delivery it drives) nor crash the process. It is a no-op
+// when no logger is configured (logDisp nil).
+func (h *Host) logEvent(name string, ev supervisor.Event) {
+	if h.logDisp == nil {
+		return
+	}
+
+	kind := ev.Kind
+	err := ev.Err
+	h.logDisp.Submit(func(l observe.Logger) {
+		kv := []any{labelPlugin, name}
+		switch kind {
+		case supervisor.EventRestarting:
+			l.Info("styx: plugin restarting", kv...)
+		case supervisor.EventUnhealthy:
+			l.Warn("styx: plugin unhealthy", append(kv, "err", err)...)
+		case supervisor.EventCrashed:
+			l.Error("styx: plugin crashed", err, kv...)
+		case supervisor.EventGaveUp:
+			l.Error("styx: plugin gave up", err, kv...)
+		case supervisor.EventStarting, supervisor.EventReady:
+			// No diagnostic for the routine, healthy transitions.
+		}
+	})
+}

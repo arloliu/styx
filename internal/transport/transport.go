@@ -286,6 +286,81 @@ type ArenaOccupancyReporter interface {
 	ArenaOccupancyBytes() uint64
 }
 
+// ByteCounter is an optional Transport capability exposing the cumulative wire
+// bytes this transport has moved, counted at the same Send/Recv chokepoint as
+// FrameCounter's frames — header plus body, advanced only once a frame is fully
+// sent or received. It is the authoritative byte-throughput source: because it
+// counts at the transport, it sees every byte on the connection — streaming
+// traffic and requests that the caller later abandoned to a timeout or cancel
+// alike — not only the bytes of calls that ran to a normal completion.
+//
+// The counts are cumulative and monotonic within one transport instance; a
+// reader compares two samples and treats a decrease (a fresh transport after a
+// restart, counting from zero) as a reset. A transport that cannot report bytes
+// omits the capability.
+type ByteCounter interface {
+	// BytesSent reports the cumulative wire bytes fully sent on this transport.
+	BytesSent() uint64
+	// BytesReceived reports the cumulative wire bytes fully received on this transport.
+	BytesReceived() uint64
+}
+
+// RingDepthReporter is an optional Transport capability reporting the
+// shared-memory ring's currently-occupied descriptor count, the source for the
+// ring-depth gauge. Only the shared-memory transport has a ring; the uds
+// transport omits the capability, so the periodic reporter emits no ring-depth
+// value over uds rather than fabricating one.
+type RingDepthReporter interface {
+	// RingDepth reports the ring's occupied-descriptor count as a cheap snapshot
+	// (no locks on a hot path, no syscalls): the periodic reporter reads it on a
+	// cold path but it must never contend with the data path.
+	RingDepth() uint64
+}
+
+// BackpressureEdgeCounter is an optional Transport capability exposing the
+// cumulative count of TRANSITIONS into data-lane backpressure rejection — each
+// edge where a transport that was admitting data frames starts rejecting them
+// because its bounded submission queue is full (the shared-memory reject-mode
+// condition; docs/specs/2026-07-16-styx-design.md, flow control). It counts
+// transitions, not rejected frames: a run of
+// consecutive rejections is one edge, and the next admitted frame re-arms the
+// edge so the following rejection registers a fresh transition.
+//
+// The count is maintained where the admission decision is made, under the same
+// synchronization that decides admission, so the transition is ordered
+// structurally rather than by scheduler timing: a concurrent admitter can neither
+// double-count one episode nor let a stale admission split a rejection run. This
+// is why the count lives on the transport and not on a caller that classifies
+// after Send returns — a caller has no lock that orders it with the admission
+// decision, so it cannot count edges correctly.
+//
+// Only the shared-memory transport can reject; the uds transport
+// blocks until space frees and never rejects, so it omits the capability and the
+// periodic reporter emits no backpressure value over it. The count is cumulative
+// and monotonic within one transport instance; a reader compares two samples and
+// treats a decrease (a fresh transport after a restart, counting from zero) as a
+// reset — so a new connection generation starts at zero with no cross-generation
+// carryover.
+type BackpressureEdgeCounter interface {
+	// BackpressureEdges reports the cumulative count of transitions into reject-mode
+	// data-lane backpressure as a cheap snapshot. It is cumulative and monotonic
+	// within one transport instance.
+	BackpressureEdges() uint64
+}
+
+// WakeupSyscallCounter is an optional Transport capability exposing the
+// cumulative count of eventfd wakeup syscalls this transport has performed, the
+// source for the wakeup-rate gauge (the periodic reporter divides the per-interval
+// delta by the interval to publish a per-second rate). Only the shared-memory
+// transport wakes a peer with eventfd; the uds transport omits the capability, so
+// the reporter emits no wakeup value over uds rather than fabricating one.
+type WakeupSyscallCounter interface {
+	// WakeupSyscalls reports the cumulative eventfd wakeup syscall count as a cheap
+	// snapshot. It is cumulative and monotonic within one transport instance; the
+	// reporter compares two samples and treats a decrease as a reset.
+	WakeupSyscalls() uint64
+}
+
 // checkImplementedKind returns nil for the nine kinds Send/Recv carry
 // (FrameUnaryReq, FrameUnaryResp, FrameCancel, FrameUnaryErr, and the five
 // Stream* kinds) and ErrUnimplementedFrameKind for any other out-of-range byte

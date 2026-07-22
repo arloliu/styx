@@ -184,6 +184,31 @@ type writer struct {
 	closeMu  sync.RWMutex
 	closed   bool
 	stopOnce sync.Once
+
+	// edgeMu orders the reject-mode data-lane admission decision with the
+	// backpressure-edge update, so the transition into rejection is counted
+	// structurally and not by scheduler timing. A reject-mode data enqueue holds
+	// it across the non-blocking admission select and, in the same critical
+	// section, updates edgeActive: the whole classify-and-update is indivisible and
+	// applies in lock-acquisition order — which, because the admission decision
+	// itself is made under the lock, IS the admission order. A stale admission can
+	// therefore never split a rejection run. The select never blocks (it has a
+	// default), so the critical section is bounded: a non-blocking channel attempt
+	// plus whatever conditional state update its outcome requires; concurrent
+	// reject-mode admitters serialize on the lock. run — which drains the queue and
+	// takes no part in edgeMu — cannot deadlock against it. Block mode and the
+	// lifecycle lane never reject, so they never take edgeMu and edgeCount stays
+	// zero for them.
+	edgeMu     sync.Mutex
+	edgeActive bool
+	edgeCount  atomic.Uint64
+
+	// edgeHook, nil in every production build, fires inside the edgeMu critical
+	// section after the edge update so a test can park an admission decision
+	// mid-transition and prove a concurrent admitter's edge update is ordered
+	// behind it. It is set before any concurrent submit and never in production, so
+	// the guarded call is a no-op that leaves enqueue's control flow unchanged.
+	edgeHook func()
 }
 
 // newWriter builds a writer over an already-attached ring and arena. dataDepth
@@ -378,15 +403,33 @@ func (w *writer) enqueue(ctx context.Context, i intent, l lane) error {
 	// Reject mode applies only to the data lane (design §19). The lifecycle lane
 	// never rejects: losing a CANCEL is worse than briefly blocking, and its ring
 	// budget is sized so it does not fill (shm-abi.md §18).
+	//
+	// The admission decision and the backpressure-edge update share edgeMu: the
+	// select is made under the lock and the edge is updated before it is released,
+	// so the transition into rejection is ordered by the admission decision itself,
+	// not by scheduler timing (see edgeMu's doc). The select never blocks, so
+	// holding the lock across it is bounded.
 	if l == laneData && w.mode == admitReject {
+		w.edgeMu.Lock()
+		defer w.edgeMu.Unlock()
+
 		select {
 		case q <- i:
+			w.edgeActive = false // an admitted frame clears the edge.
+			w.runEdgeHook()
+
 			return nil
 		case <-ctx.Done():
-			return ctx.Err()
+			return ctx.Err() // caller abandon: neither an admission nor a rejection.
 		case <-w.shutdown:
 			return transport.ErrClosed
 		default:
+			if !w.edgeActive {
+				w.edgeActive = true
+				w.edgeCount.Add(1) // count the transition into backpressure.
+			}
+			w.runEdgeHook()
+
 			return ErrBackpressure
 		}
 	}
@@ -398,6 +441,22 @@ func (w *writer) enqueue(ctx context.Context, i intent, l lane) error {
 		return ctx.Err()
 	case <-w.shutdown:
 		return transport.ErrClosed
+	}
+}
+
+// backpressureEdges reports the cumulative count of transitions into reject-mode
+// data-lane backpressure (transport.BackpressureEdgeCounter). It is read lock-free
+// via the atomic; the count is only ever advanced under edgeMu, where the
+// admission decision that produces a transition is made.
+func (w *writer) backpressureEdges() uint64 {
+	return w.edgeCount.Load()
+}
+
+// runEdgeHook fires the test-only edge-ordering observation hook while edgeMu is
+// held. It is nil in every production build, so this is a no-op there.
+func (w *writer) runEdgeHook() {
+	if w.edgeHook != nil {
+		w.edgeHook()
 	}
 }
 

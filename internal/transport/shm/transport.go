@@ -188,9 +188,20 @@ type Transport struct {
 }
 
 var (
-	_ transport.Transport     = (*Transport)(nil)
-	_ transport.WriterStopper = (*Transport)(nil)
+	_ transport.Transport               = (*Transport)(nil)
+	_ transport.WriterStopper           = (*Transport)(nil)
+	_ transport.BackpressureEdgeCounter = (*Transport)(nil)
 )
+
+// BackpressureEdges reports the cumulative count of transitions into reject-mode
+// data-lane backpressure this transport's writer has taken
+// (transport.BackpressureEdgeCounter). It is zero unless the writer runs in
+// reject mode (docs/specs/2026-07-16-styx-design.md, flow control); production
+// admission blocks, so a production writer reports zero until reject mode is
+// negotiated. The periodic reporter samples it as a counter delta.
+func (t *Transport) BackpressureEdges() uint64 {
+	return t.outbound.backpressureEdges()
+}
 
 // producerSignal runs the §12 producer signal after each publish: it wakes a
 // parked consumer via the outbound eventfd, unless the region is poisoned or
