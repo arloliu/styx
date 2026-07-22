@@ -221,8 +221,17 @@ func TestStream_ACKOwedCancel_ClosesObligationAtCancelHandoff(t *testing.T) {
 	// instead of sending it now.
 	mapCancelToTerminal(s, ErrCanceledLocally)
 	require.Equal(t, tokenCancelOwed, s.token.Load())
+
+	// The terminal also handed the droppable data-lane STREAM_ERR to the connection
+	// emitter. Wait until the emitter has DELIVERED it, then assert the obligation is
+	// still open: the STREAM_ERR is the pair's droppable frame, so its delivery must
+	// not close the obligation while the load-bearing CANCEL is still parked behind
+	// the ack — only the CANCEL's handoff may. (An emitter delivery that closed the
+	// obligation here is exactly the stalled-teardown blindness this pins.)
+	require.Eventually(t, func() bool { return rt.countOfKind(transport.FrameStreamErr) == 1 },
+		time.Second, time.Millisecond, "the emitter delivers the teardown STREAM_ERR")
 	require.True(t, obl.isOpen(callID),
-		"the obligation stays open while the owed CANCEL is still parked behind the ack")
+		"the obligation stays open after the STREAM_ERR delivery while the owed CANCEL is still parked")
 
 	// Resolve the ack: releaseAckToken submits the owed CANCEL and closes the obligation.
 	s.releaseAckToken(0, true)

@@ -128,6 +128,15 @@ type emitJob struct {
 	callID uint64
 	status *transport.FrameStatus
 	reject bool
+	// keepObligation marks a teardown STREAM_ERR whose stream still owes its
+	// load-bearing terminal CANCEL to an outstanding STREAM_ACK holder: the
+	// STREAM_ERR is the pair's droppable frame (§9 tolerates its loss because the
+	// CANCEL carries the outcome), so its delivery must NOT close the response
+	// obligation — that close belongs solely to the CANCEL's handoff in
+	// releaseAckToken. Without this, the emitter racing the parked ack could close
+	// the obligation while the load-bearing teardown is still stuck, hiding
+	// exactly the stalled teardown the obligation accounting exists to expose.
+	keepObligation bool
 }
 
 // obligationSink opens a call's response obligation when its stream is admitted and
@@ -565,8 +574,12 @@ func (t *StreamTable) runEmitter() {
 			// A handler that returned while this send was parked kept the obligation
 			// open until here, which is what makes a stuck terminal emission
 			// dispatch-wedged. Idempotent and keyed, so a rejection (no obligation) or a
-			// terminal already closed synchronously is a no-op.
-			t.closeObligation(job.callID)
+			// terminal already closed synchronously is a no-op. A job whose stream still
+			// owes its terminal CANCEL to an ack holder keeps the obligation open —
+			// releaseAckToken closes it at that CANCEL's handoff (see emitJob).
+			if !job.keepObligation {
+				t.closeObligation(job.callID)
+			}
 		case <-t.stopCh:
 			return
 		}
@@ -584,6 +597,15 @@ func (t *StreamTable) runEmitter() {
 // close it after the Send) from a dropped one (the caller must close it now).
 func (t *StreamTable) emitStreamErr(callID uint64, status *transport.FrameStatus, reject bool) bool {
 	return t.enqueueEmit(emitJob{callID: callID, status: status, reject: reject})
+}
+
+// emitTeardownErrKeepObligation enqueues a teardown STREAM_ERR for a stream whose
+// terminal CANCEL is owed to an outstanding STREAM_ACK holder: the frame is emitted
+// exactly like emitStreamErr's teardown class, but its delivery does not close the
+// response obligation — releaseAckToken closes it when the owed CANCEL reaches the
+// transport (see emitJob.keepObligation).
+func (t *StreamTable) emitTeardownErrKeepObligation(callID uint64, status *transport.FrameStatus) {
+	t.enqueueEmit(emitJob{callID: callID, status: status, keepObligation: true})
 }
 
 // emitOwedTeardownErr enqueues the data-lane STREAM_ERR that terminates a peer

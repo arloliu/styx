@@ -1345,7 +1345,10 @@ func (s *Stream) finishTerminal(oc StreamOutcome, locallyInitiated, fromSubmitte
 		}
 		switch {
 		case locallyInitiated:
-			s.emitTeardownErr() // data-lane STREAM_ERR, handed off; the winner MUST NOT wait on it (§7.1)
+			// data-lane STREAM_ERR, handed off; the winner MUST NOT wait on it (§7.1).
+			// With the CANCEL owed to an ack holder, the emitted frame keeps the
+			// obligation open — only the CANCEL's handoff closes it.
+			s.emitTeardownErr(deferObligationToAck)
 		case s.handlerErrStatus != nil:
 			// A handler-error termination (§9.1 step 4): emit a single data-lane
 			// STREAM_ERR carrying the handler's full status through the connection's one
@@ -1423,8 +1426,17 @@ func (s *Stream) sendTeardownCancel() {
 // STREAM_ERR never loses the outcome. This engine emits only teardown-class
 // STREAM_ERRs (rejection emissions are the connection wiring's concern), so no
 // rejection reserve is needed here.
-func (s *Stream) emitTeardownErr() {
-	s.tbl.emitStreamErr(s.callID, &transport.FrameStatus{Code: s.teardownCode.Load()}, false)
+func (s *Stream) emitTeardownErr(keepObligation bool) {
+	status := &transport.FrameStatus{Code: s.teardownCode.Load()}
+	if keepObligation {
+		// The terminal CANCEL is owed to an outstanding ack holder, so this droppable
+		// STREAM_ERR must not close the response obligation — releaseAckToken does,
+		// at the CANCEL's actual transport handoff.
+		s.tbl.emitTeardownErrKeepObligation(s.callID, status)
+
+		return
+	}
+	s.tbl.emitStreamErr(s.callID, status, false)
 }
 
 // emitOwedTeardownErr hands the ambiguous-open teardown's data-lane STREAM_ERR to the

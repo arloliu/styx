@@ -1362,7 +1362,7 @@ func TestStreamTable_Emitter_CapacityAndOverflowDrop(t *testing.T) {
 	s.teardownCode.Store(StatusCodeStreamCanceled)
 
 	// The emitter pops the first job and parks in its blocked Send, emptying emitCh.
-	s.emitTeardownErr()
+	s.emitTeardownErr(false)
 	select {
 	case <-et.entered:
 	case <-time.After(time.Second):
@@ -1372,12 +1372,12 @@ func TestStreamTable_Emitter_CapacityAndOverflowDrop(t *testing.T) {
 	// Fill the buffer to capacity: all nine fit (teardown emissions are never held
 	// to the rejection reserve).
 	for range 9 {
-		s.emitTeardownErr()
+		s.emitTeardownErr(false)
 	}
 	// The queue is full; every further enqueue MUST drop without blocking. If it
 	// blocked, this loop would hang and the test would time out.
 	for range 3 {
-		s.emitTeardownErr()
+		s.emitTeardownErr(false)
 	}
 
 	close(et.release) // the emitter drains the one in-flight plus the nine buffered
@@ -1743,7 +1743,7 @@ func TestEmitOwedOpenTeardown_ErrDroppedUnderSaturation_FailsConnection(t *testi
 	filler.teardownCode.Store(StatusCodeStreamCanceled)
 
 	// The emitter pops the first job and parks in its blocked Send, emptying emitCh.
-	filler.emitTeardownErr()
+	filler.emitTeardownErr(false)
 	select {
 	case <-gt.entered:
 	case <-time.After(3 * time.Second):
@@ -1752,7 +1752,7 @@ func TestEmitOwedOpenTeardown_ErrDroppedUnderSaturation_FailsConnection(t *testi
 	// Fill the queue to capacity with teardown-class jobs (admitted whenever not full),
 	// so the next data-lane STREAM_ERR provably cannot be admitted.
 	for range cap(tbl.emitCh) {
-		filler.emitTeardownErr()
+		filler.emitTeardownErr(false)
 	}
 
 	// Given: an ambiguous-open stream — SUBMITTED, its OPEN queued on the data lane —
@@ -1816,7 +1816,7 @@ func TestStreamTable_OrdinaryTeardown_OwedTeardownDrop_DoesNotRecordFatal(t *tes
 	filler.teardownCode.Store(StatusCodeStreamCanceled)
 
 	// The emitter pops the first job and parks in its blocked Send, emptying emitCh.
-	filler.emitTeardownErr()
+	filler.emitTeardownErr(false)
 	select {
 	case <-gt.entered:
 	case <-time.After(3 * time.Second):
@@ -1824,7 +1824,7 @@ func TestStreamTable_OrdinaryTeardown_OwedTeardownDrop_DoesNotRecordFatal(t *tes
 	}
 	// Fill the queue to capacity, so the next data-lane STREAM_ERR cannot be admitted.
 	for range cap(tbl.emitCh) {
-		filler.emitTeardownErr()
+		filler.emitTeardownErr(false)
 	}
 
 	// When: an owed-teardown STREAM_ERR is dropped in the teardown window — closed
