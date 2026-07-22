@@ -987,6 +987,12 @@ func (s *Stream) CloseSend(ctx context.Context, payload []byte) error {
 	s.sendClosed.Store(true)
 	s.notifySend() // wake a credit-parked sender; it fails per §6.4
 
+	// The server's terminal output (this STREAM_CLOSE) is on the wire: no response is
+	// owed on this stream anymore, so its obligation closes now rather than at full
+	// terminal, which a bidi stream reaches only once the peer also closes. That keeps
+	// a half-closed bidi awaiting a slow peer from being read as a stuck dispatch.
+	s.tbl.closeObligation(s.callID)
+
 	if s.bothClosed() {
 		s.terminate(StreamOutcome{Code: OutcomeCompleted}, 0, false, streamSubmitted, streamPublished)
 	}
@@ -1314,10 +1320,28 @@ func (s *Stream) finishTerminal(oc StreamOutcome, locallyInitiated, fromSubmitte
 	// OPEN it already sent, so the CANCEL can never precede the OPEN. An accept-side
 	// stream is always PUBLISHED before its handler runs, so this branch never
 	// suppresses a handler-error STREAM_ERR.
+	// deferObligationToEmitter is set only when this stream's SOLE terminal frame is
+	// a handler-error STREAM_ERR the emitter admitted: the emitter then closes the
+	// response obligation once that frame reaches the transport, so a handler that
+	// returned while the emission is stuck stays counted as owing a response.
+	// deferObligationToAck is set when the load-bearing terminal CANCEL is owed to an
+	// outstanding STREAM_ACK holder: the CANCEL reaches the transport only when the
+	// ack resolves (releaseAckToken), so the obligation closes there, not here — a
+	// parked ack keeps the owed teardown counted. Every other terminal has already
+	// handed its terminal output to the transport by the close below (the STREAM_CLOSE
+	// the server sent, or the sync teardown CANCEL), or owes nothing, so it closes the
+	// obligation here.
+	deferObligationToEmitter := false
+	deferObligationToAck := false
 	if !fromSubmitted {
 		if s.claimTerminalToken(locallyInitiated) {
 			// synchronous lifecycle submit — safe, the lifecycle lane can't be backpressured (§7.1)
 			s.sendTeardownCancel()
+		} else if locallyInitiated {
+			// claimTerminalToken handed the owed CANCEL to the outstanding ack holder
+			// (tokenCancelOwed); it reaches the transport only when releaseAckToken
+			// resolves the ack, which closes the obligation at that handoff.
+			deferObligationToAck = true
 		}
 		switch {
 		case locallyInitiated:
@@ -1327,8 +1351,12 @@ func (s *Stream) finishTerminal(oc StreamOutcome, locallyInitiated, fromSubmitte
 			// STREAM_ERR carrying the handler's full status through the connection's one
 			// emitter, and NO teardown CANCEL (a FAILED outcome has no step-1 pair,
 			// §7.1). The winner MUST NOT wait on the data-lane Send.
-			s.tbl.emitStreamErr(s.callID, s.handlerErrStatus, false)
+			deferObligationToEmitter = s.tbl.emitStreamErr(s.callID, s.handlerErrStatus, false)
 		}
+	}
+
+	if !deferObligationToEmitter && !deferObligationToAck {
+		s.tbl.closeObligation(s.callID)
 	}
 
 	s.outcome = oc
@@ -1450,6 +1478,11 @@ func (s *Stream) releaseAckToken(_ uint64, success bool) {
 	if s.token.Load() == tokenCancelOwed {
 		s.token.Store(tokenTerminal) // plain store: only this holder can leave CANCEL_OWED (§5.1)
 		s.sendTeardownCancel()
+		// The load-bearing terminal CANCEL has now reached the transport, so the
+		// response obligation finishTerminal deferred (deferObligationToAck) closes
+		// here. Idempotent, so the exactly-once close holds whether the winner sent the
+		// CANCEL itself or handed it off to this ack resolution.
+		s.tbl.closeObligation(s.callID)
 
 		return
 	}

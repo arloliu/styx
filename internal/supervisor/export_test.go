@@ -84,6 +84,16 @@ func (s *Supervisor) SetSpawnForTest(f FakeSpawn) {
 	}
 }
 
+// ErrWedged, ErrTransportWedged, and ErrDispatchWedged re-export the wedge
+// sentinels for supervisor_test (external test package) to assert which wedge
+// kind an EventUnhealthy carries. The two component sentinels wrap the base, so
+// errors.Is(err, ErrWedged) holds for either.
+var (
+	ErrWedged          = errWedged
+	ErrTransportWedged = errTransportWedged
+	ErrDispatchWedged  = errDispatchWedged
+)
+
 // HostOfferForTest re-exports hostOffer for supervisor_test (external test
 // package): the streaming-required negotiation flag is derived from
 // Config.RequireStreaming, exercised directly here without a real handshake.
@@ -97,6 +107,51 @@ func (s *Supervisor) HostOfferForTest() control.Offer {
 // process to observe what lifecycle.Spawn would have received.
 func (s *Supervisor) SpecForSpawnForTest(reloadSuccessor bool) lifecycle.Spec {
 	return s.specForSpawn(reloadSuccessor)
+}
+
+// WedgeTracker re-exports the per-instance wedge-persistence tracker for
+// wedge_tracker_test (external test package) to drive with scripted heartbeat
+// sequences, proving a wedge fires only after it has persisted for the whole window
+// on the sender's timebase and a recovering sequence never fires.
+type WedgeTracker struct{ t wedgeTracker }
+
+// NewWedgeTrackerForTest builds a tracker over window with the plugin's send cadence;
+// an adjacent Sequence increment proves at least MinHeartbeatSpacing of that cadence
+// in real sender time, and the tracker's span conversion divides by that minimum.
+func NewWedgeTrackerForTest(window, senderCadence time.Duration) *WedgeTracker {
+	return &WedgeTracker{t: newWedgeTracker(window, senderCadence)}
+}
+
+// Observe feeds one per-pair verdict carried by the heartbeat at sequence and
+// reports whether a wedge has now persisted for the whole window, and which kind.
+func (w *WedgeTracker) Observe(class HealthClass, kind WedgeKind, sequence uint64) (WedgeKind, bool) {
+	return w.t.observe(class, kind, sequence)
+}
+
+// Clear resets the tracker, as a serviced reload or a fresh generation does.
+func (w *WedgeTracker) Clear() { w.t.clear() }
+
+// WindowBeats reports the Sequence-increment span a continuous stall must reach before it
+// fires — ceil(window / MinHeartbeatSpacing(cadence)) — for wedge_tracker_test to pin the
+// window conversion directly.
+func (w *WedgeTracker) WindowBeats() uint64 { return w.t.windowBeats }
+
+// SetSenderCadenceForTest overrides the plugin send cadence the heartbeat loop uses to
+// convert the wedge window into a Sequence-increment span, so a wiring test that
+// compresses the peer's heartbeat cadence keys the tracker to that SAME compressed
+// value — proving the production coupling where sender cadence, not the host's
+// configurable liveness interval, sets the beat-to-time conversion. Production leaves
+// it at DefaultHeartbeatInterval. Must be called before Run.
+func (s *Supervisor) SetSenderCadenceForTest(d time.Duration) {
+	s.senderCadence = d
+}
+
+// SetSampleObserverForTest installs a host-side hook the heartbeat loop calls with
+// each heartbeat AFTER classifying it, so a wiring test can gate its progress on the
+// host having observed and classified a sample — not on the free-running peer merely
+// having built one. Production never installs it.
+func (s *Supervisor) SetSampleObserverForTest(f func(HeartbeatSample)) {
+	s.observeSampleForTest = f
 }
 
 // ReloadQueuedForTest reports whether a Reload request is currently buffered

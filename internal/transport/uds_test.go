@@ -127,6 +127,101 @@ func TestUDSTransport_Recv_RejectsUnimplementedFrameKind(t *testing.T) {
 	require.ErrorIs(t, err, transport.ErrUnimplementedFrameKind)
 }
 
+// Test the frame counters advancing once per successful Send and Recv, the
+// progress signal the supervisor's heartbeat classifier reads.
+func TestUDSTransport_FrameCounters_AdvanceOnSuccessfulSendRecv(t *testing.T) {
+	// Given
+	a, b := newTestTransportPair(t)
+	var fc transport.FrameCounter = a
+	require.Zero(t, fc.FramesSent())
+	require.Zero(t, fc.FramesReceived())
+	f := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: []byte("x")}
+
+	// When: a sends two frames, b receives them, then b replies once.
+	require.NoError(t, a.Send(t.Context(), f))
+	require.NoError(t, a.Send(t.Context(), f))
+	_, err := b.Recv(t.Context())
+	require.NoError(t, err)
+	_, err = b.Recv(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, b.Send(t.Context(), transport.Frame{CallID: 1, Kind: transport.FrameUnaryResp}))
+	_, err = a.Recv(t.Context())
+	require.NoError(t, err)
+
+	// Then: a produced two frames and consumed one; b consumed two and produced one.
+	require.Equal(t, uint64(2), a.FramesSent())
+	require.Equal(t, uint64(1), a.FramesReceived())
+	require.Equal(t, uint64(2), b.FramesReceived())
+	require.Equal(t, uint64(1), b.FramesSent())
+}
+
+// Test ReadableNow probing concurrently with a single reader's Recv being safe: the
+// non-consuming MSG_PEEK probe removes no bytes, so under -race a reader draining a
+// stream of frames while another goroutine hammers ReadableNow sees no data race and
+// loses no frame — every frame arrives intact and in order. This mirrors production,
+// where the plugin's heartbeat assembly probes ReadableNow on its own goroutine while
+// the serve loop runs Recv.
+func TestUDSTransport_ReadableNow_ConcurrentWithRecv_LosesNoFrame(t *testing.T) {
+	// Given: a will send a stream of frames with ascending call IDs; b reads them.
+	a, b := newTestTransportPair(t)
+	const frames = 200
+
+	var wg sync.WaitGroup
+
+	// Sender: one frame at a time, ascending call IDs.
+	wg.Go(func() {
+		for i := uint64(1); i <= frames; i++ {
+			f := transport.Frame{CallID: i, Kind: transport.FrameUnaryReq, Payload: []byte("payload")}
+			require.NoError(t, a.Send(t.Context(), f))
+		}
+	})
+
+	// Prober: hammers the non-consuming probe from a DIFFERENT goroutine than the
+	// reader, concurrent with its Recv, until the reader is done.
+	proberStop := make(chan struct{})
+	wg.Go(func() {
+		for {
+			select {
+			case <-proberStop:
+				return
+			default:
+				_ = b.ReadableNow()
+			}
+		}
+	})
+
+	// Reader: the single Recv goroutine. Every frame must arrive intact and in order,
+	// proving the concurrent probe stole nothing.
+	wg.Go(func() {
+		defer close(proberStop)
+		for i := uint64(1); i <= frames; i++ {
+			got, err := b.Recv(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, i, got.CallID, "frames must arrive intact and in order despite the concurrent probe")
+			require.Equal(t, []byte("payload"), got.Payload)
+		}
+	})
+
+	wg.Wait()
+	require.Equal(t, uint64(frames), b.FramesReceived())
+}
+
+// Test a rejected-before-write Send leaving the sent counter untouched — only a
+// frame that actually reached the wire counts as produced.
+func TestUDSTransport_FramesSent_UnchangedOnRejectedSend(t *testing.T) {
+	// Given
+	a, _ := newTestTransportPair(t)
+
+	// When: an oversized payload is rejected before any byte is written.
+	err := a.Send(t.Context(), transport.Frame{
+		CallID: 1, Kind: transport.FrameUnaryReq, Payload: make([]byte, transport.MaxFrameSize+1),
+	})
+
+	// Then
+	require.Error(t, err)
+	require.Zero(t, a.FramesSent())
+}
+
 // Test UDSTransport.Recv draining a rejected frame's declared payload so the
 // next Recv on the same connection still gets a clean frame, instead of
 // misreading the drained frame's payload bytes as the next frame's header.

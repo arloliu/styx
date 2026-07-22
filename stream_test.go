@@ -41,7 +41,19 @@ func startStreamPlugin(
 ) {
 	t.Helper()
 
-	srv := newStreamServer(pluginTr, handlers, codec.Proto{})
+	startStreamPluginWithLeases(t, pluginTr, handlers)
+}
+
+// startStreamPluginWithLeases is startStreamPlugin exposing the session lease
+// table, so a test can assert a streaming handler's response obligation opens at
+// publish and closes once its terminal frame reaches the transport.
+func startStreamPluginWithLeases(
+	t *testing.T, pluginTr transport.Transport, handlers map[streamKey]streamHandlerReg,
+) *rpcruntime.LeaseTable {
+	t.Helper()
+
+	leases := rpcruntime.NewLeaseTable()
+	srv := newStreamServer(pluginTr, handlers, codec.Proto{}, leases)
 	d := rpcruntime.NewDispatcher()
 	done := make(chan struct{})
 	go func() {
@@ -53,6 +65,8 @@ func startStreamPlugin(
 		<-done
 		srv.teardown(ErrPluginUnavailable)
 	})
+
+	return leases
 }
 
 // Test OpenStream completing a client-streaming round trip: the client sends a
@@ -99,6 +113,61 @@ func TestOpenStream_ClientStreamingRoundTrip_ThroughInProcessPair(t *testing.T) 
 	require.ErrorIs(t, err, io.EOF)
 
 	require.NoError(t, st.Err(), "the stream completed normally on both sides")
+}
+
+// Test a running streaming handler self-exempting from the unleased inflight_count:
+// while its handler runs it holds a lease, so its open response obligation is
+// excluded from the count (governed by the call's own deadline, not wedge
+// detection), and once the stream completes the lease is gone and no obligation
+// remains — the streaming half of the heartbeat's inflight_count.
+func TestStreamServer_RunningHandler_SelfExemptsFromUnleasedCount(t *testing.T) {
+	clientTr, pluginTr := newStreamingTransportPairForTest(t)
+
+	const service, method = "echo.Echo", "Collect"
+	running := make(chan struct{})
+	release := make(chan struct{})
+	handlers := map[streamKey]streamHandlerReg{
+		{service: fnv64a(service), method: fnv64a(method)}: {handler: func(st *Stream) error {
+			close(running)
+			<-release // hold the handler open so a snapshot sees the live lease
+			if _, eof := st.RecvMsg(context.Background()); !errors.Is(eof, io.EOF) {
+				return eof
+			}
+
+			return st.CloseSend(context.Background(), []byte("done"))
+		}},
+	}
+	leases := startStreamPluginWithLeases(t, pluginTr, handlers)
+
+	table := rpcruntime.NewTable(firstGeneration)
+	cc := newClientConn("p", table, clientTr, codec.Proto{})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	st, err := cc.OpenStream(ctx, service, method)
+	require.NoError(t, err)
+	require.NoError(t, st.CloseSend(ctx, nil)) // client half-closes immediately
+
+	// While the handler runs: it holds a lease, so its obligation is leased and does
+	// not count as an unleased owed response.
+	<-running
+	snap, unleased := leases.SnapshotWithObligations()
+	require.Len(t, snap, 1, "a running streaming handler holds a lease")
+	require.Zero(t, unleased, "a running handler's obligation is excluded from the unleased count")
+
+	// Let the handler complete; its STREAM_CLOSE carries the terminal output.
+	close(release)
+	resp, err := st.RecvMsg(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []byte("done"), resp)
+	_, err = st.RecvMsg(ctx)
+	require.ErrorIs(t, err, io.EOF)
+
+	// Once complete: the lease is released and the obligation is closed — nothing owed.
+	require.Eventually(t, func() bool {
+		s, obl := leases.SnapshotWithObligations()
+		return len(s) == 0 && obl == 0
+	}, 2*time.Second, 5*time.Millisecond, "the lease and obligation clear once the stream completes")
 }
 
 // Test the ID-accepting entry points (OpenStreamID / RegisterStreamHandlerID)

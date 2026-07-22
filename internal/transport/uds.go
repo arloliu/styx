@@ -37,7 +37,10 @@ const controlWordSize = 8
 // only between whole-Frame calls.
 const pollInterval = 50 * time.Millisecond
 
-var _ Transport = (*UDSTransport)(nil)
+var (
+	_ Transport    = (*UDSTransport)(nil)
+	_ FrameCounter = (*UDSTransport)(nil)
+)
 
 // peekSyscall is a seam over the non-blocking MSG_PEEK recv the drain probe uses,
 // so a test can inject a transient errno (EINTR) at the probe's own syscall;
@@ -67,6 +70,15 @@ type UDSTransport struct {
 	writeMu   sync.Mutex
 	closed    atomic.Bool
 	closeOnce sync.Once
+
+	// sentCount and recvCount are the cumulative frame-progress counters exposed
+	// via FrameCounter: each advances once per fully-completed Send/Recv, never on
+	// a rejected-before-write Send or a mid-frame abort. They are the plugin's
+	// heartbeat produce/consume counters and the host's own H2P produce reference
+	// (see FrameCounter's doc). A single atomic add on the already-syscall-bound
+	// Send/Recv path is negligible.
+	sentCount atomic.Uint64
+	recvCount atomic.Uint64
 }
 
 // headerLen is this connection's fixed wire-header length: 45 bytes when the
@@ -143,8 +155,21 @@ func (t *UDSTransport) Send(ctx context.Context, f Frame) error {
 			len(body), MaxFrameSize, ErrPayloadTooLarge)
 	}
 
-	return t.writeFrame(ctx, f, body)
+	if err := t.writeFrame(ctx, f, body); err != nil {
+		return err
+	}
+	t.sentCount.Add(1) // a frame that reached the wire in full: produce progress.
+
+	return nil
 }
+
+// FramesSent reports the cumulative count of frames fully written to the wire
+// (transport.FrameCounter). See the counter fields' and FrameCounter's docs.
+func (t *UDSTransport) FramesSent() uint64 { return t.sentCount.Load() }
+
+// FramesReceived reports the cumulative count of frames fully read off the wire
+// (transport.FrameCounter). See the counter fields' and FrameCounter's docs.
+func (t *UDSTransport) FramesReceived() uint64 { return t.recvCount.Load() }
 
 // AcceptanceUnknown reports whether a failed Send left the frame's acceptance
 // unknown (transport.AcceptanceClassifier). For SOCK_STREAM, acceptance is "a byte
@@ -248,11 +273,13 @@ func (t *UDSTransport) Recv(ctx context.Context) (Frame, error) {
 			return Frame{}, err
 		}
 		f.Status = status
+		t.recvCount.Add(1) // a fully-read frame: consume progress.
 
 		return f, nil
 	}
 
 	f.Payload = body
+	t.recvCount.Add(1) // a fully-read frame: consume progress.
 
 	return f, nil
 }
@@ -307,9 +334,13 @@ func (t *UDSTransport) abortFrame(err error, started bool) error {
 //     state — retried in the loop;
 //   - a closed transport or any other recv error: the next Recv surfaces it.
 //
-// It is called only from the single reader goroutine between its Recv calls, so it
-// never races Recv; a concurrent Send holds writeMu and only writes, so it never
-// races this read-side peek.
+// It is safe to call concurrently with a single reader's Recv, and from a different
+// goroutine than that reader (the plugin's heartbeat assembly probes it while the
+// serve loop runs Recv): the MSG_PEEK recv consumes nothing, so it removes no byte
+// the reader will read, and Recv reads exact frame bytes (io.ReadFull over the raw
+// fd, never an over-read into the next frame), so the peek and the reader never
+// contend for the same bytes. A concurrent Send holds writeMu and only writes, so it
+// never races this read-side peek either.
 func (t *UDSTransport) ReadableNow() bool {
 	if t.closed.Load() {
 		return true // the next Recv surfaces ErrClosed; never confirm drained off a closed probe

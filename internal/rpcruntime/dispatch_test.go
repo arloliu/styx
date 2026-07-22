@@ -22,6 +22,159 @@ func (h stubHandler) Handle(
 	return h.fn(ctx, methodID, payload)
 }
 
+// Test InflightCount reflecting an executing handler while it runs and dropping
+// back to zero once it returns — the in-flight accounting the CANCEL path relies
+// on. This is NOT the heartbeat's inflight_count (which is the response-obligation
+// count, tracked separately and outliving handler execution).
+func TestDispatcher_InflightCount_ReflectsExecutingHandler(t *testing.T) {
+	// Given: a handler that blocks until released, dispatched on its own goroutine.
+	d := rpcruntime.NewDispatcher()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	d.Register(7, stubHandler{fn: func(_ context.Context, _ uint64, _ []byte) ([]byte, *rpcruntime.Status, error) {
+		close(entered)
+		<-release
+		return []byte("ok"), nil, nil
+	}})
+	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
+	require.Zero(t, d.InflightCount())
+
+	// When: the handler is executing.
+	done := make(chan struct{})
+	go func() { defer close(done); d.Dispatch(t.Context(), req, time.Now()) }()
+	<-entered
+
+	// Then
+	require.Equal(t, uint64(1), d.InflightCount())
+
+	// When: the handler returns.
+	close(release)
+	<-done
+
+	// Then
+	require.Zero(t, d.InflightCount())
+}
+
+// Test a lease being held while a handler runs and released after it returns,
+// so the heartbeat's active-handler leases mark a genuinely-running handler.
+func TestDispatcher_LeaseTable_HeldWhileHandlerRuns(t *testing.T) {
+	// Given
+	d := rpcruntime.NewDispatcher()
+	lt := rpcruntime.NewLeaseTable()
+	d.SetLeaseTable(lt)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	d.Register(7, stubHandler{fn: func(_ context.Context, _ uint64, _ []byte) ([]byte, *rpcruntime.Status, error) {
+		close(entered)
+		<-release
+		return []byte("ok"), nil, nil
+	}})
+	req := transport.Frame{CallID: 42, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
+
+	// When: the handler is executing.
+	done := make(chan struct{})
+	go func() { defer close(done); d.Dispatch(t.Context(), req, time.Now()) }()
+	<-entered
+
+	// Then: a lease for this call is present.
+	snap := lt.Snapshot()
+	require.Len(t, snap, 1)
+	require.Equal(t, uint64(42), snap[0].CallID)
+
+	// When: the handler returns.
+	close(release)
+	<-done
+
+	// Then: the lease is released.
+	require.Empty(t, lt.Snapshot())
+}
+
+// Test a unary call's response obligation staying open after the handler returns
+// — until the serve loop publishes the response — so a response stuck in a
+// post-return send is still counted as owed. The serve loop opens the obligation at
+// consumption (modeled by OpenObligation) and closes it once the response is
+// published; the lease releases with the handler, the obligation does not.
+func TestDispatcher_Obligation_StaysOpenUntilResponsePublished(t *testing.T) {
+	// Given
+	d := rpcruntime.NewDispatcher()
+	lt := rpcruntime.NewLeaseTable()
+	d.SetLeaseTable(lt)
+	d.Register(7, stubHandler{fn: func(context.Context, uint64, []byte) ([]byte, *rpcruntime.Status, error) {
+		return []byte("ok"), nil, nil
+	}})
+	req := transport.Frame{CallID: 9, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
+
+	// When: the serve loop opens the obligation at consumption, then the handler runs
+	// to completion and Dispatch returns a response frame.
+	d.OpenObligation(9)
+	out := d.Dispatch(t.Context(), req, time.Now())
+	require.Len(t, out, 1, "a response is owed")
+
+	// Then: the lease is released, but the obligation is still open (and unleased) —
+	// the response has not been handed to the transport yet.
+	leases, obligations := lt.SnapshotWithObligations()
+	require.Empty(t, leases)
+	require.Equal(t, uint64(1), obligations)
+
+	// When: the serve loop publishes the response.
+	d.CloseObligation(9)
+
+	// Then
+	_, obligations = lt.SnapshotWithObligations()
+	require.Zero(t, obligations)
+}
+
+// Test an unknown-service unary carrying a response obligation for its owed
+// UNARY_ERR reply: the serve loop opens the obligation at consumption (before
+// dispatch), Dispatch returns the error frame without ever acquiring a lease, and the
+// obligation stays open (unleased) until the reply is published — so a stuck error
+// reply becomes a visible dispatch stall.
+func TestDispatcher_UnknownService_ObligationTrackedUntilReplyPublished(t *testing.T) {
+	// Given: nothing registered for service 7.
+	d := rpcruntime.NewDispatcher()
+	lt := rpcruntime.NewLeaseTable()
+	d.SetLeaseTable(lt)
+	req := transport.Frame{CallID: 5, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
+
+	// When: the serve loop opens the obligation at consumption, then dispatches.
+	d.OpenObligation(5)
+	out := d.Dispatch(t.Context(), req, time.Now())
+	require.Len(t, out, 1)
+	require.Equal(t, transport.FrameUnaryErr, out[0].Kind, "an unknown service owes a UNARY_ERR reply")
+
+	// Then: no lease was ever acquired, and the obligation is open and unleased.
+	leases, unleased := lt.SnapshotWithObligations()
+	require.Empty(t, leases)
+	require.Equal(t, uint64(1), unleased, "the owed error reply is tracked as an unleased obligation")
+
+	// When: the serve loop publishes the error reply.
+	d.CloseObligation(5)
+
+	// Then
+	_, unleased = lt.SnapshotWithObligations()
+	require.Zero(t, unleased)
+}
+
+// Test a panicking handler still releasing its lease (and inflight slot), so a
+// crash inside one handler cannot leave a phantom lease masking a real stall.
+func TestDispatcher_LeaseTable_ReleasedOnHandlerPanic(t *testing.T) {
+	// Given
+	d := rpcruntime.NewDispatcher()
+	lt := rpcruntime.NewLeaseTable()
+	d.SetLeaseTable(lt)
+	d.Register(7, stubHandler{fn: func(_ context.Context, _ uint64, _ []byte) ([]byte, *rpcruntime.Status, error) {
+		panic("boom")
+	}})
+	req := transport.Frame{CallID: 5, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
+
+	// When
+	require.Panics(t, func() { d.Dispatch(t.Context(), req, time.Now()) })
+
+	// Then
+	require.Empty(t, lt.Snapshot())
+	require.Zero(t, d.InflightCount())
+}
+
 // Test Dispatcher invoking the registered handler and returning a UNARY_RESP frame
 func TestDispatcher_Dispatch_InvokesHandlerAndReturnsResponseFrame(t *testing.T) {
 	// Given

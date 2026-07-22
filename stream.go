@@ -738,6 +738,13 @@ type streamServer struct {
 	codec     codec.Codec    // the connection's negotiated codec, threaded into each handler's *Stream
 	handlerWG sync.WaitGroup // joins handler goroutines in teardown
 
+	// leases records an active-handler lease for each running stream handler, so a
+	// long-lived stream (a bidi or server-streaming handler that legitimately runs
+	// far longer than the wedge window) reports a renewing lease and is not read as
+	// dispatch-wedged. Shared with the unary dispatcher so one heartbeat snapshot
+	// covers every executing handler.
+	leases *rpcruntime.LeaseTable
+
 	// beforePublish, when non-nil, runs in onStreamOpen after the accept-side stream
 	// is admitted (its deadline watcher deferred) but BEFORE Publish. It is a
 	// test-only ordering seam that lets a test drive a terminal from SUBMITTED to
@@ -755,13 +762,21 @@ type streamServer struct {
 //
 //nolint:unparam // cdc is the codec seam; see doc above — proto is the only codec today.
 func newStreamServer(
-	tr transport.Transport, handlers map[streamKey]streamHandlerReg, cdc codec.Codec,
+	tr transport.Transport, handlers map[streamKey]streamHandlerReg, cdc codec.Codec, leases *rpcruntime.LeaseTable,
 ) *streamServer {
-	return &streamServer{
+	srv := &streamServer{
 		plane:    newStreamPlane(tr),
 		handlers: handlers,
 		codec:    cdc,
+		leases:   leases,
 	}
+	// The engine opens each stream's response obligation when the stream is admitted
+	// (atomically with registration, before it can reach any terminal) and closes it
+	// once its terminal frame reaches the transport (a stuck emission keeps it owed).
+	// Set once here at setup, before any stream.
+	srv.plane.streams.SetObligationSink(leases)
+
+	return srv
 }
 
 // onStreamOpen handles an inbound STREAM_OPEN (accept side). It admits the stream,
@@ -847,9 +862,25 @@ func (s *streamServer) onStreamOpen(f transport.Frame) error {
 	// (newStream's clock read), so the deferral did not silently extend it.
 	st.StartDeadlineWatcher()
 
+	// Acquire the handler's active-handler lease before the goroutine is launched, so
+	// it is visible to any heartbeat the instant the stream is published. The stream's
+	// response obligation was already opened when the stream was admitted (OpenAccepting,
+	// atomically with registration, before this stream could reach any terminal), so
+	// between admission and this acquire the obligation is unleased for a transient the
+	// host's persistence window absorbs. The lease is released when the handler returns
+	// (including on panic, via the deferred release) — a released lease must never
+	// linger and mask a real dispatch stall — while the obligation stays open until the
+	// stream's terminal frame reaches the transport, so a handler that returned with its
+	// terminal emission stuck is still counted as owing a response.
+	if s.leases != nil {
+		s.leases.Acquire(f.CallID, time.Now())
+	}
 	s.handlerWG.Add(1)
 	go func() {
 		defer s.handlerWG.Done()
+		if s.leases != nil {
+			defer s.leases.Release(f.CallID)
+		}
 		s.runHandler(reg, st)
 	}()
 

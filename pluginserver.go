@@ -155,7 +155,13 @@ func (s *PluginServer) runServing(
 		}
 	}
 
+	// One active-handler lease table for this serving session, shared by the unary
+	// dispatcher and the streaming accept half so a single heartbeat snapshot sees
+	// every executing handler's lease.
+	leases := rpcruntime.NewLeaseTable()
+
 	dispatcher := rpcruntime.NewDispatcher()
+	dispatcher.SetLeaseTable(leases)
 	s.mu.Lock()
 	for _, rs := range s.services {
 		dispatcher.Register(rs.desc.ServiceID, newServiceHandler(rs, codec.Proto{}))
@@ -173,7 +179,7 @@ func (s *PluginServer) runServing(
 	// serve loop poisons on any STREAM_* frame a peer sends (§11.2).
 	var srv *streamServer
 	if streaming {
-		srv = newStreamServer(tr, streamHandlers, codec.Proto{})
+		srv = newStreamServer(tr, streamHandlers, codec.Proto{}, leases)
 	}
 
 	// A cancelable context so a data-plane death can stop the control loop below.
@@ -199,7 +205,8 @@ func (s *PluginServer) runServing(
 	// the plugin keep heartbeating on a dead data plane, so the host supervisor
 	// would never see the fault and never restart it.
 	ctrlDone := make(chan error, 1)
-	go func() { ctrlDone <- s.runServingControl(ctx, conn) }()
+	progress := newHeartbeatProgress(tr, leases)
+	go func() { ctrlDone <- s.runServingControl(ctx, conn, progress) }()
 
 	var ctrlErr error
 	select {
@@ -261,13 +268,13 @@ var errServingDataPlaneDied = errors.New("styx: serving data plane died")
 // It returns nil when the host shut the plugin down gracefully or a
 // successful reload retired it (the process should exit 0), and a non-nil
 // error on a host crash/disconnect or a protocol violation (exit 1).
-func (s *PluginServer) runServingControl(ctx context.Context, conn *control.Conn) error {
+func (s *PluginServer) runServingControl(ctx context.Context, conn *control.Conn, progress *heartbeatProgress) error {
 	// The heartbeat sender is the only other goroutine that Sends on conn.
 	// control.Conn permits one in-flight Send, and a reload's ServeReload also
 	// Sends on conn, so the dispatch loop pauses this sender for the duration
 	// of a reload exchange and stop() joins it before the ShutdownAck below —
 	// the two Senders never overlap.
-	hb := newHeartbeatSender(conn, heartbeatInterval())
+	hb := newHeartbeatSender(conn, heartbeatInterval(), progress)
 	hb.start(ctx)
 
 	err := s.dispatchControl(ctx, conn, hb)
@@ -641,6 +648,15 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 			return errServeLoopPoisoned
 		default:
 			recvAt := time.Now()
+			if f.Kind == transport.FrameUnaryReq {
+				// Open the response obligation at consumption, before dispatch, so a
+				// reply owed by a pre-dispatch refusal (an unknown service, which never
+				// acquires a handler lease) or by a stuck post-handler send is visible to
+				// the host as an unleased obligation. The handler's lease joins later
+				// inside Dispatch; the obligation closes below once the reply (or the
+				// decision that none is owed) has reached the transport.
+				d.OpenObligation(f.CallID)
+			}
 			for _, resp := range d.Dispatch(ctx, f, recvAt) {
 				if serr := tr.Send(ctx, resp); serr != nil {
 					if errors.Is(serr, transport.ErrPoisoned) {
@@ -652,6 +668,14 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 
 					return nil // peer close / ErrClosed / ctx: not a self-initiated poison
 				}
+			}
+			if f.Kind == transport.FrameUnaryReq {
+				// The response (or the decision that none is owed) has now been handed to
+				// the transport: close the obligation opened at consumption above. A send
+				// stuck in the loop never reaches here, so a response owed by an
+				// already-returned handler — or by an unknown-service refusal whose reply
+				// send is stuck — stays counted and becomes dispatch-wedged.
+				d.CloseObligation(f.CallID)
 			}
 		}
 	}
@@ -700,13 +724,80 @@ func heartbeatInterval() time.Duration {
 	return supervisor.DefaultHeartbeatInterval
 }
 
+// heartbeatProgress assembles the data-plane progress a Heartbeat carries from
+// the live serving components: the data-plane transport (its frame counters and,
+// for the shared-memory transport, arena occupancy), the dispatcher's in-flight
+// count, and the active-handler lease table. It is a cold path — read once per
+// heartbeat (1s default) — so the snapshot is taken plainly, no hot-path
+// concern. Any of its components may be nil (the control-only test seam builds it
+// without a data plane), in which case the corresponding fields stay zero.
+type heartbeatProgress struct {
+	tr     transport.Transport
+	leases *rpcruntime.LeaseTable
+}
+
+// newHeartbeatProgress wires the serving components a Heartbeat reports from.
+func newHeartbeatProgress(tr transport.Transport, leases *rpcruntime.LeaseTable) *heartbeatProgress {
+	return &heartbeatProgress{tr: tr, leases: leases}
+}
+
+// heartbeat builds the Heartbeat message for sequence seq observed at now: the
+// transport's received/sent frame counts as the consume/produce counters, whether
+// inbound work is still readable, the arena occupancy when the transport reports one
+// (0 over uds), the count of unleased response obligations as inflight_count, and a
+// snapshot of the active-handler leases. It renews every live lease to now first —
+// the dispatch layer's periodic renewal, at the heartbeat cadence — so a
+// genuinely-running handler's lease is always fresh when the host observes it. The
+// leases travel for observability only: the host no longer uses their staleness in
+// any verdict, and could not observe a stale one anyway, because renewal and the
+// snapshot share this one assembly path (a lease is renewed in the same heartbeat it
+// is reported). The unleased-obligation count and the lease set are read together
+// under one lock, so the pair is coherent.
+func (p *heartbeatProgress) heartbeat(seq uint64, now time.Time) *controlpb.Heartbeat {
+	hb := &controlpb.Heartbeat{Sequence: seq}
+
+	if fc, ok := p.tr.(transport.FrameCounter); ok {
+		hb.DescriptorsConsumedH2P = fc.FramesReceived()
+		// Probe whether inbound work is still readable in the same snapshot as the
+		// consume count, so the host judges a stalled ring consumer on the plugin's
+		// one clock (consume frozen AND inbound still readable) rather than pairing a
+		// host send-count with a plugin consume-count across two clocks. The consume
+		// count is read first and the probe immediately after, minimizing within-sample
+		// skew; any residual skew is one sample and is absorbed by the host's stall
+		// persistence window. The probe runs on this heartbeat-assembly goroutine, not
+		// the single reader goroutine, but it is a non-consuming MSG_PEEK: it cannot
+		// steal a frame from the reader (the kernel serializes the two reads), so the
+		// reader's framing is untouched. A transport that cannot probe its inbound queue
+		// omits the capability and inbound_readable stays false — the plugin is then
+		// never transport-wedged, the same safe degradation as an older plugin build.
+		if pr, ok := p.tr.(transport.InboundQueueProber); ok {
+			hb.InboundReadable = pr.ReadableNow()
+		}
+		hb.DescriptorsProducedP2H = fc.FramesSent()
+	}
+	if ar, ok := p.tr.(transport.ArenaOccupancyReporter); ok {
+		hb.ArenaOccupancyBytes = ar.ArenaOccupancyBytes()
+	}
+	if p.leases != nil {
+		p.leases.RenewAll(now)
+		leases, unleased := p.leases.SnapshotWithObligations()
+		hb.InflightCount = unleased
+		for _, l := range leases {
+			hb.Leases = append(hb.Leases, &controlpb.ActiveHandlerLease{
+				CallId:               l.CallID,
+				StartUnixNano:        l.StartedAt.UnixNano(),
+				LeaseRenewedUnixNano: l.LastRenewedAt.UnixNano(),
+			})
+		}
+	}
+
+	return hb
+}
+
 // heartbeatSender owns the control-plane heartbeat goroutine: it sends a
 // Heartbeat immediately (so the host's first receive window need not wait out
-// a full interval) and then on every tick of its interval. Every field but
-// Sequence is zero-valued: there is no real SHM ring yet, so progress counters
-// are trivially zero over the current uds transport, and an all-zero sample
-// only ever degrades internal/supervisor.Classify to plain liveness (HealthOK
-// — no queued work is ever reported, so neither wedged branch can fire). A
+// a full interval) and then on every tick of its interval. Each Heartbeat
+// carries the live data-plane progress its heartbeatProgress reports. A
 // failed Send is not itself fatal — it most commonly means the host already
 // went away, which the dispatch loop's own Recv will detect authoritatively.
 //
@@ -719,6 +810,7 @@ func heartbeatInterval() time.Duration {
 type heartbeatSender struct {
 	interval time.Duration
 	send     func(ctx context.Context) // sends one Heartbeat; captures the conn + Sequence
+	now      func() time.Time          // monotonic clock for the spacing guard; time.Now in production
 
 	pauseReq  chan struct{}
 	pauseAck  chan struct{}
@@ -728,27 +820,71 @@ type heartbeatSender struct {
 }
 
 // newHeartbeatSender builds a heartbeatSender that Sends Heartbeat messages on
-// conn at interval. The messages carry a monotonically increasing Sequence and
-// nothing else (see the type doc).
-func newHeartbeatSender(conn *control.Conn, interval time.Duration) *heartbeatSender {
-	var seq uint64
-	send := func(ctx context.Context) {
-		seq++
-		msg := &controlpb.ControlMessage{
-			Body: &controlpb.ControlMessage_Heartbeat{Heartbeat: &controlpb.Heartbeat{Sequence: seq}},
-		}
-		_ = sendControl(ctx, conn, msg, control.ReplyDeadlines[control.KindHeartbeat])
-	}
-
-	return &heartbeatSender{
+// conn at interval, each carrying a monotonically increasing Sequence and the
+// data-plane progress reported by progress (see heartbeatProgress).
+//
+// Two properties make the Sequence a sound elapsed-time and continuity signal for the
+// host's wedge tracker, which reads a stall's persistence off the Sequence span:
+//
+//   - Minimum spacing. time.NewTicker can deliver a pending tick and then the next
+//     scheduled tick less than one interval apart after the receiver goroutine was
+//     starved. Sending both would place two Sequence increments under one interval
+//     apart, making the span OVERSTATE elapsed time and accelerate a wedge verdict —
+//     the unsafe direction. The guard skips a build whose monotonic delta since the
+//     last BUILT heartbeat is below supervisor.MinHeartbeatSpacing(interval) (one
+//     interval minus a jitter slack), so each adjacent increment provably represents at
+//     least that admitted minimum of real sender time. The host's wedge-window
+//     conversion divides the window by the SAME minimum, so the two cannot drift into an
+//     early-fire gap. A skipped tick consumes no Sequence number — Sequence increments
+//     only for a heartbeat actually built and submitted.
+//   - Delivery continuity. A built heartbeat consumes its Sequence number even when
+//     the send errors, so a heartbeat that did not reach the host leaves a GAP in the
+//     delivered Sequence. The host's tracker advances a stall only across ADJACENT
+//     sequences, so a gap clears it: a heartbeat the host never saw (which may have
+//     carried a recovery) can never be counted as continuous stall time. Rolling the
+//     number back on a failed send would instead hide the loss behind a contiguous
+//     Sequence and let an unobserved recovery pass unnoticed, so the number is
+//     deliberately consumed. Missed-heartbeat liveness is unaffected — the host counts
+//     a miss whenever a heartbeat fails to arrive within its own interval regardless —
+//     and the reload flow is unaffected because the sender is paused for the whole
+//     reload exchange (no heartbeat is built during it).
+func newHeartbeatSender(conn *control.Conn, interval time.Duration, progress *heartbeatProgress) *heartbeatSender {
+	h := &heartbeatSender{
 		interval:  interval,
-		send:      send,
+		now:       time.Now,
 		pauseReq:  make(chan struct{}),
 		pauseAck:  make(chan struct{}),
 		resumeReq: make(chan struct{}),
 		stopReq:   make(chan struct{}),
 		done:      make(chan struct{}),
 	}
+
+	var seq uint64
+	var lastBuilt time.Time
+	var haveBuilt bool
+	// The admitted minimum spacing is derived from the shared supervisor helper the host's
+	// wedge-window conversion also uses, so the guard and that conversion can never disagree
+	// on how much real sender time one adjacent Sequence increment proves. The comparison is
+	// strict, so a delta of exactly minSpacing is ADMITTED (only a strictly smaller gap is
+	// skipped) — the boundary the conversion assumes as its per-increment minimum.
+	minSpacing := supervisor.MinHeartbeatSpacing(interval)
+	h.send = func(ctx context.Context) {
+		now := h.now()
+		if haveBuilt && now.Sub(lastBuilt) < minSpacing {
+			return // minimum spacing: a caught-up tick lands too soon; skip it, consuming no Sequence.
+		}
+		seq++
+		lastBuilt, haveBuilt = now, true
+
+		msg := &controlpb.ControlMessage{
+			Body: &controlpb.ControlMessage_Heartbeat{Heartbeat: progress.heartbeat(seq, now)},
+		}
+		// The Sequence is consumed above before the send: a failed send therefore leaves
+		// a gap the host reads as an unobserved heartbeat (see this function's doc).
+		_ = sendControl(ctx, conn, msg, control.ReplyDeadlines[control.KindHeartbeat])
+	}
+
+	return h
 }
 
 // start launches the sender goroutine. Every subsequent pause/resume/stop call

@@ -15,6 +15,7 @@ import (
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/control/controlpb"
 	"github.com/arloliu/styx/internal/lifecycle"
+	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/transport"
 )
@@ -533,6 +534,70 @@ func TestPluginServer_ShutdownGracefully_OnHostShutdown(t *testing.T) {
 
 	// When / Then
 	h.shutdownAndExpectAck(done)
+}
+
+// Test the assembled Heartbeat carrying live data-plane progress: the
+// transport's consume/produce frame counts, the open response-obligation count as
+// inflight_count, and every executing handler's active-handler lease renewed to the
+// send time.
+func TestPluginServer_Heartbeat_CarriesLiveDataPlaneProgress(t *testing.T) {
+	// Given: a connected transport pair with three frames sent one way and one
+	// back, a dispatcher, and a lease table holding two live handler leases.
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	plugin, err := transport.NewUDSTransport(fds[0], false)
+	require.NoError(t, err)
+	host, err := transport.NewUDSTransport(fds[1], false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = plugin.Close(); _ = host.Close() })
+
+	for range 3 {
+		require.NoError(t, host.Send(t.Context(), transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq}))
+		_, rerr := plugin.Recv(t.Context())
+		require.NoError(t, rerr)
+	}
+	require.NoError(t, plugin.Send(t.Context(), transport.Frame{CallID: 1, Kind: transport.FrameUnaryResp}))
+
+	leases := rpcruntime.NewLeaseTable()
+	start := time.Now().Add(-2 * time.Second)
+	// Two running handlers hold leases with open obligations (leased, so excluded from
+	// inflight_count), and two responses are owed with no handler running for them
+	// (unleased) — so inflight_count is the unleased count, 2.
+	leases.OpenObligation(11)
+	leases.Acquire(11, start)
+	leases.OpenObligation(22)
+	leases.Acquire(22, start)
+	leases.OpenObligation(101)
+	leases.OpenObligation(102)
+
+	// When: the plugin has consumed all three sent frames, so its inbound queue is
+	// drained.
+	now := time.Now()
+	hb := styx.BuildHeartbeatForTest(plugin, leases, 7, now)
+
+	// Then: counters mirror the transport, inflight_count is the unleased-obligation
+	// count, inbound_readable is false (nothing left to consume), and each lease is
+	// renewed to now with its original start preserved.
+	require.Equal(t, uint64(7), hb.GetSequence())
+	require.Equal(t, uint64(3), hb.GetDescriptorsConsumedH2P())
+	require.Equal(t, uint64(1), hb.GetDescriptorsProducedP2H())
+	require.Equal(t, uint64(2), hb.GetInflightCount(), "inflight_count reports the unleased response obligations")
+	require.False(t, hb.GetInboundReadable(), "the plugin drained its inbound queue")
+	require.Zero(t, hb.GetArenaOccupancyBytes()) // uds has no arena
+	require.Len(t, hb.GetLeases(), 2)
+	for _, l := range hb.GetLeases() {
+		require.Equal(t, start.UnixNano(), l.GetStartUnixNano())
+		require.Equal(t, now.UnixNano(), l.GetLeaseRenewedUnixNano())
+	}
+
+	// When: the host sends a frame the plugin has not consumed.
+	require.NoError(t, host.Send(t.Context(), transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq}))
+	hb = styx.BuildHeartbeatForTest(plugin, leases, 8, time.Now())
+
+	// Then: the plugin reports inbound work still readable, in the same snapshot as
+	// its (now stale) consume count.
+	require.True(t, hb.GetInboundReadable(), "an unconsumed inbound frame reports readable")
+	require.Equal(t, uint64(3), hb.GetDescriptorsConsumedH2P(), "consume is frozen: the frame is not yet consumed")
 }
 
 // Test the serving loop returning an error when the host disconnects (the

@@ -209,7 +209,7 @@ func TestStreamServer_HandlerError_TerminatesStreamAndReachesOpener(t *testing.T
 			return &Status{Code: CodeInternal, Message: "boom"}
 		}},
 	}
-	srv := newStreamServer(pluginTr, handlers, codec.Proto{})
+	srv := newStreamServer(pluginTr, handlers, codec.Proto{}, rpcruntime.NewLeaseTable())
 	d := rpcruntime.NewDispatcher()
 	done := make(chan struct{})
 	go func() { defer close(done); _ = runServeLoop(context.Background(), pluginTr, d, srv) }()
@@ -245,7 +245,7 @@ func TestStreamServer_OnStreamOpen_PoisonsMalformedOpens(t *testing.T) {
 			return st.Context().Err()
 		}},
 	}
-	srv := newStreamServer(pluginTr, handlers, codec.Proto{})
+	srv := newStreamServer(pluginTr, handlers, codec.Proto{}, rpcruntime.NewLeaseTable())
 	t.Cleanup(func() { _ = pluginTr.Close(); srv.teardown(ErrPluginUnavailable) })
 
 	// Nonzero high 32 bits of the control word.
@@ -278,7 +278,7 @@ func TestStreamServer_OnStreamOpen_DuplicateUnknownRoute_Poisons(t *testing.T) {
 			return st.Context().Err()
 		}},
 	}
-	srv := newStreamServer(pluginTr, handlers, codec.Proto{})
+	srv := newStreamServer(pluginTr, handlers, codec.Proto{}, rpcruntime.NewLeaseTable())
 	t.Cleanup(func() { _ = pluginTr.Close(); srv.teardown(ErrPluginUnavailable) })
 
 	require.NoError(t, srv.onStreamOpen(transport.Frame{

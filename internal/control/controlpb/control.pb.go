@@ -927,8 +927,16 @@ type Heartbeat struct {
 	InflightCount          uint64                 `protobuf:"varint,4,opt,name=inflight_count,json=inflightCount,proto3" json:"inflight_count,omitempty"`
 	ArenaOccupancyBytes    uint64                 `protobuf:"varint,5,opt,name=arena_occupancy_bytes,json=arenaOccupancyBytes,proto3" json:"arena_occupancy_bytes,omitempty"`
 	Leases                 []*ActiveHandlerLease  `protobuf:"bytes,6,rep,name=leases,proto3" json:"leases,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// inbound_readable is the plugin's own report, taken in the same snapshot as
+	// descriptors_consumed_h2p, of whether inbound data-plane work is still readable
+	// (unconsumed) on its transport. It lets the host judge a stalled ring consumer
+	// on one clock — the plugin's — instead of pairing a host send-count with a
+	// plugin consume-count across two clocks. A plugin that never sets it (an older
+	// build, or a transport that cannot probe its inbound queue) reports false and is
+	// never transport-wedged.
+	InboundReadable bool `protobuf:"varint,7,opt,name=inbound_readable,json=inboundReadable,proto3" json:"inbound_readable,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *Heartbeat) Reset() {
@@ -1001,6 +1009,13 @@ func (x *Heartbeat) GetLeases() []*ActiveHandlerLease {
 		return x.Leases
 	}
 	return nil
+}
+
+func (x *Heartbeat) GetInboundReadable() bool {
+	if x != nil {
+		return x.InboundReadable
+	}
+	return false
 }
 
 type HeartbeatAck struct {
@@ -1625,14 +1640,15 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\x12ActiveHandlerLease\x12\x17\n" +
 	"\acall_id\x18\x01 \x01(\x04R\x06callId\x12&\n" +
 	"\x0fstart_unix_nano\x18\x02 \x01(\x03R\rstartUnixNano\x125\n" +
-	"\x17lease_renewed_unix_nano\x18\x03 \x01(\x03R\x14leaseRenewedUnixNano\"\xb0\x02\n" +
+	"\x17lease_renewed_unix_nano\x18\x03 \x01(\x03R\x14leaseRenewedUnixNano\"\xdb\x02\n" +
 	"\tHeartbeat\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x128\n" +
 	"\x18descriptors_consumed_h2p\x18\x02 \x01(\x04R\x16descriptorsConsumedH2p\x128\n" +
 	"\x18descriptors_produced_p2h\x18\x03 \x01(\x04R\x16descriptorsProducedP2h\x12%\n" +
 	"\x0einflight_count\x18\x04 \x01(\x04R\rinflightCount\x122\n" +
 	"\x15arena_occupancy_bytes\x18\x05 \x01(\x04R\x13arenaOccupancyBytes\x128\n" +
-	"\x06leases\x18\x06 \x03(\v2 .styx.control.ActiveHandlerLeaseR\x06leases\"*\n" +
+	"\x06leases\x18\x06 \x03(\v2 .styx.control.ActiveHandlerLeaseR\x06leases\x12)\n" +
+	"\x10inbound_readable\x18\a \x01(\bR\x0finboundReadable\"*\n" +
 	"\fHeartbeatAck\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\"5\n" +
 	"\x05Drain\x12,\n" +

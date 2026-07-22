@@ -93,6 +93,16 @@ type StreamTable struct {
 
 	discarded atomic.Uint64 // §8.2 diagnostic counter of late/unknown frames
 
+	// obligations opens a streaming handler's response obligation when its stream is
+	// admitted and closes it once its terminal frame has been handed to the transport
+	// — set once at setup by the plugin accept side (SetObligationSink), before any
+	// stream opens, so it needs no synchronization on the read path (like the
+	// dispatcher's lease table). It is nil on the opener side (host/client), which
+	// runs no handlers and owes no responses. Keyed by call ID, so open and close are
+	// each idempotent and the several terminal paths that may fire for one stream can
+	// each close safely.
+	obligations obligationSink
+
 	// Test-only ordering seams (nil in production, no runtime cost there).
 	// afterStopAdmission runs inside Close after the closed flag is set but before
 	// the fan-out, so a test can drive an Open provably after admission stopped.
@@ -118,6 +128,41 @@ type emitJob struct {
 	callID uint64
 	status *transport.FrameStatus
 	reject bool
+}
+
+// obligationSink opens a call's response obligation when its stream is admitted and
+// closes it once the stream's terminal frame has reached the transport. *LeaseTable
+// is the production implementation; the narrow interface keeps the stream engine
+// decoupled from the rest of the handler-accounting the lease table owns.
+type obligationSink interface {
+	OpenObligation(callID uint64)
+	CloseObligation(callID uint64)
+}
+
+// SetObligationSink installs the sink the admission path opens an obligation on and
+// the emitter and terminal paths close it on once a stream's terminal frame reaches
+// the transport. It is set once at setup, before any stream opens, by the plugin
+// accept side; the opener side leaves it nil.
+func (t *StreamTable) SetObligationSink(sink obligationSink) {
+	t.obligations = sink
+}
+
+// openObligation opens callID's response obligation if a sink is installed. It is
+// called under t.mu, atomically with the stream's registration, so no terminal
+// transition (which must find the stream in the table) can close the obligation
+// before it is opened. A no-op on the opener side (nil sink).
+func (t *StreamTable) openObligation(callID uint64) {
+	if t.obligations != nil {
+		t.obligations.OpenObligation(callID)
+	}
+}
+
+// closeObligation closes callID's response obligation if a sink is installed — a
+// no-op on the opener side, and idempotent, so any terminal path may call it.
+func (t *StreamTable) closeObligation(callID uint64) {
+	if t.obligations != nil {
+		t.obligations.CloseObligation(callID)
+	}
 }
 
 // NewStreamTable builds a stream table capped at maxOpenStreams (S_max,
@@ -217,6 +262,13 @@ func (t *StreamTable) admitStream(callID uint64, side StreamSide, cfg StreamConf
 
 	s := newStream(t, callID, side, cfg)
 	t.streams[callID] = s
+	// Open the response obligation under t.mu, atomically with registration, so it
+	// exists before the stream can reach any terminal: a terminal transition (a
+	// deadline win, a FailAll/OnPeerCrash fan-out) must find the stream in this table,
+	// which requires t.mu, so it cannot run — and close the obligation — before this
+	// open. Any terminal thereafter closes it (finishTerminal). On the opener side the
+	// sink is nil and this is a no-op.
+	t.openObligation(callID)
 	if startWatch {
 		s.beginDeadlineWatch()
 	}
@@ -508,6 +560,13 @@ func (t *StreamTable) runEmitter() {
 				Kind:   transport.FrameStreamErr,
 				Status: job.status,
 			})
+			// This STREAM_ERR is a stream's terminal frame; it has now been handed to
+			// the transport, so any response obligation the stream still owed is closed.
+			// A handler that returned while this send was parked kept the obligation
+			// open until here, which is what makes a stuck terminal emission
+			// dispatch-wedged. Idempotent and keyed, so a rejection (no obligation) or a
+			// terminal already closed synchronously is a no-op.
+			t.closeObligation(job.callID)
 		case <-t.stopCh:
 			return
 		}
@@ -519,9 +578,12 @@ func (t *StreamTable) runEmitter() {
 // the peer a stream, so they are admitted whenever the queue is not full; only the
 // rejection class is held to the reserve. Enqueue never blocks; a job that does
 // not fit is dropped (§9 overflow — the paired CANCEL still carries a teardown's
-// outcome, and a definitive CANCEL failure fails the connection).
-func (t *StreamTable) emitStreamErr(callID uint64, status *transport.FrameStatus, reject bool) {
-	t.enqueueEmit(emitJob{callID: callID, status: status, reject: reject})
+// outcome, and a definitive CANCEL failure fails the connection). It returns
+// whether the job was admitted, so a caller that hands its stream's
+// obligation-close to the emitter can tell an admitted job (the emitter will
+// close it after the Send) from a dropped one (the caller must close it now).
+func (t *StreamTable) emitStreamErr(callID uint64, status *transport.FrameStatus, reject bool) bool {
+	return t.enqueueEmit(emitJob{callID: callID, status: status, reject: reject})
 }
 
 // emitOwedTeardownErr enqueues the data-lane STREAM_ERR that terminates a peer

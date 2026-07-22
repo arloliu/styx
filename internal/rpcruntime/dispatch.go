@@ -40,6 +40,12 @@ type Dispatcher struct {
 	mu       sync.Mutex
 	services map[uint64]ServiceHandler     // keyed by FNV-64 service ID (assigned by generated code)
 	inFlight map[uint64]context.CancelFunc // callID -> cancel, for CANCEL frames
+
+	// leases, when non-nil, records an active-handler lease for the duration of
+	// each unary handler so the heartbeat can report a genuinely-running handler.
+	// It is set once at setup (SetLeaseTable), before Dispatch runs, like the
+	// registered services, so it needs no synchronization on the read path.
+	leases *LeaseTable
 }
 
 // NewDispatcher returns a Dispatcher with no registered services.
@@ -56,6 +62,50 @@ func (d *Dispatcher) Register(serviceID uint64, h ServiceHandler) {
 	d.mu.Lock()
 	d.services[serviceID] = h
 	d.mu.Unlock()
+}
+
+// SetLeaseTable installs lt as the active-handler lease table this Dispatcher
+// records unary handler leases into. Like Register, it is expected to be called
+// once during setup, before Dispatch runs. A Dispatcher with no lease table set
+// tracks only in-flight cancellation, exactly as before.
+func (d *Dispatcher) SetLeaseTable(lt *LeaseTable) {
+	d.leases = lt
+}
+
+// InflightCount reports how many unary handlers are currently executing (consumed
+// but not yet returned) — the in-flight accounting the CANCEL path relies on. It
+// is NOT the heartbeat's inflight_count: that field reports the response-obligation
+// count (which outlives handler execution until the response is published), read
+// from the lease table.
+func (d *Dispatcher) InflightCount() uint64 {
+	d.mu.Lock()
+	n := len(d.inFlight)
+	d.mu.Unlock()
+
+	//nolint:gosec // the in-flight handler count never approaches uint64's range
+	return uint64(n)
+}
+
+// OpenObligation opens a unary call's response obligation at request consumption,
+// before Dispatch runs, so a reply owed by a pre-dispatch refusal (an unknown
+// service) or by a stuck post-handler send is visible to the host as an unleased
+// obligation. The serve loop opens it for every UNARY_REQ and closes it with
+// CloseObligation once the response (or the decision that none is owed) has reached
+// the transport. It is a no-op when no lease table is installed.
+func (d *Dispatcher) OpenObligation(callID uint64) {
+	if d.leases != nil {
+		d.leases.OpenObligation(callID)
+	}
+}
+
+// CloseObligation closes a unary call's response obligation once the serve loop
+// has finished sending its response frame(s) — the point the response is
+// published. It is a no-op when no lease table is installed or the call opened no
+// obligation (an early reject before the handler ran).
+func (d *Dispatcher) CloseObligation(callID uint64) {
+	if d.leases != nil {
+		d.leases.CloseObligation(callID)
+	}
 }
 
 // Dispatch processes exactly one inbound Frame and returns the Frame(s) to send
@@ -113,7 +163,7 @@ func (d *Dispatcher) dispatchUnary(ctx context.Context, f transport.Frame, recvA
 	}
 
 	callCtx, cancel := contextFor(ctx, deadline)
-	d.trackCall(f.CallID, cancel)
+	d.trackCall(f.CallID, cancel, recvAt)
 	defer d.untrackCall(f.CallID, cancel)
 
 	payload, status, err := h.Handle(callCtx, f.Method, f.Payload)
@@ -167,19 +217,37 @@ func statusFrame(f transport.Frame, s *Status) transport.Frame {
 	}
 }
 
-// trackCall records cancel against callID so a later CANCEL Frame can reach
-// the in-flight handler's context.
-func (d *Dispatcher) trackCall(callID uint64, cancel context.CancelFunc) {
+// trackCall records cancel against callID so a later CANCEL Frame can reach the
+// in-flight handler's context, and acquires the call's active-handler lease
+// (startedAt is the frame's receive time) when a lease table is installed. The
+// call's response obligation was already opened at consumption (the serve loop's
+// OpenObligation), before this lease is acquired; the lease joins it here for the
+// duration the handler runs, and the obligation stays open past handler return until
+// the serve loop closes it once the response is published.
+func (d *Dispatcher) trackCall(callID uint64, cancel context.CancelFunc, startedAt time.Time) {
 	d.mu.Lock()
 	d.inFlight[callID] = cancel
 	d.mu.Unlock()
+	if d.leases != nil {
+		d.leases.Acquire(callID, startedAt)
+	}
 }
 
-// untrackCall removes callID's in-flight entry and releases its context.
+// untrackCall removes callID's in-flight entry, releases its active-handler
+// lease, and releases its context. It does NOT close the response obligation:
+// the response frame is sent by the serve loop after Dispatch returns, so the
+// obligation stays open until the loop closes it — a stuck send after the handler
+// returns is exactly the dispatch stall the obligation makes visible. Reached from
+// dispatchUnary's defer, so a handler panic still releases the lease and in-flight
+// slot; the panic then unwinds to crash the process (restarting the instance), so
+// its still-open obligation is moot.
 func (d *Dispatcher) untrackCall(callID uint64, cancel context.CancelFunc) {
 	d.mu.Lock()
 	delete(d.inFlight, callID)
 	d.mu.Unlock()
+	if d.leases != nil {
+		d.leases.Release(callID)
+	}
 	cancel()
 }
 

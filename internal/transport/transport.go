@@ -205,9 +205,16 @@ type InboundQueueProber interface {
 	// below-threshold ACK is never armed off an unconfirmed-empty queue. The next
 	// Recv surfaces the real condition. "Currently available" means present in the
 	// transport's own inbound buffer or the kernel socket buffer at the instant of
-	// the call — not a promise about future arrivals. It is called only from the
-	// single reader goroutine, between that reader's Recv calls, so it never races
-	// Recv.
+	// the call — not a promise about future arrivals.
+	//
+	// ReadableNow is a NON-CONSUMING probe: it removes no inbound bytes, so it is safe
+	// to call concurrently with a single reader's Recv. It may be called from a
+	// goroutine other than that reader (the plugin's heartbeat assembly probes it
+	// while the serve loop runs Recv). An implementation MUST therefore leave the
+	// inbound stream untouched — it may not consume, advance, or reorder any frame
+	// the reader will read — and it still may not run concurrently with a SECOND
+	// ReadableNow or with a second reader; the guarantee is one reader plus this
+	// non-consuming probe, not arbitrary concurrent reads.
 	ReadableNow() bool
 }
 
@@ -241,6 +248,42 @@ type AcceptanceClassifier interface {
 	// are on a connection already dead. It is called only with a non-nil Send error
 	// from the same transport.
 	AcceptanceUnknown(err error) bool
+}
+
+// FrameCounter is an optional Transport capability exposing cumulative counts of
+// the frames this transport has successfully sent and received. The supervisor's
+// heartbeat-as-progress-contract reads them as the data-plane progress signal:
+//
+//   - On the plugin side, FramesReceived is the plugin's consume progress
+//     (frames drained off the host-to-plugin direction) and FramesSent is its
+//     produce progress (responses and stream frames it emitted) — the
+//     heartbeat's descriptors_consumed_h2p and descriptors_produced_p2h.
+//   - On the host side, FramesSent is how many frames the host has put onto the
+//     host-to-plugin direction; the classifier compares it against the plugin's
+//     reported consume count to decide whether inbound work is queued and
+//     unconsumed (a host that has sent more than the plugin has consumed, while
+//     the plugin's consume count is frozen, is the transport-wedged signal).
+//
+// The counts are cumulative and monotonic; the classifier only ever compares two
+// samples, so wrap at uint64 scale is acceptable. A transport that cannot report
+// them omits the capability, and the reader treats the count as 0.
+type FrameCounter interface {
+	// FramesSent reports the cumulative count of frames fully sent on this transport.
+	FramesSent() uint64
+	// FramesReceived reports the cumulative count of frames fully received on this transport.
+	FramesReceived() uint64
+}
+
+// ArenaOccupancyReporter is an optional Transport capability reporting the
+// shared-memory arena's current occupancy in bytes, mirrored into the heartbeat's
+// arena_occupancy_bytes so the classifier's overload check has a real
+// backpressure signal. Only the shared-memory transport has an arena; the uds
+// transport omits the capability and the heartbeat reports 0.
+type ArenaOccupancyReporter interface {
+	// ArenaOccupancyBytes reports the arena's currently-allocated byte count. It
+	// MUST be a cheap snapshot (no locks on a hot path, no syscalls): it is read
+	// once per heartbeat, a cold path, but must never contend with the data path.
+	ArenaOccupancyBytes() uint64
 }
 
 // checkImplementedKind returns nil for the nine kinds Send/Recv carry

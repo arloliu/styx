@@ -95,6 +95,14 @@ message Heartbeat {
   uint64 inflight_count = 4;
   uint64 arena_occupancy_bytes = 5;
   repeated ActiveHandlerLease leases = 6;
+  // inbound_readable is the plugin's own report, taken in the same snapshot as
+  // descriptors_consumed_h2p, of whether inbound data-plane work is still readable
+  // (unconsumed) on its transport. It lets the host judge a stalled ring consumer
+  // on one clock — the plugin's — instead of pairing a host send-count with a
+  // plugin consume-count across two clocks. A plugin that never sets it (an older
+  // build, or a transport that cannot probe its inbound queue) reports false and is
+  // never transport-wedged.
+  bool inbound_readable = 7;
 }
 message HeartbeatAck { uint64 sequence = 1; }
 

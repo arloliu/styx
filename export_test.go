@@ -2,9 +2,11 @@ package styx
 
 import (
 	"context"
+	"time"
 
 	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/control"
+	"github.com/arloliu/styx/internal/control/controlpb"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/transport"
@@ -40,7 +42,7 @@ func InProcessStreamPairForTest(s *PluginServer) (*ClientConn, func(), error) {
 	}
 	s.mu.Unlock()
 
-	srv := newStreamServer(pluginTr, handlers, codec.Proto{})
+	srv := newStreamServer(pluginTr, handlers, codec.Proto{}, rpcruntime.NewLeaseTable())
 	dispatcher := rpcruntime.NewDispatcher()
 	done := make(chan struct{})
 	go func() {
@@ -71,7 +73,10 @@ const HeartbeatIntervalEnv = heartbeatIntervalEnv
 // caller-supplied control.Conn, so the reload wiring can be exercised in-process
 // against a scripted host without a real spawned child.
 func (s *PluginServer) RunServingControlForTest(ctx context.Context, conn *control.Conn) error {
-	return s.runServingControl(ctx, conn)
+	// The reload/shutdown dispatch tests drive only the control plane, with no
+	// data plane behind the heartbeat; an all-nil progress reports a
+	// sequence-only Heartbeat, exactly the prior behavior.
+	return s.runServingControl(ctx, conn, newHeartbeatProgress(nil, nil))
 }
 
 // RunServingForTest re-exports runServing for pluginserver_test (external test
@@ -84,6 +89,41 @@ func (s *PluginServer) RunServingForTest(
 	ctx context.Context, conn *control.Conn, tr transport.Transport, streaming bool,
 ) error {
 	return s.runServing(ctx, conn, tr, streaming)
+}
+
+// HeartbeatSenderForTest wraps the unexported heartbeat sender so pluginserver_test
+// (external test package) can drive its minimum-spacing guard with a scripted clock
+// over a real control.Conn — proving a caught-up ticker cannot emit two heartbeats
+// less than one interval apart.
+type HeartbeatSenderForTest struct{ h *heartbeatSender }
+
+// NewHeartbeatSenderForTest builds a heartbeat sender over conn at interval whose
+// spacing-guard clock is driven by now (each SendOnce reads it once). The heartbeat
+// carries no data plane — a Sequence-only message, enough to count what the guard
+// admits.
+func NewHeartbeatSenderForTest(
+	conn *control.Conn, interval time.Duration, now func() time.Time,
+) *HeartbeatSenderForTest {
+	h := newHeartbeatSender(conn, interval, newHeartbeatProgress(nil, nil))
+	h.now = now
+
+	return &HeartbeatSenderForTest{h: h}
+}
+
+// SendOnce runs one send attempt: it builds and submits a heartbeat, or skips when the
+// scripted clock says less than the minimum spacing has elapsed since the last built
+// heartbeat.
+func (s *HeartbeatSenderForTest) SendOnce(ctx context.Context) { s.h.send(ctx) }
+
+// BuildHeartbeatForTest assembles a Heartbeat from the given serving components
+// exactly as the plugin's heartbeat sender does, for pluginserver_test (external
+// test package) to assert every field carries live progress — the transport's
+// frame counts, the open response-obligation count as inflight_count, arena
+// occupancy, and the active-handler leases (renewed to now).
+func BuildHeartbeatForTest(
+	tr transport.Transport, leases *rpcruntime.LeaseTable, seq uint64, now time.Time,
+) *controlpb.Heartbeat {
+	return newHeartbeatProgress(tr, leases).heartbeat(seq, now)
 }
 
 // AddRuntimeForTest registers a pluginRuntime backed by sup under name, the way

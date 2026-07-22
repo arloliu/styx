@@ -43,16 +43,46 @@ const (
 	featureStreaming = "streaming"
 )
 
-// DefaultHeartbeatInterval is Config.HeartbeatInterval's default (1s),
-// applied by New/applyDefaults when a caller leaves it zero.
-// Exported so pluginserver.go's heartbeat sender — the plugin-side
-// origin of the Heartbeat messages this package's heartbeatLoop
-// consumes — can derive its own send interval from the identical
-// default rather than a second, independently-maintained magic number.
-// There is currently no wire mechanism to negotiate a non-default interval
-// a Host might configure per plugin; both sides independently default to
-// this same constant.
+// DefaultHeartbeatInterval is the plugin's fixed heartbeat SEND cadence and
+// Config.HeartbeatInterval's default (1s). It is the sender-side timebase the
+// supervisor converts the wedge window against: one adjacent heartbeat Sequence
+// increment proves at least MinHeartbeatSpacing of this cadence in real sender
+// time (the sender's spacing guard admits nothing closer).
+//
+// Exported so pluginserver.go's heartbeat sender — the plugin-side origin of the
+// Heartbeat messages this package's heartbeatLoop consumes — can derive its own send
+// interval from the identical default rather than a second, independently-maintained
+// magic number. There is currently no wire mechanism to negotiate a non-default
+// cadence; both sides independently default to this same constant, and the supervisor
+// keys its beat-to-time conversion on it (see Supervisor.senderCadence). If a
+// negotiated per-plugin cadence is ever added, the plugin's send interval and the
+// supervisor's senderCadence must both come from the negotiated value; neither may be
+// silently coupled to the host's configurable Config.HeartbeatInterval liveness wait.
 const DefaultHeartbeatInterval = time.Second
+
+// heartbeatSpacingToleranceDivisor sets how far below a cadence the plugin sender's
+// spacing guard admits a build: at least cadence - cadence/divisor of monotonic time
+// must have passed since the last built heartbeat. The slack absorbs ordinary ticker
+// jitter (a tick landing a hair early relative to the previous send) without admitting a
+// caught-up tick that would place two Sequence increments far under a cadence apart.
+const heartbeatSpacingToleranceDivisor = 8
+
+// MinHeartbeatSpacing is the smallest gap between two built heartbeats the plugin
+// sender's spacing guard admits for cadence: cadence - cadence/heartbeatSpacingToleranceDivisor.
+// The guard admits a build once at least this much monotonic time has elapsed since the
+// last built heartbeat, and the boundary value itself is admitted (only a strictly
+// smaller gap is skipped). It is therefore the true lower bound on the real sender time
+// one adjacent heartbeat Sequence increment represents.
+//
+// Both sides of the sender-timebase proof MUST derive their spacing from this one
+// function, so they cannot drift apart: the sender's guard (pluginserver.go) rejects a
+// build closer than this, and the wedge-window conversion (newWedgeTracker) divides the
+// window by exactly this minimum. If the two used independent constants, a guard that
+// admitted a closer spacing than the conversion assumed would let a qualifying stall fire
+// before the configured window of real sender time had passed.
+func MinHeartbeatSpacing(cadence time.Duration) time.Duration {
+	return cadence - cadence/heartbeatSpacingToleranceDivisor
+}
 
 // Capture and classification tuning left to the implementation. These are
 // fixed rather than exposed on Config because no test exercises a
@@ -63,12 +93,32 @@ const (
 	maxCapturedLineBytes = 4096 // per-line cap for captured stdout/stderr.
 	capturedBufferLines  = 256  // per-stream pending-delivery queue bound.
 
-	defaultHighWaterBytes    = uint64(1) << 30 // Classify's ArenaOccupancyBytes high-water mark.
-	defaultHighWaterInflight = uint64(10_000)  // Classify's InflightCount high-water mark.
+	defaultHighWaterBytes = uint64(1) << 30 // Classify's ArenaOccupancyBytes high-water mark.
 )
 
-// errWedged is EventUnhealthy's Err when Classify reports HealthWedged.
+// errWedged is the base sentinel for a Classify-detected wedge, so a consumer can
+// errors.Is(err, errWedged) regardless of which component wedged. The two
+// component-specific sentinels below wrap it and are what EventUnhealthy actually
+// carries, so a consumer can also distinguish the fault.
 var errWedged = errors.New("supervisor: heartbeat classifier detected a wedged plugin")
+
+// errTransportWedged and errDispatchWedged are EventUnhealthy's Err for the two
+// wedge kinds Classify distinguishes: a stalled ring consumer with queued work,
+// and a dispatch owing a response with no renewing handler lease. Both wrap
+// errWedged.
+var (
+	errTransportWedged = fmt.Errorf("%w: transport-wedged (ring consumer stalled with queued work)", errWedged)
+	errDispatchWedged  = fmt.Errorf("%w: dispatch-wedged (response owed with no running handler)", errWedged)
+)
+
+// wedgeError maps a Classify WedgeKind to the EventUnhealthy sentinel it carries.
+func wedgeError(kind WedgeKind) error {
+	if kind == WedgeDispatch {
+		return errDispatchWedged
+	}
+
+	return errTransportWedged
+}
 
 // errConnLost is the crash reason when the routing layer escalates a data-plane
 // fault via Instance.NotifyConnLost (a stream conformance poison or a
@@ -161,8 +211,16 @@ func (c *CrashInfo) Unwrap() error { return c.Cause }
 
 // Config is one plugin's full supervision configuration.
 type Config struct {
-	Spec              lifecycle.Spec
-	Restart           RestartPolicy
+	Spec    lifecycle.Spec
+	Restart RestartPolicy
+	// HeartbeatInterval is the host's missed-heartbeat LIVENESS wait: how long a
+	// receive blocks for the plugin's next heartbeat before counting a miss (default
+	// 1s). It is deliberately NOT the timebase for the wedge window — that conversion
+	// keys on the plugin's actual send cadence (DefaultHeartbeatInterval), because a
+	// Sequence increment proves at least MinHeartbeatSpacing of the SENDER's cadence,
+	// never anything about the host interval. The two are
+	// decoupled: an operator may lengthen or shorten this liveness wait without
+	// changing how a stall's Sequence span maps to elapsed time.
 	HeartbeatInterval time.Duration // default 1s
 	MissedHeartbeats  int           // default 3
 	WedgeWindow       time.Duration // default 5s "no-transport-progress-with-queued-work"
@@ -278,6 +336,25 @@ type Supervisor struct {
 	// touched only on Run's own goroutine (Run's loop and the reload it runs
 	// inline on the heartbeat loop), so it needs no synchronization.
 	generation uint64
+
+	// observeSampleForTest, when set, is called on the heartbeat loop with each
+	// heartbeat AFTER it has been classified, so a wiring test can gate its
+	// progress on the host having observed and classified a sample rather than on
+	// the plugin peer merely having built one. It is nil in production.
+	observeSampleForTest func(HeartbeatSample)
+
+	// senderCadence is the plugin's ACTUAL heartbeat send interval — the nominal cadence
+	// the wedge-window conversion keys on. The conversion divides the window by the
+	// admitted MINIMUM spacing this cadence implies, MinHeartbeatSpacing(senderCadence),
+	// because the sender admits a build as close as that minimum, so one adjacent Sequence
+	// increment proves that much real sender time. It is NOT Config.HeartbeatInterval: that field is the
+	// host's own missed-heartbeat liveness wait and is operator-configurable, whereas
+	// the beat-to-time conversion must key on the sender's cadence or the span
+	// mis-measures elapsed time. New sets it to DefaultHeartbeatInterval, the shared
+	// constant both sides of this module default to; it is deliberately not exposed on
+	// Config so an operator cannot desync it from the plugin. Tests that compress the
+	// plugin cadence set it to the same compressed value.
+	senderCadence time.Duration
 }
 
 // New creates a Supervisor. Run must be called (typically in its own
@@ -291,6 +368,11 @@ func New(cfg Config, bus *EventBus) *Supervisor {
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 		reloadCh: make(chan reloadRequest, 1),
+		// Production always converts wedge-window beats on the plugin's fixed default
+		// cadence. There is currently no wire mechanism to negotiate a non-default
+		// plugin cadence; if one is ever added, this must be set from the negotiated
+		// value, never from Config.HeartbeatInterval.
+		senderCadence: DefaultHeartbeatInterval,
 	}
 	s.spawn = s.newLiveInstance
 
@@ -590,7 +672,10 @@ func (s *Supervisor) newLiveInstance(
 		return nil, crashReason(stderrTail, hsErr, exitStatus, exitStatusKnown)
 	}
 
-	li := &liveInstance{conn: conn, generation: generation, stderrTail: stderrTail, connLost: make(chan struct{})}
+	li := &liveInstance{
+		conn: conn, generation: generation, stderrTail: stderrTail,
+		connLost: make(chan struct{}),
+	}
 	li.promote = func() ReadyHooks {
 		if s.cfg.OnReady == nil {
 			return ReadyHooks{}
@@ -656,6 +741,12 @@ func (s *Supervisor) nextGeneration() uint64 {
 func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) (stopped bool, endErr error) {
 	missed := 0
 	var prev *HeartbeatSample
+	// The window is converted to a Sequence-increment span on the plugin's actual send
+	// cadence, not on cfg.HeartbeatInterval (the host's liveness wait): each adjacent
+	// Sequence increment proves at least MinHeartbeatSpacing(senderCadence) of elapsed
+	// sender time, so a span of N increments proves N such minimums — the conversion
+	// divides the window by that admitted minimum.
+	tracker := newWedgeTracker(s.cfg.WedgeWindow, s.senderCadence)
 
 	for {
 		if s.stopped() || ctx.Err() != nil {
@@ -707,7 +798,7 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 			continue // nothing else is currently expected from the plugin during serving.
 		}
 
-		sample := heartbeatSampleFromMessage(msg.GetHeartbeat(), time.Now())
+		sample := heartbeatSampleFromMessage(msg.GetHeartbeat())
 
 		// A reload is serviced here, after this heartbeat is received but
 		// before it is acknowledged. A real reload leaves this heartbeat
@@ -725,8 +816,11 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 			return false, reloadErr
 		case reloadServiced:
 			// A real reload ran and (on success) swapped in the successor;
-			// reset health and withhold this heartbeat's ack.
+			// reset health and withhold this heartbeat's ack. The wedge tracker
+			// drops with prev — a serviced reload is a fresh progress baseline, not
+			// a continuation of any stall observed before it.
 			missed, prev = 0, nil
+			tracker.clear()
 
 			continue
 		case reloadNone, reloadNoop:
@@ -740,12 +834,21 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 		_ = ackHeartbeat(ctx, conn, sample.Sequence) // best-effort; a lost ack does not itself end the instance.
 
 		if prev != nil {
-			class := Classify(*prev, sample, s.cfg.WedgeWindow, defaultHighWaterBytes, defaultHighWaterInflight)
-			if class == HealthWedged {
-				s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: errWedged})
+			class, wedge := Classify(*prev, sample, defaultHighWaterBytes)
+			// A wedge restarts only once it has persisted continuously for the wedge
+			// window; a single stalled pair is not the window (the spec's five-second
+			// no-progress-with-queued-work rule). Persistence is measured on the
+			// plugin's Sequence — the sender's own timebase — so a slow host consumer
+			// can neither stretch a short stall into a wedge nor mask a real one.
+			if firedKind, fire := tracker.observe(class, wedge, sample.Sequence); fire {
+				reason := wedgeError(firedKind)
+				s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: reason})
 
-				return false, errWedged
+				return false, reason
 			}
+		}
+		if s.observeSampleForTest != nil {
+			s.observeSampleForTest(sample)
 		}
 		prev = &sample
 	}
@@ -920,11 +1023,12 @@ func ackHeartbeat(ctx context.Context, conn *control.Conn, sequence uint64) erro
 	return sendControl(ctx, conn, ack, control.ReplyDeadlines[control.KindHeartbeat])
 }
 
-// heartbeatSampleFromMessage converts a wire Heartbeat into a
-// HeartbeatSample, stamping ObservedAt from the host's own clock — the
-// health classifier always compares samples on the observer's clock,
-// never the sender's.
-func heartbeatSampleFromMessage(hb *controlpb.Heartbeat, observedAt time.Time) HeartbeatSample {
+// heartbeatSampleFromMessage converts a wire Heartbeat into a HeartbeatSample.
+// Every quantity the verdict rests on is the plugin's own report, carried on the
+// wire (consume/produce counters, InboundReadable, the unleased inflight_count),
+// and stall persistence is measured on the plugin's Sequence — the sender's own
+// timebase — so host receipt time is deliberately not captured here.
+func heartbeatSampleFromMessage(hb *controlpb.Heartbeat) HeartbeatSample {
 	leases := make([]Lease, 0, len(hb.GetLeases()))
 	for _, l := range hb.GetLeases() {
 		leases = append(leases, Lease{
@@ -941,7 +1045,7 @@ func heartbeatSampleFromMessage(hb *controlpb.Heartbeat, observedAt time.Time) H
 		InflightCount:          hb.GetInflightCount(),
 		ArenaOccupancyBytes:    hb.GetArenaOccupancyBytes(),
 		Leases:                 leases,
-		ObservedAt:             observedAt,
+		InboundReadable:        hb.GetInboundReadable(),
 	}
 }
 

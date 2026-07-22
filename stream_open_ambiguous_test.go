@@ -275,7 +275,7 @@ func TestOnStreamOpen_ElapsedBudget_EmitsTeardownPairFromPublished(t *testing.T)
 			handler: func(*Stream) error { <-block; return nil },
 		},
 	}
-	srv := newStreamServer(tr, handlers, codec.Proto{})
+	srv := newStreamServer(tr, handlers, codec.Proto{}, rpcruntime.NewLeaseTable())
 	t.Cleanup(func() {
 		close(block)
 		_ = tr.Close()
@@ -338,7 +338,7 @@ func TestOnStreamOpen_PublishLostToTerminal_DoesNotRunHandler(t *testing.T) {
 			},
 		},
 	}
-	srv := newStreamServer(tr, handlers, codec.Proto{})
+	srv := newStreamServer(tr, handlers, codec.Proto{}, rpcruntime.NewLeaseTable())
 	srv.beforePublish = func(st *rpcruntime.Stream) { st.TerminateOpenAmbiguous(context.DeadlineExceeded) }
 	t.Cleanup(func() { srv.teardown(ErrPluginUnavailable) })
 
@@ -383,7 +383,7 @@ func TestOnStreamOpen_OpenAccepting_DefersWatcherUntilPublish(t *testing.T) {
 			handler: func(*Stream) error { <-block; return nil },
 		},
 	}
-	srv := newStreamServer(tr, handlers, codec.Proto{})
+	srv := newStreamServer(tr, handlers, codec.Proto{}, rpcruntime.NewLeaseTable())
 	watcherAtPublish := make(chan bool, 1)
 	srv.beforePublish = func(st *rpcruntime.Stream) { watcherAtPublish <- st.WatcherStarted() }
 	t.Cleanup(func() {
