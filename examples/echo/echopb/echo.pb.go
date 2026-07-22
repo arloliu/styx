@@ -120,7 +120,12 @@ const file_examples_echo_echo_proto_rawDesc = "" +
 	"\vSayResponse\x12\x18\n" +
 	"\amessage\x18\x01 \x01(\tR\amessage22\n" +
 	"\x04Echo\x12*\n" +
-	"\x03Say\x12\x10.echo.SayRequest\x1a\x11.echo.SayResponseB.Z,github.com/arloliu/styx/examples/echo/echopbb\x06proto3"
+	"\x03Say\x12\x10.echo.SayRequest\x1a\x11.echo.SayResponse2\x9e\x01\n" +
+	"\n" +
+	"EchoStream\x120\n" +
+	"\aCollect\x12\x10.echo.SayRequest\x1a\x11.echo.SayResponse(\x01\x12-\n" +
+	"\x04Feed\x12\x10.echo.SayRequest\x1a\x11.echo.SayResponse0\x01\x12/\n" +
+	"\x04Chat\x12\x10.echo.SayRequest\x1a\x11.echo.SayResponse(\x010\x01B.Z,github.com/arloliu/styx/examples/echo/echopbb\x06proto3"
 
 var (
 	file_examples_echo_echo_proto_rawDescOnce sync.Once
@@ -141,9 +146,15 @@ var file_examples_echo_echo_proto_goTypes = []any{
 }
 var file_examples_echo_echo_proto_depIdxs = []int32{
 	0, // 0: echo.Echo.Say:input_type -> echo.SayRequest
-	1, // 1: echo.Echo.Say:output_type -> echo.SayResponse
-	1, // [1:2] is the sub-list for method output_type
-	0, // [0:1] is the sub-list for method input_type
+	0, // 1: echo.EchoStream.Collect:input_type -> echo.SayRequest
+	0, // 2: echo.EchoStream.Feed:input_type -> echo.SayRequest
+	0, // 3: echo.EchoStream.Chat:input_type -> echo.SayRequest
+	1, // 4: echo.Echo.Say:output_type -> echo.SayResponse
+	1, // 5: echo.EchoStream.Collect:output_type -> echo.SayResponse
+	1, // 6: echo.EchoStream.Feed:output_type -> echo.SayResponse
+	1, // 7: echo.EchoStream.Chat:output_type -> echo.SayResponse
+	4, // [4:8] is the sub-list for method output_type
+	0, // [0:4] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -162,7 +173,7 @@ func file_examples_echo_echo_proto_init() {
 			NumEnums:      0,
 			NumMessages:   2,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_examples_echo_echo_proto_goTypes,
 		DependencyIndexes: file_examples_echo_echo_proto_depIdxs,

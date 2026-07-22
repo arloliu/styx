@@ -109,6 +109,16 @@ type StreamConfig struct {
 	// shape. It consumes no stream credit (§4.4). Unused for the other shapes,
 	// whose first message is a STREAM_MSG.
 	OpenPayload []byte
+	// ParentCtx, when non-nil, is the caller's context the opener side roots the
+	// stream's own context in, so a caller cancellation is observed autonomously by
+	// the deadline watcher and drives the CANCELED terminal even with no subsequent
+	// operation (stream-protocol.md §7.1's CancelStream trigger). It never extends or
+	// shrinks the budget: the stream's context is WithDeadline(ParentCtx, deadline),
+	// keeping the exact instant the budget already resolved to, so an elapsed budget
+	// still records DEADLINE and only a genuine parent cancel records CANCELED. The
+	// accept side has no caller context and leaves it nil, so its context stays rooted
+	// in context.Background exactly as before.
+	ParentCtx context.Context
 }
 
 // Framework-reserved status codes carried on a stream teardown or rejection
@@ -466,9 +476,17 @@ func newStream(tbl *StreamTable, callID uint64, side StreamSide, cfg StreamConfi
 
 	// Open rejects a non-positive budget before reaching here (§2.3), so the
 	// deadline is always positive and finite: the stream's context always carries
-	// it, never an unbounded background context.
+	// it, never an unbounded background context. The opener roots it in the caller's
+	// context (cfg.ParentCtx) so a caller cancellation is observed autonomously by
+	// watchDeadline; the accept side leaves ParentCtx nil and roots in Background. The
+	// deadline was already resolved from the caller's, so WithDeadline keeps the same
+	// instant regardless of the parent — the budget is neither extended nor shrunk.
+	parent := context.Background()
+	if cfg.ParentCtx != nil {
+		parent = cfg.ParentCtx
+	}
 	s.deadline = time.Now().Add(cfg.Deadline)
-	s.ctx, s.cancelCtx = context.WithDeadline(context.Background(), s.deadline)
+	s.ctx, s.cancelCtx = context.WithDeadline(parent, s.deadline)
 	s.phase.Store(streamSubmitted)
 
 	// Server-streaming establishment (stream-protocol.md §6.3): the single request
@@ -537,10 +555,16 @@ func (s *Stream) WatcherStarted() bool {
 	return s.watcherStarted.Load()
 }
 
-// watchDeadline drives the DEADLINE terminal transition when the stream's own
-// budget elapses (stream-protocol.md §7.1's deadline trigger). It exits without
-// terminating if the context was canceled for any other reason (the stream
-// terminated first, and the winner canceled ctx as part of its work).
+// watchDeadline is the stream's autonomous terminal observer on its own context
+// (stream-protocol.md §7.1): the budget elapsing drives the DEADLINE terminal, and a
+// parent cancellation — which reaches this context only on the opener side, where it is
+// rooted in the caller's (StreamConfig.ParentCtx) — drives the CANCELED terminal with
+// no operation required. Either transition is first-wins, so an ordinary completion
+// (whose winner cancels this context as part of its teardown, AFTER the phase CAS has
+// already landed terminal) makes the cancel branch here a strict no-op: its terminal
+// CAS finds no live source and changes nothing. The accept side roots this context in
+// Background, so its cancel branch is only ever reached post-terminal and is likewise a
+// no-op there.
 func (s *Stream) watchDeadline() {
 	select {
 	case <-s.done:
@@ -548,12 +572,19 @@ func (s *Stream) watchDeadline() {
 	case <-s.ctx.Done():
 		if errors.Is(s.ctx.Err(), context.DeadlineExceeded) {
 			mapDeadlineToTerminal(s)
+
+			return
 		}
+		// A non-deadline cancellation of the stream's context: on the opener a genuine
+		// caller cancel (drive CANCELED); on an already-terminal stream the winner's own
+		// ctx cancel (the CAS loses harmlessly, no teardown emitted).
+		mapCancelToTerminal(s, ErrCanceledLocally)
 	}
 }
 
 // Context returns the stream's own context, carrying its deadline. It is
-// canceled when the stream terminates.
+// canceled when the stream terminates, and — on the opener side, where it is rooted
+// in the caller's context (StreamConfig.ParentCtx) — also when the caller cancels.
 func (s *Stream) Context() context.Context {
 	return s.ctx
 }
@@ -1129,6 +1160,35 @@ func (s *Stream) TerminateOpenAmbiguous(err error) {
 		return
 	}
 	mapCancelToTerminal(s, ErrCanceledLocally)
+}
+
+// TerminateLocal drives a locally-initiated terminal transition on behalf of the
+// public seam wrapper for a caller-side abort a byte operation surfaced without
+// itself terminating: a pre-admission or credit-blocked caller-context cancellation
+// (SendMsg/RecvMsg/CloseSend return the context error but reserve nothing, so §4.5's
+// post-admission terminal rule never fired), or a local codec failure the opener
+// cannot put on the wire. A deadline records DEADLINE; every other cause records
+// CANCELED. The stream is PUBLISHED here (the opener holds it), so the transition
+// wins the terminal CAS from PUBLISHED and emits the §9.1 teardown pair, freeing the
+// stream's slot rather than leaving it live until the deadline. If the stream already
+// terminated — its own deadline watcher, a peer frame, or the post-admission Send path
+// won first — the CAS loses harmlessly and the recorded outcome stands.
+func (s *Stream) TerminateLocal(err error) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		mapDeadlineToTerminal(s)
+
+		return
+	}
+	mapCancelToTerminal(s, ErrCanceledLocally)
+}
+
+// SendClosed reports whether this side has committed its send half-close (a
+// STREAM_CLOSE the transport accepted, stream-protocol.md §6.4). The plugin accept
+// half reads it after a client-streaming handler returns to detect a handler that
+// completed without its mandatory response (no SendAndClose), so the stream can be
+// failed promptly rather than lingering to the deadline (§6.3).
+func (s *Stream) SendClosed() bool {
+	return s.sendClosed.Load()
 }
 
 // EmitOwedOpenTeardown emits the teardown a stream owes when a locally-initiated

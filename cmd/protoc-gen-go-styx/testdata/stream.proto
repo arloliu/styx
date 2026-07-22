@@ -1,0 +1,16 @@
+syntax = "proto3";
+package streamtest;
+option go_package = "github.com/arloliu/styx/cmd/protoc-gen-go-styx/testdata/streampb";
+
+// Streamer exercises all three streaming shapes plus a unary method, so the
+// generator's per-shape output is compiled and round-tripped end to end.
+service Streamer {
+  rpc Unary (Chunk) returns (Chunk);              // unary (coexists with streaming)
+  rpc Collect (stream Chunk) returns (Summary);   // client-streaming
+  rpc Feed (Query) returns (stream Chunk);        // server-streaming
+  rpc Chat (stream Chunk) returns (stream Chunk); // bidi
+}
+
+message Chunk { bytes data = 1; }
+message Query { string q = 1; }
+message Summary { int64 count = 1; }

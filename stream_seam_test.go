@@ -108,7 +108,7 @@ func TestOpenStream_ServerStreaming_RoundTrip(t *testing.T) {
 	handlers := map[streamKey]streamHandlerReg{
 		{service: fnv64a(service), method: fnv64a(method)}: {
 			shape: rpcruntime.ServerStreaming,
-			handler: func(st *rpcruntime.Stream) error {
+			handler: func(st *Stream) error {
 				req, err := st.RecvMsg(context.Background())
 				if err != nil {
 					return err
@@ -150,9 +150,7 @@ func TestOpenStream_ServerStreaming_RoundTrip(t *testing.T) {
 	}
 	require.Equal(t, [][]byte{[]byte("req-0"), []byte("req-1"), []byte("req-2")}, got)
 
-	oc, ok := st.Outcome()
-	require.True(t, ok)
-	require.Equal(t, rpcruntime.OutcomeCompleted, oc.Code)
+	require.NoError(t, st.Err(), "the stream completed normally on both sides")
 }
 
 // A server-streaming open whose request is ZERO bytes still establishes the shape:
@@ -165,7 +163,7 @@ func TestOpenStream_ServerStreaming_ZeroByteRequest(t *testing.T) {
 	handlers := map[streamKey]streamHandlerReg{
 		{service: fnv64a(service), method: fnv64a(method)}: {
 			shape: rpcruntime.ServerStreaming,
-			handler: func(st *rpcruntime.Stream) error {
+			handler: func(st *Stream) error {
 				req, err := st.RecvMsg(context.Background())
 				if err != nil {
 					return err
@@ -207,11 +205,11 @@ func TestStreamServer_HandlerError_TerminatesStreamAndReachesOpener(t *testing.T
 
 	const service, method = "echo.Echo", "Fail"
 	handlers := map[streamKey]streamHandlerReg{
-		{service: fnv64a(service), method: fnv64a(method)}: {handler: func(_ *rpcruntime.Stream) error {
+		{service: fnv64a(service), method: fnv64a(method)}: {handler: func(_ *Stream) error {
 			return &Status{Code: CodeInternal, Message: "boom"}
 		}},
 	}
-	srv := newStreamServer(pluginTr, handlers)
+	srv := newStreamServer(pluginTr, handlers, codec.Proto{})
 	d := rpcruntime.NewDispatcher()
 	done := make(chan struct{})
 	go func() { defer close(done); _ = runServeLoop(context.Background(), pluginTr, d, srv) }()
@@ -241,13 +239,13 @@ func TestStreamServer_OnStreamOpen_PoisonsMalformedOpens(t *testing.T) {
 	_, pluginTr := newStreamingTransportPairForTest(t)
 	const service, method = "echo.Echo", "M"
 	handlers := map[streamKey]streamHandlerReg{
-		{service: fnv64a(service), method: fnv64a(method)}: {handler: func(st *rpcruntime.Stream) error {
+		{service: fnv64a(service), method: fnv64a(method)}: {handler: func(st *Stream) error {
 			<-st.Context().Done()
 
 			return st.Context().Err()
 		}},
 	}
-	srv := newStreamServer(pluginTr, handlers)
+	srv := newStreamServer(pluginTr, handlers, codec.Proto{})
 	t.Cleanup(func() { _ = pluginTr.Close(); srv.teardown(ErrPluginUnavailable) })
 
 	// Nonzero high 32 bits of the control word.
@@ -274,13 +272,13 @@ func TestStreamServer_OnStreamOpen_DuplicateUnknownRoute_Poisons(t *testing.T) {
 	_, pluginTr := newStreamingTransportPairForTest(t)
 	const service, method = "echo.Echo", "M"
 	handlers := map[streamKey]streamHandlerReg{
-		{service: fnv64a(service), method: fnv64a(method)}: {handler: func(st *rpcruntime.Stream) error {
+		{service: fnv64a(service), method: fnv64a(method)}: {handler: func(st *Stream) error {
 			<-st.Context().Done()
 
 			return st.Context().Err()
 		}},
 	}
-	srv := newStreamServer(pluginTr, handlers)
+	srv := newStreamServer(pluginTr, handlers, codec.Proto{})
 	t.Cleanup(func() { _ = pluginTr.Close(); srv.teardown(ErrPluginUnavailable) })
 
 	require.NoError(t, srv.onStreamOpen(transport.Frame{
@@ -1189,7 +1187,7 @@ func TestOpenStream_PeerTerminalBeforePublish_ReturnsNonNilError(t *testing.T) {
 			cc := newClientConn("p", table, gate, codec.Proto{})
 			t.Cleanup(func() { _ = gate.Close() })
 
-			strCh := make(chan *rpcruntime.Stream, 1)
+			strCh := make(chan *Stream, 1)
 			errCh := make(chan error, 1)
 			go func() {
 				st, e := cc.OpenStream(t.Context(), "s", "m", tc.opts...)
@@ -1217,7 +1215,7 @@ func TestOpenStream_PeerTerminalBeforePublish_ReturnsNonNilError(t *testing.T) {
 
 			close(gate.gate) // let the OPEN send succeed AFTER the terminal already won
 
-			var st *rpcruntime.Stream
+			var st *Stream
 			var err error
 			select {
 			case st = <-strCh:

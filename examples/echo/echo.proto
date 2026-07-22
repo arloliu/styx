@@ -5,5 +5,15 @@ option go_package = "github.com/arloliu/styx/examples/echo/echopb";
 service Echo {
   rpc Say (SayRequest) returns (SayResponse);
 }
+
+// EchoStream exercises the three streaming shapes over the same messages, so the
+// generated streaming client/server pair is compiled and round-tripped alongside
+// the unary Echo service.
+service EchoStream {
+  rpc Collect (stream SayRequest) returns (SayResponse);      // client-streaming
+  rpc Feed (SayRequest) returns (stream SayResponse);         // server-streaming
+  rpc Chat (stream SayRequest) returns (stream SayResponse);  // bidi
+}
+
 message SayRequest { string message = 1; }
 message SayResponse { string message = 1; }

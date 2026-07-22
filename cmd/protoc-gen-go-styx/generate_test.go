@@ -74,12 +74,14 @@ func styxFile(t *testing.T, gen *protogen.Plugin) string {
 	return resp.GetFile()[0].GetContent()
 }
 
-// hexLiteral extracts the hex uint64 literal immediately following name in
-// content (e.g. "echoServiceID uint64 = 0x1234...") and parses it.
+// hexLiteral extracts the hex literal immediately following name in content
+// (e.g. "echoServiceID = 0x1234..." — the IDs are emitted as UNTYPED constants) and
+// parses it. The leading word boundary keeps "echoServiceID" from matching inside a
+// longer identifier that ends in the same suffix.
 func hexLiteral(t *testing.T, content, name string) uint64 {
 	t.Helper()
 
-	re := regexp.MustCompile(regexp.QuoteMeta(name) + `\s+uint64\s*=\s*(0x[0-9a-fA-F]+)`)
+	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\s*=\s*(0x[0-9a-fA-F]+)`)
 	m := re.FindStringSubmatch(content)
 	require.NotNil(t, m, "constant %q not found in generated content:\n%s", name, content)
 
@@ -105,15 +107,19 @@ func TestRun_GeneratesClientAndServerStubs_WithMatchingFNV64IDs(t *testing.T) {
 	require.Contains(t, content, "func NewEchoClient(conn *styx.ClientConn) EchoClient")
 	require.Contains(t, content, "func RegisterEchoServer(srv *styx.PluginServer, impl EchoServer)")
 
-	// And: the two ID constants equal the documented algorithm,
-	// recomputed here rather than pinned to a hardcoded hash value — this
-	// proves the IDs are deterministic and match serviceID/methodID, not
-	// merely that the generator agrees with itself.
-	wantServiceID := main.ExportServiceID("echo.Echo")
-	wantMethodID := main.ExportMethodID("echo.Echo", "Say")
+	// And: the two ID constants equal INDEPENDENT literal expectations — FNV-1a-64 of
+	// "echo.Echo" and the bare "Say", computed outside this package (a separate FNV
+	// implementation) and pinned here — so an accidental mutation of the generator's
+	// own hash cannot move both the emitted value and the expectation together.
+	const wantServiceID uint64 = 0xedc54b402664edff   // fnv1a64("echo.Echo")
+	const wantSayMethodID uint64 = 0x9836aa19fa8ee240 // fnv1a64("Say")
 
 	require.Equal(t, wantServiceID, hexLiteral(t, content, "echoServiceID"))
-	require.Equal(t, wantMethodID, hexLiteral(t, content, "echoSayMethodID"))
+	require.Equal(t, wantSayMethodID, hexLiteral(t, content, "echoSayMethodID"))
+
+	// And: the unary client dispatches by the precomputed ID constants (InvokeID), not
+	// by hashing the service/method name strings on every call.
+	require.Contains(t, content, "c.conn.InvokeID(ctx, echoServiceID, echoSayMethodID, req, resp)")
 }
 
 // Test Run emitting an EchoRequirement() helper returning the exact
@@ -145,52 +151,175 @@ func TestRun_GeneratesRequirementHelper_WithGeneratedVersionAndFullName(t *testi
 		"}")
 }
 
-// Test Run rejecting a streaming method with a clear, method-naming error instead of silently skipping it
-func TestRun_FailsGeneration_OnStreamingMethod(t *testing.T) {
-	// Given: a service with one server-streaming method, injected directly
-	// into a FileDescriptorProto (constructing a minimal streaming service
-	// by hand rather than adding a second .proto fixture).
-	streamProto := &descriptorpb.FileDescriptorProto{
-		Name:    new("stream.proto"),
-		Package: new("streamtest"),
-		Syntax:  new("proto3"),
-		Options: &descriptorpb.FileOptions{
-			GoPackage: new("github.com/arloliu/styx/cmd/protoc-gen-go-styx/testdata/streampb"),
-		},
-		MessageType: []*descriptorpb.DescriptorProto{
-			{
-				Name: new("Empty"),
-			},
-		},
-		Service: []*descriptorpb.ServiceDescriptorProto{
-			{
-				Name: new("Streamer"),
-				Method: []*descriptorpb.MethodDescriptorProto{
-					{
-						Name:            new("Watch"),
-						InputType:       new(".streamtest.Empty"),
-						OutputType:      new(".streamtest.Empty"),
-						ServerStreaming: new(true),
-					},
-				},
-			},
-		},
-	}
-
-	req := &pluginpb.CodeGeneratorRequest{
-		FileToGenerate: []string{"stream.proto"},
-		ProtoFile:      []*descriptorpb.FileDescriptorProto{streamProto},
-	}
-	gen, err := protogen.Options{}.New(req)
-	require.NoError(t, err)
+// Test Run emitting client-streaming stubs: a client that Sends and
+// CloseAndRecvs, a server that Recvs and SendAndCloses, registered by
+// precomputed ID with the client-streaming shape.
+func TestRun_GeneratesClientStreamingStubs(t *testing.T) {
+	// Given: testdata/stream.proto with a client-streaming Collect method.
+	gen := newTestPlugin(t, "testdata/stream.proto", "stream.proto")
 
 	// When
-	runErr := main.Run(gen)
+	require.NoError(t, main.Run(gen))
+	content := styxFile(t, gen)
 
-	// Then: generation fails, naming the offending service and method.
-	require.Error(t, runErr)
-	require.ErrorIs(t, runErr, main.ErrStreamingUnsupported)
-	require.Contains(t, runErr.Error(), "Watch")
+	// Then: the client method opens the stream by precomputed ID (no per-call
+	// hash — it passes the ID constants, never string names to a hash), with no
+	// open option (client-streaming is the default shape).
+	require.Contains(t, content,
+		"func (c *streamerClient) Collect(ctx context.Context) (Streamer_CollectClient, error)")
+	require.Contains(t, content, "c.conn.OpenStreamID(ctx, streamerServiceID, streamerCollectMethodID)")
+
+	// And: the typed client stream Sends requests and CloseAndRecvs the single
+	// response the server's STREAM_CLOSE carries.
+	require.Contains(t, content, "type Streamer_CollectClient interface {")
+	require.Contains(t, content, "Send(*Chunk) error")
+	require.Contains(t, content, "CloseAndRecv() (*Summary, error)")
+
+	// And: the server side Recvs requests and SendAndCloses the response, keyed
+	// by precomputed ID with the client-streaming shape.
+	require.Contains(t, content, "type Streamer_CollectServer interface {")
+	require.Contains(t, content, "SendAndClose(*Summary) error")
+	require.Contains(t, content,
+		"srv.RegisterStreamHandlerID(streamerServiceID, streamerCollectMethodID, styx.ClientStreamingShape,")
+}
+
+// Test Run emitting server-streaming stubs: the single request rides
+// STREAM_OPEN (WithServerStreamRequest), the client Recvs the response stream,
+// and the server registration delivers the OPEN request then closes on return.
+func TestRun_GeneratesServerStreamingStubs(t *testing.T) {
+	// Given: testdata/stream.proto with a server-streaming Feed method.
+	gen := newTestPlugin(t, "testdata/stream.proto", "stream.proto")
+
+	// When
+	require.NoError(t, main.Run(gen))
+	content := styxFile(t, gen)
+
+	// Then: the client method takes the single request and attaches it to the
+	// STREAM_OPEN via WithServerStreamRequest, returning a Recv-only stream.
+	require.Contains(t, content,
+		"func (c *streamerClient) Feed(ctx context.Context, req *Query) (Streamer_FeedClient, error)")
+	// The single request rides the OPEN encoded with the connection's negotiated codec
+	// (OpenServerStreamID marshals it), never a hardcoded proto.Marshal in the stub.
+	require.Contains(t, content,
+		"c.conn.OpenServerStreamID(ctx, streamerServiceID, streamerFeedMethodID, req)")
+	require.NotContains(t, content, "proto.Marshal(req)")
+	require.Contains(t, content, "type Streamer_FeedClient interface {")
+	require.Contains(t, content, "Recv() (*Chunk, error)")
+
+	// And: the server handler decodes the OPEN request with the stream's negotiated
+	// codec, runs impl.Feed, then closes its send direction so the stream completes.
+	require.Contains(t, content,
+		"srv.RegisterStreamHandlerID(streamerServiceID, streamerFeedMethodID, styx.ServerStreamingShape,")
+	require.Contains(t, content, "if err := stream.Unmarshal(payload, req); err != nil {")
+	require.Contains(t, content, "if err := impl.Feed(req, &streamerFeedServer{stream: stream}); err != nil {")
+	require.Contains(t, content, "return stream.CloseSend(context.Background(), nil)")
+}
+
+// Test the generated code compares EXACTLY against a reviewed golden file — a
+// byte-for-byte check across every shape (unary plus all three streaming shapes),
+// stronger than the per-fragment substring assertions above: any drift in the emitted
+// text, not just the fragments spot-checked, fails here. Regenerate the golden with
+// `UPDATE_GOLDEN=1 go test ./cmd/protoc-gen-go-styx/...` after an intended change.
+func TestRun_MatchesGoldenExactly(t *testing.T) {
+	gen := newTestPlugin(t, "testdata/stream.proto", "stream.proto")
+	require.NoError(t, main.Run(gen))
+	content := styxFile(t, gen)
+
+	const goldenPath = "testdata/stream.styx.go.golden"
+	if os.Getenv("UPDATE_GOLDEN") != "" {
+		require.NoError(t, os.WriteFile(goldenPath, []byte(content), 0o644))
+	}
+	want, err := os.ReadFile(goldenPath)
+	require.NoError(t, err)
+	require.Equal(t, string(want), content,
+		"generated output drifted from the reviewed golden; rerun with UPDATE_GOLDEN=1 if the change is intended")
+}
+
+// Test every generated stream interface (client and server, all three shapes)
+// exposes Context() context.Context, and the impls implement it — the generated
+// surface's standard access to the stream's deadline and cancellation.
+func TestRun_GeneratesContextAccessorOnEveryStreamInterface(t *testing.T) {
+	gen := newTestPlugin(t, "testdata/stream.proto", "stream.proto")
+	require.NoError(t, main.Run(gen))
+	content := styxFile(t, gen)
+
+	for _, iface := range []string{
+		"Streamer_CollectClient", "Streamer_CollectServer",
+		"Streamer_FeedClient", "Streamer_FeedServer",
+		"Streamer_ChatClient", "Streamer_ChatServer",
+	} {
+		require.Regexp(t, `type `+iface+` interface \{[^}]*Context\(\) context\.Context`, content,
+			"interface %s must expose Context()", iface)
+	}
+	for _, impl := range []string{
+		"streamerCollectClient", "streamerCollectServer",
+		"streamerFeedClient", "streamerFeedServer",
+		"streamerChatClient", "streamerChatServer",
+	} {
+		require.Contains(t, content,
+			"func (x *"+impl+") Context() context.Context { return x.stream.Context() }",
+			"impl %s must implement Context()", impl)
+	}
+}
+
+// Test Run emitting bidi stubs: both directions stream, the client declares the
+// bidi shape at open, and Send/Recv/CloseSend are all present.
+func TestRun_GeneratesBidiStreamingStubs(t *testing.T) {
+	// Given: testdata/stream.proto with a bidi Chat method.
+	gen := newTestPlugin(t, "testdata/stream.proto", "stream.proto")
+
+	// When
+	require.NoError(t, main.Run(gen))
+	content := styxFile(t, gen)
+
+	// Then: the client declares the bidi shape at open and exposes Send, Recv,
+	// and CloseSend.
+	require.Contains(t, content, "func (c *streamerClient) Chat(ctx context.Context) (Streamer_ChatClient, error)")
+	require.Contains(t, content,
+		"c.conn.OpenStreamID(ctx, streamerServiceID, streamerChatMethodID, styx.WithBidiStream())")
+	require.Contains(t, content, "type Streamer_ChatClient interface {")
+	require.Contains(t, content, "CloseSend() error")
+	require.Contains(t, content,
+		"srv.RegisterStreamHandlerID(streamerServiceID, streamerChatMethodID, styx.BidiStreamingShape,")
+}
+
+// Test Run precomputing every service/method ID as a generation-time constant
+// with the FNV-1a-64 algorithm-and-input comment, so no ID is hashed per call.
+func TestRun_StreamingIDs_ArePrecomputedConstants(t *testing.T) {
+	// Given
+	gen := newTestPlugin(t, "testdata/stream.proto", "stream.proto")
+
+	// When
+	require.NoError(t, main.Run(gen))
+	content := styxFile(t, gen)
+
+	// Then: each streaming method's ID constant equals an INDEPENDENT literal
+	// expectation — FNV-1a-64 computed outside this package and pinned here — so a
+	// mutation of the generator's own hash cannot move the emitted value and the
+	// expectation together.
+	require.Equal(t, uint64(0x6aa0727100b647e2), hexLiteral(t, content, "streamerServiceID"))
+	require.Equal(t, uint64(0x828e9e42981c5891), hexLiteral(t, content, "streamerCollectMethodID"))
+	require.Equal(t, uint64(0x3a8fe3852a245245), hexLiteral(t, content, "streamerFeedMethodID"))
+	require.Equal(t, uint64(0x1d318e9d0ccba86b), hexLiteral(t, content, "streamerChatMethodID"))
+	require.Contains(t, content, `fnv1a64("Collect")`)
+
+	// And: a service with any streaming method advertises RequiresStreaming so a
+	// host can set PluginSpec.RequireStreaming from it.
+	require.Contains(t, content, "const StreamerRequiresStreaming = true")
+}
+
+// Test Run leaving RequiresStreaming false for a unary-only service, so a host
+// calling only unary methods does not force the streaming feature required.
+func TestRun_RequiresStreaming_IsFalseForUnaryOnlyService(t *testing.T) {
+	// Given: the unary-only echo.proto.
+	gen := newTestPlugin(t, "testdata/echo.proto", "echo.proto")
+
+	// When
+	require.NoError(t, main.Run(gen))
+	content := styxFile(t, gen)
+
+	// Then
+	require.Contains(t, content, "const EchoRequiresStreaming = false")
 }
 
 // Test Run succeeding when two different services each declare a method

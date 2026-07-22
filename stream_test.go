@@ -41,7 +41,7 @@ func startStreamPlugin(
 ) {
 	t.Helper()
 
-	srv := newStreamServer(pluginTr, handlers)
+	srv := newStreamServer(pluginTr, handlers, codec.Proto{})
 	d := rpcruntime.NewDispatcher()
 	done := make(chan struct{})
 	go func() {
@@ -64,7 +64,7 @@ func TestOpenStream_ClientStreamingRoundTrip_ThroughInProcessPair(t *testing.T) 
 
 	const service, method = "echo.Echo", "Collect"
 	handlers := map[streamKey]streamHandlerReg{
-		{service: fnv64a(service), method: fnv64a(method)}: {handler: func(st *rpcruntime.Stream) error {
+		{service: fnv64a(service), method: fnv64a(method)}: {handler: func(st *Stream) error {
 			got, err := st.RecvMsg(context.Background())
 			if err != nil {
 				return err
@@ -98,9 +98,48 @@ func TestOpenStream_ClientStreamingRoundTrip_ThroughInProcessPair(t *testing.T) 
 	_, err = st.RecvMsg(ctx)
 	require.ErrorIs(t, err, io.EOF)
 
-	oc, ok := st.Outcome()
-	require.True(t, ok)
-	require.Equal(t, rpcruntime.OutcomeCompleted, oc.Code)
+	require.NoError(t, st.Err(), "the stream completed normally on both sides")
+}
+
+// Test the ID-accepting entry points (OpenStreamID / RegisterStreamHandlerID)
+// routing to the identical (service, method) the name-based pair hashes to:
+// generated code passes precomputed IDs and must land on the same handler a
+// hand-written name-based registration keys, with no name hashed on either side.
+func TestOpenStreamID_RoutesIdenticallyToNameBased_ThroughInProcessPair(t *testing.T) {
+	clientTr, pluginTr := newStreamingTransportPairForTest(t)
+
+	const service, method = "echo.Echo", "Collect"
+	// The plugin registers by precomputed ID; the client opens by precomputed ID.
+	// The IDs are the SAME hashes the name-based path computes.
+	serviceID, methodID := fnv64a(service), fnv64a(method)
+
+	srv := NewPluginServer()
+	srv.RegisterStreamHandlerID(serviceID, methodID, ClientStreamingShape, func(st *Stream) error {
+		got, err := st.RecvMsg(context.Background())
+		if err != nil {
+			return err
+		}
+		if _, eof := st.RecvMsg(context.Background()); !errors.Is(eof, io.EOF) {
+			return eof
+		}
+
+		return st.CloseSend(context.Background(), append([]byte("id:"), got...))
+	})
+	startStreamPlugin(t, pluginTr, srv.streamHandlers)
+
+	table := rpcruntime.NewTable(firstGeneration)
+	cc := newClientConn("p", table, clientTr, codec.Proto{})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	st, err := cc.OpenStreamID(ctx, serviceID, methodID)
+	require.NoError(t, err)
+	require.NoError(t, st.SendMsg(ctx, []byte("hello")))
+	require.NoError(t, st.CloseSend(ctx, nil))
+
+	resp, err := st.RecvMsg(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []byte("id:hello"), resp, "the ID-keyed registration received the ID-routed open")
 }
 
 // Test OpenStream against an unregistered streaming method: the accept side
@@ -157,7 +196,7 @@ func TestOpenStream_TransportClose_FailsOpenStreamAndUnblocksRecv(t *testing.T) 
 	clientTr, pluginTr := newStreamingTransportPairForTest(t)
 	// A plugin that accepts the open but never sends, so RecvMsg parks.
 	handlers := map[streamKey]streamHandlerReg{
-		{service: fnv64a("s"), method: fnv64a("m")}: {handler: func(st *rpcruntime.Stream) error {
+		{service: fnv64a("s"), method: fnv64a("m")}: {handler: func(st *Stream) error {
 			<-st.Context().Done()
 
 			return st.Context().Err()
@@ -235,7 +274,7 @@ func TestPluginOffer_RequiresStreaming_WhenHandlerRegistered(t *testing.T) {
 	require.False(t, streamingRequired(s.pluginOffer()), "streaming is optional with no stream handlers")
 
 	// Registering a stream handler makes the plugin require streaming.
-	s.RegisterStreamHandler("echo.Echo", "Feed", ServerStreamingShape, func(*rpcruntime.Stream) error { return nil })
+	s.RegisterStreamHandler("echo.Echo", "Feed", ServerStreamingShape, func(*Stream) error { return nil })
 	require.True(t, streamingRequired(s.pluginOffer()), "a registered stream handler requires streaming")
 
 	// A host that does not support streaming fails the handshake against this plugin.

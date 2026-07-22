@@ -19,10 +19,12 @@ const (
 )
 
 const (
-	echoServiceID      uint64 = 0xedc54b402664edff // fnv1a64("echo.Echo")
-	echoSayMethodID    uint64 = 0x9836aa19fa8ee240 // fnv1a64("Say")
+	echoServiceID             = 0xedc54b402664edff // fnv1a64("echo.Echo")
+	echoSayMethodID           = 0x9836aa19fa8ee240 // fnv1a64("Say")
 	EchoServiceVersion uint32 = 1
 )
+
+const EchoRequiresStreaming = false
 
 func EchoRequirement() styx.ServiceRequirement {
 	return styx.ServiceRequirement{
@@ -42,7 +44,7 @@ func NewEchoClient(conn *styx.ClientConn) EchoClient { return &echoClient{conn: 
 
 func (c *echoClient) Say(ctx context.Context, req *SayRequest) (*SayResponse, error) {
 	resp := &SayResponse{}
-	if err := c.conn.Invoke(ctx, "echo.Echo", "Say", req, resp); err != nil {
+	if err := c.conn.InvokeID(ctx, echoServiceID, echoSayMethodID, req, resp); err != nil {
 		return nil, err
 	}
 	return resp, nil
@@ -72,3 +74,270 @@ func RegisterEchoServer(srv *styx.PluginServer, impl EchoServer) {
 		},
 	}, impl)
 }
+
+const (
+	echoStreamServiceID              = 0x2a0350fa32dbae1f // fnv1a64("echo.EchoStream")
+	echoStreamCollectMethodID        = 0x828e9e42981c5891 // fnv1a64("Collect")
+	echoStreamFeedMethodID           = 0x3a8fe3852a245245 // fnv1a64("Feed")
+	echoStreamChatMethodID           = 0x1d318e9d0ccba86b // fnv1a64("Chat")
+	EchoStreamServiceVersion  uint32 = 1
+)
+
+const EchoStreamRequiresStreaming = true
+
+func EchoStreamRequirement() styx.ServiceRequirement {
+	return styx.ServiceRequirement{
+		Service:    "echo.EchoStream",
+		MinVersion: EchoStreamServiceVersion,
+		MaxVersion: EchoStreamServiceVersion,
+	}
+}
+
+type EchoStreamClient interface {
+	Collect(ctx context.Context) (EchoStream_CollectClient, error)
+	Feed(ctx context.Context, req *SayRequest) (EchoStream_FeedClient, error)
+	Chat(ctx context.Context) (EchoStream_ChatClient, error)
+}
+
+type echoStreamClient struct{ conn *styx.ClientConn }
+
+func NewEchoStreamClient(conn *styx.ClientConn) EchoStreamClient {
+	return &echoStreamClient{conn: conn}
+}
+
+func (c *echoStreamClient) Collect(ctx context.Context) (EchoStream_CollectClient, error) {
+	st, err := c.conn.OpenStreamID(ctx, echoStreamServiceID, echoStreamCollectMethodID)
+	if err != nil {
+		return nil, err
+	}
+	return &echoStreamCollectClient{stream: st, ctx: ctx}, nil
+}
+
+func (c *echoStreamClient) Feed(ctx context.Context, req *SayRequest) (EchoStream_FeedClient, error) {
+	st, err := c.conn.OpenServerStreamID(ctx, echoStreamServiceID, echoStreamFeedMethodID, req)
+	if err != nil {
+		return nil, err
+	}
+	return &echoStreamFeedClient{stream: st, ctx: ctx}, nil
+}
+
+func (c *echoStreamClient) Chat(ctx context.Context) (EchoStream_ChatClient, error) {
+	st, err := c.conn.OpenStreamID(ctx, echoStreamServiceID, echoStreamChatMethodID, styx.WithBidiStream())
+	if err != nil {
+		return nil, err
+	}
+	return &echoStreamChatClient{stream: st, ctx: ctx}, nil
+}
+
+type EchoStreamServer interface {
+	Collect(stream EchoStream_CollectServer) error
+	Feed(req *SayRequest, stream EchoStream_FeedServer) error
+	Chat(stream EchoStream_ChatServer) error
+}
+
+func RegisterEchoStreamServer(srv *styx.PluginServer, impl EchoStreamServer) {
+	srv.RegisterService(&styx.ServiceDesc{
+		ServiceName: "echo.EchoStream",
+		ServiceID:   echoStreamServiceID,
+		Version:     EchoStreamServiceVersion,
+		Methods:     []styx.MethodDesc{},
+	}, impl)
+	srv.RegisterStreamHandlerID(echoStreamServiceID, echoStreamCollectMethodID, styx.ClientStreamingShape, func(stream *styx.Stream) error {
+		return impl.Collect(&echoStreamCollectServer{stream: stream})
+	})
+	srv.RegisterStreamHandlerID(echoStreamServiceID, echoStreamFeedMethodID, styx.ServerStreamingShape, func(stream *styx.Stream) error {
+		payload, err := stream.RecvMsg(context.Background())
+		if err != nil {
+			return err
+		}
+		req := &SayRequest{}
+		if err := stream.Unmarshal(payload, req); err != nil {
+			return err
+		}
+		if err := impl.Feed(req, &echoStreamFeedServer{stream: stream}); err != nil {
+			return err
+		}
+		return stream.CloseSend(context.Background(), nil)
+	})
+	srv.RegisterStreamHandlerID(echoStreamServiceID, echoStreamChatMethodID, styx.BidiStreamingShape, func(stream *styx.Stream) error {
+		if err := impl.Chat(&echoStreamChatServer{stream: stream}); err != nil {
+			return err
+		}
+		return stream.CloseSend(context.Background(), nil)
+	})
+}
+
+type EchoStream_CollectClient interface {
+	Send(*SayRequest) error
+	CloseAndRecv() (*SayResponse, error)
+	Context() context.Context
+}
+
+type echoStreamCollectClient struct {
+	stream *styx.Stream
+	ctx    context.Context
+}
+
+func (x *echoStreamCollectClient) Send(m *SayRequest) error {
+	payload, err := x.stream.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return styx.StreamError(x.stream.SendMsg(x.ctx, payload))
+}
+
+func (x *echoStreamCollectClient) CloseAndRecv() (*SayResponse, error) {
+	if err := x.stream.CloseSend(x.ctx, nil); err != nil {
+		return nil, styx.StreamError(err)
+	}
+	payload, err := x.stream.RecvMsg(x.ctx)
+	if err != nil {
+		return nil, styx.StreamError(err)
+	}
+	resp := &SayResponse{}
+	if err := x.stream.Unmarshal(payload, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (x *echoStreamCollectClient) Context() context.Context { return x.stream.Context() }
+
+type EchoStream_CollectServer interface {
+	Recv() (*SayRequest, error)
+	SendAndClose(*SayResponse) error
+	Context() context.Context
+}
+
+type echoStreamCollectServer struct{ stream *styx.Stream }
+
+func (x *echoStreamCollectServer) Recv() (*SayRequest, error) {
+	payload, err := x.stream.RecvMsg(context.Background())
+	if err != nil {
+		return nil, styx.StreamError(err)
+	}
+	req := &SayRequest{}
+	if err := x.stream.Unmarshal(payload, req); err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
+func (x *echoStreamCollectServer) SendAndClose(m *SayResponse) error {
+	payload, err := x.stream.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return styx.StreamError(x.stream.CloseSend(context.Background(), payload))
+}
+
+func (x *echoStreamCollectServer) Context() context.Context { return x.stream.Context() }
+
+type EchoStream_FeedClient interface {
+	Recv() (*SayResponse, error)
+	Context() context.Context
+}
+
+type echoStreamFeedClient struct {
+	stream *styx.Stream
+	ctx    context.Context
+}
+
+func (x *echoStreamFeedClient) Recv() (*SayResponse, error) {
+	payload, err := x.stream.RecvMsg(x.ctx)
+	if err != nil {
+		return nil, styx.StreamError(err)
+	}
+	resp := &SayResponse{}
+	if err := x.stream.Unmarshal(payload, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (x *echoStreamFeedClient) Context() context.Context { return x.stream.Context() }
+
+type EchoStream_FeedServer interface {
+	Send(*SayResponse) error
+	Context() context.Context
+}
+
+type echoStreamFeedServer struct{ stream *styx.Stream }
+
+func (x *echoStreamFeedServer) Send(m *SayResponse) error {
+	payload, err := x.stream.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return styx.StreamError(x.stream.SendMsg(context.Background(), payload))
+}
+
+func (x *echoStreamFeedServer) Context() context.Context { return x.stream.Context() }
+
+type EchoStream_ChatClient interface {
+	Send(*SayRequest) error
+	Recv() (*SayResponse, error)
+	CloseSend() error
+	Context() context.Context
+}
+
+type echoStreamChatClient struct {
+	stream *styx.Stream
+	ctx    context.Context
+}
+
+func (x *echoStreamChatClient) Send(m *SayRequest) error {
+	payload, err := x.stream.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return styx.StreamError(x.stream.SendMsg(x.ctx, payload))
+}
+
+func (x *echoStreamChatClient) Recv() (*SayResponse, error) {
+	payload, err := x.stream.RecvMsg(x.ctx)
+	if err != nil {
+		return nil, styx.StreamError(err)
+	}
+	resp := &SayResponse{}
+	if err := x.stream.Unmarshal(payload, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (x *echoStreamChatClient) CloseSend() error {
+	return styx.StreamError(x.stream.CloseSend(x.ctx, nil))
+}
+
+func (x *echoStreamChatClient) Context() context.Context { return x.stream.Context() }
+
+type EchoStream_ChatServer interface {
+	Send(*SayResponse) error
+	Recv() (*SayRequest, error)
+	Context() context.Context
+}
+
+type echoStreamChatServer struct{ stream *styx.Stream }
+
+func (x *echoStreamChatServer) Send(m *SayResponse) error {
+	payload, err := x.stream.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return styx.StreamError(x.stream.SendMsg(context.Background(), payload))
+}
+
+func (x *echoStreamChatServer) Recv() (*SayRequest, error) {
+	payload, err := x.stream.RecvMsg(context.Background())
+	if err != nil {
+		return nil, styx.StreamError(err)
+	}
+	req := &SayRequest{}
+	if err := x.stream.Unmarshal(payload, req); err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
+func (x *echoStreamChatServer) Context() context.Context { return x.stream.Context() }

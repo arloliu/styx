@@ -7,3 +7,8 @@ modules:
       # both are in the same buf module. The test invokes buf/protoc against
       # this file directly, scoped outside the root module.
       - cmd/protoc-gen-go-styx/testdata
+      # The gRPC baseline for the spike benchmark: it is generated with
+      # protoc-gen-go-grpc (ping_grpc.pb.go) for an apples-to-apples gRPC
+      # comparison, so the styx generator must not also emit a Ping client/server
+      # here — the two would redeclare the same PingClient/NewPingClient symbols.
+      - bench/spike/baseline/pingpb

@@ -381,6 +381,23 @@ func statusFromFrame(fs *transport.FrameStatus) *rpcruntime.Status {
 // caller of Invoke — hand-calling it is supported but bypasses no safety
 // mechanism; it's a plain typed RPC call.
 func (c *ClientConn) Invoke(ctx context.Context, service, method string, req, resp proto.Message) error {
+	return c.invokeByID(ctx, fnv64a(service), fnv64a(method), req, resp)
+}
+
+// InvokeID is Invoke with the FNV-1a-64 service/method routing hashes supplied
+// directly, so a caller that already holds them skips the per-call hash. Generated
+// unary client stubs call it, passing the service/method ID constants
+// protoc-gen-go-styx precomputed at generation time (with the same algorithm as
+// fnv64a) — so a generated unary call never rehashes a name on the hot path.
+// Hand-written code uses the name-based Invoke; both land on the identical
+// (service, method) routing, mirroring OpenStream/OpenStreamID.
+func (c *ClientConn) InvokeID(ctx context.Context, serviceID, methodID uint64, req, resp proto.Message) error {
+	return c.invokeByID(ctx, serviceID, methodID, req, resp)
+}
+
+// invokeByID is the shared core of Invoke and InvokeID: it submits and publishes a
+// unary request routed by the precomputed serviceID/methodID hashes.
+func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64, req, resp proto.Message) error {
 	state := c.state.Load()
 	if state == nil {
 		return ErrPluginUnavailable
@@ -414,8 +431,8 @@ func (c *ClientConn) Invoke(ctx context.Context, service, method string, req, re
 		f := transport.Frame{
 			CallID:  callID,
 			Kind:    transport.FrameUnaryReq,
-			Service: fnv64a(service),
-			Method:  fnv64a(method),
+			Service: serviceID,
+			Method:  methodID,
 			Budget:  budget,
 			Payload: payload,
 		}

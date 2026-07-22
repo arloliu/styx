@@ -3,10 +3,62 @@ package styx
 import (
 	"context"
 
+	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/control"
+	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/transport"
+	"golang.org/x/sys/unix"
 )
+
+// InProcessStreamPairForTest wires a *ClientConn (client end) to s's registered
+// stream handlers (plugin end) over an in-process streaming socketpair, and
+// returns the client conn plus a stop func. It lets an external test — including
+// the generated-code streaming round-trip in package styx_test, which cannot
+// reach package styx's own in-process helpers — exercise a GENERATED
+// New<Service>Client against a GENERATED Register<Service>Server end to end
+// without a spawned plugin process. stop closes both transports, joins the serve
+// loop, and tears the streaming half down in the same order runServing does.
+func InProcessStreamPairForTest(s *PluginServer) (*ClientConn, func(), error) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	clientTr, err := transport.NewUDSTransport(fds[0], true)
+	if err != nil {
+		return nil, nil, err
+	}
+	pluginTr, err := transport.NewUDSTransport(fds[1], true)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s.mu.Lock()
+	handlers := make(map[streamKey]streamHandlerReg, len(s.streamHandlers))
+	for k, h := range s.streamHandlers {
+		handlers[k] = h
+	}
+	s.mu.Unlock()
+
+	srv := newStreamServer(pluginTr, handlers, codec.Proto{})
+	dispatcher := rpcruntime.NewDispatcher()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = runServeLoop(context.Background(), pluginTr, dispatcher, srv)
+	}()
+
+	cc := newClientConn("p", rpcruntime.NewTable(firstGeneration), clientTr, codec.Proto{})
+
+	stop := func() {
+		_ = clientTr.Close()
+		_ = pluginTr.Close()
+		<-done
+		srv.teardown(ErrPluginUnavailable)
+	}
+
+	return cc, stop, nil
+}
 
 // HeartbeatIntervalEnv re-exports heartbeatIntervalEnv so pluginserver_test
 // (external test package) can shorten or lengthen the heartbeat send interval

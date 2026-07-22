@@ -173,7 +173,7 @@ func (s *PluginServer) runServing(
 	// serve loop poisons on any STREAM_* frame a peer sends (§11.2).
 	var srv *streamServer
 	if streaming {
-		srv = newStreamServer(tr, streamHandlers)
+		srv = newStreamServer(tr, streamHandlers, codec.Proto{})
 	}
 
 	// A cancelable context so a data-plane death can stop the control loop below.

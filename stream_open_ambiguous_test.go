@@ -272,10 +272,10 @@ func TestOnStreamOpen_ElapsedBudget_EmitsTeardownPairFromPublished(t *testing.T)
 	handlers := map[streamKey]streamHandlerReg{
 		{service: fnv64a("s"), method: fnv64a("m")}: {
 			shape:   rpcruntime.ClientStreaming,
-			handler: func(*rpcruntime.Stream) error { <-block; return nil },
+			handler: func(*Stream) error { <-block; return nil },
 		},
 	}
-	srv := newStreamServer(tr, handlers)
+	srv := newStreamServer(tr, handlers, codec.Proto{})
 	t.Cleanup(func() {
 		close(block)
 		_ = tr.Close()
@@ -328,7 +328,7 @@ func TestOnStreamOpen_PublishLostToTerminal_DoesNotRunHandler(t *testing.T) {
 	handlers := map[streamKey]streamHandlerReg{
 		{service: fnv64a("s"), method: fnv64a("m")}: {
 			shape: rpcruntime.ClientStreaming,
-			handler: func(*rpcruntime.Stream) error {
+			handler: func(*Stream) error {
 				select {
 				case ran <- struct{}{}:
 				default:
@@ -338,7 +338,7 @@ func TestOnStreamOpen_PublishLostToTerminal_DoesNotRunHandler(t *testing.T) {
 			},
 		},
 	}
-	srv := newStreamServer(tr, handlers)
+	srv := newStreamServer(tr, handlers, codec.Proto{})
 	srv.beforePublish = func(st *rpcruntime.Stream) { st.TerminateOpenAmbiguous(context.DeadlineExceeded) }
 	t.Cleanup(func() { srv.teardown(ErrPluginUnavailable) })
 
@@ -380,10 +380,10 @@ func TestOnStreamOpen_OpenAccepting_DefersWatcherUntilPublish(t *testing.T) {
 	handlers := map[streamKey]streamHandlerReg{
 		{service: fnv64a("s"), method: fnv64a("m")}: {
 			shape:   rpcruntime.ClientStreaming,
-			handler: func(*rpcruntime.Stream) error { <-block; return nil },
+			handler: func(*Stream) error { <-block; return nil },
 		},
 	}
-	srv := newStreamServer(tr, handlers)
+	srv := newStreamServer(tr, handlers, codec.Proto{})
 	watcherAtPublish := make(chan bool, 1)
 	srv.beforePublish = func(st *rpcruntime.Stream) { watcherAtPublish <- st.WatcherStarted() }
 	t.Cleanup(func() {

@@ -12,8 +12,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/transport"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -32,6 +34,145 @@ const (
 	// always carries a positive, finite budget.
 	defaultStreamBudget = 30 * time.Second
 )
+
+// Stream is the public, narrow handle to a gRPC-shaped stream: OpenStream /
+// OpenStreamID / OpenServerStreamID return it, and a RegisterStreamHandler handler
+// receives it. It wraps the runtime's stream state machine — which stays in
+// internal/rpcruntime, so external generated code cannot reach it — and exposes ONLY
+// the operations generated code and hand-written seam users need: the byte-level
+// SendMsg/RecvMsg/CloseSend, the connection's negotiated codec (Marshal/Unmarshal),
+// the stream Context, and the terminal Err. The engine's lifecycle controls (deadline
+// watcher, publication, handler-termination, teardown emission) are deliberately NOT
+// promoted through this handle.
+//
+// The wrapper also closes stream-protocol.md §7.4's local-abort gap the raw byte
+// methods leave open: on the OPENER side a caller-context cancellation the runtime
+// surfaces without terminating (a pre-admission or credit-blocked cancel), and a local
+// codec failure the opener cannot send, both drive the stream terminal here so its
+// admission slot frees promptly instead of lingering to the deadline. The accepter's
+// termination flows through its handler's error return instead, so the wrapper drives
+// no local terminal there.
+type Stream struct {
+	stream *rpcruntime.Stream
+	codec  codec.Codec
+	// opener is true for the OpenStream side, which owns driving the stream terminal
+	// on a local abort (caller-context cancel or codec failure); the accept side leaves
+	// it false and terminates through its handler's error return.
+	opener bool
+}
+
+// newClientStream wraps the opener side of a freshly opened stream with the
+// connection's negotiated codec.
+func newClientStream(st *rpcruntime.Stream, cdc codec.Codec) *Stream {
+	return &Stream{stream: st, codec: cdc, opener: true}
+}
+
+// newServerStream wraps the accept side of a stream for the plugin handler, with the
+// connection's negotiated codec.
+func newServerStream(st *rpcruntime.Stream, cdc codec.Codec) *Stream {
+	return &Stream{stream: st, codec: cdc, opener: false}
+}
+
+// SendMsg sends payload as a STREAM_MSG under ctx (stream-protocol.md §4.5). On the
+// opener side a caller-context cancellation the runtime surfaces without terminating
+// drives the stream terminal, freeing its slot. The returned error is the raw engine
+// error; callers wrap it through StreamError at the application boundary.
+func (s *Stream) SendMsg(ctx context.Context, payload []byte) error {
+	return s.driveLocal(ctx, s.stream.SendMsg(ctx, payload))
+}
+
+// RecvMsg returns the next delivered STREAM_MSG payload, io.EOF at stream end, or the
+// terminal error (stream-protocol.md §4.6). On the opener side a caller-context
+// cancellation drives the stream terminal, freeing its slot.
+func (s *Stream) RecvMsg(ctx context.Context) ([]byte, error) {
+	payload, err := s.stream.RecvMsg(ctx)
+
+	return payload, s.driveLocal(ctx, err)
+}
+
+// CloseSend half-closes this side's send direction, optionally carrying a final
+// payload (a client-streaming server's single response, stream-protocol.md §6.3/§6.4).
+// On the opener side a caller-context cancellation drives the stream terminal.
+func (s *Stream) CloseSend(ctx context.Context, payload []byte) error {
+	return s.driveLocal(ctx, s.stream.CloseSend(ctx, payload))
+}
+
+// Marshal encodes m with the connection's negotiated codec — the same codec unary
+// calls and every other stream message use, so a second codec cannot silently fork
+// the wire encoding (stream-protocol.md §2.4). On the opener side an encode failure
+// the opener cannot send drives the stream terminal, freeing its slot rather than
+// leaving it live to the deadline.
+func (s *Stream) Marshal(m proto.Message) ([]byte, error) {
+	payload, err := s.codec.Marshal(m)
+	if err != nil {
+		s.abortLocal(err)
+	}
+
+	return payload, err
+}
+
+// Unmarshal decodes payload into m with the connection's negotiated codec. On the
+// opener side a decode failure drives the stream terminal, freeing its slot.
+func (s *Stream) Unmarshal(payload []byte, m proto.Message) error {
+	if err := s.codec.Unmarshal(payload, m); err != nil {
+		s.abortLocal(err)
+
+		return err
+	}
+
+	return nil
+}
+
+// Context returns the stream's own context, carrying its deadline and canceled when
+// the stream terminates (stream-protocol.md §7.1). On the opener side it is rooted in
+// the caller's OpenStream context, so it inherits the caller's values and is canceled
+// when the caller cancels — the intended gRPC-shaped semantics. Generated stream
+// interfaces expose it so a handler or caller can observe the stream's deadline and
+// cancellation.
+func (s *Stream) Context() context.Context {
+	return s.stream.Context()
+}
+
+// Err reports the stream's terminal error once it has terminated — translated to the
+// styx taxonomy — or nil while it is still live or completed normally. It gives seam
+// users the terminal outcome without exposing the engine's internal outcome type.
+func (s *Stream) Err() error {
+	oc, ok := s.stream.Outcome()
+	if !ok || oc.Code == rpcruntime.OutcomeCompleted {
+		return nil
+	}
+
+	return StreamError(oc.Err)
+}
+
+// driveLocal drives the opener's stream terminal when a byte op surfaced the caller
+// context's cancellation without itself terminating the stream (a pre-admission or
+// credit-blocked cancel/deadline, stream-protocol.md §4.5), so the slot frees promptly.
+// It only fires when the passed context is genuinely done AND the surfaced error is
+// that context error, so a normal terminal outcome (io.EOF, a peer status, an engine
+// sentinel) never misfires. A post-admission Send already terminated internally, so a
+// second drive here is an idempotent no-op (the terminal CAS already lost). The
+// accepter (opener false) leaves termination to its handler's error return.
+func (s *Stream) driveLocal(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if s.opener && ctx.Err() != nil &&
+		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		s.stream.TerminateLocal(ctx.Err())
+	}
+
+	return err
+}
+
+// abortLocal drives the opener's stream terminal on a local codec failure it cannot
+// put on the wire, freeing the slot. The accepter (opener false) surfaces a codec
+// failure through its handler's error return, which drives the terminal there.
+func (s *Stream) abortLocal(err error) {
+	if s.opener {
+		s.stream.TerminateLocal(err)
+	}
+}
 
 // StreamShape is a streaming method's gRPC-shaped direction set. Generated code
 // declares it explicitly on both sides — the opener through OpenStream's options,
@@ -92,9 +233,15 @@ func WithBidiStream() StreamOption {
 // (service, method) shape. It computes the FNV-1a-64 service/method routing
 // hashes, resolves the caller's deadline to a strictly-positive budget
 // (materializing the connection default when none is set), proposes a credit N
-// bounded by N_max, publishes the STREAM_OPEN, and returns the live
-// rpcruntime.Stream. Generated code wraps the returned Stream with typed
-// Send/Recv for the method's message types.
+// bounded by N_max, publishes the STREAM_OPEN, and returns the live narrow
+// *Stream. Generated code wraps the returned Stream with typed Send/Recv for the
+// method's message types.
+//
+// The returned stream's context is rooted in ctx, so canceling ctx cancels the
+// stream — the gRPC-shaped semantics — and terminates it autonomously (its slot
+// frees promptly) even if the caller performs no further operation; a cancel while
+// this call is still publishing the OPEN returns the cancel outcome and no live
+// stream.
 //
 // Optimistic sends are permitted: the stream is live on the opener's side the
 // moment the transport accepts the STREAM_OPEN (stream-protocol.md §7.4/§4.5), so
@@ -104,7 +251,51 @@ func WithBidiStream() StreamOption {
 // stream through the ordinary inbound path (§4.7/§9.1).
 func (c *ClientConn) OpenStream(
 	ctx context.Context, service, method string, opts ...StreamOption,
-) (*rpcruntime.Stream, error) {
+) (*Stream, error) {
+	return c.openStreamByID(ctx, fnv64a(service), fnv64a(method), opts...)
+}
+
+// OpenStreamID is OpenStream with the FNV-1a-64 service/method routing hashes
+// supplied directly, so a caller that already holds them skips the per-call hash.
+// Generated streaming client code calls it, passing the service/method ID
+// constants the generator precomputed at generation time (protoc-gen-go-styx
+// hashes once, at build time, with the same algorithm as fnv64a) — so a stream
+// open never rehashes a name on the hot path. Hand-written code uses the
+// name-based OpenStream; both land on the identical (service, method) routing.
+func (c *ClientConn) OpenStreamID(
+	ctx context.Context, serviceID, methodID uint64, opts ...StreamOption,
+) (*Stream, error) {
+	return c.openStreamByID(ctx, serviceID, methodID, opts...)
+}
+
+// OpenServerStreamID opens a server-streaming stream by precomputed service/method
+// hashes, marshaling req onto the STREAM_OPEN with the connection's negotiated codec
+// (stream-protocol.md §6.3). Generated server-streaming client code calls it so the
+// single request rides the OPEN encoded with the SAME codec every other message on
+// the connection uses — never a hardcoded one — and the accepter, decoding with the
+// negotiated codec, reads back exactly what was sent. The opener is half-closed-local
+// at establishment: it sends no STREAM_MSG.
+func (c *ClientConn) OpenServerStreamID(
+	ctx context.Context, serviceID, methodID uint64, req proto.Message,
+) (*Stream, error) {
+	state := c.state.Load()
+	if state == nil {
+		return nil, ErrPluginUnavailable
+	}
+	payload, err := state.codec.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("styx: open server stream: marshal request: %w", err)
+	}
+
+	return c.openStreamByID(ctx, serviceID, methodID, WithServerStreamRequest(payload))
+}
+
+// openStreamByID is the shared core of OpenStream, OpenStreamID, and
+// OpenServerStreamID: it admits and publishes a STREAM_OPEN routed by the precomputed
+// serviceID/methodID hashes.
+func (c *ClientConn) openStreamByID(
+	ctx context.Context, serviceID, methodID uint64, opts ...StreamOption,
+) (*Stream, error) {
 	state := c.state.Load()
 	if state == nil {
 		return nil, ErrPluginUnavailable
@@ -123,7 +314,13 @@ func (c *ClientConn) OpenStream(
 		return nil, translateCtxErr(err)
 	}
 
-	cfg := rpcruntime.StreamConfig{Service: fnv64a(service), Method: fnv64a(method)}
+	// Root the engine stream's own context in the caller's, so a caller cancellation
+	// is observed autonomously by the stream's deadline watcher and drives the CANCELED
+	// terminal even when the caller performs no further operation, and so a cancel while
+	// the OPEN send is parked aborts that send (the send below runs under the stream's
+	// context). The budget is still resolved from the caller's deadline below, so this
+	// derivation keeps the same instant — it neither extends nor shrinks the budget.
+	cfg := rpcruntime.StreamConfig{Service: serviceID, Method: methodID, ParentCtx: ctx}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -166,15 +363,19 @@ func (c *ClientConn) OpenStream(
 		// when the payload is present, so it emits no separate client STREAM_CLOSE.
 		Payload: cfg.OpenPayload,
 	}
-	// The OPEN send is bounded by the stream's OWN context (its deadline, canceled
-	// on any terminal), NOT context.Background — so a deadline (or terminal) that
-	// wins while the writer is gated aborts the send cleanly BEFORE any byte
-	// reaches the wire (§7.4: nothing on the wire is owed nothing). A deadline that
-	// elapses MID-write leaves a torn OPEN frame, which the transport correctly
-	// poisons — a partial STREAM_OPEN desynchronizes the peer's framing regardless,
-	// so poison is the right disposition there, not a lingering half-frame.
+	// The OPEN send is bounded by the stream's OWN context (its deadline, its rooting
+	// in the caller's context, and its cancel on any terminal), NOT context.Background —
+	// so a deadline, a caller cancellation, or a racing terminal that wins while the
+	// writer is gated aborts the send cleanly BEFORE any byte reaches the wire (§7.4:
+	// nothing on the wire is owed nothing); resolveOpenSendErr then surfaces the cancel
+	// or deadline outcome instead of a live stream. A deadline that elapses MID-write
+	// leaves a torn OPEN frame, which the transport correctly poisons — a partial
+	// STREAM_OPEN desynchronizes the peer's framing regardless, so poison is the right
+	// disposition there, not a lingering half-frame.
 	if sendErr := state.tr.Send(st.Context(), f); sendErr != nil {
-		return resolveOpenSendErr(state, st, sendErr)
+		// resolveOpenSendErr never yields a live stream — it discards or terminates the
+		// SUBMITTED stream and surfaces the outcome, so OpenStream returns no wrapper.
+		return nil, resolveOpenSendErr(state, st, sendErr)
 	}
 	// The OPEN reached the transport. Publish arbitrates against termination
 	// (stream-protocol.md §7.4): any terminal transition — the deadline watcher, a
@@ -198,7 +399,7 @@ func (c *ClientConn) OpenStream(
 		return nil, translateStreamOutcomeErr(oc)
 	}
 
-	return st, nil
+	return newClientStream(st, state.codec), nil
 }
 
 // translateStreamOutcomeErr maps a stream that reached a terminal outcome before
@@ -243,7 +444,29 @@ func translateStreamOutcomeErr(oc rpcruntime.StreamOutcome) error {
 // on its own goroutine when a matching STREAM_OPEN is accepted, passing the server
 // half of the stream.
 func (s *PluginServer) RegisterStreamHandler(
-	service, method string, shape StreamShape, handler func(*rpcruntime.Stream) error,
+	service, method string, shape StreamShape, handler func(*Stream) error,
+) {
+	s.registerStreamHandlerByID(fnv64a(service), fnv64a(method), shape, handler)
+}
+
+// RegisterStreamHandlerID is RegisterStreamHandler with the FNV-1a-64
+// service/method hashes supplied directly, so a caller that already holds them
+// skips the per-registration hash. Generated streaming server code calls it,
+// passing the service/method ID constants the generator precomputed at
+// generation time — the accepter's keys are thus the exact literals the opener's
+// STREAM_OPEN carries, with no name hashed at startup. Hand-written code uses the
+// name-based RegisterStreamHandler; both key the identical (service, method).
+func (s *PluginServer) RegisterStreamHandlerID(
+	serviceID, methodID uint64, shape StreamShape, handler func(*Stream) error,
+) {
+	s.registerStreamHandlerByID(serviceID, methodID, shape, handler)
+}
+
+// registerStreamHandlerByID is the shared core of RegisterStreamHandler and
+// RegisterStreamHandlerID: it installs handler under the precomputed
+// serviceID/methodID hashes with the method's declared shape.
+func (s *PluginServer) registerStreamHandlerByID(
+	serviceID, methodID uint64, shape StreamShape, handler func(*Stream) error,
 ) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -251,7 +474,7 @@ func (s *PluginServer) RegisterStreamHandler(
 	if s.streamHandlers == nil {
 		s.streamHandlers = make(map[streamKey]streamHandlerReg)
 	}
-	s.streamHandlers[streamKey{service: fnv64a(service), method: fnv64a(method)}] = streamHandlerReg{
+	s.streamHandlers[streamKey{service: serviceID, method: methodID}] = streamHandlerReg{
 		shape:   rpcruntime.StreamShape(shape),
 		handler: handler,
 	}
@@ -259,10 +482,12 @@ func (s *PluginServer) RegisterStreamHandler(
 
 // streamHandlerReg is one registered streaming method: its declared shape (which
 // the accepter establishes the stream from, stream-protocol.md §6.3/§7.4) and its
-// handler.
+// handler. The handler receives the narrow public *Stream (wrapping the runtime
+// stream with the connection's codec); runHandler builds that wrapper at dispatch,
+// where the codec is known.
 type streamHandlerReg struct {
 	shape   rpcruntime.StreamShape
-	handler func(*rpcruntime.Stream) error
+	handler func(*Stream) error
 }
 
 // streamKey routes an inbound STREAM_OPEN to its registered handler by the two
@@ -510,6 +735,7 @@ func (p *streamPlane) teardown(cause error) {
 type streamServer struct {
 	plane     *streamPlane
 	handlers  map[streamKey]streamHandlerReg
+	codec     codec.Codec    // the connection's negotiated codec, threaded into each handler's *Stream
 	handlerWG sync.WaitGroup // joins handler goroutines in teardown
 
 	// beforePublish, when non-nil, runs in onStreamOpen after the accept-side stream
@@ -521,11 +747,20 @@ type streamServer struct {
 }
 
 // newStreamServer builds the plugin accept half over tr with the registered
-// handlers.
-func newStreamServer(tr transport.Transport, handlers map[streamKey]streamHandlerReg) *streamServer {
+// handlers, threading cdc (the connection's negotiated codec) into every handler's
+// *Stream so a streaming handler encodes with the same codec as the rest of the
+// connection. proto is the only codec offered today, so cdc is codec.Proto{} at every
+// call site; the parameter is the seam that lets a second negotiated codec thread
+// through without a signature change.
+//
+//nolint:unparam // cdc is the codec seam; see doc above — proto is the only codec today.
+func newStreamServer(
+	tr transport.Transport, handlers map[streamKey]streamHandlerReg, cdc codec.Codec,
+) *streamServer {
 	return &streamServer{
 		plane:    newStreamPlane(tr),
 		handlers: handlers,
+		codec:    cdc,
 	}
 }
 
@@ -615,23 +850,46 @@ func (s *streamServer) onStreamOpen(f transport.Frame) error {
 	s.handlerWG.Add(1)
 	go func() {
 		defer s.handlerWG.Done()
-		s.runHandler(reg.handler, st)
+		s.runHandler(reg, st)
 	}()
 
 	return nil
 }
 
-// runHandler invokes a stream handler and, if it returns an error without having
-// completed the stream, drives the stream's terminal transition carrying the
-// handler's status: the terminal-CAS winner emits the data-lane STREAM_ERR through
-// the connection emitter (stream-protocol.md §9.1 step 4), so the stream terminates
-// promptly rather than lingering LIVE until its deadline. A handler that completes
-// normally (its final CloseSend drove the stream terminal) makes TerminateHandlerError
-// a no-op.
-func (s *streamServer) runHandler(handler func(*rpcruntime.Stream) error, st *rpcruntime.Stream) {
-	if err := handler(st); err != nil {
-		st.TerminateHandlerError(statusFromHandlerErr(err))
+// runHandler wraps the accept-side runtime stream in the narrow public *Stream (with
+// the connection's codec), invokes reg.handler, and drives the stream's terminal
+// transition on the two ways a handler can leave it live:
+//
+//   - The handler returned an error: terminate carrying the handler's status — the
+//     terminal-CAS winner emits the data-lane STREAM_ERR through the connection
+//     emitter (stream-protocol.md §9.1 step 4), so the stream terminates promptly
+//     rather than lingering LIVE until its deadline.
+//   - A client-streaming handler returned nil WITHOUT sending its response (no
+//     SendAndClose, so the send half is still open): a client-streaming method's
+//     single response is mandatory — it rides the server's STREAM_CLOSE (§6.3), and
+//     the client's CloseAndRecv blocks on it — so a nil return without it is a handler
+//     bug that would otherwise leave both sides waiting until the deadline. Fail the
+//     stream with an internal status so the client observes a clear error promptly,
+//     rather than auto-closing empty (which would surface a zero-value response and
+//     mask the bug). The other shapes have no mandatory trailing response: the
+//     generated server-streaming/bidi adapters close the send direction themselves,
+//     and a bidi stream legitimately stays live until both sides close.
+//
+// A handler that already drove the stream terminal (its SendAndClose or a peer
+// teardown won the CAS) makes TerminateHandlerError a no-op.
+func (s *streamServer) runHandler(reg streamHandlerReg, st *rpcruntime.Stream) {
+	err := reg.handler(newServerStream(st, s.codec))
+	if err == nil {
+		if reg.shape == rpcruntime.ClientStreaming && !st.SendClosed() {
+			st.TerminateHandlerError(&rpcruntime.Status{
+				Code:    uint32(CodeInternal),
+				Message: "styx: client-streaming handler returned without sending a response",
+			})
+		}
+
+		return
 	}
+	st.TerminateHandlerError(statusFromHandlerErr(err))
 }
 
 // teardown fails every accept-side stream and joins the streaming finishers and
@@ -692,9 +950,10 @@ func translateStreamSendErr(err error) error {
 }
 
 // resolveOpenSendErr classifies a failed STREAM_OPEN Send by transport ACCEPTANCE —
-// not by whether Send returned nil — into one of three dispositions and returns
-// OpenStream's result (stream-protocol.md §4.5's publication boundary, §7.4). It
-// never returns a live stream.
+// not by whether Send returned nil — into one of three dispositions and returns the
+// error OpenStream surfaces (stream-protocol.md §4.5's publication boundary, §7.4). It
+// never yields a live stream, so it returns an error alone and OpenStream returns no
+// wrapper.
 //
 //  1. AMBIGUOUS + poisoned (a uds mid-frame poison): the peer MAY hold the OPEN's
 //     prefix and the framing is desynced, so the teardown pair cannot be sent on the
@@ -709,12 +968,12 @@ func translateStreamSendErr(err error) error {
 //  3. DEFINITIVELY NOT ACCEPTED (a pre-write / pre-enqueue rejection): nothing on or
 //     headed for the wire, so discard the stream (freeing its S_max slot at once) and
 //     surface the retryable, not-dispatched send error (§7.4).
-func resolveOpenSendErr(state *connState, st *rpcruntime.Stream, sendErr error) (*rpcruntime.Stream, error) {
+func resolveOpenSendErr(state *connState, st *rpcruntime.Stream, sendErr error) error {
 	if errors.Is(sendErr, transport.ErrPoisoned) {
 		state.escalatePoison()               // FailAll in-flight + notify the owner: the escalation is the teardown
 		st.DiscardBeforePublish(ErrPoisoned) // terminate the SUBMITTED stream; the connection is tearing down
 
-		return nil, ErrPoisoned
+		return ErrPoisoned
 	}
 	if acceptanceUnknown(state.tr, sendErr) {
 		st.TerminateOpenAmbiguous(sendErr) // §4.5: post-acceptance ctx error is terminal (DEADLINE/CANCELED)
@@ -722,15 +981,15 @@ func resolveOpenSendErr(state *connState, st *rpcruntime.Stream, sendErr error) 
 		oc, _ := st.Outcome()
 		st.EmitOwedOpenTeardown() // one-shot; emits the pair after the OPEN, or no-ops if nothing is owed
 
-		return nil, translateStreamOutcomeErr(oc)
+		return translateStreamOutcomeErr(oc)
 	}
 	if st.DiscardBeforePublish(ErrPluginUnavailable) {
-		return nil, translateStreamSendErr(sendErr)
+		return translateStreamSendErr(sendErr)
 	}
 	<-st.Done()
 	oc, _ := st.Outcome()
 
-	return nil, translateStreamOutcomeErr(oc)
+	return translateStreamOutcomeErr(oc)
 }
 
 // acceptanceUnknown asks the transport to classify a failed STREAM_OPEN Send
@@ -770,6 +1029,14 @@ func StreamError(err error) error {
 		return ErrDeadlineExceeded
 	case errors.Is(err, rpcruntime.ErrStreamTableClosed):
 		return ErrPluginUnavailable
+	case errors.Is(err, context.Canceled):
+		// A raw caller-context cancellation a byte op surfaced (RecvMsg/SendMsg/
+		// CloseSend return ctx.Err() directly on a pre-admission or credit-blocked
+		// cancel): translate it to the styx sentinel, exactly as the engine's own
+		// ErrCanceledLocally maps.
+		return ErrCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return ErrDeadlineExceeded
 	}
 
 	var statusErr *rpcruntime.StreamStatusError
