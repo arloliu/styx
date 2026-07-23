@@ -105,7 +105,10 @@ const (
 // accepted before the cutoff is silently dropped: an accepted call completes on
 // this instance before DrainAck, or was never admitted (the design of record's
 // completion requirement, docs/specs/2026-07-16-styx-design.md hot-reload section).
-// If quiescence is not reached by the deadline, drain fails and the host rolls back.
+// If quiescence is not reached by the deadline, no DrainAck goes out; the host rolls
+// back by sending Resume, and this instance waits for it, restarts its mutators, and
+// keeps serving (a phase-2 deadline miss resumes the live predecessor) rather than
+// tearing down.
 //
 // Once DrainAck has gone out — never before — it always sends a snapshot:
 // hooks.Saver's output when one is registered, or an empty payload when
@@ -179,14 +182,26 @@ func ServeReloadAfterDrain(
 	// accepted before the host's cutoff has finished on this instance, bounded by the
 	// drain deadline (dctx). This closes the gap where DrainAck certified only
 	// mutator-freeze and an accepted call could still be in flight — the ack now means
-	// both are true. A timeout (or any non-nil return) fails the drain, and the host's
-	// existing rollback path runs unchanged. nil waitDrained (a control-only test
-	// seam with no data plane) skips the wait.
+	// both are true. nil waitDrained (a control-only test seam with no data plane)
+	// skips the wait.
+	//
+	// A non-nil return means quiescence was not reached within the drain deadline. That
+	// is a phase-2 deadline miss, not a freeze failure: the instance is healthy and its
+	// mutators are frozen, so the reload's rollback can unfreeze it and it keeps serving.
+	// waitDrained only ever returns its context's error (a deadline miss, or the parent
+	// ctx being canceled at shutdown), never an application fault. No DrainAck goes out,
+	// so the host — still awaiting DrainAck — times out and rolls back by sending Resume,
+	// exactly as it does when snapshot production fails silently below. Wait for that
+	// Resume and restart the mutators rather than tearing the instance down: a teardown
+	// here would strand the host's rollback into a crash-equivalent and drop the live
+	// predecessor, whereas the design requires every phase-2 deadline miss to resume it
+	// (docs/specs/2026-07-16-styx-design.md hot-reload rollback). A parent-cancel return
+	// finds the conn ending and exits cleanly through the same wait.
 	if waitDrained != nil {
 		if err := waitDrained(dctx); err != nil {
 			cancel()
 
-			return ReloadRetired, fmt.Errorf("lifecycle: reload: await call quiescence: %w", err)
+			return awaitResumeOrExit(ctx, conn, hooks.Mutators)
 		}
 	}
 

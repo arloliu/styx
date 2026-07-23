@@ -43,9 +43,9 @@ const (
 	// PhaseCutoff stops admitting new calls. It is host-local, so aborting
 	// here is trivial: nothing is frozen and no successor exists.
 	PhaseCutoff Phase = iota
-	// PhaseDrainAck waits for the plugin to freeze its mutable state.
-	// DrainAck presently certifies mutator quiescence only: a call accepted
-	// before cutoff may still be in flight on the plugin when the ack arrives
+	// PhaseDrainAck waits for the plugin to freeze its mutable state AND to join
+	// every data-plane call it accepted before cutoff: DrainAck certifies both, so
+	// once it arrives no accepted call is still in flight on the plugin
 	// (internal/lifecycle/plugin_reload.go's ServeReload doc).
 	PhaseDrainAck
 	// PhaseSnapshot waits for the sealed snapshot memfd and verifies it.
@@ -277,9 +277,10 @@ func (tx *Transaction) Run(ctx context.Context) (ReloadTarget, error) {
 		return nil, tx.rollback(ctx, PhaseCutoff, nil, fmt.Errorf("lifecycle: reload: cutoff: %w", err))
 	}
 
-	// Phase 2: drain. The plugin acks once its mutable state is frozen; an
-	// accepted call may still be in flight on the plugin when the ack arrives
-	// (internal/lifecycle/plugin_reload.go's ServeReload doc).
+	// Phase 2: drain. The plugin acks once its mutable state is frozen and every
+	// call it accepted before cutoff has finished on it, so no accepted call is still
+	// in flight when the ack arrives (internal/lifecycle/plugin_reload.go's ServeReload
+	// doc).
 	if err := tx.drain(ctx); err != nil {
 		return nil, tx.rollback(ctx, PhaseDrainAck, nil, err)
 	}
@@ -317,13 +318,28 @@ func (tx *Transaction) Run(ctx context.Context) (ReloadTarget, error) {
 	return successor, nil
 }
 
+// drainAckHostMargin is how much longer than the plugin's own drain deadline the
+// host keeps listening for DrainAck. The absolute deadline carried in Drain bounds the
+// plugin's freeze, quiescence wait, and DrainAck send; the host must not declare a
+// timeout and enter rollback while the plugin is still inside that deadline and about
+// to ack, or a DrainAck could arrive after the host expects only ResumeAck — a
+// protocol failure. Waiting strictly longer makes the two outcomes mutually exclusive:
+// a plugin that acks always acks before the host gives up, and a plugin that misses
+// its deadline has already stopped trying to ack (it awaits Resume) before the host
+// rolls back. Both processes share one host wall clock, so the margin only has to
+// cover DrainAck's local-socket delivery and scheduling latency; a second is ample and
+// negligible against the multi-second drain deadline.
+const drainAckHostMargin = 1 * time.Second
+
 // drain runs phase 2: send Drain carrying its absolute deadline, then wait
-// for the plugin's DrainAck.
+// for the plugin's DrainAck. The host's own receive deadline is that absolute deadline
+// plus drainAckHostMargin, so it outlasts the plugin's send deadline and a late ack
+// cannot race the host into rollback (see drainAckHostMargin).
 func (tx *Transaction) drain(ctx context.Context) error {
-	dctx, cancel := context.WithTimeout(ctx, tx.deadlines.DrainAck)
+	deadline := time.Now().Add(tx.deadlines.DrainAck)
+	dctx, cancel := context.WithDeadline(ctx, deadline.Add(drainAckHostMargin))
 	defer cancel()
 
-	deadline := time.Now().Add(tx.deadlines.DrainAck)
 	msg := &controlpb.ControlMessage{
 		Body: &controlpb.ControlMessage_Drain{Drain: &controlpb.Drain{DeadlineUnixNano: deadline.UnixNano()}},
 	}
