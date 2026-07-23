@@ -160,6 +160,12 @@ func ValidateStartupCapacity(layout shm.Layout, maxInflight int, checksum, stric
 	// count across a direction's reachable classes (shm-abi.md §18). Find that
 	// binding class per direction and, if it is exceeded, name it — the
 	// most-constrained class, not merely the first one that fails.
+	//
+	// This assumes the region-validated size-class table: ascending, distinct slab
+	// sizes (shm-abi.md §2, enforced at CreateRegion/attach). Under that invariant
+	// every class is reachable — each is the serving class for some payload up to
+	// the derived max_payload — so taking the minimum over all classes subsumes the
+	// "reachable classes" qualifier without a separate reachability filter.
 	for dir := range layout.Arenas {
 		classes := layout.Arenas[dir].Classes
 		bindClass, bindUsable := 0, usableSlabs(classes[0], 0)

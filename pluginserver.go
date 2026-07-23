@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -75,6 +76,12 @@ type PluginServer struct {
 	// (false) is the enterprise profile: a handler panic taints the process and
 	// terminates it. See panic_policy.go.
 	continueAfterPanic atomic.Bool
+
+	// transports is the plugin's data-plane transport allowlist — the transports it
+	// advertises during negotiation, set once at construction from WithTransports
+	// (default both). It is the plugin's only data-plane knob; geometry and the
+	// transport preference are host-authored. Read-only after NewPluginServer.
+	transports []string
 }
 
 // PluginServerOption configures a PluginServer at construction. The zero-option
@@ -84,8 +91,9 @@ type PluginServerOption func(*pluginServerConfig)
 // pluginServerConfig accumulates the applied PluginServerOptions before
 // NewPluginServer resolves them onto the server.
 type pluginServerConfig struct {
-	metrics  observe.MetricsSink
-	interval time.Duration
+	metrics    observe.MetricsSink
+	interval   time.Duration
+	transports []string
 }
 
 // WithMetrics routes the plugin's built-in instrumentation to sink. nil (the
@@ -98,6 +106,18 @@ func WithMetrics(sink observe.MetricsSink) PluginServerOption {
 // uses one second. Ignored when no metrics sink is configured.
 func WithMetricsInterval(d time.Duration) PluginServerOption {
 	return func(c *pluginServerConfig) { c.interval = d }
+}
+
+// WithTransports sets the plugin's data-plane transport allowlist — the transports
+// it advertises during handshake negotiation. The default (both "shm" and "uds")
+// lets the host pick per its own preference; pass only "uds" to advertise a
+// uds-only plugin, or only "shm" for a shared-memory-only one. This is the
+// plugin's SOLE data-plane knob: the region geometry and the transport preference
+// are host-authored on PluginSpec. An empty list restores the default. Unknown
+// names are simply never a common transport, so a host that offers only those
+// fails the handshake rather than silently downgrading.
+func WithTransports(transports ...string) PluginServerOption {
+	return func(c *pluginServerConfig) { c.transports = transports }
 }
 
 // registeredService pairs one RegisterService call's desc and impl for
@@ -119,6 +139,7 @@ func NewPluginServer(opts ...PluginServerOption) *PluginServer {
 	s := &PluginServer{
 		services:        make(map[uint64]registeredService),
 		metricsInterval: resolveMetricsInterval(cfg.interval),
+		transports:      resolvePluginTransports(cfg.transports),
 	}
 	if cfg.metrics != nil {
 		s.metrics = observeq.NewDispatcher(cfg.metrics, metricsBufferSize)
@@ -796,24 +817,50 @@ func (s *PluginServer) serviceVersions() []control.ServiceVersion {
 	return versions
 }
 
-// m1PluginOffer is the plugin's base negotiation offer, the plugin-side mirror of
-// internal/supervisor's hostOffer: protocol version 1 only, both data-plane
-// transports (the plugin's default transport allowlist), the shared-memory layout
-// version this build speaks, the proto codec, and the streaming feature offered as
-// supported (not required). The shared-memory transport is offered so a host that
-// prefers it can negotiate it; a host that offers only uds still negotiates uds.
-// Service versions are passed to Negotiate separately (Offer.Services is
-// host-only). pluginOffer refines the streaming flag's Required bit from what this
-// plugin actually serves.
-func m1PluginOffer() control.Offer {
-	return control.Offer{
-		ProtocolMin:    m1ProtocolVersion,
-		ProtocolMax:    m1ProtocolVersion,
-		Transports:     []string{control.TransportSHM, control.TransportUDS},
-		Codecs:         []string{codecProto},
-		Features:       []control.FeatureFlag{{Name: featureStreaming}},
-		LayoutVersions: []uint32{control.ShmLayoutVersion},
+// defaultPluginTransports is the plugin's default transport allowlist: both
+// transports (shared-memory preferred), so a host negotiates per its own
+// preference.
+func defaultPluginTransports() []string {
+	return []string{control.TransportSHM, control.TransportUDS}
+}
+
+// resolvePluginTransports returns the configured allowlist, or the default when
+// none was set (an empty or nil WithTransports).
+func resolvePluginTransports(transports []string) []string {
+	if len(transports) == 0 {
+		return defaultPluginTransports()
 	}
+
+	return transports
+}
+
+// pluginBaseOffer builds the plugin's negotiation offer for a transport allowlist
+// and streaming-required bit: protocol version 1, the given transports, the proto
+// codec, and the streaming feature. The shared-memory layout version this build
+// speaks is advertised iff the allowlist includes the shared-memory transport
+// (shm-abi.md §19) — a uds-only plugin advertises no layout version. Service
+// versions travel separately (Offer.Services is host-only).
+func pluginBaseOffer(transports []string, requireStreaming bool) control.Offer {
+	offer := control.Offer{
+		ProtocolMin: m1ProtocolVersion,
+		ProtocolMax: m1ProtocolVersion,
+		Transports:  transports,
+		Codecs:      []string{codecProto},
+		Features:    []control.FeatureFlag{{Name: featureStreaming, Required: requireStreaming}},
+	}
+	if slices.Contains(transports, control.TransportSHM) {
+		offer.LayoutVersions = []uint32{control.ShmLayoutVersion}
+	}
+
+	return offer
+}
+
+// m1PluginOffer is the plugin's default base offer — both transports, streaming
+// optional — the plugin-side mirror of internal/supervisor's hostOffer. It is the
+// documented default and is used by tests; a live server's pluginOffer builds from
+// its own configured allowlist.
+func m1PluginOffer() control.Offer {
+	return pluginBaseOffer(defaultPluginTransports(), false)
 }
 
 // pluginOffer is this server's negotiation offer, m1PluginOffer with the streaming
@@ -828,16 +875,7 @@ func (s *PluginServer) pluginOffer() control.Offer {
 	requireStreaming := len(s.streamHandlers) > 0
 	s.mu.Unlock()
 
-	offer := m1PluginOffer()
-	if requireStreaming {
-		for i := range offer.Features {
-			if offer.Features[i].Name == featureStreaming {
-				offer.Features[i].Required = true
-			}
-		}
-	}
-
-	return offer
+	return pluginBaseOffer(s.transports, requireStreaming)
 }
 
 // errServeLoopPoisoned is runServeLoop's non-nil return when it exited because it

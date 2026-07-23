@@ -1,6 +1,7 @@
 package styx_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -19,6 +20,7 @@ import (
 var (
 	fixtureReadyPlugin     string
 	fixtureVersionedPlugin string
+	fixtureUDSOnlyPlugin   string
 )
 
 // TestMain builds the cross-process plugin fixtures once (Host.Start spawns
@@ -46,6 +48,14 @@ func TestMain(m *testing.M) {
 	)
 	if out, err := vBuild.CombinedOutput(); err != nil {
 		panic("building versionedplugin fixture: " + err.Error() + "\n" + string(out))
+	}
+
+	// A plugin whose transport allowlist advertises only uds (WithTransports),
+	// used to prove the transport-selection fallback rule end to end.
+	fixtureUDSOnlyPlugin = filepath.Join(dir, "udsonlyplugin")
+	uBuild := exec.Command("go", "build", "-o", fixtureUDSOnlyPlugin, "./testdata/udsonlyplugin")
+	if out, err := uBuild.CombinedOutput(); err != nil {
+		panic("building udsonlyplugin fixture: " + err.Error() + "\n" + string(out))
 	}
 
 	m.Run()
@@ -374,4 +384,41 @@ func TestExternalGeometryFixture_Compiles(t *testing.T) {
 	combined, err := cmd.CombinedOutput()
 	require.NoError(t, err,
 		"the external-module geometry fixture must compile against the public API alone:\n%s", string(combined))
+}
+
+// Test the transport-selection fallback rule end to end against a real spawned
+// plugin whose allowlist advertises only uds: an "auto" host negotiates uds and
+// serves — the fallback fires because the shared-memory transport is absent from
+// the plugin's offer, not because an attach failed.
+func TestHost_AutoTransport_FallsBackToUDS_AgainstUDSOnlyPlugin(t *testing.T) {
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{Name: "udsonly", Path: fixtureUDSOnlyPlugin, Transport: "auto"}},
+	})
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	require.NoError(t, h.Start(t.Context()),
+		"auto must fall back to uds when the plugin offers no shared-memory transport")
+
+	ev := awaitEvent(t, h.Events(), styx.EventReady)
+	require.Equal(t, "udsonly", ev.Plugin)
+	require.True(t, processExists(t, "udsonlyplugin"), "the uds-only plugin must serve after an auto fallback")
+}
+
+// Test the no-downgrade rule end to end: an "shm"-pinned host against a
+// uds-only plugin fails the handshake (no common transport) with a typed
+// *styx.IncompatibleError, rather than silently downgrading to uds. No serving
+// instance is ever produced.
+func TestHost_ShmPinned_FailsHandshake_AgainstUDSOnlyPlugin(t *testing.T) {
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{Name: "udsonly", Path: fixtureUDSOnlyPlugin, Transport: "shm"}},
+	})
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	err := h.Start(t.Context())
+	require.Error(t, err, "an shm-pinned host must not downgrade to a uds-only plugin")
+	require.ErrorIs(t, err, styx.ErrIncompatible)
+
+	var incompatible *styx.IncompatibleError
+	require.ErrorAs(t, err, &incompatible)
+	require.ErrorIs(t, h.Plugin("udsonly").Invoke(t.Context(), "svc", "M", nil, nil), styx.ErrPluginUnavailable)
 }
