@@ -48,6 +48,12 @@ var (
 // production always uses the unix package.
 var peekSyscall = unix.Recvmsg
 
+// readinessWaitHook, when non-nil, is invoked immediately before waitReadable blocks in
+// the readiness peek — test-only, letting a test prove a reserving reader has reached the
+// readiness wait (and so holds no reservation) before it asserts quiescence. Nil in
+// production: one predictable nil check per readiness wait.
+var readinessWaitHook func()
+
 // UDSTransport implements Transport over an already-connected SOCK_STREAM
 // socket. Concurrency contract: writeMu serializes concurrent Send calls
 // so their header+body writes can never interleave. This IS load-bearing:
@@ -440,6 +446,10 @@ func (t *UDSTransport) waitReadable(ctx context.Context) error {
 		}
 		if err := setSocketTimeout(ctx, t.fd, unix.SO_RCVTIMEO); err != nil {
 			return err
+		}
+
+		if readinessWaitHook != nil {
+			readinessWaitHook() // test-only: the reader is about to block in the readiness peek.
 		}
 
 		// Blocking peek (no MSG_DONTWAIT): SO_RCVTIMEO bounds it, so it returns

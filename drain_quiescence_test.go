@@ -3,7 +3,6 @@ package styx
 import (
 	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -355,65 +354,6 @@ func TestServeOneFrame_RetiresReservation_OnTransportErrorEdges(t *testing.T) {
 			requireReservedAndRetired(t, coord)
 		})
 	}
-}
-
-// readSignalTransport wraps a reserving transport and signals the first time the serve
-// loop enters RecvReserving, so a test can block until the reader has provably committed
-// to the read (and, with nothing on the wire, is parked in the readiness wait) before it
-// asserts quiescence. It forwards the reserving and prober capabilities to the inner
-// transport unchanged.
-type readSignalTransport struct {
-	transport.Transport
-	entered chan struct{}
-	once    sync.Once
-}
-
-func (t *readSignalTransport) RecvReserving(ctx context.Context, reserve func()) (transport.Frame, error) {
-	t.once.Do(func() { close(t.entered) })
-	rr, _ := t.Transport.(transport.ReservingReceiver)
-
-	return rr.RecvReserving(ctx, reserve)
-}
-
-func (t *readSignalTransport) ReadableNow() bool {
-	p, _ := t.Transport.(transport.InboundQueueProber)
-
-	return p.ReadableNow()
-}
-
-// Test a REAL parked reader is certified quiescent WHILE it is parked. The test blocks
-// until the serve loop has entered RecvReserving — with nothing on the wire it is then
-// in the non-destructive readiness wait, holding no reservation — and only then asserts
-// quiescence, so certification provably happens while the reader is parked, not before
-// its goroutine reached the read. It then proves the reader was parked-and-alive by
-// sending a request and observing the reply: the reader could only produce it by waking
-// from that park.
-func TestServeLoop_ParkedReaderCertifiedQuiescent_WhileInReadinessWait(t *testing.T) {
-	client, inner := newStreamingTransportPairForTest(t)
-	plugin := &readSignalTransport{Transport: inner, entered: make(chan struct{})}
-	coord := newDrainCoordinator()
-	leases := rpcruntime.NewLeaseTable()
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = runServeLoop(t.Context(), plugin, rpcruntime.NewDispatcher(), nil, nil, coord)
-	}()
-	t.Cleanup(func() { _ = inner.Close(); <-done })
-
-	// Block until the reader has entered RecvReserving: with nothing on the wire it is
-	// now parked in the readiness wait, holding no reservation and having consumed
-	// nothing. Certification therefore happens while the reader is provably parked.
-	<-plugin.entered
-	require.NoError(t, coord.waitQuiescent(t.Context(), plugin, leases, clearTaint),
-		"a reader parked in the readiness wait, holding no reservation, is quiescent")
-
-	// Prove the reader was parked-and-alive: it wakes, serves the request (unknown
-	// service -> an error reply), and the reply reaches the client.
-	require.NoError(t, client.Send(t.Context(), unaryReqFrame(100)))
-	reply, err := client.Recv(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, uint64(100), reply.CallID)
 }
 
 // Test the concurrent taint-vs-last-obligation-close race: a required-fatal session

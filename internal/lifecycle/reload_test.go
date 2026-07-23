@@ -82,6 +82,12 @@ type fakeReloadTarget struct {
 	resumeGate       chan struct{}
 	releaseResumeAck chan struct{}
 
+	// drainReceivedGate, when non-nil, is closed the instant handleDrain runs — the
+	// host's Drain send has returned and it is now awaiting DrainAck — so a test can
+	// cancel the caller context in the post-Send window and observe the commitment
+	// invariant (the wait runs to its bounded deadline, not the caller cancel).
+	drainReceivedGate chan struct{}
+
 	scriptDone chan struct{}
 }
 
@@ -220,6 +226,10 @@ func (f *fakeReloadTarget) handle(kind control.MessageKind, msg *controlpb.Contr
 // otherwise, seals and hands over the snapshot memfd.
 func (f *fakeReloadTarget) handleDrain() bool {
 	f.drainSent.Store(true)
+
+	if f.drainReceivedGate != nil {
+		close(f.drainReceivedGate)
+	}
 
 	if f.closeConnAfterDrain {
 		return false // closes the conn via script's defer: the instance died mid-reload.
@@ -507,6 +517,85 @@ func TestTransaction_Drain_TransmitsDeadlineStrictlyBeforeHostWait_UnderTightCal
 	gap := time.Duration(callerDeadline.UnixNano() - transmitted)
 	require.GreaterOrEqual(t, gap, 500*time.Millisecond,
 		"the transmitted deadline must trail the host wait by a real margin, not a sliver")
+}
+
+// Test that a Drain whose send fails — the datagram never reaches the plugin, so the
+// drain never committed and the plugin never froze — aborts before commitment: it rolls
+// back cutoff-style (reopen admission) WITHOUT a Resume to an unfrozen instance, not as a
+// drain-ack failure. A closed control conn makes the send fail deterministically; the fix
+// classifies ANY pre-Send failure the same way, cancellation included (Run's own ctx
+// check already catches a cancel that lands before drain).
+func TestTransaction_Drain_AbortsWithoutResume_WhenSendFails(t *testing.T) {
+	admission := &lifecycle.AdmissionGate{}
+	admission.Open()
+	old := newFakeReloadTarget(t, admission)
+	// Do not start the script; close the host's control conn so the Drain send fails.
+	require.NoError(t, old.Control().Close())
+
+	var spawnCalled atomic.Bool
+	spawnNew := func(context.Context) (lifecycle.ReloadTarget, error) {
+		spawnCalled.Store(true)
+
+		return nil, errFakeMustNotBeCalled
+	}
+	tx := lifecycle.NewTransaction(old, spawnNew, lifecycle.DefaultPhaseDeadlines, admission)
+
+	promoted, err := tx.Run(t.Context())
+
+	require.Error(t, err)
+	require.Nil(t, promoted)
+	require.ErrorContains(t, err, "send Drain")
+	require.NotErrorIs(t, err, lifecycle.ErrReloadCrashEquivalent,
+		"a pre-commitment abort must not try to Resume an unfrozen instance")
+	require.False(t, spawnCalled.Load(), "no successor is spawned on a pre-commitment abort")
+	require.True(t, admission.IsOpen(), "a pre-commitment abort reopens admission, cutoff-style")
+}
+
+// Test that once Drain is SENT the host honors its commitment: a caller cancellation in
+// the post-Send window does not abandon the plugin, which froze and is still entitled to
+// ack. The caller is canceled while the host awaits DrainAck; the plugin then acks, and
+// the host — awaiting on a wait detached from the caller cancellation — reads the ack and
+// advances PAST the drain to the snapshot phase, where the now-canceled caller context
+// legitimately aborts the reload. A "await SaveState" outcome therefore proves the drain
+// completed despite the cancel; a drain still bound to the caller context would instead
+// abandon at DrainAck. Either way the reload rolls back and Resumes the frozen plugin.
+//
+// The witness is deterministic for the committed (uncancelable) wait: it reads the ack
+// regardless of the cancel's timing. A caller-bound wait would only abandon when the
+// cancel is observed at the control-conn Recv entry — a narrow window the fix closes
+// outright.
+func TestTransaction_Drain_HonorsCommitment_WhenCallerCancelsAfterSend(t *testing.T) {
+	admission := &lifecycle.AdmissionGate{}
+	admission.Open()
+	old := newFakeReloadTarget(t, admission)
+	old.ackDrainOnly = true // ack DrainAck, then produce no snapshot
+	old.drainReceivedGate = make(chan struct{})
+	old.start(t)
+
+	spawnNew := func(context.Context) (lifecycle.ReloadTarget, error) { return nil, errFakeMustNotBeCalled }
+	tx := lifecycle.NewTransaction(old, spawnNew, lifecycle.DefaultPhaseDeadlines, admission)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := tx.Run(ctx)
+		done <- err
+	}()
+
+	// The plugin has received Drain, so the host's Send returned and it is now awaiting
+	// DrainAck. Cancel the caller: a committed drain must not abandon on this. The plugin
+	// then acks (ackDrainOnly), which the committed wait must still read.
+	<-old.drainReceivedGate
+	cancel()
+
+	err := <-done
+	require.Error(t, err)
+	require.ErrorContains(t, err, "await SaveState",
+		"a committed drain reads the ack and advances past the drain despite the caller cancel")
+	require.NotErrorIs(t, err, lifecycle.ErrReloadCrashEquivalent,
+		"the committed drain must not be abandoned mid-exchange")
+	require.True(t, old.drainSent.Load())
+	require.True(t, admission.IsOpen(), "the reload rolled back cleanly and reopened admission")
 }
 
 // Test transaction holding admission closed until the old instance acks Resume during rollback

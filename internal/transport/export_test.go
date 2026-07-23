@@ -19,6 +19,18 @@ func SetPeekSyscallForTest(
 	return func() { peekSyscall = prev }
 }
 
+// SetReadinessWaitHookForTest installs a hook waitReadable invokes immediately before
+// it blocks in the readiness peek, and returns a restore func. It lets a transport_test
+// prove a reserving reader has reached the readiness wait — where it provably holds no
+// reservation — before asserting the drain predicate certifies it quiescent. Test-only;
+// not part of the package's public API.
+func SetReadinessWaitHookForTest(fn func()) (restore func()) {
+	prev := readinessWaitHook
+	readinessWaitHook = fn
+
+	return func() { readinessWaitHook = prev }
+}
+
 // WriteFrameUnchecked re-exports writeFrame for transport_test: it skips
 // Send's Kind/size validation so a test can put a frame Send itself would
 // never produce (a reserved streaming Kind, an oversized payload) onto

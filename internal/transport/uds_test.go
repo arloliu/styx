@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +36,53 @@ func newTransportPairStreaming(t *testing.T, streaming bool) (a, b *transport.UD
 	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
 
 	return a, b
+}
+
+// Test that a reserving reader parked in the readiness wait holds no reservation. This
+// underlies the drain predicate's certification of a parked reader: its two conditions —
+// ReadableNow reports the queue empty AND no reservation is outstanding — must both hold
+// WHILE the reader is provably in the wait, not merely after RecvReserving was entered.
+// The reserve callback fires only AFTER the readiness commit, so a reader still in the
+// wait cannot have reserved. A wait-entry hook makes "in the wait" observable; a frame
+// then proves the reader was parked-and-alive, waking to reserve and deliver exactly one.
+func TestUDSTransport_RecvReserving_ParkedInReadinessWait_HoldsNoReservation(t *testing.T) {
+	host, plugin := newTestTransportPair(t)
+
+	inWait := make(chan struct{}, 1)
+	restore := transport.SetReadinessWaitHookForTest(func() {
+		select {
+		case inWait <- struct{}{}:
+		default:
+		}
+	})
+	t.Cleanup(restore)
+
+	var reserves atomic.Int64
+	type recvResult struct {
+		f   transport.Frame
+		err error
+	}
+	got := make(chan recvResult, 1)
+	go func() {
+		f, err := plugin.RecvReserving(context.Background(), func() { reserves.Add(1) })
+		got <- recvResult{f, err}
+	}()
+
+	// The reader has reached the readiness wait with nothing on the wire: it is parked,
+	// about to block in the peek, holding no reservation. Both predicate conditions for a
+	// parked reader hold concurrently with it being parked.
+	<-inWait
+	require.Zero(t, reserves.Load(), "a reader parked in the readiness wait has not reserved")
+	require.False(t, plugin.ReadableNow(), "with nothing on the wire the queue reports empty")
+
+	// Prove it was parked-and-alive: a frame wakes it, the reserve fires, and the frame is
+	// delivered.
+	require.NoError(t, host.Send(context.Background(),
+		transport.Frame{CallID: 7, Kind: transport.FrameUnaryReq, Payload: []byte("x")}))
+	r := <-got
+	require.NoError(t, r.err)
+	require.Equal(t, uint64(7), r.f.CallID)
+	require.Equal(t, int64(1), reserves.Load(), "the delivered frame reserved exactly once")
 }
 
 // Test UDSTransport round-tripping a unary request frame with its payload intact
