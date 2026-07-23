@@ -227,6 +227,13 @@ func (r *slotTouchRecordingRing) Peek() (ring.Descriptor, ring.PeekStatus) {
 func (r *slotTouchRecordingRing) Advance()     {}
 func (r *slotTouchRecordingRing) Tail() uint64 { return 0 }
 func (r *slotTouchRecordingRing) Empty() bool  { return r.empty }
+func (r *slotTouchRecordingRing) Len() uint64 {
+	if r.empty {
+		return 0
+	}
+
+	return 1
+}
 
 // Test ReadableNow confirming the inbound queue empty only when it is, so neither
 // live caller (the heartbeat's InboundReadable report or the stream reader's
@@ -1553,6 +1560,13 @@ func (r *shutdownOnPeekRing) Advance() {
 }
 func (r *shutdownOnPeekRing) Tail() uint64 { return 1 }
 func (r *shutdownOnPeekRing) Empty() bool  { return r.peeked }
+func (r *shutdownOnPeekRing) Len() uint64 {
+	if r.peeked {
+		return 0
+	}
+
+	return 1
+}
 
 // Test the §9 fail-closed shutdown gate AFTER copy-out but before dispatch: a
 // frame that the top gate already admitted (shutdown clear) must still not be
@@ -1826,4 +1840,125 @@ func TestSupervisorIntegration_PoisonedTransport_TriggersTeardownWithFreshRegion
 	f, err := fresh.plugin.Recv(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), f.CallID)
+}
+
+// recvOne drains exactly one frame from tr, failing the test on error. The frame
+// it drains was already published (Send returns only after the writer's publish
+// report), so Recv finds it in the ring without parking.
+func recvOne(t *testing.T, tr *Transport) transport.Frame {
+	t.Helper()
+	f, err := tr.Recv(t.Context())
+	require.NoError(t, err)
+
+	return f
+}
+
+// Test that the shared-memory transport's FrameCounter and ByteCounter track
+// progress per direction, count header-plus-body wire bytes (one 64-byte
+// descriptor plus the payload) at the same publish/deliver chokepoint, and
+// transition from zero to non-zero only on the side that actually moved a frame.
+func TestTransport_FrameAndByteCounters_TrackPerDirection(t *testing.T) {
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+	// Given: both directions start at zero.
+	require.Zero(t, ep.host.FramesSent())
+	require.Zero(t, ep.host.BytesSent())
+	require.Zero(t, ep.plugin.FramesReceived())
+	require.Zero(t, ep.plugin.BytesReceived())
+
+	// When: the host sends one request (40-byte payload) and the plugin drains it.
+	reqPayload := make([]byte, 40)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: reqPayload}))
+	gotReq := recvOne(t, ep.plugin)
+	require.Equal(t, reqPayload, gotReq.Payload)
+
+	// Then: the host counts one frame sent and 64 + 40 wire bytes; the plugin
+	// counts the mirror image received; the reverse direction is untouched.
+	require.EqualValues(t, 1, ep.host.FramesSent())
+	require.EqualValues(t, shm.DescriptorSize+len(reqPayload), ep.host.BytesSent())
+	require.EqualValues(t, 1, ep.plugin.FramesReceived())
+	require.EqualValues(t, shm.DescriptorSize+len(reqPayload), ep.plugin.BytesReceived())
+	require.Zero(t, ep.host.FramesReceived())
+	require.Zero(t, ep.plugin.FramesSent())
+
+	// When: the plugin replies (50-byte payload) and the host drains it.
+	respPayload := make([]byte, 50)
+	require.NoError(t, ep.plugin.Send(t.Context(),
+		transport.Frame{CallID: 1, Kind: transport.FrameUnaryResp, Payload: respPayload}))
+	gotResp := recvOne(t, ep.host)
+	require.Equal(t, respPayload, gotResp.Payload)
+
+	// Then: the plugin's produce counters and the host's consume counters move,
+	// each in its own direction.
+	require.EqualValues(t, 1, ep.plugin.FramesSent())
+	require.EqualValues(t, shm.DescriptorSize+len(respPayload), ep.plugin.BytesSent())
+	require.EqualValues(t, 1, ep.host.FramesReceived())
+	require.EqualValues(t, shm.DescriptorSize+len(respPayload), ep.host.BytesReceived())
+}
+
+// Test that ArenaOccupancyBytes and RingDepth track a known in-flight set: with
+// several frames published but not yet consumed, the producer's arena occupancy
+// equals the sum of the serving class's slab sizes and the consumer's inbound
+// ring depth equals the frame count; draining the ring returns its depth to zero.
+func TestTransport_OccupancyAndRingDepth_TrackInFlightSet(t *testing.T) {
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+	// Given: nothing in flight.
+	require.Zero(t, ep.host.ArenaOccupancyBytes())
+	require.Zero(t, ep.plugin.RingDepth())
+
+	// When: the host publishes five 40-byte requests (each served by the 64 B
+	// class) without the plugin consuming any.
+	const n = 5
+	const servingSlabSize = 64
+	for i := 0; i < n; i++ {
+		require.NoError(t, ep.host.Send(t.Context(),
+			transport.Frame{CallID: uint64(i + 1), Kind: transport.FrameUnaryReq, Payload: make([]byte, 40)}))
+	}
+
+	// Then: the host's outbound arena reserves five 64-byte slabs, and the
+	// plugin's inbound ring is five descriptors deep.
+	require.EqualValues(t, n*servingSlabSize, ep.host.ArenaOccupancyBytes())
+	require.EqualValues(t, n, ep.plugin.RingDepth())
+
+	// When: the plugin drains all five.
+	for i := 0; i < n; i++ {
+		recvOne(t, ep.plugin)
+	}
+
+	// Then: the inbound ring is empty again (its head has passed every frame).
+	require.Zero(t, ep.plugin.RingDepth())
+}
+
+// Test that every transport counter is scoped to a single generation: a fresh
+// region (a new generation) starts all counters at zero regardless of the
+// traffic a prior generation's pair moved, so a reader comparing samples sees a
+// clean reset across a generation change rather than cross-generation carryover.
+func TestTransport_CountersResetToZero_AcrossGenerationChange(t *testing.T) {
+	// Given: a first-generation pair that has moved a frame each way, so its
+	// counters are non-zero.
+	gen1 := newEndpoints(t, roundTripLayout(), validConfig(false))
+	require.NoError(t, gen1.host.Send(t.Context(),
+		transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: make([]byte, 40)}))
+	recvOne(t, gen1.plugin)
+	require.NotZero(t, gen1.host.FramesSent())
+	require.NotZero(t, gen1.plugin.FramesReceived())
+
+	// When: a successor generation attaches to a fresh region.
+	layout := roundTripLayout()
+	layout.Generation = 8 // strictly greater than roundTripLayout's generation 7
+	gen2 := newEndpoints(t, layout, validConfig(false))
+
+	// Then: every counter on the fresh generation starts at zero on both ends —
+	// no carryover from the retired generation.
+	for _, tr := range []*Transport{gen2.host, gen2.plugin} {
+		require.Zero(t, tr.FramesSent())
+		require.Zero(t, tr.FramesReceived())
+		require.Zero(t, tr.BytesSent())
+		require.Zero(t, tr.BytesReceived())
+		require.Zero(t, tr.ArenaOccupancyBytes())
+		require.Zero(t, tr.RingDepth())
+		require.Zero(t, tr.WakeupSyscalls())
+	}
 }

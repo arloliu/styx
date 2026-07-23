@@ -10,6 +10,7 @@ import (
 
 	"github.com/arloliu/styx/internal/arena"
 	"github.com/arloliu/styx/internal/ring"
+	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/transport"
 )
 
@@ -100,6 +101,15 @@ type slabRef struct {
 type writer struct {
 	ring  descriptorRing
 	arena payloadArena
+
+	// framesSent and bytesSent count outbound progress at the single publish
+	// chokepoint (published): one frame and its header-plus-body wire bytes
+	// (DescriptorSize + payload_length) per successful ring push. Only the run
+	// goroutine writes them, so the increment adds no hot-path lock; they are
+	// atomic so a cold-path reporter reads a consistent snapshot without
+	// contending with the data path (the same discipline as backpressureEdges).
+	framesSent atomic.Uint64
+	bytesSent  atomic.Uint64
 
 	dataQueue      chan intent
 	lifecycleQueue chan intent
@@ -452,6 +462,13 @@ func (w *writer) backpressureEdges() uint64 {
 	return w.edgeCount.Load()
 }
 
+// framesSentCount and bytesSentCount report this writer's cumulative outbound
+// frame and wire-byte progress as cheap atomic snapshots (transport.FrameCounter
+// / transport.ByteCounter), read on a cold path and never contending with the
+// data path.
+func (w *writer) framesSentCount() uint64 { return w.framesSent.Load() }
+func (w *writer) bytesSentCount() uint64  { return w.bytesSent.Load() }
+
 // runEdgeHook fires the test-only edge-ordering observation hook while edgeMu is
 // held. It is nil in every production build, so this is a no-op there.
 func (w *writer) runEdgeHook() {
@@ -639,7 +656,7 @@ func (w *writer) emitLifecycle(i intent) {
 
 	// A CANCEL allocates no slab, but the publish still wakes a parked consumer
 	// (shm-abi.md §12) and records "no slab" at its sequence.
-	w.published(seq, slabRef{})
+	w.published(seq, slabRef{}, d.PayloadLength())
 	w.report(i, nil)
 }
 
@@ -727,7 +744,7 @@ func (w *writer) place(c *carry) emitResult {
 		fpAfterTailPublish()
 	}
 
-	w.published(seq, slabRef{h: c.h, present: c.hasSlab})
+	w.published(seq, slabRef{h: c.h, present: c.hasSlab}, c.d.PayloadLength())
 	w.report(c.i, nil)
 
 	return emitDone
@@ -960,7 +977,13 @@ func (w *writer) stampPayload(i intent, d ring.Descriptor, wire []byte) (ring.De
 // and the equality still holds. A ">" comparison instead loses that boundary: 0 >
 // math.MaxUint64 is false, so it would skip the free and strand the slab (§10;
 // internal/ring is wrap-safe for exactly this reason).
-func (w *writer) published(seq uint64, ref slabRef) {
+func (w *writer) published(seq uint64, ref slabRef, payloadLen uint32) {
+	// Frame-completion counting (shm-abi.md §4/§12): both publish paths funnel
+	// here after a successful ring push, so every fully-sent frame is counted
+	// exactly once, with its header (one descriptor) plus body (payload) wire bytes.
+	w.framesSent.Add(1)
+	w.bytesSent.Add(uint64(shm.DescriptorSize) + uint64(payloadLen))
+
 	if w.handleTable != nil {
 		// This is the POST-PUSH reclaim (Ring.Push above has already advanced
 		// tail by one): the honest reconcile-distance bound is capacity+1, not

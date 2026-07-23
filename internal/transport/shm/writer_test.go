@@ -1810,7 +1810,7 @@ func TestWriter_Published_FreesConsumedSlab_AcrossWrapBoundary(t *testing.T) {
 			w.lastReclaimed = tc.head // reclaim is a no-op; isolate the predicate
 
 			ref := slabRef{h: arena.SlabHandle{Offset: slabOffset}, present: true}
-			w.published(tc.seq, ref)
+			w.published(tc.seq, ref, 0)
 
 			slot := tc.seq & w.handleMask
 			if tc.wantFree {

@@ -87,6 +87,10 @@ type inboundReader interface {
 	// sequence words only (no descriptor-slot read), so the non-consuming drain
 	// probe can observe emptiness safely alongside the single consumer.
 	Empty() bool
+	// Len reports the ring's occupied-descriptor count (tail - head) from the two
+	// sequence words only, for the cold-path ring-depth reporter — the same safe,
+	// non-consuming observation Empty makes.
+	Len() uint64
 }
 
 var _ inboundReader = (*ring.Ring)(nil)
@@ -173,6 +177,21 @@ type Transport struct {
 	lastSeen       uint64
 	staleDiscarded uint64
 
+	// framesReceived and bytesReceived count inbound progress at the single
+	// deliverable-frame chokepoint in drain: one frame and its header-plus-body
+	// wire bytes (DescriptorSize + payload_length) per frame handed to the caller,
+	// never counting a stale-generation discard. Only the single Recv consumer
+	// writes them; atomic so a cold-path reporter reads a consistent snapshot
+	// (transport.FrameCounter / transport.ByteCounter).
+	framesReceived atomic.Uint64
+	bytesReceived  atomic.Uint64
+
+	// outArena is this side's outbound arena (the one its writer allocates from),
+	// retained so the cold-path occupancy reporter can snapshot its currently-
+	// reserved bytes without reaching through the writer's narrowed interface
+	// (transport.ArenaOccupancyReporter).
+	outArena *arena.Arena
+
 	// closeMu is the closing gate: Send and Recv hold the read side for their
 	// whole call, since both read region-mapped memory directly on the calling
 	// goroutine (the poison/shutdown words, and Recv's ring/arena/park-state
@@ -196,6 +215,11 @@ var (
 	_ transport.WriterStopper           = (*Transport)(nil)
 	_ transport.BackpressureEdgeCounter = (*Transport)(nil)
 	_ transport.InboundQueueProber      = (*Transport)(nil)
+	_ transport.FrameCounter            = (*Transport)(nil)
+	_ transport.ByteCounter             = (*Transport)(nil)
+	_ transport.ArenaOccupancyReporter  = (*Transport)(nil)
+	_ transport.RingDepthReporter       = (*Transport)(nil)
+	_ transport.WakeupSyscallCounter    = (*Transport)(nil)
 )
 
 // BackpressureEdges reports the cumulative count of transitions into reject-mode
@@ -206,6 +230,71 @@ var (
 // negotiated. The periodic reporter samples it as a counter delta.
 func (t *Transport) BackpressureEdges() uint64 {
 	return t.outbound.backpressureEdges()
+}
+
+// FramesSent reports the cumulative frames this side has published to its
+// outbound ring — its produce progress (transport.FrameCounter). Cheap atomic
+// snapshot, read on the heartbeat's cold path.
+func (t *Transport) FramesSent() uint64 {
+	return t.outbound.framesSentCount()
+}
+
+// FramesReceived reports the cumulative frames this side has drained and
+// delivered from its inbound ring — its consume progress (transport.FrameCounter),
+// excluding stale-generation discards. Cheap atomic snapshot.
+func (t *Transport) FramesReceived() uint64 {
+	return t.framesReceived.Load()
+}
+
+// BytesSent reports the cumulative header-plus-body wire bytes this side has
+// published (transport.ByteCounter), counted at the same publish chokepoint as
+// FramesSent. Cheap atomic snapshot for the periodic metrics reporter.
+func (t *Transport) BytesSent() uint64 {
+	return t.outbound.bytesSentCount()
+}
+
+// BytesReceived reports the cumulative header-plus-body wire bytes this side has
+// drained and delivered (transport.ByteCounter), counted at the same deliver
+// chokepoint as FramesReceived. Cheap atomic snapshot.
+func (t *Transport) BytesReceived() uint64 {
+	return t.bytesReceived.Load()
+}
+
+// ArenaOccupancyBytes reports this side's outbound arena's currently-reserved
+// byte count (transport.ArenaOccupancyReporter): the sum of the slab_size of
+// every live allocation, a cheap atomic snapshot for the heartbeat's occupancy
+// field. Zero on an isolated writer with no attached arena.
+func (t *Transport) ArenaOccupancyBytes() uint64 {
+	if t.outArena == nil {
+		return 0
+	}
+
+	return t.outArena.OccupancyBytes()
+}
+
+// RingDepth reports this side's inbound ring occupied-descriptor count
+// (transport.RingDepthReporter), observed from the ring's two sequence words only
+// — a cheap, non-consuming snapshot for the periodic ring-depth reporter that
+// never contends with the single Recv consumer.
+func (t *Transport) RingDepth() uint64 {
+	return t.inboundRing.Len()
+}
+
+// WakeupSyscalls reports the cumulative eventfd wakeup syscalls this side has
+// performed (transport.WakeupSyscallCounter): its producer's wake writes on the
+// outbound eventfd plus its consumer's park reads on the inbound eventfd. Each
+// process holds its own duplicate of each eventfd, so a per-EventFD syscall count
+// is exactly this side's syscalls on that fd. Cheap atomic snapshot.
+func (t *Transport) WakeupSyscalls() uint64 {
+	var n uint64
+	if t.inboundEFD != nil {
+		n += t.inboundEFD.SyscallCount()
+	}
+	if t.signal != nil && t.signal.efd != nil {
+		n += t.signal.efd.SyscallCount()
+	}
+
+	return n
 }
 
 // producerSignal runs the §12 producer signal after each publish: it wakes a
@@ -397,6 +486,7 @@ func newTransport(region regionHandle, layout shm.Layout, p AttachParams) (*Tran
 	return &Transport{
 		region:            region,
 		outbound:          w,
+		outArena:          outArena,
 		signal:            sig,
 		inboundRing:       inRing,
 		inboundArenaBytes: arenaSpan(bytes, layout, inDir),
@@ -613,6 +703,12 @@ func (t *Transport) drain(newTail uint64) (transport.Frame, bool, error) {
 				}
 				t.inboundRing.Advance() // reclaim signal, after copy-out (§9)
 				t.lastSeen++
+				// Frame-completion counting: the payload is copied out and the frame
+				// is being delivered, so count one received frame and its header-
+				// plus-body wire bytes. A stale-generation discard below never
+				// reaches here, so it is correctly excluded (shm-abi.md §9/§15).
+				t.framesReceived.Add(1)
+				t.bytesReceived.Add(uint64(shm.DescriptorSize) + uint64(d.PayloadLength()))
 
 				return f, true, nil
 			}

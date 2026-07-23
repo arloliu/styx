@@ -108,6 +108,12 @@ type Arena struct {
 	// id is this arena's process-local identity, stamped into every handle so
 	// Free/Validate can reject a handle minted by a different arena (§6).
 	id uint64
+	// occupancy is the total slab_size bytes currently reserved: Alloc adds the
+	// served class's slab_size, Free subtracts it. Only the direction's single
+	// writer calls Alloc/Free, so the update needs no lock (shm-abi.md §6); it is
+	// atomic so a cold-path reporter can read a consistent snapshot concurrently
+	// with the writer, never contending with the data path.
+	occupancy atomic.Uint64
 }
 
 // New builds an Arena over mem using classes (a direction's already-decoded,
@@ -199,6 +205,7 @@ func (a *Arena) Alloc(size uint32) (SlabHandle, []byte, error) {
 	pool.liveSeq[idx] = seq
 
 	sc := a.classes[ci]
+	a.occupancy.Add(uint64(sc.SlabSize)) // reserved footprint; Free subtracts the same
 	// off is computed in uint32 because payload_offset is a uint32 wire field
 	// (shm-abi.md §4); New's maxSlabExtent bound check (in uint64) already proved
 	// this class's slabs fit within mem, so the sum cannot overflow here.
@@ -260,8 +267,19 @@ func (a *Arena) Free(h SlabHandle) error {
 
 	pool.liveSeq[h.index] = 0
 	pool.free = append(pool.free, h.index)
+	// Subtract the reserved footprint Alloc added for this class (two's-complement
+	// add: atomic.Uint64 has no Sub). h.class was range-checked by locate above.
+	a.occupancy.Add(^(uint64(a.classes[h.class].SlabSize) - 1))
 
 	return nil
+}
+
+// OccupancyBytes reports the total slab_size bytes currently reserved by live
+// allocations — the arena's currently-allocated byte count (shm-abi.md §6). It
+// is a cheap atomic snapshot with no lock and no syscall, safe for a cold-path
+// reporter to read concurrently with the single writer's Alloc/Free.
+func (a *Arena) OccupancyBytes() uint64 {
+	return a.occupancy.Load()
 }
 
 // Validate reports whether h names a currently live slab with a matching
