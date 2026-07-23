@@ -944,13 +944,24 @@ func (s *Supervisor) handshakeAndAttach(
 		}
 	}
 
-	tuple := control.HelloAckToTuple(ack)
-	if tuple.Transport != transportUDS || tuple.Codec != codecProto {
-		return nil, false, fmt.Errorf("supervisor: handshake: negotiated transport=%q codec=%q unsupported",
-			tuple.Transport, tuple.Codec)
+	// Recompute the negotiation from the host's own offer and the plugin offer
+	// echoed on the ack, and reject any acknowledged tuple that differs — the
+	// host never attaches on the plugin's unverified word (shm-abi.md §19).
+	// This subsumes the former hard transport/codec membership check.
+	tuple, verr := control.ValidateAcknowledgedTuple(s.hostOffer(), ack)
+	if verr != nil {
+		var ie *control.IncompatibleError
+		if errors.As(verr, &ie) {
+			return nil, false, ie
+		}
+
+		return nil, false, fmt.Errorf("supervisor: handshake: validate acknowledged tuple: %w", verr)
+	}
+	if tuple.Codec != codecProto {
+		return nil, false, fmt.Errorf("supervisor: handshake: negotiated codec=%q unsupported", tuple.Codec)
 	}
 
-	streaming := tuple.Features["streaming"]
+	streaming := tuple.Features[featureStreaming]
 	tr, err := s.attach(ctx, conn, generation, streaming)
 
 	return tr, streaming, err

@@ -73,7 +73,7 @@ func scriptPluginHandshake(t *testing.T, conn *control.Conn, supportsStreaming b
 
 		return
 	}
-	ack := control.TupleToHelloAck(tuple, hello.GetNonce(), control.PluginIdentity{}, nil)
+	ack := control.TupleToHelloAck(tuple, hello.GetNonce(), control.PluginIdentity{}, nil, pluginOffer)
 	ackMsg := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_HelloAck{HelloAck: ack}}
 	if err := conn.Send(ctx, ackMsg); err != nil {
 		t.Errorf("plugin: send HelloAck: %v", err)

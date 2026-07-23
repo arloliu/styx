@@ -4,14 +4,33 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"slices"
 	"unicode/utf8"
 
 	"github.com/arloliu/styx/internal/control/controlpb"
 )
+
+// TransportSHM and TransportUDS name the two negotiable data-plane transports.
+// The shared-memory transport carries a versioned region layout and so
+// participates in layout-version negotiation; the Unix-domain-socket transport
+// carries no region and fixes the negotiated layout version at 0.
+const (
+	TransportSHM = "shm"
+	TransportUDS = "uds"
+)
+
+// ShmLayoutVersion is the shared-memory region layout version this build
+// speaks (the region's layout page carries layout_version = 1, shm-abi.md §2).
+// An Offer that lists the shared-memory transport advertises this value in its
+// LayoutVersions set; Negotiate selects the highest version common to both
+// sides (shm-abi.md §19). A future breaking layout ships as a new version this
+// set would additionally advertise.
+const ShmLayoutVersion uint32 = 1
 
 // Offer is one side's declared capabilities for handshake negotiation.
 // Services is populated only on the host's offer (its required version
@@ -23,6 +42,12 @@ type Offer struct {
 	Transports               []string
 	Codecs                   []string
 	Services                 []ServiceRequirement // host-only
+	// LayoutVersions is the set of shared-memory region layout versions this
+	// side can speak (shm-abi.md §19). It is populated only when the offer
+	// lists the shared-memory transport; Negotiate selects the highest version
+	// common to both sides. Left nil by a side that offers no shared-memory
+	// transport.
+	LayoutVersions []uint32
 }
 
 // FeatureFlag is a named, independently versioned capability: most protocol
@@ -56,8 +81,8 @@ type ServiceVersion struct {
 }
 
 // Tuple is the fully negotiated compatibility tuple: protocol version,
-// transport, layout version (0 unless transport == "shm" — not yet
-// populated, since only "uds" is currently negotiated), the resolved
+// transport, layout version (0 for "uds", the highest shared-memory layout
+// version common to both sides for "shm", shm-abi.md §19), the resolved
 // feature set (name -> whether both sides will use it), and codec. Both
 // sides acknowledge the identical Tuple before any region is attached, so
 // an untested combination of individually-valid versions can never run.
@@ -95,8 +120,11 @@ func (e *IncompatibleError) Error() string {
 // that only one side supports is simply false, not an error);
 // Tuple.Transport and Tuple.Codec are each the lexicographically first
 // common entry (deterministic tie-break, so a future multi-option list has
-// defined behavior); Tuple.LayoutVersion is 0 for "uds" (the only
-// transport currently supported).
+// defined behavior); Tuple.LayoutVersion is 0 for "uds" and the highest
+// shared-memory layout version common to both sides for "shm" (shm-abi.md
+// §19: a memory layout cannot be partially compatible, so the sets are
+// intersected and the single highest common version selected, or the
+// handshake fails).
 //
 // Every failure returns a *IncompatibleError carrying both offers and a
 // distinct Reason naming the offending axis.
@@ -117,6 +145,19 @@ func Negotiate(host, plugin Offer, pluginServices []ServiceVersion) (Tuple, erro
 	transport, ok := firstCommon(host.Transports, plugin.Transports)
 	if !ok {
 		return fail("transport: no common transport")
+	}
+
+	// Layout version — negotiated only for the shared-memory transport, where a
+	// versioned region layout is mapped (shm-abi.md §19). Both sides advertise a
+	// set; the single highest common version is selected, or the handshake fails
+	// closed. The uds transport carries no region and fixes layout 0.
+	layoutVersion := uint32(0)
+	if transport == TransportSHM {
+		v, common := highestCommonLayout(host.LayoutVersions, plugin.LayoutVersions)
+		if !common {
+			return fail("layout_version: no common shared-memory layout version")
+		}
+		layoutVersion = v
 	}
 
 	// Codec — lexicographically-first common entry.
@@ -140,10 +181,30 @@ func Negotiate(host, plugin Offer, pluginServices []ServiceVersion) (Tuple, erro
 	return Tuple{
 		ProtocolVersion: protocolVersion,
 		Transport:       transport,
-		LayoutVersion:   0, // only "shm" populates a non-zero layout version (not yet implemented)
+		LayoutVersion:   layoutVersion,
 		Features:        features,
 		Codec:           codec,
 	}, nil
+}
+
+// highestCommonLayout returns the highest layout version present in both sets,
+// and false when the intersection is empty (shm-abi.md §19: exact-match axis,
+// highest common version selected). Order-independent — it scans a for any
+// member of b, tracking the maximum — so the two sides need not advertise their
+// sets in any particular order.
+func highestCommonLayout(a, b []uint32) (uint32, bool) {
+	set := make(map[uint32]struct{}, len(b))
+	for _, v := range b {
+		set[v] = struct{}{}
+	}
+	best, found := uint32(0), false
+	for _, v := range a {
+		if _, ok := set[v]; ok && (!found || v > best) {
+			best, found = v, true
+		}
+	}
+
+	return best, found
 }
 
 // negotiateFeatures resolves the feature axis. A side supports a flag if the
@@ -287,11 +348,12 @@ func VerifyBinaryIdentity(path string, pinned []byte) error {
 // repeated field.
 func OfferToHello(o Offer, nonce uint64) *controlpb.Hello {
 	h := &controlpb.Hello{
-		ProtocolMin: o.ProtocolMin,
-		ProtocolMax: o.ProtocolMax,
-		Transports:  o.Transports,
-		Codecs:      o.Codecs,
-		Nonce:       nonce,
+		ProtocolMin:    o.ProtocolMin,
+		ProtocolMax:    o.ProtocolMax,
+		Transports:     o.Transports,
+		Codecs:         o.Codecs,
+		Nonce:          nonce,
+		LayoutVersions: o.LayoutVersions,
 	}
 	for _, f := range o.Features {
 		h.Features = append(h.Features, &controlpb.FeatureFlag{Name: f.Name, Required: f.Required})
@@ -312,10 +374,11 @@ func OfferToHello(o Offer, nonce uint64) *controlpb.Hello {
 // is expressed by a flag's presence in the list — so it is dropped here.
 func HelloToOffer(h *controlpb.Hello) Offer {
 	o := Offer{
-		ProtocolMin: h.GetProtocolMin(),
-		ProtocolMax: h.GetProtocolMax(),
-		Transports:  h.GetTransports(),
-		Codecs:      h.GetCodecs(),
+		ProtocolMin:    h.GetProtocolMin(),
+		ProtocolMax:    h.GetProtocolMax(),
+		Transports:     h.GetTransports(),
+		Codecs:         h.GetCodecs(),
+		LayoutVersions: h.GetLayoutVersions(),
 	}
 	for _, f := range h.GetFeatures() {
 		o.Features = append(o.Features, FeatureFlag{Name: f.GetName(), Required: f.GetRequired()})
@@ -332,10 +395,15 @@ func HelloToOffer(h *controlpb.Hello) Offer {
 }
 
 // TupleToHelloAck builds a controlpb.HelloAck from a negotiated Tuple, the
-// echoed nonce, and the plugin's self-reported identity/service versions. The
-// resolved feature set is emitted with the Supported bit set to the tuple's
-// resolved value so the peer sees exactly which flags are active.
-func TupleToHelloAck(t Tuple, nonce uint64, identity PluginIdentity, services []ServiceVersion) *controlpb.HelloAck {
+// echoed nonce, the plugin's self-reported identity/service versions, and the
+// plugin's own negotiation offer. The resolved feature set is emitted with the
+// Supported bit set to the tuple's resolved value so the peer sees exactly which
+// flags are active. The plugin offer travels in plugin_offer so the host can
+// recompute Negotiate and compare it field-by-field to the acknowledged tuple
+// (ValidateAcknowledgedTuple) before creating any region fd.
+func TupleToHelloAck(
+	t Tuple, nonce uint64, identity PluginIdentity, services []ServiceVersion, pluginOffer Offer,
+) *controlpb.HelloAck {
 	ack := &controlpb.HelloAck{
 		ProtocolVersion: t.ProtocolVersion,
 		Transport:       t.Transport,
@@ -345,6 +413,7 @@ func TupleToHelloAck(t Tuple, nonce uint64, identity PluginIdentity, services []
 		PluginName:      identity.Name,
 		PluginSemver:    identity.SemVer,
 		BinarySha256:    identity.BinarySHA256,
+		PluginOffer:     OfferToHello(pluginOffer, 0),
 	}
 	names := make([]string, 0, len(t.Features))
 	for name := range t.Features {
@@ -379,6 +448,79 @@ func HelloAckToTuple(ack *controlpb.HelloAck) Tuple {
 	return t
 }
 
+// ValidateAcknowledgedTuple recomputes the negotiation from the host's own offer
+// and the plugin offer echoed on a success ack, then rejects the ack unless every
+// acknowledged axis matches that recomputation. The host cannot trust the
+// acknowledged tuple on the plugin's word alone — a buggy or hostile plugin could
+// acknowledge a transport the host never offered, a layout version outside either
+// side's advertised set, an out-of-range protocol, an unoffered codec, or a
+// feature resolution neither side would compute. So the host reruns Negotiate
+// against its own offer, the plugin offer carried in plugin_offer, and the plugin's
+// advertised service versions, and compares protocol version, transport, codec,
+// layout version, and the resolved feature set field-by-field. This subsumes the
+// per-axis membership checks (transport in the offered set, uds implies layout 0,
+// shm implies the negotiated non-zero layout, no invented or dropped required
+// feature). On success it returns the validated Tuple; on any mismatch, or if the
+// recomputation itself fails, a *IncompatibleError — so no region fd is ever
+// created against an unverified tuple (shm-abi.md §19: the tuple is fixed before
+// any region is attached).
+func ValidateAcknowledgedTuple(hostOffer Offer, ack *controlpb.HelloAck) (Tuple, error) {
+	acked := HelloAckToTuple(ack)
+	pluginOffer := HelloToOffer(ack.GetPluginOffer())
+	pluginServices := serviceVersionsFromAck(ack)
+
+	recomputed, err := Negotiate(hostOffer, pluginOffer, pluginServices)
+	if err != nil {
+		var ie *IncompatibleError
+		if errors.As(err, &ie) {
+			return Tuple{}, ie
+		}
+
+		return Tuple{}, &IncompatibleError{HostOffer: hostOffer, PluginOffer: pluginOffer, Reason: err.Error()}
+	}
+
+	if !tupleEqual(recomputed, acked) {
+		return Tuple{}, &IncompatibleError{
+			HostOffer:   hostOffer,
+			PluginOffer: pluginOffer,
+			Reason: fmt.Sprintf(
+				"acknowledged tuple (transport=%q codec=%q protocol=%d layout=%d) does not match "+
+					"host recomputation (transport=%q codec=%q protocol=%d layout=%d)",
+				acked.Transport, acked.Codec, acked.ProtocolVersion, acked.LayoutVersion,
+				recomputed.Transport, recomputed.Codec, recomputed.ProtocolVersion, recomputed.LayoutVersion,
+			),
+		}
+	}
+
+	return recomputed, nil
+}
+
+// tupleEqual reports whether two negotiated tuples agree on every axis: protocol
+// version, transport, layout version, codec, and the resolved feature set.
+func tupleEqual(a, b Tuple) bool {
+	return a.ProtocolVersion == b.ProtocolVersion &&
+		a.Transport == b.Transport &&
+		a.LayoutVersion == b.LayoutVersion &&
+		a.Codec == b.Codec &&
+		maps.Equal(a.Features, b.Features)
+}
+
+// serviceVersionsFromAck projects the plugin's advertised service versions off a
+// HelloAck (the same field a success and a rejection ack both carry), for the
+// host's recompute-and-compare.
+func serviceVersionsFromAck(ack *controlpb.HelloAck) []ServiceVersion {
+	svs := ack.GetServices()
+	if len(svs) == 0 {
+		return nil
+	}
+	out := make([]ServiceVersion, len(svs))
+	for i, s := range svs {
+		out[i] = ServiceVersion{Service: s.GetService(), Version: s.GetVersion()}
+	}
+
+	return out
+}
+
 // MaxIncompatibleReasonBytes bounds IncompatibleToHelloAck's reason field
 // (MSG-size discipline: control.Conn caps any single encoded
 // ControlMessage at MaxMessageSize, and a reason string is the one
@@ -395,22 +537,14 @@ const genericIncompatibleReason = "control: incompatible handshake (no reason re
 
 // IncompatibleToHelloAck builds a rejection HelloAck for a plugin-side
 // Negotiate failure. nonce is echoed (so VerifyNonce still passes on the
-// host). offer is the plugin's own (currently fixed) Offer and services its
-// own advertised ServiceVersions — both carried through the SAME fields
-// TupleToHelloAck already populates on a success ack (protocol_version,
-// transport, codec, features, services), so the host reconstructs a
-// structured PluginOffer (IncompatibleError carries both sides' offers,
-// not prose in Reason alone) via HelloAckIncompatible rather than adding
-// new wire fields.
-//
-// The current plugin offer (pluginserver.go's m1PluginOffer) is
-// single-valued on every axis — exactly one protocol version (ProtocolMin
-// == ProtocolMax), one transport, one codec — so collapsing offer's
-// ranges/lists into HelloAck's singular protocol_version/transport/codec
-// fields (the same fields a SUCCESS ack uses for the negotiated, also
-// single-valued, Tuple) is lossless today. A genuinely multi-valued plugin
-// offer in the future would need dedicated range/list fields here instead
-// of reusing the success-ack shape.
+// host). offer is the plugin's own full Offer and services its own advertised
+// ServiceVersions. The offer travels in plugin_offer — the same field a success
+// ack carries — so the host reconstructs the plugin's structured, multi-valued
+// offer (IncompatibleError carries both sides' offers, not prose in Reason
+// alone) via HelloAckIncompatible, with no loss even when the offer is
+// multi-valued (several transports, a protocol range, a layout-version set). The
+// singular success-ack fields (transport, codec, the resolved feature list) stay
+// unset on a rejection reply.
 //
 // reason is bounded to MaxIncompatibleReasonBytes (truncated on a valid
 // UTF-8 boundary) and, if empty, replaced with genericIncompatibleReason.
@@ -421,18 +555,9 @@ func IncompatibleToHelloAck(offer Offer, services []ServiceVersion, reason strin
 	reason = truncateUTF8(reason, MaxIncompatibleReasonBytes)
 
 	ack := &controlpb.HelloAck{
-		ProtocolVersion:    offer.ProtocolMax,
 		Nonce:              nonce,
 		IncompatibleReason: reason,
-	}
-	if len(offer.Transports) > 0 {
-		ack.Transport = offer.Transports[0]
-	}
-	if len(offer.Codecs) > 0 {
-		ack.Codec = offer.Codecs[0]
-	}
-	for _, f := range offer.Features {
-		ack.Features = append(ack.Features, &controlpb.FeatureFlag{Name: f.Name, Required: f.Required})
+		PluginOffer:        OfferToHello(offer, 0),
 	}
 	for _, s := range services {
 		ack.Services = append(ack.Services, &controlpb.ServiceVersion{Service: s.Service, Version: s.Version})
@@ -458,28 +583,20 @@ func truncateUTF8(s string, maxBytes int) string {
 }
 
 // HelloAckIncompatible reports whether ack is a rejection reply built by
-// IncompatibleToHelloAck (IncompatibleReason non-empty), returning that
-// reason plus the plugin's own Offer reconstructed from the ack's fields
-// (reversing the collapse IncompatibleToHelloAck's doc describes). An
-// ordinary success ack (TupleToHelloAck's output) always leaves
-// IncompatibleReason empty, so rejected is false for it and pluginOffer is
-// the zero Offer.
+// IncompatibleToHelloAck (IncompatibleReason non-empty), returning that reason
+// plus the plugin's own Offer reconstructed from plugin_offer (protocol range,
+// transports, codecs, features, and layout-version set) together with the
+// plugin's advertised service versions from the ack's services field, projected
+// into degenerate exact-version requirements. An ordinary success ack
+// (TupleToHelloAck's output) always leaves IncompatibleReason empty, so rejected
+// is false for it and pluginOffer is the zero Offer.
 func HelloAckIncompatible(ack *controlpb.HelloAck) (reason string, pluginOffer Offer, rejected bool) {
 	reason = ack.GetIncompatibleReason()
 	if reason == "" {
 		return "", Offer{}, false
 	}
 
-	pluginOffer = Offer{ProtocolMin: ack.GetProtocolVersion(), ProtocolMax: ack.GetProtocolVersion()}
-	if t := ack.GetTransport(); t != "" {
-		pluginOffer.Transports = []string{t}
-	}
-	if c := ack.GetCodec(); c != "" {
-		pluginOffer.Codecs = []string{c}
-	}
-	for _, f := range ack.GetFeatures() {
-		pluginOffer.Features = append(pluginOffer.Features, FeatureFlag{Name: f.GetName(), Required: f.GetRequired()})
-	}
+	pluginOffer = HelloToOffer(ack.GetPluginOffer())
 	for _, s := range ack.GetServices() {
 		pluginOffer.Services = append(pluginOffer.Services, ServiceRequirement{
 			Service: s.GetService(), MinVersion: s.GetVersion(), MaxVersion: s.GetVersion(),

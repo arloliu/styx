@@ -532,16 +532,21 @@ func (x *ServiceVersion) GetVersion() uint32 {
 }
 
 type Hello struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ProtocolMin   uint32                 `protobuf:"varint,1,opt,name=protocol_min,json=protocolMin,proto3" json:"protocol_min,omitempty"`
-	ProtocolMax   uint32                 `protobuf:"varint,2,opt,name=protocol_max,json=protocolMax,proto3" json:"protocol_max,omitempty"`
-	Features      []*FeatureFlag         `protobuf:"bytes,3,rep,name=features,proto3" json:"features,omitempty"`
-	Transports    []string               `protobuf:"bytes,4,rep,name=transports,proto3" json:"transports,omitempty"`
-	Codecs        []string               `protobuf:"bytes,5,rep,name=codecs,proto3" json:"codecs,omitempty"`
-	Nonce         uint64                 `protobuf:"varint,6,opt,name=nonce,proto3" json:"nonce,omitempty"`
-	Services      []*ServiceRequirement  `protobuf:"bytes,7,rep,name=services,proto3" json:"services,omitempty"` // host->plugin only; empty from plugin
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	ProtocolMin uint32                 `protobuf:"varint,1,opt,name=protocol_min,json=protocolMin,proto3" json:"protocol_min,omitempty"`
+	ProtocolMax uint32                 `protobuf:"varint,2,opt,name=protocol_max,json=protocolMax,proto3" json:"protocol_max,omitempty"`
+	Features    []*FeatureFlag         `protobuf:"bytes,3,rep,name=features,proto3" json:"features,omitempty"`
+	Transports  []string               `protobuf:"bytes,4,rep,name=transports,proto3" json:"transports,omitempty"`
+	Codecs      []string               `protobuf:"bytes,5,rep,name=codecs,proto3" json:"codecs,omitempty"`
+	Nonce       uint64                 `protobuf:"varint,6,opt,name=nonce,proto3" json:"nonce,omitempty"`
+	Services    []*ServiceRequirement  `protobuf:"bytes,7,rep,name=services,proto3" json:"services,omitempty"` // host->plugin only; empty from plugin
+	// layout_versions is the set of shared-memory layout versions this side can
+	// speak. Both sides advertise sets; negotiation selects the single highest
+	// version in the intersection, or fails the handshake (shm-abi.md §19). Empty
+	// when the side offers no shared-memory transport.
+	LayoutVersions []uint32 `protobuf:"varint,8,rep,packed,name=layout_versions,json=layoutVersions,proto3" json:"layout_versions,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Hello) Reset() {
@@ -623,6 +628,13 @@ func (x *Hello) GetServices() []*ServiceRequirement {
 	return nil
 }
 
+func (x *Hello) GetLayoutVersions() []uint32 {
+	if x != nil {
+		return x.LayoutVersions
+	}
+	return nil
+}
+
 type HelloAck struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	ProtocolVersion uint32                 `protobuf:"varint,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
@@ -641,11 +653,20 @@ type HelloAck struct {
 	// with the offending service named in the error. The plugin still
 	// replies (echoing nonce) instead of silently closing, so the host
 	// can reconstruct a typed IncompatibleError instead of observing an
-	// undifferentiated connection loss. Every other field is unset on a
+	// undifferentiated connection loss. Every other singular field is unset on a
 	// rejection reply.
 	IncompatibleReason string `protobuf:"bytes,11,opt,name=incompatible_reason,json=incompatibleReason,proto3" json:"incompatible_reason,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// plugin_offer carries the plugin's full, multi-valued negotiation offer
+	// (protocol range, transports, codecs, features, and layout-version set) so
+	// the host can recompute Negotiate against its own offer and compare the
+	// result field-by-field to the acknowledged tuple before creating any region
+	// fd. It rides both a success ack (the host's recompute-and-compare) and a
+	// rejection ack (the structured offer a typed IncompatibleError carries). The
+	// nested nonce and services fields are unused here; the plugin's advertised
+	// service versions travel in the services field above.
+	PluginOffer   *Hello `protobuf:"bytes,12,opt,name=plugin_offer,json=pluginOffer,proto3" json:"plugin_offer,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HelloAck) Reset() {
@@ -753,6 +774,13 @@ func (x *HelloAck) GetIncompatibleReason() string {
 		return x.IncompatibleReason
 	}
 	return ""
+}
+
+func (x *HelloAck) GetPluginOffer() *Hello {
+	if x != nil {
+		return x.PluginOffer
+	}
+	return nil
 }
 
 type AttachRegion struct {
@@ -1603,7 +1631,7 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"maxVersion\"D\n" +
 	"\x0eServiceVersion\x12\x18\n" +
 	"\aservice\x18\x01 \x01(\tR\aservice\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\rR\aversion\"\x90\x02\n" +
+	"\aversion\x18\x02 \x01(\rR\aversion\"\xb9\x02\n" +
 	"\x05Hello\x12!\n" +
 	"\fprotocol_min\x18\x01 \x01(\rR\vprotocolMin\x12!\n" +
 	"\fprotocol_max\x18\x02 \x01(\rR\vprotocolMax\x125\n" +
@@ -1613,7 +1641,8 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"transports\x12\x16\n" +
 	"\x06codecs\x18\x05 \x03(\tR\x06codecs\x12\x14\n" +
 	"\x05nonce\x18\x06 \x01(\x04R\x05nonce\x12<\n" +
-	"\bservices\x18\a \x03(\v2 .styx.control.ServiceRequirementR\bservices\"\xb3\x03\n" +
+	"\bservices\x18\a \x03(\v2 .styx.control.ServiceRequirementR\bservices\x12'\n" +
+	"\x0flayout_versions\x18\b \x03(\rR\x0elayoutVersions\"\xeb\x03\n" +
 	"\bHelloAck\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12\x1c\n" +
 	"\ttransport\x18\x02 \x01(\tR\ttransport\x12%\n" +
@@ -1627,7 +1656,8 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\rbinary_sha256\x18\t \x01(\tR\fbinarySha256\x128\n" +
 	"\bservices\x18\n" +
 	" \x03(\v2\x1c.styx.control.ServiceVersionR\bservices\x12/\n" +
-	"\x13incompatible_reason\x18\v \x01(\tR\x12incompatibleReason\"\x91\x01\n" +
+	"\x13incompatible_reason\x18\v \x01(\tR\x12incompatibleReason\x126\n" +
+	"\fplugin_offer\x18\f \x01(\v2\x13.styx.control.HelloR\vpluginOffer\"\x91\x01\n" +
 	"\fAttachRegion\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\x04R\n" +
@@ -1736,12 +1766,13 @@ var file_internal_control_control_proto_depIdxs = []int32{
 	2,  // 18: styx.control.Hello.services:type_name -> styx.control.ServiceRequirement
 	1,  // 19: styx.control.HelloAck.features:type_name -> styx.control.FeatureFlag
 	3,  // 20: styx.control.HelloAck.services:type_name -> styx.control.ServiceVersion
-	8,  // 21: styx.control.Heartbeat.leases:type_name -> styx.control.ActiveHandlerLease
-	22, // [22:22] is the sub-list for method output_type
-	22, // [22:22] is the sub-list for method input_type
-	22, // [22:22] is the sub-list for extension type_name
-	22, // [22:22] is the sub-list for extension extendee
-	0,  // [0:22] is the sub-list for field type_name
+	4,  // 21: styx.control.HelloAck.plugin_offer:type_name -> styx.control.Hello
+	8,  // 22: styx.control.Heartbeat.leases:type_name -> styx.control.ActiveHandlerLease
+	23, // [23:23] is the sub-list for method output_type
+	23, // [23:23] is the sub-list for method input_type
+	23, // [23:23] is the sub-list for extension type_name
+	23, // [23:23] is the sub-list for extension extendee
+	0,  // [0:23] is the sub-list for field type_name
 }
 
 func init() { file_internal_control_control_proto_init() }

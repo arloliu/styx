@@ -51,6 +51,11 @@ message Hello {
   repeated string codecs = 5;
   uint64 nonce = 6;
   repeated ServiceRequirement services = 7; // host->plugin only; empty from plugin
+  // layout_versions is the set of shared-memory layout versions this side can
+  // speak. Both sides advertise sets; negotiation selects the single highest
+  // version in the intersection, or fails the handshake (shm-abi.md §19). Empty
+  // when the side offers no shared-memory transport.
+  repeated uint32 layout_versions = 8;
 }
 
 message HelloAck {
@@ -70,9 +75,18 @@ message HelloAck {
   // with the offending service named in the error. The plugin still
   // replies (echoing nonce) instead of silently closing, so the host
   // can reconstruct a typed IncompatibleError instead of observing an
-  // undifferentiated connection loss. Every other field is unset on a
+  // undifferentiated connection loss. Every other singular field is unset on a
   // rejection reply.
   string incompatible_reason = 11;
+  // plugin_offer carries the plugin's full, multi-valued negotiation offer
+  // (protocol range, transports, codecs, features, and layout-version set) so
+  // the host can recompute Negotiate against its own offer and compare the
+  // result field-by-field to the acknowledged tuple before creating any region
+  // fd. It rides both a success ack (the host's recompute-and-compare) and a
+  // rejection ack (the structured offer a typed IncompatibleError carries). The
+  // nested nonce and services fields are unused here; the plugin's advertised
+  // service versions travel in the services field above.
+  Hello plugin_offer = 12;
 }
 
 message AttachRegion {

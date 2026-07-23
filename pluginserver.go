@@ -572,7 +572,7 @@ func (s *PluginServer) pluginHandshake(ctx context.Context, conn *control.Conn) 
 		return false, err
 	}
 
-	ack := control.TupleToHelloAck(tuple, hello.GetNonce(), control.PluginIdentity{}, services)
+	ack := control.TupleToHelloAck(tuple, hello.GetNonce(), control.PluginIdentity{}, services, offer)
 	ackMsg := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_HelloAck{HelloAck: ack}}
 	if err := sendControl(ctx, conn, ackMsg, control.ReplyDeadlines[control.KindHello]); err != nil {
 		return false, err
@@ -657,18 +657,22 @@ func (s *PluginServer) serviceVersions() []control.ServiceVersion {
 }
 
 // m1PluginOffer is the plugin's base negotiation offer, the plugin-side mirror of
-// internal/supervisor's hostOffer: protocol version 1 only, the uds transport, the
-// proto codec, and the streaming feature offered as supported (not required).
+// internal/supervisor's hostOffer: protocol version 1 only, both data-plane
+// transports (the plugin's default transport allowlist), the shared-memory layout
+// version this build speaks, the proto codec, and the streaming feature offered as
+// supported (not required). The shared-memory transport is offered so a host that
+// prefers it can negotiate it; a host that offers only uds still negotiates uds.
 // Service versions are passed to Negotiate separately (Offer.Services is
 // host-only). pluginOffer refines the streaming flag's Required bit from what this
 // plugin actually serves.
 func m1PluginOffer() control.Offer {
 	return control.Offer{
-		ProtocolMin: m1ProtocolVersion,
-		ProtocolMax: m1ProtocolVersion,
-		Transports:  []string{transportUDS},
-		Codecs:      []string{codecProto},
-		Features:    []control.FeatureFlag{{Name: featureStreaming}},
+		ProtocolMin:    m1ProtocolVersion,
+		ProtocolMax:    m1ProtocolVersion,
+		Transports:     []string{control.TransportSHM, control.TransportUDS},
+		Codecs:         []string{codecProto},
+		Features:       []control.FeatureFlag{{Name: featureStreaming}},
+		LayoutVersions: []uint32{control.ShmLayoutVersion},
 	}
 }
 

@@ -722,7 +722,7 @@ func TestSupervisor_ShortCircuitsToGaveUp_WithZeroRestarts_OnHandshakeIncompatib
 		[]control.ServiceRequirement{{Service: "versiontest.Versioned", MinVersion: 1, MaxVersion: 1}},
 		incompatErr.PluginOffer.Services,
 	)
-	require.Equal(t, []string{"uds"}, incompatErr.PluginOffer.Transports)
+	require.Equal(t, []string{"shm", "uds"}, incompatErr.PluginOffer.Transports)
 	require.Equal(t, []string{"proto"}, incompatErr.PluginOffer.Codecs)
 
 	// And: ZERO Restarting events — the deterministic failure never enters

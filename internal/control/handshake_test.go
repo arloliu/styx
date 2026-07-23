@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/arloliu/styx/internal/control"
+	"github.com/arloliu/styx/internal/control/controlpb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -185,7 +186,7 @@ func TestTupleToHelloAck_HelloAckToTuple_RoundTripsTuple(t *testing.T) {
 
 	// When
 	ack := control.TupleToHelloAck(original, 0xABCD, control.PluginIdentity{Name: "p"},
-		[]control.ServiceVersion{{Service: "echo.Echo", Version: 1}})
+		[]control.ServiceVersion{{Service: "echo.Echo", Version: 1}}, control.Offer{})
 	got := control.HelloAckToTuple(ack)
 
 	// Then
@@ -335,13 +336,208 @@ func TestIncompatibleToHelloAck_TruncatesOverlongReason(t *testing.T) {
 	require.True(t, utf8.ValidString(reason), "truncation must not split a multi-byte rune")
 }
 
+// Test Negotiate's transport selection and shared-memory layout-version
+// negotiation: auto (both transports offered) selects the shared-memory
+// transport when both sides offer it and falls back to uds when the plugin
+// does not; a shared-memory-pinned host fails against a uds-only plugin; and
+// when shm is negotiated the layout version is the highest common one, failing
+// closed on a disjoint set (shm-abi.md §19).
+func TestNegotiate_SelectsTransportAndLayoutVersion(t *testing.T) {
+	cases := []struct {
+		name          string
+		host, plugin  control.Offer
+		wantErr       bool
+		wantErrReason string
+		wantTransport string
+		wantLayout    uint32
+	}{
+		{
+			name: "auto negotiates shm when both offer it, highest common layout",
+			host: control.Offer{ProtocolMin: 1, ProtocolMax: 1, Codecs: []string{"proto"},
+				Transports: []string{"shm", "uds"}, LayoutVersions: []uint32{1, 2}},
+			plugin: control.Offer{ProtocolMin: 1, ProtocolMax: 1, Codecs: []string{"proto"},
+				Transports: []string{"shm", "uds"}, LayoutVersions: []uint32{1, 2, 3}},
+			wantTransport: "shm",
+			wantLayout:    2, // highest common of {1,2} and {1,2,3}
+		},
+		{
+			name: "auto falls back to uds when plugin lacks shm",
+			host: control.Offer{ProtocolMin: 1, ProtocolMax: 1, Codecs: []string{"proto"},
+				Transports: []string{"shm", "uds"}, LayoutVersions: []uint32{1}},
+			plugin: control.Offer{ProtocolMin: 1, ProtocolMax: 1, Codecs: []string{"proto"},
+				Transports: []string{"uds"}},
+			wantTransport: "uds",
+			wantLayout:    0, // uds carries no region layout
+		},
+		{
+			name: "shm-pinned host fails against a uds-only plugin",
+			host: control.Offer{ProtocolMin: 1, ProtocolMax: 1, Codecs: []string{"proto"},
+				Transports: []string{"shm"}, LayoutVersions: []uint32{1}},
+			plugin: control.Offer{ProtocolMin: 1, ProtocolMax: 1, Codecs: []string{"proto"},
+				Transports: []string{"uds"}},
+			wantErr:       true,
+			wantErrReason: "transport",
+		},
+		{
+			name: "shm negotiated but disjoint layout sets fails closed",
+			host: control.Offer{ProtocolMin: 1, ProtocolMax: 1, Codecs: []string{"proto"},
+				Transports: []string{"shm"}, LayoutVersions: []uint32{1}},
+			plugin: control.Offer{ProtocolMin: 1, ProtocolMax: 1, Codecs: []string{"proto"},
+				Transports: []string{"shm"}, LayoutVersions: []uint32{2}},
+			wantErr:       true,
+			wantErrReason: "layout_version",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tuple, err := control.Negotiate(tc.host, tc.plugin, nil)
+			if tc.wantErr {
+				var incompatErr *control.IncompatibleError
+				require.ErrorAs(t, err, &incompatErr)
+				require.Contains(t, incompatErr.Reason, tc.wantErrReason)
+
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantTransport, tuple.Transport)
+			require.Equal(t, tc.wantLayout, tuple.LayoutVersion)
+		})
+	}
+}
+
+// faithfulShmOffers returns a host and plugin offer that both negotiate the
+// shared-memory transport at layout version 1 with an optional checksum feature,
+// for the recompute-and-compare tests below.
+func faithfulShmOffers() (host, plugin control.Offer) {
+	host = control.Offer{
+		ProtocolMin: 1, ProtocolMax: 2, Codecs: []string{"proto"},
+		Transports: []string{"shm", "uds"}, LayoutVersions: []uint32{1},
+		Features: []control.FeatureFlag{{Name: "checksum"}},
+	}
+	plugin = control.Offer{
+		ProtocolMin: 1, ProtocolMax: 2, Codecs: []string{"proto"},
+		Transports: []string{"shm", "uds"}, LayoutVersions: []uint32{1},
+		Features: []control.FeatureFlag{{Name: "checksum"}},
+	}
+
+	return host, plugin
+}
+
+// Test ValidateAcknowledgedTuple accepting a faithfully-built success ack: the
+// host recomputes Negotiate from its own offer plus the plugin offer echoed on
+// the ack and, finding every axis identical, returns the validated tuple.
+func TestValidateAcknowledgedTuple_AcceptsFaithfulAck(t *testing.T) {
+	// Given: a faithful ack the plugin would build from a real negotiation.
+	host, plugin := faithfulShmOffers()
+	tuple, err := control.Negotiate(host, plugin, nil)
+	require.NoError(t, err)
+	ack := control.TupleToHelloAck(tuple, 0xABCD, control.PluginIdentity{}, nil, plugin)
+
+	// When
+	got, verr := control.ValidateAcknowledgedTuple(host, ack)
+
+	// Then: the validated tuple matches the negotiation exactly.
+	require.NoError(t, verr)
+	require.Equal(t, "shm", got.Transport)
+	require.EqualValues(t, 1, got.LayoutVersion)
+	require.Equal(t, tuple, got)
+}
+
+// Test ValidateAcknowledgedTuple rejecting a forged ack on each axis, before any
+// region fd would be created: a tuple the host's own recomputation does not
+// produce is refused with a typed *IncompatibleError (shm-abi.md §19).
+func TestValidateAcknowledgedTuple_RejectsForgedAck(t *testing.T) {
+	cases := []struct {
+		name   string
+		tamper func(ack *controlpb.HelloAck)
+	}{
+		{
+			name:   "transport the host never offered",
+			tamper: func(ack *controlpb.HelloAck) { ack.Transport = "quic" },
+		},
+		{
+			name:   "codec the host never offered",
+			tamper: func(ack *controlpb.HelloAck) { ack.Codec = "cbor" },
+		},
+		{
+			name:   "protocol version outside the negotiated range",
+			tamper: func(ack *controlpb.HelloAck) { ack.ProtocolVersion = 99 },
+		},
+		{
+			name:   "layout version outside the advertised set",
+			tamper: func(ack *controlpb.HelloAck) { ack.LayoutVersion = 7 },
+		},
+		{
+			name: "resolved feature flipped to a value neither side computed",
+			tamper: func(ack *controlpb.HelloAck) {
+				for _, f := range ack.GetFeatures() {
+					f.Supported = !f.GetSupported()
+				}
+			},
+		},
+		{
+			name: "plugin offer echoed on the ack contradicts the acked transport",
+			tamper: func(ack *controlpb.HelloAck) {
+				// Acked shm, but the echoed plugin offer no longer offers shm — the
+				// host's recomputation now yields uds and the shm tuple is refused.
+				ack.GetPluginOffer().Transports = []string{"uds"}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given: a faithful ack, then a single tampered field.
+			host, plugin := faithfulShmOffers()
+			tuple, err := control.Negotiate(host, plugin, nil)
+			require.NoError(t, err)
+			ack := control.TupleToHelloAck(tuple, 0xABCD, control.PluginIdentity{}, nil, plugin)
+			tc.tamper(ack)
+
+			// When
+			got, verr := control.ValidateAcknowledgedTuple(host, ack)
+
+			// Then: rejected with a typed error and no validated tuple.
+			var incompatErr *control.IncompatibleError
+			require.ErrorAs(t, verr, &incompatErr)
+			require.Equal(t, control.Tuple{}, got)
+		})
+	}
+}
+
+// Test ValidateAcknowledgedTuple rejecting an ack whose echoed plugin offer
+// cannot satisfy the host's per-service version requirement: the recomputation
+// itself fails, so the ack is refused rather than attached.
+func TestValidateAcknowledgedTuple_RejectsWhenRecomputeFailsServices(t *testing.T) {
+	// Given: the host requires echo.Echo v2; the ack advertises only v1.
+	host := control.Offer{
+		ProtocolMin: 1, ProtocolMax: 1, Codecs: []string{"proto"}, Transports: []string{"uds"},
+		Services: []control.ServiceRequirement{{Service: "echo.Echo", MinVersion: 2, MaxVersion: 2}},
+	}
+	plugin := control.Offer{ProtocolMin: 1, ProtocolMax: 1, Codecs: []string{"proto"}, Transports: []string{"uds"}}
+	services := []control.ServiceVersion{{Service: "echo.Echo", Version: 1}}
+	// The plugin's own Negotiate would have failed; simulate a forged success ack
+	// that claims a clean tuple while echoing the real (unsatisfying) offer.
+	tuple := control.Tuple{ProtocolVersion: 1, Transport: "uds", Codec: "proto", Features: map[string]bool{}}
+	ack := control.TupleToHelloAck(tuple, 0xABCD, control.PluginIdentity{}, services, plugin)
+
+	// When
+	_, verr := control.ValidateAcknowledgedTuple(host, ack)
+
+	// Then
+	var incompatErr *control.IncompatibleError
+	require.ErrorAs(t, verr, &incompatErr)
+	require.Contains(t, incompatErr.Reason, "echo.Echo")
+}
+
 // Test HelloAckIncompatible reporting ok=false for an ordinary success ack
 // (empty IncompatibleReason), so the host's happy path is unaffected.
 func TestHelloAckIncompatible_ReturnsFalse_ForSuccessAck(t *testing.T) {
 	// Given: a normal success ack built the existing way, never touching the
 	// new field.
 	tuple := control.Tuple{ProtocolVersion: 1, Transport: "uds", Codec: "proto", Features: map[string]bool{}}
-	ack := control.TupleToHelloAck(tuple, 0xDEADBEEF, control.PluginIdentity{}, nil)
+	ack := control.TupleToHelloAck(tuple, 0xDEADBEEF, control.PluginIdentity{}, nil, control.Offer{})
 
 	// When
 	reason, pluginOffer, rejected := control.HelloAckIncompatible(ack)
