@@ -27,10 +27,11 @@ import (
 // matching the build-once-per-package cross-process fixture pattern used
 // elsewhere (see styx/host_test.go's TestMain).
 var (
-	fixtureCrashPlugin     string
-	fixtureReadyPlugin     string
-	fixtureExitPlugin      string
-	fixtureVersionedPlugin string
+	fixtureCrashPlugin       string
+	fixtureReadyPlugin       string
+	fixtureExitPlugin        string
+	fixtureVersionedPlugin   string
+	fixtureCrashAttachPlugin string
 )
 
 func TestMain(m *testing.M) {
@@ -65,6 +66,16 @@ func TestMain(m *testing.M) {
 	versionedBuild := exec.Command("go", "build", "-o", fixtureVersionedPlugin, "./testdata/versionedplugin")
 	if out, err := versionedBuild.CombinedOutput(); err != nil {
 		panic("building versionedplugin fixture: " + err.Error() + "\n" + string(out))
+	}
+
+	// The crash-attach fixture crashes AT a named plugin-side shm attach step; its
+	// failpoint seam compiles only under -tags failpoint (mirroring chaos/'s tagged
+	// testpeer build). The supervisor test binary itself stays untagged.
+	fixtureCrashAttachPlugin = filepath.Join(dir, "crashattachplugin")
+	crashAttachBuild := exec.Command("go", "build", "-tags", "failpoint",
+		"-o", fixtureCrashAttachPlugin, "./testdata/crashattachplugin")
+	if out, err := crashAttachBuild.CombinedOutput(); err != nil {
+		panic("building crashattachplugin fixture: " + err.Error() + "\n" + string(out))
 	}
 
 	m.Run()
@@ -1152,6 +1163,135 @@ func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
 	case <-runDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after the wedge was declared unhealthy")
+	}
+}
+
+// requireCleanShmSpawn proves a fresh supervisor spawns a plugin that attaches over
+// shm and reaches Ready, then tears it down without leaking — used after an attach
+// crash to show it left no poisoned host residue.
+func requireCleanShmSpawn(t *testing.T) {
+	t.Helper()
+
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+	cfg := supervisor.Config{
+		Spec:              lifecycle.Spec{Path: fixtureReadyPlugin},
+		Restart:           supervisor.RestartPolicy{Max: 0},
+		HeartbeatInterval: 100 * time.Millisecond,
+		Transport:         "shm",
+		ShmLayout:         leanShmLayout(),
+		MaxDataInflight:   32,
+		OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
+			return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	requireEventOfKind(t, ch, supervisor.EventReady)
+	require.NoError(t, sup.Stop(t.Context()))
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("clean spawn: Run did not return after Stop")
+	}
+}
+
+// Test the crash-window matrix on the control-plane shared-memory attach path: a
+// plugin that dies AT each plugin-side attach step (before it sends AttachRegionAck)
+// makes the host's attach fail, and the supervisor must classify that death as a typed
+// spawn/attach failure on the event stream — never a hang, never a silent uds
+// downgrade to Ready — release every host-side resource so the fd and region-mapping
+// counts return exactly to baseline, and leave no poisoned residue that would break a
+// subsequent clean spawn. The crash is driven by STYX_CRASH_AT_ATTACH_STEP, so each
+// window is reached deterministically at the step itself, with no timing to race.
+//
+// These are the crash-window forms of the data plane's per-step attach ownership
+// table. The host-side pre-send steps (region create, the two eventfd creates) involve
+// no live child; their partial-cleanup is covered by that error-injection unit table
+// and is not re-exercised as a process-death window here.
+func TestSupervisor_ShmAttachCrashWindows_ClassifiedAndNoLeak(t *testing.T) {
+	steps := []string{"recv-fds", "hp-wrap", "ph-wrap", "attach", "ack-send"}
+	for _, step := range steps {
+		t.Run(step, func(t *testing.T) {
+			fdsBefore := testutil.CountOpenFDs(t)
+			mapsBefore := countRegionMappings(t)
+
+			bus := supervisor.NewEventBus()
+			collector := newEventCollector(bus)
+			defer collector.unsub()
+			cfg := supervisor.Config{
+				Spec: lifecycle.Spec{
+					Path: fixtureCrashAttachPlugin,
+					Env:  []string{"STYX_CRASH_AT_ATTACH_STEP=" + step},
+				},
+				Restart:           supervisor.RestartPolicy{Max: 0}, // give up after the first crash
+				HeartbeatInterval: 100 * time.Millisecond,
+				Transport:         "shm",
+				ShmLayout:         leanShmLayout(),
+				MaxDataInflight:   32,
+				OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
+					t.Errorf("attach crash at %q reached Ready — a silent uds downgrade", step)
+
+					return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
+				},
+			}
+			sup := supervisor.New(cfg, bus)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			runDone := make(chan struct{})
+			go func() { defer close(runDone); sup.Run(ctx) }()
+
+			// Classification: the run ends in GaveUp — never a hang (awaitKind is
+			// deadline-bounded), never Ready (no silent uds downgrade) — and the terminal
+			// error is a typed spawn/attach failure: the plugin's exit status (its crash at
+			// the seam) wrapping the host's attach step (the missing AttachRegionAck).
+			seen := collector.awaitKind(t)
+			var failErr error
+			for _, ev := range seen {
+				require.NotEqual(t, supervisor.EventReady, ev.Kind,
+					"attach crash at %q must not reach Ready (no silent uds downgrade)", step)
+				if ev.Err != nil {
+					failErr = ev.Err
+				}
+			}
+			require.Equal(t, supervisor.EventGaveUp, seen[len(seen)-1].Kind)
+			require.Error(t, failErr, "the mid-attach death must be classified as a typed failure")
+			require.Contains(t, failErr.Error(), "exit status 3",
+				"the failure must carry the plugin's crash-at-attach exit status")
+			require.Contains(t, failErr.Error(), "AttachRegionAck",
+				"the failure must be the shm attach ack step, not a generic or downgraded path")
+
+			select {
+			case <-runDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run did not return after GaveUp")
+			}
+
+			// No leak: the failed attach released the host's region and both eventfds, so
+			// the fd and region-mapping counts return exactly to baseline.
+			require.Eventually(t, func() bool { return testutil.CountOpenFDs(t) <= fdsBefore },
+				2*time.Second, 20*time.Millisecond,
+				"host leaked fds after an attach crash at %q: before=%d after=%d",
+				step, fdsBefore, testutil.CountOpenFDs(t))
+			require.Eventually(t, func() bool { return countRegionMappings(t) <= mapsBefore },
+				2*time.Second, 20*time.Millisecond,
+				"host leaked a region mapping after an attach crash at %q", step)
+
+			// No poisoned residue: a subsequent spawn attaches over shm and reaches Ready,
+			// then tears down back to the same baseline.
+			requireCleanShmSpawn(t)
+			require.Eventually(t, func() bool { return testutil.CountOpenFDs(t) <= fdsBefore },
+				2*time.Second, 20*time.Millisecond, "a clean spawn after crash at %q leaked fds", step)
+			require.Eventually(t, func() bool { return countRegionMappings(t) <= mapsBefore },
+				2*time.Second, 20*time.Millisecond, "a clean spawn after crash at %q leaked a region mapping", step)
+		})
 	}
 }
 

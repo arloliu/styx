@@ -36,7 +36,7 @@
 //
 // # Scope boundary: windows covered elsewhere, and one still open here
 //
-// Two scenarios that once could not be exercised at all — the host integrates the
+// Three scenarios that once could not be exercised at all — the host integrates the
 // shared-memory transport end to end now (a control-plane SCM_RIGHTS attach, supervisor
 // shm wiring, and shm heartbeat capabilities all exist) — are exercised across a real
 // process boundary in internal/supervisor rather than in this hand-rolled bridge, which
@@ -52,13 +52,15 @@
 //     (internal/supervisor's SIGSTOP-wedge test). This bridge's SIGSTOP scenario still
 //     asserts only that the host's in-flight call is bounded by its own context — the
 //     transport-level guarantee, complementary to the supervisor-level classification.
-//
-// One crash-window class remains open here: the fd-transfer / ready-ack windows on the
-// control-plane attach path (crash the plugin at a pluginAttachSHM step — recv-fds,
-// eventfd wrap, attach, or send-ack — via the per-step attach failpoint seams that today
-// inject errors). The attach path now exists, so these are reachable; adding them as
-// deterministic matrix windows with exact host-side fd/mapping-count assertions is a
-// follow-up, not a blocked gap.
+//   - fd-transfer / ready-ack attach crash windows on the control-plane attach path: a
+//     plugin dies at each plugin-side pluginAttachSHM step (recv-fds, the two eventfd
+//     wraps, attach, ack-send) before it sends AttachRegionAck, and the supervisor
+//     classifies the death as a typed spawn/attach failure with the host's fd and
+//     region-mapping counts back at baseline and no poisoned residue for the next spawn
+//     (internal/supervisor's attach-crash-window matrix, driven by the -tags failpoint
+//     crash-attach fixture through STYX_CRASH_AT_ATTACH_STEP). The host-side pre-send
+//     steps (region create, the two eventfd creates) involve no live child; their
+//     partial-cleanup stays covered by the data plane's error-injection unit table.
 //
 // Two further boundaries stand on their own:
 //
