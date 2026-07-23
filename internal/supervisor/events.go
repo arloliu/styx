@@ -96,6 +96,12 @@ type busSubscriber[T any] struct {
 
 	droppedInformational uint64
 
+	// sending is true from the moment next() checks an event out for delivery
+	// until the forwarder's send completes. quiesced reads it so a shutdown
+	// drain never concludes the subscriber is idle while one event is still in
+	// the forwarder's hand, after leaving the ring but before reaching ch.
+	sending bool
+
 	ch   chan T
 	wake chan struct{}
 	done chan struct{}
@@ -107,10 +113,13 @@ func NewBus[T any](isCritical func(T) bool) *Bus[T] {
 	return &Bus[T]{subs: make(map[*busSubscriber[T]]struct{}), isCritical: isCritical}
 }
 
-// Subscribe registers a new receiver channel and returns it plus an
-// unsubscribe func. Calling the returned func more than once is safe
-// (subsequent calls are no-ops).
-func (b *Bus[T]) Subscribe() (<-chan T, func()) {
+// Subscribe registers a new receiver channel and returns it, an unsubscribe
+// func, and a quiesced probe. Calling the returned unsubscribe func more than
+// once is safe (subsequent calls are no-ops). quiesced reports whether nothing
+// is queued or in flight for this subscriber (no critical pending, ring empty,
+// no send outstanding); a caller that is about to unsubscribe uses it to drain
+// first, so no queued event is discarded by the teardown.
+func (b *Bus[T]) Subscribe() (<-chan T, func(), func() bool) {
 	s := &busSubscriber[T]{
 		ch:   make(chan T),
 		wake: make(chan struct{}, 1),
@@ -133,7 +142,14 @@ func (b *Bus[T]) Subscribe() (<-chan T, func()) {
 		})
 	}
 
-	return s.ch, unsub
+	quiesced := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		return !s.hasCritical && s.ringLen == 0 && !s.sending
+	}
+
+	return s.ch, unsub, quiesced
 }
 
 // Publish delivers ev to every current subscriber per the drop-oldest /
@@ -209,6 +225,7 @@ func (s *busSubscriber[T]) next() (T, bool) {
 	if s.hasCritical {
 		ev := s.critical
 		s.hasCritical = false
+		s.sending = true
 
 		return ev, true
 	}
@@ -221,8 +238,17 @@ func (s *busSubscriber[T]) next() (T, bool) {
 	ev := s.ring[s.ringHead]
 	s.ringHead = (s.ringHead + 1) % len(s.ring)
 	s.ringLen--
+	s.sending = true
 
 	return ev, true
+}
+
+// clearSending marks the checked-out event's delivery finished, so quiesced can
+// again report the subscriber idle once its ring is also empty.
+func (s *busSubscriber[T]) clearSending() {
+	s.mu.Lock()
+	s.sending = false
+	s.mu.Unlock()
 }
 
 // forward is the sole writer to s.ch: it drains s's queue one event at a
@@ -242,7 +268,9 @@ func (s *busSubscriber[T]) forward() {
 
 		select {
 		case s.ch <- ev:
+			s.clearSending()
 		case <-s.done:
+			s.clearSending()
 			return
 		}
 	}
@@ -261,11 +289,11 @@ func NewEventBus() *EventBus {
 	return &EventBus{bus: NewBus(func(e Event) bool { return e.Kind.isCritical() })}
 }
 
-// Subscribe registers a new receiver channel and returns it plus an
-// unsubscribe func. Buffering is handled internally via the bounded
-// informational ring buffer and critical-event slot described above,
-// not by the channel itself.
-func (b *EventBus) Subscribe() (<-chan Event, func()) {
+// Subscribe registers a new receiver channel and returns it, an unsubscribe
+// func, and a quiesced probe (see Bus.Subscribe). Buffering is handled
+// internally via the bounded informational ring buffer and critical-event slot
+// described above, not by the channel itself.
+func (b *EventBus) Subscribe() (<-chan Event, func(), func() bool) {
 	return b.bus.Subscribe()
 }
 

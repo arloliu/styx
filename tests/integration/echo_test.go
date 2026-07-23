@@ -189,7 +189,7 @@ func TestEcho_DeadlinePropagation_ReturnsErrDeadlineExceeded_WhenHandlerExceedsB
 		}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(t.Context()) })
+	stopHostInCleanup(t, h)
 
 	client := echopb.NewEchoClient(h.Plugin("echo"))
 	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
@@ -224,7 +224,7 @@ func TestEcho_Cancellation_ReturnsErrCanceled_BeforeHandlerCompletes(t *testing.
 		}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(t.Context()) })
+	stopHostInCleanup(t, h)
 
 	client := echopb.NewEchoClient(h.Plugin("echo"))
 	ctx, cancel := context.WithCancel(t.Context())
@@ -274,7 +274,7 @@ func TestEcho_PluginCrashMidCall_ReturnsErrOutcomeUnknown_WhenDispatchMayHaveBeg
 		}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(t.Context()) })
+	stopHostInCleanup(t, h)
 
 	client := echopb.NewEchoClient(h.Plugin("echo"))
 	resultCh := make(chan error, 1)
@@ -334,7 +334,7 @@ func TestEcho_PluginCrashBeforeDispatch_ReturnsRetryablePluginCrashError(t *test
 		}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(t.Context()) })
+	stopHostInCleanup(t, h)
 
 	// When: release the plugin's startup checkpoint (it has been blocked
 	// there since before the handshake even began) and wait for the
@@ -373,7 +373,7 @@ func TestEcho_HandlerStatus_RoundTripsAsTypedStatus_WithinBudget(t *testing.T) {
 		}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(t.Context()) })
+	stopHostInCleanup(t, h)
 
 	client := echopb.NewEchoClient(h.Plugin("echo"))
 	// A generous deadline: if status framing didn't work, the call would hang
@@ -416,7 +416,7 @@ func TestEcho_HandlerStatus_TerminatesCall_WithNoClientDeadline(t *testing.T) {
 		}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(t.Context()) })
+	stopHostInCleanup(t, h)
 
 	client := echopb.NewEchoClient(h.Plugin("echo"))
 
@@ -450,7 +450,7 @@ func TestEcho_UnregisteredService_ReturnsErrServiceNotFound(t *testing.T) {
 		Plugins: []styx.PluginSpec{{Name: "echo", Path: echoPluginBin}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(t.Context()) })
+	stopHostInCleanup(t, h)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
@@ -474,7 +474,7 @@ func TestEcho_UnknownMethod_ReturnsErrMethodNotFound(t *testing.T) {
 		Plugins: []styx.PluginSpec{{Name: "echo", Path: echoPluginBin}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(t.Context()) })
+	stopHostInCleanup(t, h)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
@@ -512,7 +512,7 @@ func TestEcho_SupervisorRestartsCrashingPlugin_PerConfiguredPolicy(t *testing.T)
 		}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(t.Context()) })
+	stopHostInCleanup(t, h)
 
 	// When / Then: drive three crash/restart cycles — well within the
 	// policy's budget of 5 — asserting a fresh Restarting-then-Ready pair

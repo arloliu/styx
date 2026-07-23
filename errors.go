@@ -171,6 +171,16 @@ var (
 	ErrPoisoned          = errors.New("styx: region poisoned")
 	ErrServiceNotFound   = errors.New("styx: service not found")
 	ErrMethodNotFound    = errors.New("styx: method not found")
+	// ErrPluginStopping reports that a Start or Reload named a plugin whose
+	// previous instance is still shutting down: a Stop deadline expired before
+	// that instance's supervisor joined, so the name is retained in a stopping
+	// state until the join completes. Starting a second instance under the same
+	// name while the first is still stopping would let two supervisors race for
+	// one name, so both Start and Reload reject it with this error until the
+	// prior instance finishes tearing down (automatically once its Run exits, or
+	// on a retried Stop). It is a lifecycle/framework error, not a per-call one,
+	// so IsRetryable does not classify it.
+	ErrPluginStopping = errors.New("styx: plugin still stopping")
 	// ErrStreamAlreadyClosed reports that a stream reached its terminal outcome
 	// before OpenStream could hand it back — a fast peer completion won the race
 	// against the opener's own publish step, so there is no usable stream to return.

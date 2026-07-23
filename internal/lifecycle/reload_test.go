@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,6 +34,8 @@ type fakeReloadTarget struct {
 
 	// Script knobs, set before the script goroutine starts.
 	ackDrainOnly        bool   // ack Drain, then never produce a snapshot
+	withholdDrainAck    bool   // receive Drain but never ack it, staying alive so rollback can still Resume it
+	withholdResumeAck   bool   // receive Resume but hold ResumeAck until releaseResumeAck is closed
 	closeConnAfterDrain bool   // die (close the control conn) right after Drain arrives
 	isSuccessor         bool   // this instance awaits Restore rather than Drain
 	restoreNotReady     bool   // reply RestoreAck{ready: false}
@@ -71,6 +74,13 @@ type fakeReloadTarget struct {
 	// verified the snapshot rather than echoing the producer's own value.
 	restoredChecksum atomic.Pointer[[]byte]
 
+	// resumeGate is closed the instant the fake receives Resume, so a test that
+	// withholds ResumeAck can observe the interval while admission must stay
+	// closed. releaseResumeAck is closed by that test to let the held ResumeAck
+	// through. Both are unused unless withholdResumeAck is set.
+	resumeGate       chan struct{}
+	releaseResumeAck chan struct{}
+
 	scriptDone chan struct{}
 }
 
@@ -83,10 +93,12 @@ func newFakeReloadTarget(t *testing.T, admission *lifecycle.AdmissionGate) *fake
 	require.NoError(t, err)
 
 	f := &fakeReloadTarget{
-		hostConn:   control.NewConn(fds[0], 1),
-		pluginConn: control.NewConn(fds[1], 1),
-		admission:  admission,
-		scriptDone: make(chan struct{}),
+		hostConn:         control.NewConn(fds[0], 1),
+		pluginConn:       control.NewConn(fds[1], 1),
+		admission:        admission,
+		resumeGate:       make(chan struct{}),
+		releaseResumeAck: make(chan struct{}),
+		scriptDone:       make(chan struct{}),
 	}
 
 	return f
@@ -186,6 +198,12 @@ func (f *fakeReloadTarget) handle(kind control.MessageKind, msg *controlpb.Contr
 	case control.KindResume:
 		f.resumeReceived.Store(true)
 		f.admissionOpenAtResume.Store(f.admission.IsOpen())
+		if f.withholdResumeAck {
+			// Signal receipt and park: the host stays blocked awaiting ResumeAck,
+			// so admission cannot reopen until the test releases the ack.
+			close(f.resumeGate)
+			<-f.releaseResumeAck
+		}
 
 		return f.send(&controlpb.ControlMessage{
 			Body: &controlpb.ControlMessage_ResumeAck{ResumeAck: &controlpb.ResumeAck{}},
@@ -202,6 +220,13 @@ func (f *fakeReloadTarget) handleDrain() bool {
 
 	if f.closeConnAfterDrain {
 		return false // closes the conn via script's defer: the instance died mid-reload.
+	}
+
+	if f.withholdDrainAck {
+		// Stay alive without acking: the host's DrainAck deadline must fire while
+		// this instance can still be told to Resume, unlike a crash. The script
+		// keeps reading, so the rollback's Resume still reaches it.
+		return true
 	}
 
 	if !f.send(&controlpb.ControlMessage{
@@ -402,6 +427,109 @@ func TestTransaction_AwaitResumeAckBeforeReopeningAdmission_OnSnapshotPhaseDeadl
 	require.False(t, old.admissionOpenAtResume.Load(),
 		"admission must not reopen until the old instance's Resume is acked")
 	require.True(t, admission.IsOpen(), "a completed rollback must leave admission open again")
+}
+
+// Test transaction resuming a live predecessor and reopening admission only after ResumeAck when drain-ack times out
+func TestTransaction_AwaitResumeAckBeforeReopeningAdmission_OnDrainAckPhaseDeadline(t *testing.T) {
+	// Given: the old instance receives Drain but never acks it, and stays alive -
+	// so unlike a crash the host can still Resume it once the deadline fires.
+	admission := &lifecycle.AdmissionGate{}
+	admission.Open()
+	old := newFakeReloadTarget(t, admission)
+	old.withholdDrainAck = true
+	old.start(t)
+
+	var spawnCalled atomic.Bool
+	spawnNew := func(context.Context) (lifecycle.ReloadTarget, error) {
+		spawnCalled.Store(true)
+
+		return nil, errFakeMustNotBeCalled
+	}
+	// A short DrainAck deadline both fires the drain phase and bounds the rollback's
+	// own Resume round trip, which is a local socketpair exchange well within it.
+	deadlines := lifecycle.PhaseDeadlines{
+		DrainAck:        200 * time.Millisecond,
+		Snapshot:        50 * time.Millisecond,
+		RestoreValidate: 2 * time.Second,
+	}
+	tx := lifecycle.NewTransaction(old, spawnNew, deadlines, admission)
+
+	// When
+	promoted, err := tx.Run(t.Context())
+
+	// Then: ordering - the live old instance was resumed and its Resume acked while
+	// admission was still closed, and only then reopened.
+	require.Error(t, err)
+	require.Nil(t, promoted)
+	require.ErrorContains(t, err, "await DrainAck")
+	require.True(t, old.drainSent.Load(), "the drain phase must have sent Drain")
+	require.False(t, spawnCalled.Load(), "no successor is spawned when the drain phase fails")
+	require.True(t, old.resumeReceived.Load(), "rollback must send Resume to the still-live old instance")
+	require.False(t, old.admissionOpenAtResume.Load(),
+		"admission must not reopen until the old instance's Resume is acked")
+	require.True(t, admission.IsOpen(), "a completed rollback must leave admission open again")
+}
+
+// Test transaction holding admission closed until the old instance acks Resume during rollback
+func TestTransaction_HoldAdmissionClosed_UntilOldInstanceAcksResume(t *testing.T) {
+	// Given: the old instance acks Drain but never produces a snapshot, so the
+	// snapshot phase times out and rollback sends it Resume - which it receives but
+	// holds, acking only once the test releases it. A generous DrainAck deadline
+	// bounds the rollback's own Resume round trip well above the withheld window;
+	// the short snapshot deadline is what actually fires the rollback.
+	admission := &lifecycle.AdmissionGate{}
+	admission.Open()
+	old := newFakeReloadTarget(t, admission)
+	old.ackDrainOnly = true
+	old.withholdResumeAck = true
+	old.start(t)
+
+	deadlines := lifecycle.PhaseDeadlines{
+		DrainAck:        5 * time.Second,
+		Snapshot:        50 * time.Millisecond,
+		RestoreValidate: 2 * time.Second,
+	}
+	tx := lifecycle.NewTransaction(old, nil, deadlines, admission)
+
+	// When: Run drives the whole transaction, including the blocking rollback, on its
+	// own goroutine so the test can observe admission while ResumeAck is withheld.
+	type runResult struct {
+		promoted lifecycle.ReloadTarget
+		err      error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		promoted, err := tx.Run(t.Context())
+		done <- runResult{promoted: promoted, err: err}
+	}()
+
+	// Then: once the old instance has received Resume, admission cannot reopen until
+	// it acks. Reopening admission is strictly rollback's last step and runs only
+	// after resumeOld returns, which cannot happen while the ack is withheld - so a
+	// bounded observation of admission staying closed is a proof by that invariant,
+	// not a sample that could miss a reopen. The bound only gives a hypothetical
+	// premature reopen many scheduler turns to surface.
+	select {
+	case <-old.resumeGate:
+	case <-time.After(4 * time.Second):
+		t.Fatal("rollback never sent Resume to the old instance")
+	}
+	closedUntilAck := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(closedUntilAck) {
+		require.False(t, admission.IsOpen(),
+			"admission must stay closed until the old instance acks Resume")
+		runtime.Gosched()
+	}
+
+	// When: the old instance is allowed to ack Resume.
+	close(old.releaseResumeAck)
+
+	// Then: rollback completes and only now reopens admission.
+	res := <-done
+	require.Error(t, res.err)
+	require.Nil(t, res.promoted)
+	require.True(t, old.resumeReceived.Load(), "rollback must send Resume to the old instance")
+	require.True(t, admission.IsOpen(), "admission must reopen once the old instance acks Resume")
 }
 
 // Test transaction reporting a crash-equivalent error, not hanging, when the old instance dies during rollback

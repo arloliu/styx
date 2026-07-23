@@ -476,6 +476,13 @@ func (s *Supervisor) Run(ctx context.Context) {
 // calling it more than once, or before Run has started, is safe (the
 // latter blocks until Run starts and then finishes, or until ctx is
 // done).
+//
+// Stop's error is the caller's join signal: nil exactly when Run has returned
+// (its goroutine has exited and will publish nothing further, so resources it
+// could still touch are safe to release), and ctx.Err() when the deadline fired
+// before that join, leaving Run possibly still alive. A later Stop is the way to
+// complete the join. A closed doneCh always wins a tie with an expired ctx so a
+// Run that has actually joined is never reported not-joined.
 func (s *Supervisor) Stop(ctx context.Context) error {
 	s.stopOnce.Do(func() { close(s.stopCh) })
 
@@ -483,8 +490,23 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	case <-s.doneCh:
 		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		select {
+		case <-s.doneCh:
+			return nil
+		default:
+			return ctx.Err()
+		}
 	}
+}
+
+// Done returns a channel closed exactly when Run has returned — the same join
+// signal a nil Stop error reports, exposed so a caller that let a Stop deadline
+// expire can wait for the join out of band (without holding a Stop call open)
+// and then release resources the exited Run can no longer touch. The channel is
+// closed once and never reopened; a receive on it after Run has returned
+// completes immediately.
+func (s *Supervisor) Done() <-chan struct{} {
+	return s.doneCh
 }
 
 // stopped reports whether Stop has been called.

@@ -78,7 +78,7 @@ func TestObserve_HostSink_ReceivesLatencyAndRestart(t *testing.T) {
 		}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(t.Context()) })
+	stopHostInCleanup(t, h)
 	awaitEvent(t, h.Events(), styx.EventReady)
 
 	// When: a call round-trips successfully.
@@ -127,7 +127,7 @@ func TestObserve_HostSink_ReceivesHeartbeatMissAndRestart(t *testing.T) {
 		}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(t.Context()) })
+	stopHostInCleanup(t, h)
 	awaitEvent(t, h.Events(), styx.EventReady)
 
 	// When: a call round-trips successfully before the silence drives a miss.

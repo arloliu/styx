@@ -25,7 +25,7 @@ func TestEventBus_DropsOldestInformationalEvent_WhenSubscriberBufferFull(t *test
 	// Given: a subscriber that never reads, and more informational events
 	// published than the bus's per-subscriber informational capacity.
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	base := time.Now()
@@ -76,7 +76,7 @@ func TestEventBus_CoalescesCriticalEventToLatest_InsteadOfDropping(t *testing.T)
 	// Given: a subscriber that never reads while several critical events
 	// are published back to back.
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	base := time.Now()
@@ -111,7 +111,7 @@ done:
 func TestEventBus_Publish_NeverBlocks_OnUnreadSlowSubscriber(t *testing.T) {
 	// Given: a subscriber that never reads at all.
 	bus := supervisor.NewEventBus()
-	_, unsub := bus.Subscribe()
+	_, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	// When: publish far more events (informational and critical mixed) than
@@ -142,9 +142,9 @@ func TestEventBus_Publish_NeverBlocks_OnUnreadSlowSubscriber(t *testing.T) {
 func TestEventBus_DeliversToEverySubscriber_Independently(t *testing.T) {
 	// Given
 	bus := supervisor.NewEventBus()
-	ch1, unsub1 := bus.Subscribe()
+	ch1, unsub1, _ := bus.Subscribe()
 	defer unsub1()
-	ch2, unsub2 := bus.Subscribe()
+	ch2, unsub2, _ := bus.Subscribe()
 	defer unsub2()
 
 	// When
@@ -165,7 +165,7 @@ func TestEventBus_DeliversToEverySubscriber_Independently(t *testing.T) {
 func TestEventBus_StopsDelivering_AfterUnsubscribe(t *testing.T) {
 	// Given
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 
 	// When
 	unsub()
@@ -178,4 +178,37 @@ func TestEventBus_StopsDelivering_AfterUnsubscribe(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		// No delivery observed — also acceptable if unsub leaves ch open but idle.
 	}
+}
+
+// Test quiesced reporting not-quiesced while the forwarder holds an event
+// checked out for delivery, then quiesced again once the queue is empty and the
+// send has completed — the signal a shutdown drain relies on to know no event
+// is still in flight before discarding the subscription.
+func TestEventBus_QuiescedTracksInFlightSend_AcrossHandoff(t *testing.T) {
+	// Given: a fresh subscription with nothing queued.
+	bus := supervisor.NewEventBus()
+	ch, unsub, quiesced := bus.Subscribe()
+	defer unsub()
+
+	// Then: an idle subscription is quiesced.
+	require.True(t, quiesced(), "a subscription with nothing queued must be quiesced")
+
+	// When: one event is published but never read, the forwarder dequeues it
+	// (emptying the ring) and blocks on the send.
+	bus.Publish(supervisor.Event{Kind: supervisor.EventUnhealthy, Time: time.Now()})
+
+	// Then: quiesced stays false while that send is outstanding. Once the ring has
+	// drained, only the in-flight-send flag can keep it false, so require.Never
+	// fails if the send window is not tracked.
+	require.Eventually(t, func() bool { return !quiesced() }, time.Second, time.Millisecond,
+		"a published event must make the subscription not quiesced")
+	require.Never(t, quiesced, 100*time.Millisecond, 5*time.Millisecond,
+		"an event checked out for delivery must keep the subscription not quiesced")
+
+	// When: the event is finally received, the send completes and the ring stays empty.
+	require.Equal(t, supervisor.EventUnhealthy, (<-ch).Kind)
+
+	// Then: quiesced reports quiesced again once nothing is queued or in flight.
+	require.Eventually(t, quiesced, time.Second, time.Millisecond,
+		"once the queue is empty and the send has completed the subscription must be quiesced")
 }

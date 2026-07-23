@@ -411,7 +411,7 @@ func runReloadSupervisor(
 	t.Helper()
 
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 
 	sup := supervisor.New(cfg, bus)
 	sup.SetSpawnForTest(sp.spawn)
@@ -456,7 +456,7 @@ func TestSupervisor_NotifyConnLost_TearsDownAndRestarts(t *testing.T) {
 	cfg.Restart = supervisor.RestartPolicy{Max: 2, Backoff: func(int) time.Duration { return 5 * time.Millisecond }}
 
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	sup := supervisor.New(cfg, bus)

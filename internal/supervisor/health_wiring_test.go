@@ -181,7 +181,7 @@ func TestSupervisor_TransportWedged_WhenConsumerFrozenWithInboundReadable(t *tes
 	// Given: the plugin's consume counter never advances, and it reports inbound work
 	// still readable (both in every heartbeat's own snapshot).
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	nextHB := func(seq uint64) *controlpb.Heartbeat {
@@ -225,7 +225,7 @@ func TestSupervisor_DispatchWedged_WhenUnleasedResponseOwed(t *testing.T) {
 	// Given: consume is not frozen-with-readable (no transport wedge), but produce is
 	// frozen with one unleased response obligation (no handler running for it).
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	nextHB := func(seq uint64) *controlpb.Heartbeat {
@@ -312,7 +312,7 @@ func requireHealthyForBeats(
 // heartbeats the host has classified, spanning many windows — not a real-time sleep.
 func TestSupervisor_StaysHealthy_ForLongRunningHandler(t *testing.T) {
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	// A lease travels for observability only; no verdict rests on its stamps, so they
@@ -364,7 +364,7 @@ func TestSupervisor_StaysHealthy_ForLongRunningHandler(t *testing.T) {
 // wedge. The gate is host-observed.
 func TestSupervisor_StaysHealthy_WhenFreeRunningBacklogDrains(t *testing.T) {
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	nextHB := func(seq uint64) *controlpb.Heartbeat {
@@ -408,7 +408,7 @@ func TestSupervisor_StaysHealthy_WhenFreeRunningBacklogDrains(t *testing.T) {
 // wiring-level counterpart of the queued-sub-window tracker capture.
 func TestSupervisor_StaysHealthy_WhenQueuedQualifyingBacklogRecovers(t *testing.T) {
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	// Qualify for well under a window of sequence increments, then recover for good.
@@ -460,7 +460,7 @@ func TestSupervisor_StaysHealthy_WhenQueuedQualifyingBacklogRecovers(t *testing.
 // transport-wedge verdict once the sequence span covers the window, then restarts.
 func TestSupervisor_TransportWedged_FiresOnceOnQueuedBacklogSpanningWindow(t *testing.T) {
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	nextHB := func(seq uint64) *controlpb.Heartbeat {
@@ -513,7 +513,7 @@ func TestSupervisor_WindowConvertsOnSenderCadence_NotHostInterval(t *testing.T) 
 	// coupling.
 
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	nextHB := func(seq uint64) *controlpb.Heartbeat {
@@ -561,7 +561,7 @@ func TestSupervisor_WindowConvertsOnSenderCadence_NotHostInterval(t *testing.T) 
 // directly.
 func TestSupervisor_StaysHealthy_WhenDeliveredSequenceGapsAcrossWindow(t *testing.T) {
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	// The peer's internal beat counter maps to delivered sequences 1,2,3 then (gap)
@@ -669,7 +669,7 @@ func TestSupervisor_CallsOnHeartbeatMiss_PerMissedInterval(t *testing.T) {
 	// of 3 with no restarts so the run ends deterministically after one instance.
 	const missBudget = 3
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	var misses atomic.Int64

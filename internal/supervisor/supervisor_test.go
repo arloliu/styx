@@ -78,7 +78,7 @@ type eventCollector struct {
 }
 
 func newEventCollector(bus *supervisor.EventBus) *eventCollector {
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 
 	return &eventCollector{ch: ch, unsub: unsub}
 }
@@ -109,7 +109,7 @@ func (c *eventCollector) awaitKind(t *testing.T) []supervisor.Event {
 func TestSupervisor_EmitsStartingThenReady_ForHealthyPlugin(t *testing.T) {
 	// Given
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	cfg := supervisor.Config{
@@ -160,7 +160,7 @@ func TestSupervisor_StaysHealthy_PastMissedHeartbeatsWindow_WithRealHeartbeatSen
 	const missed = 3
 
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	cfg := supervisor.Config{
@@ -346,7 +346,7 @@ func TestSupervisor_MakesProgress_WithWedgedSubscriber(t *testing.T) {
 	// Given: two subscribers on the same bus — one that never reads, and
 	// one this test actually drains.
 	bus := supervisor.NewEventBus()
-	wedged, unsubWedged := bus.Subscribe()
+	wedged, unsubWedged, _ := bus.Subscribe()
 	defer unsubWedged()
 	_ = wedged // deliberately never read from
 	observer := newEventCollector(bus)
@@ -383,7 +383,7 @@ func TestSupervisor_Stop_DuringBackoff_ReturnsPromptly(t *testing.T) {
 	// Given: a crashing plugin with a long backoff delay, so this test
 	// would time out if Stop had to wait for it.
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	cfg := supervisor.Config{
@@ -416,6 +416,41 @@ func TestSupervisor_Stop_DuringBackoff_ReturnsPromptly(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after Stop")
 	}
+}
+
+// Test Supervisor.Stop reporting Run joined (nil) once Run has returned, even
+// when the caller's context is already canceled. Stop's error is the caller's
+// join signal, so a Run that has actually exited must never be misreported as
+// still running just because the deadline fired in the same instant — a closed
+// doneCh wins the tie.
+func TestSupervisor_Stop_ReturnsNil_WhenRunJoinedUnderCanceledContext(t *testing.T) {
+	// Given: a supervisor whose Run has already returned. A plugin that crashes
+	// before handshake with a zero restart budget drives Run to GaveUp and exit.
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	cfg := supervisor.Config{
+		Spec:    lifecycle.Spec{Path: fixtureCrashPlugin},
+		Restart: supervisor.RestartPolicy{Max: 0},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(t.Context()) }()
+	requireEventOfKind(t, ch, supervisor.EventGaveUp)
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after GaveUp")
+	}
+
+	// When: Stop runs with an already-canceled context after Run has joined.
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	// Then: Stop reports the join as nil, never the canceled context's error.
+	require.NoError(t, sup.Stop(canceled))
 }
 
 // requireEvent reads the next event from ch, failing the test on timeout.
@@ -591,7 +626,7 @@ func TestSupervisor_ReachesReady_WhenPluginServiceVersionSatisfiesRequirement(t 
 	// Given: versionedplugin advertises version 2 of "versiontest.Versioned";
 	// the host requires exactly version 2.
 	bus := supervisor.NewEventBus()
-	ch, unsub := bus.Subscribe()
+	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
 	cfg := supervisor.Config{

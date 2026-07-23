@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -114,6 +115,22 @@ type Host struct {
 	plugins  map[string]*ClientConn
 	runtimes []*pluginRuntime
 
+	// stopping names the plugins whose supervisor did not join before a Stop
+	// deadline expired: their runtime is retained (still in runtimes, relay still
+	// subscribed) until the join completes, but their client mapping is gone from
+	// plugins, so Plugin reports them unavailable. Start and Reload consult this
+	// set to reject a name whose prior instance is still tearing down, so two
+	// supervisors never race for one name. An entry clears when the runtime's
+	// deferred teardown completes (a watcher after Run exits, or a retried Stop).
+	stopping map[string]struct{}
+	// stopRequested latches true on the first Stop. It gates the deferred
+	// observability release: the workers are torn down only after Stop has been
+	// asked to and no runtime is still awaiting its join. obsReleased makes that
+	// release happen exactly once whether Stop's own tail or the last deferred
+	// watcher reaches it first.
+	stopRequested bool
+	obsReleased   bool
+
 	// bus fans every plugin's relayed events into the one channel
 	// Events() exposes, using internal/supervisor.Bus's own
 	// drop-oldest-informational / coalesce-latest-critical semantics — the
@@ -150,6 +167,18 @@ type pluginRuntime struct {
 	unsub     func()
 	stopRelay chan struct{}
 	relayDone chan struct{}
+
+	// teardownOnce guards the relay/subscription teardown so a retried Stop and
+	// the deferred join watcher — either of which may reach a runtime once its
+	// Run has joined — close stopRelay and unsubscribe exactly once between them.
+	// watchOnce guards spawning that watcher, so retaining the same runtime on
+	// more than one expired Stop never starts a second watcher. torn records,
+	// under Host.mu, that the teardown has run, so an in-flight Stop that already
+	// classified the runtime unjoined does not re-retain one a watcher has since
+	// completed.
+	teardownOnce sync.Once
+	watchOnce    sync.Once
+	torn         bool
 }
 
 // hostCriticalEventKinds are the lifecycle-critical Host-level event
@@ -163,7 +192,7 @@ func hostEventIsCritical(e Event) bool {
 // NewHost creates a Host from the given configuration but does not start it.
 func NewHost(cfg HostConfig) *Host {
 	bus := supervisor.NewBus(hostEventIsCritical)
-	events, _ := bus.Subscribe() // never unsubscribed: this is Events()'s channel for the Host's whole life.
+	events, _, _ := bus.Subscribe() // never unsubscribed: this is Events()'s channel for the Host's whole life.
 
 	h := &Host{
 		cfg:             cfg,
@@ -235,6 +264,16 @@ func (h *Host) Start(ctx context.Context) error {
 // records its pluginRuntime for Stop; on any failure it leaves no
 // goroutine, subscription, or running Supervisor behind.
 func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
+	// Reject a name whose prior instance has not finished stopping: its
+	// supervisor did not join before an earlier Stop's deadline and may still be
+	// publishing on its retained relay. Spawning a second instance here would let
+	// two supervisors race for one name and leave the next Stop owning both. The
+	// caller retries once the prior instance's teardown completes. h.mu is held
+	// by Start across this call, so the read is safe.
+	if _, stopping := h.stopping[spec.Name]; stopping {
+		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, ErrPluginStopping)
+	}
+
 	if spec.BinarySHA256 != nil {
 		if verr := control.VerifyBinaryIdentity(spec.Path, spec.BinarySHA256); verr != nil {
 			err := translateIncompatible(verr)
@@ -264,12 +303,12 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	}
 	sup := supervisor.New(cfg, bus)
 
-	events, unsub := bus.Subscribe()
+	events, unsub, quiesced := bus.Subscribe()
 	stopRelay := make(chan struct{})
 	relayDone := make(chan struct{})
 	firstOutcome := make(chan error, 1)
 
-	go h.relayEvents(spec.Name, events, stopRelay, relayDone, firstOutcome)
+	go h.relayEvents(spec.Name, events, quiesced, stopRelay, relayDone, firstOutcome)
 	//nolint:gosec // sup.Run's lifetime is host-scoped (until sup.Stop, e.g. on
 	// Host shutdown), not scoped to ctx, which only bounds this call's wait for
 	// the first Ready/GaveUp outcome below.
@@ -328,7 +367,11 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 // Ready, the GaveUp reason otherwise), non-blockingly — startOne only
 // waits for the first one.
 func (h *Host) relayEvents(
-	name string, events <-chan supervisor.Event, stopRelay, relayDone chan struct{}, firstOutcome chan<- error,
+	name string,
+	events <-chan supervisor.Event,
+	quiesced func() bool,
+	stopRelay, relayDone chan struct{},
+	firstOutcome chan<- error,
 ) {
 	defer close(relayDone)
 
@@ -358,52 +401,223 @@ func (h *Host) relayEvents(
 				}
 			}
 		case <-stopRelay:
+			h.drainOnStop(name, events, quiesced)
+
 			return
 		}
 	}
 }
 
+// drainOnStop relays whatever the subscription still holds before its caller
+// discards it, so a terminal Unhealthy/Restarting published by a heartbeat in
+// flight just before shutdown still reaches Host.Events(). stopRelay is only
+// closed after the plugin's Supervisor.Stop has returned, which waits for its
+// Run goroutine — the sole publisher onto this bus — to exit; no further event
+// can therefore be enqueued here. The first Ready/GaveUp outcome was reported
+// long before shutdown, so this path only publishes and logs.
+//
+// Termination is a progress argument, not a timing one: the queue is finite,
+// nothing new enqueues, and the forwarder keeps making progress, so an event
+// still queued or mid-handoff is received on a later turn and quiesced then
+// reports the subscription idle (nothing queued, nothing in flight).
+func (h *Host) drainOnStop(name string, events <-chan supervisor.Event, quiesced func() bool) {
+	for {
+		select {
+		case ev := <-events:
+			h.publish(translateEvent(name, ev))
+			h.logEvent(name, ev)
+		default:
+			if quiesced() {
+				return
+			}
+
+			runtime.Gosched()
+		}
+	}
+}
+
 // Stop drains and shuts down every plugin via its Supervisor's own Stop
-// (which runs the normative teardown machine) and blocks until
-// every child has been reaped.
+// (which runs the normative teardown machine) and blocks until every child
+// that joins within ctx has been reaped. For the whole call, every plugin
+// being torn down is held in a stopping state that rejects a concurrent Start
+// or Reload of the same name, so no second supervisor is ever created for a
+// name mid-teardown.
+//
+// A plugin whose Supervisor.Run — the sole publisher onto its event bus — does
+// not join before ctx expires cannot be torn down safely yet: closing its relay
+// and unsubscribing now could let the drain declare the subscription quiescent
+// and drop a terminal lifecycle event the still-running Run publishes later. So
+// Stop returns that plugin's deadline error but retains the runtime intact — its
+// relay stays subscribed, its client mapping stays absent (Plugin reports it
+// unavailable), and its name is held in a stopping state that rejects a new
+// Start or Reload. The retained runtime's teardown then completes automatically
+// once its Run finally exits, via a detached watcher on the join signal, or on a
+// retried Stop, whichever happens first. The observability workers are released
+// only after the last such runtime is gone, so a Run still logging or reporting
+// keeps its workers until it joins.
 func (h *Host) Stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	h.mu.Lock()
+	h.stopRequested = true
 	runtimes := h.runtimes
 	h.runtimes = nil
 	h.plugins = make(map[string]*ClientConn)
+	// Gate every snapshot name for the whole teardown, not just once a join
+	// deadline has already expired. Marking each name stopping here — under the
+	// same lock that removes the runtimes — closes the window where the host
+	// would look empty and ungated while Stop waits below in Supervisor.Stop: a
+	// concurrent Start or Reload in that window would otherwise find no gate and
+	// spawn a second supervisor for a name whose predecessor is still stopping.
+	// Each name clears when its runtime tears down cleanly (completeTeardown) and
+	// persists for one whose Run has not joined (retainUnjoined), so
+	// ErrPluginStopping holds for exactly as long as the teardown is in flight.
+	//
+	// Two concurrent Stops cannot both own a runtime: this snapshot swap is
+	// atomic under h.mu, so the loser's snapshot is empty and it publishes no
+	// names — it only reaches the observability gate below, which the winner's
+	// provisional names keep closed until the winner finishes tearing down.
+	if len(runtimes) > 0 {
+		if h.stopping == nil {
+			h.stopping = make(map[string]struct{})
+		}
+		for _, rt := range runtimes {
+			h.stopping[rt.name] = struct{}{}
+		}
+	}
 	h.mu.Unlock()
 
 	var errs []error
+	var unjoined []*pluginRuntime
 	for _, rt := range runtimes {
 		if err := rt.sup.Stop(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("styx: stop plugin %q: %w", rt.name, err))
+			unjoined = append(unjoined, rt)
+
+			continue
 		}
+
+		h.completeTeardown(rt)
+	}
+
+	if len(unjoined) > 0 {
+		h.retainUnjoined(unjoined)
+	}
+
+	// Release the observability workers once no runtime is still awaiting its
+	// join. With everything joined this fires here; with runtimes still stopping
+	// it is deferred to the last watcher (or retried Stop) that clears them.
+	h.maybeReleaseObservability()
+
+	return errors.Join(errs...)
+}
+
+// completeTeardown tears one runtime's relay and subscription down exactly once
+// — closing stopRelay, draining, and unsubscribing — whether a retried Stop or
+// the deferred join watcher reaches it first, and drops the runtime from the
+// host's live and stopping sets. It never releases the observability workers
+// itself: the caller decides when via maybeReleaseObservability, so a multi-
+// plugin Stop releases only after its last runtime is done.
+func (h *Host) completeTeardown(rt *pluginRuntime) {
+	rt.teardownOnce.Do(func() {
 		close(rt.stopRelay)
 		<-rt.relayDone
 		rt.unsub()
+
+		h.mu.Lock()
+		rt.torn = true
+		h.runtimes = removeRuntime(h.runtimes, rt)
+		delete(h.stopping, rt.name)
+		h.mu.Unlock()
+	})
+}
+
+// retainUnjoined keeps every runtime whose Run has not joined so its teardown can
+// complete later, marks its name stopping so a new Start or Reload is rejected
+// meanwhile, and starts one detached watcher per runtime to finish the teardown
+// once Run exits. A runtime a watcher already completed during this Stop (torn)
+// is dropped rather than re-retained.
+func (h *Host) retainUnjoined(unjoined []*pluginRuntime) {
+	h.mu.Lock()
+	if h.stopping == nil {
+		h.stopping = make(map[string]struct{})
 	}
 
-	// Stop the metrics and log dispatchers and every per-plugin reporter, then
-	// join them so no observability goroutine outlives the host. A no-op when
-	// neither a sink nor a logger was configured (obsCancel stays nil). The join is
-	// bounded: a user sink or logger call wedged inside a dispatcher can never
-	// stall Stop past obsShutdownBound (see joinBounded).
-	if h.obsCancel != nil {
+	var toWatch []*pluginRuntime
+	for _, rt := range unjoined {
+		if rt.torn {
+			continue
+		}
+
+		h.runtimes = append(h.runtimes, rt)
+		h.stopping[rt.name] = struct{}{}
+		toWatch = append(toWatch, rt)
+	}
+	h.mu.Unlock()
+
+	for _, rt := range toWatch {
+		h.watchJoin(rt)
+	}
+}
+
+// watchJoin starts (at most once per runtime) a detached goroutine that waits for
+// a retained plugin's Supervisor.Run to finally join, then completes the teardown
+// the expired Stop deferred and releases the observability workers if this was
+// the last runtime a Stop was still awaiting.
+func (h *Host) watchJoin(rt *pluginRuntime) {
+	rt.watchOnce.Do(func() {
+		go func() {
+			<-rt.sup.Done()
+			h.completeTeardown(rt)
+			h.maybeReleaseObservability()
+		}()
+	})
+}
+
+// maybeReleaseObservability stops the metrics and log dispatchers and every
+// per-plugin reporter, then joins them, but only once Stop has been requested and
+// no runtime is still awaiting its join. It runs the release exactly once. A
+// no-op when neither a sink nor a logger was configured (obsCancel stays nil).
+// The join is bounded: a user sink or logger call wedged inside a dispatcher can
+// never stall past obsShutdownBound (see joinBounded).
+func (h *Host) maybeReleaseObservability() {
+	h.mu.Lock()
+	release := h.stopRequested && len(h.stopping) == 0 && !h.obsReleased
+	if release {
+		h.obsReleased = true
+	}
+	h.mu.Unlock()
+
+	if release && h.obsCancel != nil {
 		h.obsCancel()
 		joinBounded(&h.obsWG, obsShutdownBound)
 	}
+}
 
-	return errors.Join(errs...)
+// removeRuntime returns runtimes without target, matched by identity. It is the
+// single point that drops a runtime the host no longer owns; the caller holds
+// h.mu.
+func removeRuntime(runtimes []*pluginRuntime, target *pluginRuntime) []*pluginRuntime {
+	for i, rt := range runtimes {
+		if rt == target {
+			return append(runtimes[:i], runtimes[i+1:]...)
+		}
+	}
+
+	return runtimes
 }
 
 // Plugin returns the named plugin's client connection, or a ClientConn
 // that fails every call with ErrPluginUnavailable if the plugin isn't
 // running — generated constructors accept this return value directly,
 // mirroring grpc.ClientConnInterface.
+//
+// A plugin whose prior instance is still stopping (a Stop deadline expired
+// before its supervisor joined) also reports unavailable, deliberately: its
+// client mapping was removed when Stop began, and no new instance may take the
+// name until that teardown completes, so there is nothing live to route to.
 func (h *Host) Plugin(name string) *ClientConn {
 	h.mu.Lock()
 	cc, ok := h.plugins[name]

@@ -32,12 +32,21 @@ func (h *Host) Reload(ctx context.Context, name string) error {
 	}
 
 	h.mu.Lock()
+	if _, stopping := h.stopping[name]; stopping {
+		h.mu.Unlock()
+
+		// The prior instance's supervisor has not joined a still-completing Stop.
+		// Its runtime is retained but tearing down, so reloading it in place is not
+		// possible until that teardown finishes; reject it distinctly from a name
+		// that was never running.
+		return fmt.Errorf("styx: reload plugin %q: %w", name, ErrPluginStopping)
+	}
 	rt := h.runtimeFor(name)
 	h.mu.Unlock()
 
-	// h.plugins and h.runtimes are always populated and cleared together
-	// (Host.startOne, Host.Stop), so a nil pluginRuntime here already means
-	// no plugin of this name is running; no second lookup is needed.
+	// A retained, still-stopping runtime is filtered out above, so a live
+	// pluginRuntime here has a matching client mapping. A nil one means no plugin
+	// of this name is running; no second lookup is needed.
 	if rt == nil {
 		return fmt.Errorf("styx: reload plugin %q: %w", name, ErrPluginUnavailable)
 	}
