@@ -934,3 +934,78 @@ func TestSupervisor_AttachesSharedMemoryCrossProcess_ThenTearsDownWithoutLeak(t 
 		"host leaked fds after shared-memory teardown (region/eventfds not closed): before=%d after=%d",
 		fdsBefore, countOpenFDs(t))
 }
+
+// Test that each instance generation gets a FRESH shared-memory region, and that
+// tearing a generation down releases its region and eventfds before the next
+// generation attaches — so restarting a plugin many times over the shared-memory
+// transport leaves no cumulative fd or mapping leak. A plugin that attaches over
+// shm (reaching Ready) and then exits drives generation after generation, each
+// creating and destroying its own region; after the policy gives up and Run
+// returns, every generation's resources are closed and the fd count is back at
+// its baseline. The supervisor never reuses or mutates a region in place across
+// generations: attachSHM creates a new region stamped with the new generation
+// each spawn.
+func TestSupervisor_FreshShmRegionPerGeneration_NoLeakAcrossRestarts(t *testing.T) {
+	// Given: a plugin that attaches over shm then self-exits, and a policy that
+	// restarts it a few times before giving up — so several generations each
+	// create and tear down their own region.
+	const maxRestarts = 3
+	bus := supervisor.NewEventBus()
+	collector := newEventCollector(bus)
+	defer collector.unsub()
+
+	cfg := supervisor.Config{
+		Spec: lifecycle.Spec{
+			Path: fixtureExitPlugin,
+			Env:  []string{"STYX_EXIT_AFTER=40ms"},
+		},
+		Restart: supervisor.RestartPolicy{
+			Max: maxRestarts, Backoff: func(int) time.Duration { return 5 * time.Millisecond },
+		},
+		HeartbeatInterval: 50 * time.Millisecond,
+		Transport:         "shm",
+		ShmLayout:         leanShmLayout(),
+		MaxDataInflight:   32,
+		OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
+			return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	fdsBefore := countOpenFDs(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// When: the policy eventually gives up, having attached over shm and torn
+	// down a region once per generation.
+	seen := collector.awaitKind(t)
+
+	// Then: at least one generation reached Ready over shm and at least one
+	// restart genuinely happened (a fresh region per generation), and GaveUp is
+	// terminal.
+	var readyCount, restartingCount int
+	for _, ev := range seen {
+		switch ev.Kind { //nolint:exhaustive // only Ready/Restarting are tallied
+		case supervisor.EventReady:
+			readyCount++
+		case supervisor.EventRestarting:
+			restartingCount++
+		}
+	}
+	require.Equal(t, supervisor.EventGaveUp, seen[len(seen)-1].Kind)
+	require.GreaterOrEqual(t, readyCount, 2, "at least two generations must attach over shm")
+	require.GreaterOrEqual(t, restartingCount, 1, "a fresh region must be created per generation")
+
+	// And: Run returns and every generation's region and eventfds are released —
+	// no cumulative leak, regardless of how many generations ran.
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after GaveUp")
+	}
+	require.Eventually(t, func() bool { return countOpenFDs(t) <= fdsBefore }, 2*time.Second, 20*time.Millisecond,
+		"shm resources leaked across generations: before=%d after=%d", fdsBefore, countOpenFDs(t))
+}
