@@ -1004,6 +1004,157 @@ func TestSupervisor_FreshShmRegionPerGeneration_NoLeakAcrossRestarts(t *testing.
 		"shm resources leaked across generations: before=%d after=%d", fdsBefore, testutil.CountOpenFDs(t))
 }
 
+// Test a supervisor-driven TRANSPARENT RESTART on the shared-memory transport under a
+// real crash: a plugin attaches over shm and reaches Ready, is then SIGKILLed (an
+// unclean death, not a cooperative exit), and the supervisor detects the death and
+// restarts it — a FRESH generation attaches over a fresh region and reaches Ready again
+// (recovery), a different process than the killed one. After teardown, both the open-fd
+// count and the region-mapping count return to their pre-start baseline: the crashed
+// generation's host-side region and eventfds were released on its reap, and no region
+// mapping survives, so a crash-restart cycle over shm misdelivers no descriptor and
+// leaks no region.
+func TestSupervisor_ShmTransparentRestart_AfterSIGKILL_RecoversNoLeak(t *testing.T) {
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	pids := make(chan int, 8)
+	cfg := supervisor.Config{
+		Spec: lifecycle.Spec{Path: fixtureReadyPlugin},
+		Restart: supervisor.RestartPolicy{
+			Max: 3, Backoff: func(int) time.Duration { return 5 * time.Millisecond },
+		},
+		HeartbeatInterval: 100 * time.Millisecond,
+		Transport:         "shm",
+		ShmLayout:         leanShmLayout(),
+		MaxDataInflight:   32,
+		OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
+			pids <- inst.Process.PID
+
+			return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	readPID := func() int {
+		t.Helper()
+		select {
+		case p := <-pids:
+			return p
+		case <-time.After(5 * time.Second):
+			t.Fatal("no plugin PID captured at Ready")
+
+			return 0
+		}
+	}
+
+	fdsBefore := testutil.CountOpenFDs(t)
+	mapsBefore := countRegionMappings(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// The first generation attaches over shm and reaches Ready.
+	requireEventOfKind(t, ch, supervisor.EventReady)
+	gen0 := readPID()
+
+	// A real crash: SIGKILL the Ready plugin. The supervisor observes the death and
+	// transparently restarts it.
+	require.NoError(t, syscall.Kill(gen0, syscall.SIGKILL))
+
+	// Recovery: a fresh generation attaches over a fresh region and reaches Ready — a
+	// different process than the one just killed.
+	requireEventOfKind(t, ch, supervisor.EventReady)
+	gen1 := readPID()
+	require.NotEqual(t, gen0, gen1, "a transparent restart must spawn a new plugin process")
+
+	// Teardown, then assert no fd or region-mapping leak across the crash-restart cycle:
+	// the killed generation's host-owned region and eventfds were released on its reap.
+	require.NoError(t, sup.Stop(t.Context()))
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Stop")
+	}
+	require.Eventually(t, func() bool { return testutil.CountOpenFDs(t) <= fdsBefore },
+		2*time.Second, 20*time.Millisecond,
+		"host leaked fds across an shm crash-restart: before=%d after=%d", fdsBefore, testutil.CountOpenFDs(t))
+	require.Eventually(t, func() bool { return countRegionMappings(t) <= mapsBefore },
+		2*time.Second, 20*time.Millisecond,
+		"host leaked a region mapping across an shm crash-restart: before=%d after=%d",
+		mapsBefore, countRegionMappings(t))
+}
+
+// Test that a SIGSTOP-wedged plugin on the shared-memory transport is declared
+// unhealthy by the supervisor's heartbeat liveness path within its bound. The plugin
+// attaches over shm, reaches Ready, and sends heartbeats faster than the host's
+// per-interval receive wait, so it is healthy; SIGSTOP then freezes it, its heartbeats
+// stop, and after MissedHeartbeats consecutive silent intervals the host publishes
+// Unhealthy. The bound is MissedHeartbeats x HeartbeatInterval, well inside the wait.
+// This is the Task 2 shm-heartbeat wiring under a real freeze signal; the host call's
+// own ctx-boundedness during a wedge is asserted at the transport level by the chaos
+// package's SIGSTOP scenario.
+func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	const beat = 100 * time.Millisecond
+	pids := make(chan int, 8)
+	cfg := supervisor.Config{
+		Spec: lifecycle.Spec{
+			Path: fixtureReadyPlugin,
+			// Send heartbeats faster than the host's per-interval receive wait, so the
+			// plugin is healthy until it is frozen.
+			Env: []string{"STYX_HEARTBEAT_INTERVAL_FOR_TEST=" + (beat / 4).String()},
+		},
+		Restart:           supervisor.RestartPolicy{Max: 0}, // give up after the wedge; we assert only Unhealthy
+		HeartbeatInterval: beat,
+		MissedHeartbeats:  3,
+		Transport:         "shm",
+		ShmLayout:         leanShmLayout(),
+		MaxDataInflight:   32,
+		OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
+			pids <- inst.Process.PID
+
+			return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	requireEventOfKind(t, ch, supervisor.EventReady)
+	var pid int
+	select {
+	case pid = <-pids:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no plugin PID captured at Ready")
+	}
+
+	// Freeze the plugin: its heartbeats stop, and the host's liveness path must declare
+	// it unhealthy within MissedHeartbeats silent intervals.
+	require.NoError(t, syscall.Kill(pid, syscall.SIGSTOP))
+	ev := awaitUnhealthy(t, ch)
+	require.Equal(t, supervisor.EventUnhealthy, ev.Kind,
+		"a frozen shm plugin's missed heartbeats must be declared unhealthy")
+
+	// Continue the frozen child so the supervisor's teardown reaps it promptly, then
+	// stop and join.
+	_ = syscall.Kill(pid, syscall.SIGCONT)
+	_ = sup.Stop(t.Context())
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the wedge was declared unhealthy")
+	}
+}
+
 // countRegionMappings counts the shared-memory region mappings currently held by
 // this process, by matching the region memfd's name in /proc/self/maps. Each
 // CreateRegion/OpenRegion mapping is one such line, so a leaked munmap (which the

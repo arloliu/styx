@@ -34,25 +34,33 @@
 // make NO cross-process race claim. Only the in-process harness orchestration
 // runs under the race detector.
 //
-// # Deferred windows / scope boundary
+// # Scope boundary: windows covered elsewhere, and one still open here
 //
-// These belong to the crash-window story but cannot be exercised until the host
-// integrates the shared-memory transport end to end, which does not exist yet
-// (negotiation is hardcoded to the uds fallback; the supervisor has no shm
-// wiring; the handshake reports shm "not yet implemented"). They are called out
-// here so their absence is a recorded scope boundary, not an oversight:
+// Two scenarios that once could not be exercised at all — the host integrates the
+// shared-memory transport end to end now (a control-plane SCM_RIGHTS attach, supervisor
+// shm wiring, and shm heartbeat capabilities all exist) — are exercised across a real
+// process boundary in internal/supervisor rather than in this hand-rolled bridge, which
+// deliberately hands fds over exec and drives no supervisor:
 //
-//   - AfterFDTransfer / AfterReadyAck — there is no shm fd-transfer or ready-ack
-//     handshake step to crash at; the bridge here hands fds over exec directly,
-//     bypassing the (unbuilt) control-plane transfer.
-//   - Supervisor-driven transparent restart — the supervisor has no shm wiring,
-//     so recovery here is a hand-rolled fresh region+peer pair (an explicit smoke
-//     test), NOT a supervisor restart, and proves nothing about crash detection.
-//   - SIGSTOP -> heartbeat-declares-unhealthy — there is no shm<->heartbeat path,
-//     so the wedge scenario asserts only that the host's in-flight call is bounded
-//     by its own context, not that any health monitor classified the peer.
+//   - Supervisor-driven transparent restart on shared memory: a plugin reaches Ready
+//     over shm, is SIGKILLed, and the supervisor restarts it to a fresh region with no
+//     fd or region-mapping leak across the crash (internal/supervisor's crash-restart
+//     test). This bridge's own fresh region+peer pair remains only an explicit smoke
+//     test, proving nothing about crash detection.
+//   - SIGSTOP -> heartbeat-declares-unhealthy on shared memory: a frozen shm plugin's
+//     missed heartbeats are declared unhealthy within the missed-beat bound
+//     (internal/supervisor's SIGSTOP-wedge test). This bridge's SIGSTOP scenario still
+//     asserts only that the host's in-flight call is bounded by its own context — the
+//     transport-level guarantee, complementary to the supervisor-level classification.
 //
-// Two further boundaries follow from the same missing integration:
+// One crash-window class remains open here: the fd-transfer / ready-ack windows on the
+// control-plane attach path (crash the plugin at a pluginAttachSHM step — recv-fds,
+// eventfd wrap, attach, or send-ack — via the per-step attach failpoint seams that today
+// inject errors). The attach path now exists, so these are reachable; adding them as
+// deterministic matrix windows with exact host-side fd/mapping-count assertions is a
+// follow-up, not a blocked gap.
+//
+// Two further boundaries stand on their own:
 //
 //   - StarveArena asserts only caller-context-boundedness. The
 //     consumer->producer space-available wake has no production caller, so an
