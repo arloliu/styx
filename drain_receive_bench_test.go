@@ -78,11 +78,9 @@ func benchReceivePath(b *testing.B, recv recvStep) {
 	})
 
 	coord := newDrainCoordinator()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		recv(ctx, consumer, coord)
 	}
-	b.StopTimer()
 }
 
 // benchReceivePathSHM is benchReceivePath over the shared-memory transport, whose reserve
@@ -101,11 +99,9 @@ func benchReceivePathSHM(b *testing.B, recv recvStep) {
 	})
 
 	coord := newDrainCoordinator()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		recv(ctx, pair.Plugin, coord)
 	}
-	b.StopTimer()
 }
 
 // BenchmarkServeReceive_Reserving drives the production uds serving receive path:

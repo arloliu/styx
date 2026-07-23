@@ -41,21 +41,25 @@ func newTransportPairStreaming(t *testing.T, streaming bool) (a, b *transport.UD
 // Test that a reserving reader parked in the readiness wait holds no reservation. This
 // underlies the drain predicate's certification of a parked reader: its two conditions —
 // ReadableNow reports the queue empty AND no reservation is outstanding — must both hold
-// WHILE the reader is provably in the wait, not merely after RecvReserving was entered.
-// The reserve callback fires only AFTER the readiness commit, so a reader still in the
-// wait cannot have reserved. A wait-entry hook makes "in the wait" observable; a frame
-// then proves the reader was parked-and-alive, waking to reserve and deliver exactly one.
+// WHILE the reader is provably parked, not merely after RecvReserving was entered. A
+// two-sided wait-entry seam makes that deterministic: the reader signals it has reached
+// the readiness boundary (before the destructive read, so the reserve callback cannot
+// have fired) and then blocks there until the test releases it, so the predicate is
+// asserted while the reader is HELD at the boundary. A frame then proves it was parked
+// and alive, waking to reserve and deliver exactly one.
 func TestUDSTransport_RecvReserving_ParkedInReadinessWait_HoldsNoReservation(t *testing.T) {
 	host, plugin := newTestTransportPair(t)
 
-	inWait := make(chan struct{}, 1)
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	var arriveOnce, releaseOnce sync.Once
 	restore := transport.SetReadinessWaitHookForTest(func() {
-		select {
-		case inWait <- struct{}{}:
-		default:
-		}
+		arriveOnce.Do(func() { close(arrived) })
+		<-release // held at the readiness boundary until the test releases it
 	})
 	t.Cleanup(restore)
+	releaseReader := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseReader) // free a reader still held at the boundary if the test fails
 
 	var reserves atomic.Int64
 	type recvResult struct {
@@ -64,20 +68,21 @@ func TestUDSTransport_RecvReserving_ParkedInReadinessWait_HoldsNoReservation(t *
 	}
 	got := make(chan recvResult, 1)
 	go func() {
-		f, err := plugin.RecvReserving(context.Background(), func() { reserves.Add(1) })
+		f, err := plugin.RecvReserving(t.Context(), func() { reserves.Add(1) })
 		got <- recvResult{f, err}
 	}()
 
-	// The reader has reached the readiness wait with nothing on the wire: it is parked,
-	// about to block in the peek, holding no reservation. Both predicate conditions for a
-	// parked reader hold concurrently with it being parked.
-	<-inWait
-	require.Zero(t, reserves.Load(), "a reader parked in the readiness wait has not reserved")
+	// The reader is HELD at the readiness boundary, before the destructive read: it
+	// provably holds no reservation and has consumed nothing. Both predicate conditions
+	// for a parked reader hold concurrently with it being parked.
+	<-arrived
+	require.Zero(t, reserves.Load(), "a reader held at the readiness boundary has not reserved")
 	require.False(t, plugin.ReadableNow(), "with nothing on the wire the queue reports empty")
 
-	// Prove it was parked-and-alive: a frame wakes it, the reserve fires, and the frame is
-	// delivered.
-	require.NoError(t, host.Send(context.Background(),
+	// Release the reader and prove it was parked-and-alive: a frame wakes it, the reserve
+	// fires, and the frame is delivered.
+	releaseReader()
+	require.NoError(t, host.Send(t.Context(),
 		transport.Frame{CallID: 7, Kind: transport.FrameUnaryReq, Payload: []byte("x")}))
 	r := <-got
 	require.NoError(t, r.err)
