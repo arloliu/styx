@@ -9,11 +9,19 @@ import (
 )
 
 // Reload hot-reloads the named plugin in place: it stops admitting new calls,
-// drains the running instance and takes its sealed, verified state snapshot,
-// restores a freshly spawned instance from it, and atomically swaps routing to
-// that successor — all without restarting supervision. It blocks until the
-// transaction reaches a terminal outcome, and on success until the old
-// instance's teardown-with-reap has completed.
+// freezes and quiesces the running instance's registered mutators, snapshots its
+// sealed, verified state, restores a freshly spawned instance from that snapshot,
+// and atomically swaps routing to that successor — all without restarting
+// supervision. It blocks until the transaction reaches a terminal outcome, and on
+// success until the old instance's teardown-with-reap has completed.
+//
+// The drain certifies mutator quiescence only: new-call admission is closed and
+// every registered Mutator is frozen before the snapshot is taken, but a
+// data-plane call the instance accepted before the admission cutoff may still be
+// in flight when the predecessor is torn down. Such an already-published call is
+// failed with ErrOutcomeUnknown — a non-retryable outcome-unknown error, because
+// the plugin may or may not have executed it before teardown. A new call refused
+// at the cutoff instead fails with ErrDrained and is retryable.
 //
 // On success it returns nil and the successor is the instance the named plugin
 // now routes to. On any pre-promote failure the reload has already rolled back

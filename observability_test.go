@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/arloliu/styx/codec"
+	"github.com/arloliu/styx/internal/observeq"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/transport"
 	"github.com/arloliu/styx/observe"
@@ -91,8 +92,8 @@ func (s *countingSink) gauge(metric string) (float64, bool) {
 }
 
 // newMetricsDispatcher builds the MetricsSink dispatcher the host and plugin use.
-func newMetricsDispatcher(sink observe.MetricsSink, bufSize int) *observe.Dispatcher[observe.MetricsSink] {
-	return observe.NewDispatcher[observe.MetricsSink](sink, bufSize)
+func newMetricsDispatcher(sink observe.MetricsSink, bufSize int) *observeq.Dispatcher[observe.MetricsSink] {
+	return observeq.NewDispatcher[observe.MetricsSink](sink, bufSize)
 }
 
 // newEchoPair wires an in-process ClientConn to a plugin-side echo dispatch loop
@@ -412,7 +413,7 @@ func (udsShapedTransport) BytesReceived() uint64 { return 0 }
 // drainMarker submits a sentinel gauge and waits for it, so a test can assert an
 // EARLIER reporter call submitted nothing: the single dispatcher preserves submit
 // order, so once the marker is delivered any earlier submit would already be too.
-func drainMarker(t *testing.T, m *observe.Dispatcher[observe.MetricsSink], sink *countingSink) {
+func drainMarker(t *testing.T, m *observeq.Dispatcher[observe.MetricsSink], sink *countingSink) {
 	t.Helper()
 	const marker = "styx.test.marker"
 	m.Submit(func(s observe.MetricsSink) { s.SetGauge(marker, 1) })

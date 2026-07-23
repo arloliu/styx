@@ -1,4 +1,4 @@
-package observe_test
+package observeq_test
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arloliu/styx/internal/observeq"
 	"github.com/arloliu/styx/observe"
 	"github.com/stretchr/testify/require"
 )
@@ -44,8 +45,8 @@ func (s *recordingSink) snapshot() []string {
 
 // newMetricsDispatcher builds a Dispatcher over a MetricsSink, the concrete
 // instantiation the styx host and plugin use.
-func newMetricsDispatcher(sink observe.MetricsSink, bufSize int) *observe.Dispatcher[observe.MetricsSink] {
-	return observe.NewDispatcher[observe.MetricsSink](sink, bufSize)
+func newMetricsDispatcher(sink observe.MetricsSink, bufSize int) *observeq.Dispatcher[observe.MetricsSink] {
+	return observeq.NewDispatcher[observe.MetricsSink](sink, bufSize)
 }
 
 // Test the dispatcher swallowing a panic from a user MetricsSink without

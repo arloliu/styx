@@ -1,8 +1,12 @@
 // Package observe defines Styx's metrics, logging, and tracing hook interfaces
 // and their no-op defaults, with no vendor dependencies. A host or plugin supplies
-// a MetricsSink and/or a TraceInjector, and a host may additionally supply a
-// Logger for its lifecycle diagnostics (the plugin side has no Logger option);
-// Styx routes its built-in instrumentation points to them off the hot path.
+// a MetricsSink, and a host may additionally supply a Logger for its lifecycle
+// diagnostics (the plugin side has no Logger option); Styx routes its built-in
+// instrumentation points to them off the hot path. The tracing interfaces
+// (TraceInjector and its SpanContext helpers) define a trace-context propagation
+// contract that Styx does not yet wire into its own instrumentation — see
+// TraceInjector — but an application may use them directly in its own handler code
+// today.
 //
 // # Delivery discipline
 //
@@ -14,8 +18,9 @@
 //     enabled gate (a nil pointer) before building any closure or label, so the
 //     disabled path is free.
 //   - Never a synchronous call into user code from a hot path. Every event goes
-//     through a Dispatcher — one bounded channel and one goroutine per sink — so
-//     the caller never blocks and never runs a user sink method inline.
+//     through a bounded dispatch queue — one bounded channel and one goroutine
+//     per sink — so the caller never blocks and never runs a user sink method
+//     inline.
 //   - Non-blocking, drop-oldest, panic-isolated delivery. A full buffer drops
 //     the oldest event (counted); a panicking sink is recovered (counted); a
 //     slow sink can never stall supervision or the data plane.

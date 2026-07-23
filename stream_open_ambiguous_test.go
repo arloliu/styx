@@ -222,8 +222,9 @@ func TestOpenStream_PoisonedOpenSend_EscalatesToOwner(t *testing.T) {
 	cc.state.Store(state)
 	cc.admission.Open()
 
-	// When: a large STREAM_OPEN blocks mid-write, and the still-SUBMITTED stream is
-	// discarded so its context cancels — tearing the frame mid-write, which uds poisons.
+	// When: a large STREAM_OPEN blocks mid-write, and the live stream is discarded so
+	// its context cancels — tearing the frame mid-write, which uds poisons. The opener
+	// publishes before it sends, so the stream is PUBLISHED while the OPEN write blocks.
 	errCh := make(chan error, 1)
 	go func() {
 		_, e := cc.OpenStream(t.Context(), "s", "m",
@@ -238,13 +239,13 @@ func TestOpenStream_PoisonedOpenSend_EscalatesToOwner(t *testing.T) {
 	_, rerr := unix.Read(fds[1], one)
 	require.NoError(t, rerr)
 
-	// Terminate the still-SUBMITTED stream to cancel its context; the blocked OPEN
-	// write's context is now done, so the runtime's async preemption interrupts the
-	// write (EINTR), whose loop re-checks the context and aborts the torn frame —
-	// which the uds transport poisons.
+	// Terminate the live stream to cancel its context; the blocked OPEN write's context
+	// is now done, so the runtime's async preemption interrupts the write (EINTR),
+	// whose loop re-checks the context and aborts the torn frame — which the uds
+	// transport poisons.
 	st, ok := plane.streams.Lookup(1)
-	require.True(t, ok, "the SUBMITTED stream must be in the table while its OPEN send blocks")
-	st.DiscardBeforePublish(errors.New("cancel the blocked open for the test"))
+	require.True(t, ok, "the live stream must be in the table while its OPEN send blocks")
+	st.DiscardUnaccepted(errors.New("cancel the blocked open for the test"))
 
 	// Then: the poison escalates to the connection owner, and OpenStream returns.
 	select {
@@ -458,12 +459,12 @@ func TestEmitOwedOpenTeardown_SecondCall_IsNoOpAndCloseCompletes(t *testing.T) {
 	t.Cleanup(func() { _ = tr.Close() })
 	tbl := rpcruntime.NewStreamTable(4, tr)
 
-	st, err := tbl.Open(1, rpcruntime.ClientStream,
-		rpcruntime.StreamConfig{Credits: 4, Deadline: time.Millisecond})
+	// Admit as the opener (its send-pending flag is set at admission), so its own
+	// deadline watcher fires a locally-initiated DEADLINE terminal that records a
+	// nonzero teardown code and suppresses the engine's own emission — leaving a
+	// teardown owed to EmitOwedOpenTeardown.
+	st, err := tbl.OpenClient(1, rpcruntime.StreamConfig{Credits: 4, Deadline: time.Millisecond})
 	require.NoError(t, err)
-	// Leave the stream SUBMITTED: its own deadline watcher fires a locally-initiated
-	// DEADLINE terminal from SUBMITTED, which records a nonzero teardown code and
-	// suppresses the engine's own emission, so a teardown is owed to EmitOwedOpenTeardown.
 	select {
 	case <-st.Done():
 	case <-time.After(3 * time.Second):

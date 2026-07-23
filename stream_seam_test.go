@@ -298,7 +298,7 @@ func TestStreamServer_OnStreamOpen_DuplicateUnknownRoute_Poisons(t *testing.T) {
 func TestStreamPlane_DispatchStreamFrame_IllegalTeardownCancelPoisons(t *testing.T) {
 	_, tr := newStreamingTransportPairForTest(t)
 	plane := newStreamPlane(tr)
-	t.Cleanup(func() { plane.teardown(ErrPluginUnavailable) })
+	t.Cleanup(func() { plane.teardown(ErrPluginUnavailable, ErrPluginUnavailable) })
 
 	cfg := rpcruntime.StreamConfig{Credits: 4, Deadline: time.Second}
 	st, err := plane.streams.Open(1, rpcruntime.ClientStream, cfg)
@@ -505,7 +505,7 @@ func TestStreamPlaneTeardown_JoinsFinishersBeforeResourceRelease(t *testing.T) {
 	// The structural teardown order: stop the writer (phase 1, unblocks the parked
 	// Send), join the finishers, then release resources (phase 2).
 	stopTransportWriter(gate) // phase 1
-	plane.teardown(ErrPluginUnavailable)
+	plane.teardown(ErrPluginUnavailable, ErrPluginUnavailable)
 	releaseTransport(gate) // phase 2
 
 	require.False(t, gate.releasedBeforeJoin.Load(),
@@ -557,7 +557,7 @@ func (f *fatalStopperTransport) StopWriter() error {
 func TestStreamPlane_FatalWatcher_StopsTransportOnConnectionFatal(t *testing.T) {
 	ft := &fatalStopperTransport{err: errors.New("shm: ring window full"), stopped: make(chan struct{})}
 	plane := newStreamPlane(ft)
-	t.Cleanup(func() { plane.teardown(ErrPluginUnavailable) })
+	t.Cleanup(func() { plane.teardown(ErrPluginUnavailable, ErrPluginUnavailable) })
 
 	// A published stream with a tiny deadline drives a local teardown whose CANCEL
 	// publish fails definitively (a teardown is owed only once PUBLISHED, §7.4).
@@ -742,6 +742,53 @@ func TestOpenStream_DeadlineWinsWhileSendGated_ReturnsDeadlineError(t *testing.T
 	case err := <-errCh:
 		require.ErrorIs(t, err, ErrDeadlineExceeded,
 			"OpenStream must return the deadline error, not a live stream, when the deadline won")
+	case <-time.After(3 * time.Second):
+		t.Fatal("OpenStream did not return")
+	}
+}
+
+// A connection teardown that wins WHILE the STREAM_OPEN send is in flight must fail
+// the open non-retryably: the OPEN is on the wire, so the peer may have accepted and
+// begun it, and a retry could double-execute. This drives the teardown into the send
+// window deterministically — the OPEN send is gated, so the stream is provably
+// PUBLISHED (the opener publishes before it hands the OPEN to the transport) when the
+// teardown fans out — closing the boundary a post-return test cannot reach.
+func TestOpenStream_TeardownDuringSend_FailsNonRetryable(t *testing.T) {
+	gate := &gatedOpenTransport{
+		gate: make(chan struct{}), entered: make(chan struct{}), closed: make(chan struct{}),
+	}
+	table := rpcruntime.NewTable(firstGeneration)
+	cc := newClientConn("p", table, gate, codec.Proto{})
+	t.Cleanup(func() { _ = gate.Close() })
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, e := cc.OpenStream(t.Context(), "s", "m")
+		errCh <- e
+	}()
+
+	// The OPEN send is entered and parked on the gate: the opener published before it,
+	// so the stream is now PUBLISHED with its send still in flight.
+	select {
+	case <-gate.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the OPEN send was never entered")
+	}
+
+	// The connection tears down (a reload retirement / crash) while the OPEN is on the
+	// wire — exactly what the host read loop's deferred teardown does. It must classify
+	// the in-flight open as dispatched.
+	state := cc.state.Load()
+	state.streams.teardown(ErrOutcomeUnknown, ErrPluginUnavailable)
+
+	close(gate.gate) // let the gated OPEN send return AFTER the teardown already won
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, ErrOutcomeUnknown,
+			"an open the transport accepted before teardown has an unknown outcome, not a retryable one")
+		require.False(t, IsRetryable(err),
+			"a stream open in flight at teardown may have executed; retrying could double-execute")
 	case <-time.After(3 * time.Second):
 		t.Fatal("OpenStream did not return")
 	}
@@ -1457,4 +1504,52 @@ func TestOpenStream_DeadlineAfterOpenAccepted_ReturnsBoundedDespiteBlockedCancel
 	case <-time.After(2 * time.Second):
 		t.Fatal("OpenStream hung waiting on Done behind the blocked lifecycle CANCEL send")
 	}
+}
+
+// Test an in-flight PUBLISHED stream failed at reload retirement (or any other
+// local host-side teardown) observing a non-retryable outcome-unknown error, not
+// a retryable unavailable one. The retired plugin may have executed the stream,
+// so classifying it retryable would let a retry double-execute it — the exact
+// at-most-once split the unary table already applies.
+func TestClientConn_PublishedStreamAtReloadRetirement_FailsNonRetryable(t *testing.T) {
+	clientTr, pluginTr := newStreamingTransportPairForTest(t)
+
+	const service, method = "echo.Echo", "Chat"
+	handlers := map[streamKey]streamHandlerReg{
+		{service: fnv64a(service), method: fnv64a(method)}: {
+			shape: rpcruntime.BidiStreaming,
+			// Stay live until teardown, so the opener's stream is still PUBLISHED and
+			// open when retirement fans out — never completed with a terminal frame.
+			handler: func(st *Stream) error {
+				<-st.Context().Done()
+
+				return st.Context().Err()
+			},
+		},
+	}
+	startStreamPlugin(t, pluginTr, handlers)
+
+	table := rpcruntime.NewTable(firstGeneration)
+	cc := newClientConn("p", table, clientTr, codec.Proto{})
+
+	// A successfully opened stream is PUBLISHED: its STREAM_OPEN reached the wire.
+	st, err := cc.OpenStream(t.Context(), service, method)
+	require.NoError(t, err)
+
+	// Drive the host-side reload-retirement teardown deterministically. stopWriter
+	// is exactly what the host's JoinGoroutines teardown step runs; it unblocks the
+	// read loop's Recv with ErrClosed, so the loop's deferred stream teardown fires
+	// with a local-close cause. Joining readLoopDone is the happens-before edge that
+	// the fan-out completed — no sleep.
+	state := cc.state.Load()
+	state.streams.stopWriter()
+	<-state.readLoopDone
+
+	// Then: the published stream's outcome is genuinely unknown, so it fails
+	// non-retryable — not the retryable ErrPluginUnavailable a submitted-but-never-
+	// published stream would get.
+	_, recvErr := st.RecvMsg(t.Context())
+	require.ErrorIs(t, recvErr, ErrOutcomeUnknown)
+	require.False(t, IsRetryable(recvErr),
+		"a published stream at retirement may have executed; retrying could double-execute")
 }

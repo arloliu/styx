@@ -2,14 +2,14 @@ package styx
 
 import "context"
 
-// DedupKey is an application-chosen idempotency key. It is host-local and
-// preparatory: it rides the call context and is carried unchanged onto a
-// retry-minted attempt's descriptor, so host-side code can read the same key back
-// across the attempts of one logical operation. It is NOT transported to the
-// plugin — the data-plane frame carries no per-call metadata field — so a plugin
-// handler cannot observe it today. The surface exists so an application can attach
-// and thread the key now; delivering it end-to-end to the handler awaits a
-// wire-carrier decision owned by the project.
+// DedupKey is an application-chosen idempotency key. It is host-local: it rides
+// the call context (attach it with WithDedupKey) and is readable host-side with
+// DedupKeyFromContext, so host-side code can tag the calls of one logical
+// operation and recognize the same key back on any of them. Reusing the same
+// context — or setting the same key on a re-issued call — carries the key across
+// those calls, but Styx mints no retries or attempts of its own around it. It is
+// NOT transported to the plugin — the data-plane frame carries no per-call
+// metadata field — so a plugin handler cannot observe it today.
 //
 // Styx does NOT deduplicate. It never inspects, compares, or acts on a DedupKey.
 // Deduplication — deciding that two attempts are the same operation and

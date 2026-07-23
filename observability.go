@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arloliu/styx/internal/observeq"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/transport"
 	"github.com/arloliu/styx/observe"
@@ -77,7 +78,7 @@ func joinBounded(wg *sync.WaitGroup, bound time.Duration) {
 // the transport's own byte counter by the periodic reporter, which sees every
 // byte the connection moves. Only ever called with a non-nil dispatcher (the
 // caller gates on it).
-func (c *ClientConn) recordCompleted(m *observe.Dispatcher[observe.MetricsSink], start time.Time) {
+func (c *ClientConn) recordCompleted(m *observeq.Dispatcher[observe.MetricsSink], start time.Time) {
 	latency := time.Since(start)
 	name := c.name
 	m.Submit(func(s observe.MetricsSink) {
@@ -88,7 +89,7 @@ func (c *ClientConn) recordCompleted(m *observe.Dispatcher[observe.MetricsSink],
 // recordAbandoned records a call abandoned locally before a terminal result:
 // its latency, plus a timeout or cancellation counter chosen from waitErr. Both
 // are low-rate per-event signals. Only ever called with a non-nil dispatcher.
-func (c *ClientConn) recordAbandoned(m *observe.Dispatcher[observe.MetricsSink], start time.Time, waitErr error) {
+func (c *ClientConn) recordAbandoned(m *observeq.Dispatcher[observe.MetricsSink], start time.Time, waitErr error) {
 	latency := time.Since(start)
 	name := c.name
 	metric := observe.MetricCancellation
@@ -109,7 +110,7 @@ func (c *ClientConn) recordAbandoned(m *observe.Dispatcher[observe.MetricsSink],
 // moved is emitted; the shared-memory-only gauges have no uds source and no value
 // is fabricated for them. It returns when ctx is done.
 func (c *ClientConn) runMetricsReporter(
-	ctx context.Context, m *observe.Dispatcher[observe.MetricsSink], interval time.Duration,
+	ctx context.Context, m *observeq.Dispatcher[observe.MetricsSink], interval time.Duration,
 ) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -167,7 +168,7 @@ func (c *ClientConn) runMetricsReporter(
 // below-baseline check is only a belt-and-braces guard against a same-instance
 // counter decrease, which never happens for a monotonic counter.
 func (c *ClientConn) reportBackpressureEdges(
-	m *observe.Dispatcher[observe.MetricsSink], tr transport.Transport, lastEdges uint64,
+	m *observeq.Dispatcher[observe.MetricsSink], tr transport.Transport, lastEdges uint64,
 ) uint64 {
 	ec, ok := tr.(transport.BackpressureEdgeCounter)
 	if !ok {
@@ -213,7 +214,7 @@ func (c *ClientConn) liveTransport() transport.Transport {
 // traffic and requests that timed out or were canceled, not only calls that ran to
 // a normal completion.
 func (c *ClientConn) reportBytesMoved(
-	m *observe.Dispatcher[observe.MetricsSink], tr transport.Transport, lastBytes uint64,
+	m *observeq.Dispatcher[observe.MetricsSink], tr transport.Transport, lastBytes uint64,
 ) uint64 {
 	bc, ok := tr.(transport.ByteCounter)
 	if !ok {
@@ -241,7 +242,7 @@ func (c *ClientConn) reportBytesMoved(
 // reportArenaOccupancy reports the live transport's arena occupancy as a gauge
 // when the transport exposes it. The uds transport does not, so nothing is
 // reported over it — no value is fabricated.
-func (c *ClientConn) reportArenaOccupancy(m *observe.Dispatcher[observe.MetricsSink], tr transport.Transport) {
+func (c *ClientConn) reportArenaOccupancy(m *observeq.Dispatcher[observe.MetricsSink], tr transport.Transport) {
 	ar, ok := tr.(transport.ArenaOccupancyReporter)
 	if !ok {
 		return
@@ -257,7 +258,7 @@ func (c *ClientConn) reportArenaOccupancy(m *observe.Dispatcher[observe.MetricsS
 // reportRingDepth reports the live transport's ring depth as a gauge when the
 // transport exposes it. The uds transport has no ring, so nothing is reported
 // over it — no value is fabricated.
-func (c *ClientConn) reportRingDepth(m *observe.Dispatcher[observe.MetricsSink], tr transport.Transport) {
+func (c *ClientConn) reportRingDepth(m *observeq.Dispatcher[observe.MetricsSink], tr transport.Transport) {
 	rd, ok := tr.(transport.RingDepthReporter)
 	if !ok {
 		return
@@ -278,7 +279,7 @@ func (c *ClientConn) reportRingDepth(m *observe.Dispatcher[observe.MetricsSink],
 // establishes the baseline and emits nothing). A count below the baseline is a
 // transport reset and re-establishes the baseline without emitting.
 func (c *ClientConn) reportWakeupRate(
-	m *observe.Dispatcher[observe.MetricsSink], tr transport.Transport,
+	m *observeq.Dispatcher[observe.MetricsSink], tr transport.Transport,
 	lastWakeups uint64, have bool, interval time.Duration,
 ) (uint64, bool) {
 	wc, ok := tr.(transport.WakeupSyscallCounter)

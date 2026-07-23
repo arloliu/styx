@@ -235,27 +235,47 @@ func NewStreamTable(maxOpenStreams int, tr transport.Transport) *StreamTable {
 //   - only a genuinely new, well-formed open is subject to the S_max cap (§4.7's
 //     retryable backpressure).
 func (t *StreamTable) Open(callID uint64, side StreamSide, cfg StreamConfig) (*Stream, error) {
-	return t.admitStream(callID, side, cfg, true)
+	return t.admitStream(callID, side, cfg, true, false)
+}
+
+// OpenClient admits the opener's (client-side) stream: the party that owns the
+// STREAM_OPEN it is about to send. It sets openSendPending atomically with admission,
+// inside the critical section and before the deadline watcher starts, so no terminal
+// path — the watcher, a fan-out, or an inbound dispatch that looks the stream up —
+// can ever observe a registered open-in-progress stream with the flag clear.
+// That is what makes a locally-initiated terminal winning
+// before OpenStream confirms the send suppress its own §9.1 emission and leave the
+// owed pair for OpenStream to drive strictly after the OPEN (see openSendPending). It
+// starts the deadline watcher at admission because the opener's send may block and its
+// own deadline must be able to reap a STREAM_OPEN whose send never reaches the wire
+// (§7.4). The plain Open leaves the flag clear for callers where the OPEN send is not
+// this table's concern.
+func (t *StreamTable) OpenClient(callID uint64, cfg StreamConfig) (*Stream, error) {
+	return t.admitStream(callID, ClientStream, cfg, true, true)
 }
 
 // OpenAccepting admits an accept-side (ServerStream) stream WITHOUT starting its
-// deadline watcher, so the plugin accept path can reach PUBLISHED before a tiny peer
-// budget can win the terminal CAS. The peer's OPEN indisputably arrived, so a
-// deadline that wins from SUBMITTED — before Publish — would be suppressed by
-// finishTerminal and orphan the peer's stream (stream-protocol.md §7.1/§7.4).
-// Deferring the watcher to StartDeadlineWatcher (called after Publish) removes that
-// race; the budget stays anchored to the OPEN's arrival, so the deferral does not
-// extend it. The opener path uses Open, which starts the watcher at admission: an
-// opener is SUBMITTED until OpenStream Publishes after a successful Send, and its own
-// deadline must be able to reap a STREAM_OPEN that never reaches the wire (§7.4).
+// deadline watcher, so the plugin accept path reaches PUBLISHED before a tiny peer
+// budget can win the terminal CAS, keeping every accept-side terminal transition on
+// the PUBLISHED side of the phase word (stream-protocol.md §7.1/§7.4). Deferring the
+// watcher to StartDeadlineWatcher (called after Publish) removes that race; the
+// budget stays anchored to the OPEN's arrival, so the deferral does not extend it.
+// The accept side never sends an OPEN, so it leaves openSendPending clear and its
+// locally-initiated terminals emit their §9.1 pair at once. The opener path uses
+// OpenClient, which sets the flag and starts the watcher at admission: an opener
+// publishes SUBMITTED -> PUBLISHED just before tr.Send.
 func (t *StreamTable) OpenAccepting(callID uint64, cfg StreamConfig) (*Stream, error) {
-	return t.admitStream(callID, ServerStream, cfg, false)
+	return t.admitStream(callID, ServerStream, cfg, false, false)
 }
 
-// open is the shared admission path for Open and OpenAccepting. startWatch selects
-// whether the deadline watcher is started at admission (the opener) or deferred to a
-// later StartDeadlineWatcher (the accept path).
-func (t *StreamTable) admitStream(callID uint64, side StreamSide, cfg StreamConfig, startWatch bool) (*Stream, error) {
+// admitStream is the shared admission path for Open, OpenClient, and OpenAccepting.
+// startWatch selects whether the deadline watcher is started at admission (the opener)
+// or deferred to a later StartDeadlineWatcher (the accept path). openSendPending marks
+// an opener whose STREAM_OPEN send is not yet confirmed, set here before the stream is
+// registered or the watcher starts so no observer sees it clear.
+func (t *StreamTable) admitStream(
+	callID uint64, side StreamSide, cfg StreamConfig, startWatch, openSendPending bool,
+) (*Stream, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -276,6 +296,13 @@ func (t *StreamTable) admitStream(callID uint64, side StreamSide, cfg StreamConf
 	}
 
 	s := newStream(t, callID, side, cfg)
+	// Establish the opener's send-pending state on the fresh stream BEFORE it is
+	// registered or its watcher starts, so the deadline/cancellation watcher and every
+	// fan-out observe the flag already set — a terminal can never win from a registered
+	// open-in-progress stream while the flag reads clear (see openSendPending).
+	if openSendPending {
+		s.openSendPending.Store(true)
+	}
 	t.streams[callID] = s
 	// Open the response obligation under t.mu, atomically with registration, so it
 	// exists before the stream can reach any terminal: a terminal transition (a

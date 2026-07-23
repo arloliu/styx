@@ -37,6 +37,13 @@ type SpanContext struct {
 // returns its wire bytes (nil when there is none); Extract parses wire bytes
 // back into a SpanContext attached to the returned context. Extract MUST be
 // total: malformed input returns the input context unchanged and never panics.
+//
+// Styx does not yet invoke a TraceInjector: no host or plugin configuration
+// accepts one, and no Styx instrumentation calls Inject or Extract. The type
+// defines the trace-context propagation contract for when Styx wires it, and an
+// application may use it — with SpanContext, ContextWithSpan, and
+// SpanFromContext — directly in its own handler code today to encode and decode
+// the binary trace-context field.
 type TraceInjector interface {
 	// Inject returns the binary trace field for the SpanContext in ctx, or nil
 	// when ctx carries no span.

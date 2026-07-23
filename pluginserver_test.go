@@ -451,6 +451,93 @@ func TestPluginServer_DispatchDrainToReloadAndRetire_OnPeerClose(t *testing.T) {
 	}
 }
 
+// Test the serving session snapshotting its reload hooks once at start: a
+// mutator registered after the session began is not part of that session, so a
+// reload it later runs freezes only the mutators registered before serving
+// started. This locks the PluginServer contract that a registration made after
+// Serve began cannot affect the running session — and, with it, that no session
+// path reads the reload-hook fields unsynchronized while a Register* call writes
+// them.
+func TestPluginServer_SnapshotsReloadHooks_IgnoringPostServeRegistration(t *testing.T) {
+	// Given: one mutator registered before serving starts.
+	h := setupPluginServeTestHelper(t)
+	t.Setenv(styx.HeartbeatIntervalEnv, "1h") // leave only the immediate beat
+	log := &callLog{}
+	h.srv.RegisterMutator(&loggingMutator{name: "before", log: log})
+	done := h.startControl()
+
+	// The immediate first heartbeat is emitted only after the session has taken its
+	// reload-hook snapshot (the snapshot precedes the heartbeat sender's start), so
+	// receiving it is the happens-before proof the snapshot is complete — a
+	// deterministic seam, not a sleep.
+	beat, err := h.hostConn.Recv(t.Context())
+	h.require.NoError(err)
+	kind, ok := control.KindOf(beat)
+	h.require.True(ok)
+	h.require.Equal(control.KindHeartbeat, kind, "the first control message is the immediate heartbeat")
+
+	// When: a second mutator is registered AFTER the snapshot, then a reload runs.
+	h.srv.RegisterMutator(&loggingMutator{name: "after", log: log})
+	h.sendDrain()
+	_, dkind := h.recvSkippingHeartbeats()
+	h.require.Equal(control.KindDrainAck, dkind)
+
+	// Then: only the pre-serve mutator froze. The post-serve registration is
+	// invisible to the running session's snapshot.
+	h.require.Equal([]string{"before:freeze"}, log.snapshot(),
+		"a reload freezes only the mutators snapshotted at serving-session start")
+
+	// Drive the reload through to a clean retirement.
+	h.recvSaveStateAndAck()
+	h.shutdownAndExpectAck(done)
+}
+
+// Test that the snapshot is taken at the PRODUCTION serving-session entry, driving
+// the whole phase through RunServingForTest (runServing, which takes the snapshot
+// before the successor restore and the control loop) rather than the control-only
+// wrapper. A mutator registered after serving started is not part of the running
+// session, so a later reload freezes only the mutator registered before it began.
+// This fails if runServing ever stops snapshotting at entry: the reload would then
+// read the live fields and freeze the post-start mutator too.
+func TestPluginServer_SnapshotsReloadHooksAtServingEntry_ThroughRunServing(t *testing.T) {
+	// Given: a first-start (non-successor) instance with one mutator registered
+	// before serving begins.
+	h := setupPluginServeTestHelper(t)
+	t.Setenv(styx.HeartbeatIntervalEnv, "1h")  // leave only the immediate beat
+	t.Setenv(lifecycle.ReloadSuccessorEnv, "") // explicitly not a successor
+	log := &callLog{}
+	h.srv.RegisterMutator(&loggingMutator{name: "before", log: log})
+
+	var restoreDone atomic.Bool
+	tr := newGateTransport(&restoreDone)
+	done := h.startServing(tr) // RunServingForTest: the production runServing entry
+
+	// The immediate first heartbeat is emitted only after runServing has taken its
+	// reload-hook snapshot at session entry (the snapshot precedes the reader launch
+	// and the heartbeat sender), so receiving it is the happens-before proof the
+	// snapshot is complete — a deterministic seam, not a sleep.
+	beat, err := h.hostConn.Recv(t.Context())
+	h.require.NoError(err)
+	kind, ok := control.KindOf(beat)
+	h.require.True(ok)
+	h.require.Equal(control.KindHeartbeat, kind, "a first-start plugin heartbeats once serving begins")
+
+	// When: a second mutator is registered AFTER the session snapshot, then a reload
+	// runs through the production control loop.
+	h.srv.RegisterMutator(&loggingMutator{name: "after", log: log})
+	h.sendDrain()
+	_, dkind := h.recvSkippingHeartbeats()
+	h.require.Equal(control.KindDrainAck, dkind)
+
+	// Then: only the pre-serve mutator froze; the post-serve registration is invisible
+	// to the session snapshot runServing took at entry.
+	h.require.Equal([]string{"before:freeze"}, log.snapshot(),
+		"a reload freezes only the mutators snapshotted at the production serving-session entry")
+
+	h.recvSaveStateAndAck()
+	h.shutdownAndExpectAck(done)
+}
+
 // Test a successful reload retiring the instance cleanly on the host's REAL
 // Shutdown teardown message (not a peer close): the retiring plugin, parked
 // awaiting the reload outcome, must treat Shutdown as a clean retirement, ack

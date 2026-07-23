@@ -27,7 +27,7 @@ func benchStreamPlane(b *testing.B) (*streamPlane, func()) {
 	p := newStreamPlane(hostTr)
 
 	return p, func() {
-		p.teardown(ErrPluginUnavailable)
+		p.teardown(ErrPluginUnavailable, ErrPluginUnavailable)
 		_ = hostTr.Close()
 		_ = peerTr.Close()
 	}

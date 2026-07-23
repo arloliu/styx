@@ -75,8 +75,10 @@ const HeartbeatIntervalEnv = heartbeatIntervalEnv
 func (s *PluginServer) RunServingControlForTest(ctx context.Context, conn *control.Conn) error {
 	// The reload/shutdown dispatch tests drive only the control plane, with no
 	// data plane behind the heartbeat; an all-nil progress reports a
-	// sequence-only Heartbeat, exactly the prior behavior.
-	return s.runServingControl(ctx, conn, newHeartbeatProgress(nil, nil))
+	// sequence-only Heartbeat, exactly the prior behavior. The reload-hook
+	// snapshot is taken here, before the control loop starts, exactly as
+	// runServing takes it at serving-session start in production.
+	return s.runServingControl(ctx, conn, newHeartbeatProgress(nil, nil), s.snapshotReloadHooks())
 }
 
 // RunServingForTest re-exports runServing for pluginserver_test (external test

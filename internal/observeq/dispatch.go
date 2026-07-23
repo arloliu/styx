@@ -1,4 +1,4 @@
-package observe
+package observeq
 
 import (
 	"context"

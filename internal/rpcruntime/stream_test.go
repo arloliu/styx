@@ -1755,11 +1755,12 @@ func TestEmitOwedOpenTeardown_ErrDroppedUnderSaturation_FailsConnection(t *testi
 		filler.emitTeardownErr(false)
 	}
 
-	// Given: an ambiguous-open stream — SUBMITTED, its OPEN queued on the data lane —
-	// whose locally-initiated terminal wins from SUBMITTED. finishTerminal suppresses
-	// the engine emission (the OPEN's wire status is unknown at SUBMITTED), so the pair
-	// is owed to EmitOwedOpenTeardown.
+	// Given: an ambiguous-open stream whose OPEN send is still unconfirmed
+	// (openSendPending, as an opener mid-send), so its locally-initiated terminal has
+	// finishTerminal suppress the engine emission — the OPEN's wire status is unknown
+	// while the send is pending — and the pair is owed to EmitOwedOpenTeardown.
 	owed := newStream(tbl, 1, ClientStream, StreamConfig{Credits: 1, Deadline: time.Hour})
+	owed.openSendPending.Store(true)
 	owed.TerminateOpenAmbiguous(context.Canceled)
 	select {
 	case <-owed.Done():

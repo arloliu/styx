@@ -11,6 +11,7 @@ import (
 	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/lifecycle"
+	"github.com/arloliu/styx/internal/observeq"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/observe"
@@ -109,6 +110,12 @@ type ServiceRequirement struct {
 // handshake, supervision, and teardown. Generated client stubs reach a
 // plugin through the *ClientConn Plugin returns. Unexported fields hold
 // the configuration and the live plugin routing table Start populates.
+//
+// All exported Host methods — Plugin, Start, Stop, Reload, and Events — are safe
+// for concurrent use by multiple goroutines. The Host serializes its routing
+// state under a mutex and tracks each plugin's stopping state, so concurrent
+// Start, Stop, and Reload calls (on the same plugin or on different ones) never
+// corrupt that state.
 type Host struct {
 	mu       sync.Mutex
 	cfg      HostConfig
@@ -149,8 +156,8 @@ type Host struct {
 	// user Logger synchronously on the event relay. obsCtx/obsCancel bound both
 	// dispatcher goroutines and every per-plugin reporter, all joined (within a
 	// bound) via obsWG on Stop.
-	metricsDisp     *observe.Dispatcher[observe.MetricsSink]
-	logDisp         *observe.Dispatcher[observe.Logger]
+	metricsDisp     *observeq.Dispatcher[observe.MetricsSink]
+	logDisp         *observeq.Dispatcher[observe.Logger]
 	metricsInterval time.Duration
 	obsCtx          context.Context
 	obsCancel       context.CancelFunc
@@ -210,7 +217,7 @@ func NewHost(cfg HostConfig) *Host {
 		h.obsCtx, h.obsCancel = context.WithCancel(context.Background())
 	}
 	if cfg.Metrics != nil {
-		h.metricsDisp = observe.NewDispatcher(cfg.Metrics, metricsBufferSize)
+		h.metricsDisp = observeq.NewDispatcher(cfg.Metrics, metricsBufferSize)
 		h.obsWG.Add(1)
 		go func() {
 			defer h.obsWG.Done()
@@ -218,7 +225,7 @@ func NewHost(cfg HostConfig) *Host {
 		}()
 	}
 	if cfg.Logger != nil {
-		h.logDisp = observe.NewDispatcher(cfg.Logger, logBufferSize)
+		h.logDisp = observeq.NewDispatcher(cfg.Logger, logBufferSize)
 		h.obsWG.Add(1)
 		go func() {
 			defer h.obsWG.Done()

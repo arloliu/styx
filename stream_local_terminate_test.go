@@ -46,8 +46,8 @@ func TestOpenStream_CallerCancel_TerminatesAndFreesSlot(t *testing.T) {
 	cancel() // the caller abandons the stream
 
 	_, recvErr := st.RecvMsg(ctx)
-	require.ErrorIs(t, StreamError(recvErr), ErrCanceled,
-		"a caller cancellation maps to the styx sentinel through StreamError")
+	require.ErrorIs(t, recvErr, ErrCanceled,
+		"RecvMsg returns the styx cancel sentinel directly, with no caller-side StreamError")
 
 	require.Eventually(t, func() bool {
 		return cc.state.Load().streams.streams.Len() == 0
@@ -310,8 +310,8 @@ func TestStreamServer_ClientStreamingNilReturn_FailsPromptly(t *testing.T) {
 		// exactly makes any change to the guard's semantics (auto-close-empty, a
 		// different code, a different message) fail this test.
 		var status *Status
-		require.ErrorAs(t, StreamError(e), &status,
-			"the missing-response guard surfaces a styx status, not a bare sentinel")
+		require.ErrorAs(t, e, &status,
+			"RecvMsg surfaces the missing-response guard as a styx status directly, not a bare sentinel")
 		require.Equal(t, CodeInternal, status.Code,
 			"the guard emits the CodeInternal-mapped status the completion contract requires")
 		require.Equal(t, "styx: client-streaming handler returned without sending a response", status.Message)

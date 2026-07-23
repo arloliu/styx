@@ -52,6 +52,17 @@ const (
 // admission slot frees promptly instead of lingering to the deadline. The accepter's
 // termination flows through its handler's error return instead, so the wrapper drives
 // no local terminal there.
+//
+// A Stream handle follows gRPC ClientStream's goroutine rules. It is safe for one
+// sending goroutine and one receiving goroutine to use concurrently: a single
+// goroutine may call SendMsg and CloseSend while another calls RecvMsg. It is a
+// caller programming error to call SendMsg or CloseSend concurrently with each
+// other or with itself — the send direction has a single owner. The runtime gives
+// CloseSend publication that single owner, so a losing concurrent CloseSend
+// returns an error instead of putting a second STREAM_CLOSE on the wire; concurrent
+// SendMsg calls are NOT serialized and race the send sequence, which can desync and
+// poison the stream. Context, Err, Marshal, and Unmarshal are safe to call from any
+// goroutine.
 type Stream struct {
 	stream *rpcruntime.Stream
 	codec  codec.Codec
@@ -73,17 +84,22 @@ func newServerStream(st *rpcruntime.Stream, cdc codec.Codec) *Stream {
 	return &Stream{stream: st, codec: cdc, opener: false}
 }
 
-// SendMsg sends payload as a STREAM_MSG under ctx (stream-protocol.md §4.5). On the
-// opener side a caller-context cancellation the runtime surfaces without terminating
-// drives the stream terminal, freeing its slot. The returned error is the raw engine
-// error; callers wrap it through StreamError at the application boundary.
+// SendMsg sends payload as a STREAM_MSG under ctx (stream-protocol.md §4.5). It
+// returns nil on success and, on failure, an error already in the styx taxonomy — the
+// same sentinels Err() reports, no caller-side StreamError wrapping needed. Once the
+// stream has terminated it returns that terminal error. On the opener side a
+// caller-context cancellation the runtime surfaces without terminating drives the
+// stream terminal, freeing its slot.
 func (s *Stream) SendMsg(ctx context.Context, payload []byte) error {
 	return s.driveLocal(ctx, s.stream.SendMsg(ctx, payload))
 }
 
-// RecvMsg returns the next delivered STREAM_MSG payload, io.EOF at stream end, or the
-// terminal error (stream-protocol.md §4.6). On the opener side a caller-context
-// cancellation drives the stream terminal, freeing its slot.
+// RecvMsg returns the next delivered STREAM_MSG payload, io.EOF at clean stream end
+// (returned unchanged, the signal generated stubs test for), or an error already in
+// the styx taxonomy — the same sentinels Err() reports, no caller-side StreamError
+// wrapping needed (stream-protocol.md §4.6). Once the stream has terminated it returns
+// that terminal error. On the opener side a caller-context cancellation drives the
+// stream terminal, freeing its slot.
 func (s *Stream) RecvMsg(ctx context.Context) ([]byte, error) {
 	payload, err := s.stream.RecvMsg(ctx)
 
@@ -92,7 +108,10 @@ func (s *Stream) RecvMsg(ctx context.Context) ([]byte, error) {
 
 // CloseSend half-closes this side's send direction, optionally carrying a final
 // payload (a client-streaming server's single response, stream-protocol.md §6.3/§6.4).
-// On the opener side a caller-context cancellation drives the stream terminal.
+// It returns nil on success and, on failure, an error already in the styx taxonomy —
+// the same sentinels Err() reports, no caller-side StreamError wrapping needed. Once
+// the stream has terminated it returns that terminal error. On the opener side a
+// caller-context cancellation drives the stream terminal.
 func (s *Stream) CloseSend(ctx context.Context, payload []byte) error {
 	return s.driveLocal(ctx, s.stream.CloseSend(ctx, payload))
 }
@@ -145,14 +164,24 @@ func (s *Stream) Err() error {
 	return StreamError(oc.Err)
 }
 
-// driveLocal drives the opener's stream terminal when a byte op surfaced the caller
-// context's cancellation without itself terminating the stream (a pre-admission or
-// credit-blocked cancel/deadline, stream-protocol.md §4.5), so the slot frees promptly.
-// It only fires when the passed context is genuinely done AND the surfaced error is
-// that context error, so a normal terminal outcome (io.EOF, a peer status, an engine
+// driveLocal is the single point where SendMsg/RecvMsg/CloseSend both drive the
+// opener's local terminal and translate their returned error into the public styx
+// taxonomy. It runs the terminal decision on the RAW engine error, then returns the
+// translated value, so the two concerns stay independent.
+//
+// The terminal drive fires when a byte op surfaced the caller context's cancellation
+// without itself terminating the stream (a pre-admission or credit-blocked
+// cancel/deadline, stream-protocol.md §4.5), so the slot frees promptly. It only fires
+// when the passed context is genuinely done AND the RAW surfaced error is that context
+// error — checked before translation, since translation rewrites a context error into a
+// styx sentinel — so a normal terminal outcome (io.EOF, a peer status, an engine
 // sentinel) never misfires. A post-admission Send already terminated internally, so a
-// second drive here is an idempotent no-op (the terminal CAS already lost). The
-// accepter (opener false) leaves termination to its handler's error return.
+// second drive here is an idempotent no-op (the terminal CAS already lost). The accepter
+// (opener false) leaves termination to its handler's error return.
+//
+// The translation is StreamError, the same mapping Err() uses, so nil stays nil, io.EOF
+// (clean stream end) is returned unchanged, and it is idempotent: a caller that still
+// wraps the return through StreamError per older guidance gets the same value.
 func (s *Stream) driveLocal(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
@@ -162,7 +191,7 @@ func (s *Stream) driveLocal(ctx context.Context, err error) error {
 		s.stream.TerminateLocal(ctx.Err())
 	}
 
-	return err
+	return StreamError(err)
 }
 
 // abortLocal drives the opener's stream terminal on a local codec failure it cannot
@@ -365,7 +394,12 @@ func (c *ClientConn) openStreamByID(
 	cfg.Deadline = budget
 
 	callID := state.table.NextID()
-	st, err := state.streams.streams.Open(callID, rpcruntime.ClientStream, cfg)
+	// OpenClient marks this opener's STREAM_OPEN send pending atomically with admission,
+	// so a terminal that wins before ConfirmOpenSent below suppresses its own §9.1
+	// emission and leaves the owed pair for this call to drive strictly after the OPEN
+	// (see openSendPending). The flag is set before the deadline watcher can run, so no
+	// terminal ever observes this open-in-progress stream with the flag clear.
+	st, err := state.streams.streams.OpenClient(callID, cfg)
 	if err != nil {
 		c.admission.Leave()
 
@@ -387,6 +421,22 @@ func (c *ClientConn) openStreamByID(
 		// when the payload is present, so it emits no separate client STREAM_CLOSE.
 		Payload: cfg.OpenPayload,
 	}
+	// Publish the phase SUBMITTED -> PUBLISHED BEFORE handing the OPEN to the
+	// transport, exactly as the unary table publishes before its Send: from here the
+	// frozen §7.2 crash split classifies this open as dispatched (OUTCOME_UNKNOWN),
+	// never the retryable SUBMITTED, so a teardown that wins while the OPEN is on the
+	// wire can never call an accepted open retryable. The phase CAS is the atomic
+	// linearization. Publish fails only when a terminal already won SUBMITTED (the
+	// stream's own deadline, or a connection teardown) before the opener could
+	// publish: nothing has been sent, so surface that outcome and owe no teardown
+	// (§7.4 — nothing on the wire is owed nothing).
+	if !st.Publish() {
+		c.admission.Leave()
+		<-st.Done()
+		oc, _ := st.Outcome()
+
+		return nil, translateStreamOutcomeErr(oc)
+	}
 	// The OPEN send is bounded by the stream's OWN context (its deadline, its rooting
 	// in the caller's context, and its cancel on any terminal), NOT context.Background —
 	// so a deadline, a caller cancellation, or a racing terminal that wins while the
@@ -395,34 +445,33 @@ func (c *ClientConn) openStreamByID(
 	// or deadline outcome instead of a live stream. A deadline that elapses MID-write
 	// leaves a torn OPEN frame, which the transport correctly poisons — a partial
 	// STREAM_OPEN desynchronizes the peer's framing regardless, so poison is the right
-	// disposition there, not a lingering half-frame.
+	// disposition there, not a lingering half-frame. Publication is confirmed AFTER a
+	// successful send, so until then a terminal winning here suppresses its own §9.1
+	// emission (openSendPending) and the owed pair is driven below, ordered after the
+	// OPEN — the phase is already PUBLISHED but the wire fate is still this call's to
+	// resolve.
 	if sendErr := state.tr.Send(st.Context(), f); sendErr != nil {
 		c.admission.Leave()
 
 		// resolveOpenSendErr never yields a live stream — it discards or terminates the
-		// SUBMITTED stream and surfaces the outcome, so OpenStream returns no wrapper.
+		// published-but-unsent stream and surfaces the outcome, so OpenStream returns no
+		// wrapper.
 		return nil, resolveOpenSendErr(state, st, sendErr)
 	}
-	// The OPEN reached the transport: release the publication barrier now, before
-	// the Publish arbitration below (whose terminal wait cutoff must not join).
+	// The OPEN reached the transport: release the publication barrier now, before the
+	// send-confirm arbitration below (whose terminal wait cutoff must not join).
 	c.admission.Leave()
-	// The OPEN reached the transport. Publish arbitrates against termination
-	// (stream-protocol.md §7.4): any terminal transition — the deadline watcher, a
-	// local cancel, or a fast peer STREAM_ERR/STREAM_CLOSE/completion the reader
-	// dispatched while the OPEN send was in flight — can win the terminal CAS from
-	// SUBMITTED before this Publish runs, so Publish (SUBMITTED->PUBLISHED) may
-	// fail: the stream is already terminal.
-	if !st.Publish() {
-		// Wait for the terminal-CAS winner to FULLY publish the outcome before
-		// reading it. A SUBMITTED-phase winner delivers the outcome (code AND Err,
-		// then closes done) WITHOUT any synchronous lifecycle Send — it deferred the
-		// teardown to here precisely so this wait is bounded even on a transport
-		// whose lifecycle lane a stuck peer can block. So Done is closed promptly.
+	// Confirm the OPEN send against a terminal that may have won DURING it — the
+	// deadline watcher, a local cancel, or a fast peer STREAM_ERR/STREAM_CLOSE/
+	// completion the reader dispatched while the send was in flight (stream-protocol.md
+	// §7.4/§9.1). ConfirmOpenSent clears the emission-deferral flag and returns true
+	// only if the stream is still live; a false return means a terminal won during the
+	// send, and since the send succeeded the peer observed the OPEN and is owed the
+	// terminal pair — drive it strictly after the OPEN, handed off so this return stays
+	// within the deadline.
+	if !st.ConfirmOpenSent() {
 		<-st.Done()
 		oc, _ := st.Outcome()
-		// The peer observed the OPEN (the send above succeeded), so if the terminal
-		// was locally initiated the teardown pair is now owed — drive it strictly
-		// after the OPEN, handed off so this return stays within the deadline.
 		st.EmitOwedOpenTeardown()
 
 		return nil, translateStreamOutcomeErr(oc)
@@ -737,21 +786,27 @@ func (p *streamPlane) probeDrain() {
 	p.drainOwed = false
 }
 
-// teardown fails every open stream with cause and joins the streaming half's
-// finishers, in the peer-crash teardown ordering (stream-protocol.md §9). It stops
-// the connection-fatal watcher, runs OnPeerCrash's fan-out (waking parked RecvMsg
-// and credit waiters), then StreamTable.Close's finisher join. That join MUST
-// complete before the transport's mapped region is released: the caller stops the
-// transport writer (stopTransportWriter) BEFORE reaching this teardown — so a
-// parked finisher's lifecycle CANCEL Send returns — and releases the region
-// (releaseTransport) only AFTER this teardown returns. The two-phase split is
-// structural, carried by transport.WriterStopper, not by a comment: a uds
-// transport unmaps nothing so its single Close is correct in either phase, and a
-// shm transport's StopWriter stops the writer without unmapping so the join here
-// always precedes the unmap.
-func (p *streamPlane) teardown(cause error) {
+// teardown fails every open stream, splitting by dispatch state exactly as the
+// unary table does, and joins the streaming half's finishers in the peer-crash
+// teardown ordering (stream-protocol.md §7.2, §9). A PUBLISHED stream fails with
+// dispatchedErr (its outcome is genuinely unknown — the peer may have executed
+// it — so the styx boundary supplies a non-retryable error); a SUBMITTED stream
+// whose STREAM_OPEN never reached the wire fails with notDispatchedErr (provably
+// not dispatched, the retryable class). It stops the connection-fatal watcher,
+// runs FailAll's split fan-out (waking parked RecvMsg and credit waiters), then
+// StreamTable.Close's finisher join.
+//
+// That join MUST complete before the transport's mapped region is released: the
+// caller stops the transport writer (stopTransportWriter) BEFORE reaching this
+// teardown — so a parked finisher's lifecycle CANCEL Send returns — and releases
+// the region (releaseTransport) only AFTER this teardown returns. The two-phase
+// split is structural, carried by transport.WriterStopper, not by a comment: a
+// uds transport unmaps nothing so its single Close is correct in either phase,
+// and a shm transport's StopWriter stops the writer without unmapping so the
+// join here always precedes the unmap.
+func (p *streamPlane) teardown(dispatchedErr, notDispatchedErr error) {
 	p.stopFatalWatch()
-	p.streams.OnPeerCrash(cause)
+	p.streams.FailAll(dispatchedErr, notDispatchedErr)
 	_ = p.streams.Close()
 }
 
@@ -1020,8 +1075,11 @@ func (s *streamServer) invokeStreamHandler(reg streamHandlerReg, ss *Stream) (re
 // loop's owner before teardown runs, so the finisher join and every handler's
 // now-failing stream op complete promptly (stream-protocol.md §9).
 func (s *streamServer) teardown(cause error) {
-	s.plane.teardown(cause) // fan out + finisher join; wakes handlers' parked stream ops
-	s.handlerWG.Wait()      // join handler goroutines (their stream ops now fail fast)
+	// The plugin accept side has no caller that retries, so the dispatch-state
+	// split the opener needs is moot here: both phase classes fail with the same
+	// cause, the fan-out the plane join then reaps.
+	s.plane.teardown(cause, cause) // fan out + finisher join; wakes handlers' parked stream ops
+	s.handlerWG.Wait()             // join handler goroutines (their stream ops now fail fast)
 }
 
 // streamOpenRejectCode maps a StreamTable.Open rejection to the STREAM_ERR status
@@ -1085,16 +1143,16 @@ func translateStreamSendErr(err error) error {
 //     directly; the poisoned error is never swallowed.
 //  2. AMBIGUOUS on a live transport (an shm context error after enqueue): the writer
 //     may still publish the OPEN, so the stream is live-and-owed. Drive the
-//     locally-initiated terminal §4.5 makes it (a SUBMITTED win emits nothing from
-//     the engine), then emit the owed teardown pair — ordered strictly after the OPEN
-//     this Send already enqueued (§9.1).
+//     locally-initiated terminal §4.5 makes it (openSendPending suppresses the
+//     engine's own emission), then emit the owed teardown pair — ordered strictly
+//     after the OPEN this Send already enqueued (§9.1).
 //  3. DEFINITIVELY NOT ACCEPTED (a pre-write / pre-enqueue rejection): nothing on or
 //     headed for the wire, so discard the stream (freeing its S_max slot at once) and
-//     surface the retryable, not-dispatched send error (§7.4).
+//     surface the retryable, not-dispatched send error (§4.5's rollback set, §7.4).
 func resolveOpenSendErr(state *connState, st *rpcruntime.Stream, sendErr error) error {
 	if errors.Is(sendErr, transport.ErrPoisoned) {
-		state.escalatePoison()               // FailAll in-flight + notify the owner: the escalation is the teardown
-		st.DiscardBeforePublish(ErrPoisoned) // terminate the SUBMITTED stream; the connection is tearing down
+		state.escalatePoison()            // FailAll in-flight + notify the owner: the escalation is the teardown
+		st.DiscardUnaccepted(ErrPoisoned) // terminate the stream; the connection is tearing down
 
 		return ErrPoisoned
 	}
@@ -1106,7 +1164,7 @@ func resolveOpenSendErr(state *connState, st *rpcruntime.Stream, sendErr error) 
 
 		return translateStreamOutcomeErr(oc)
 	}
-	if st.DiscardBeforePublish(ErrPluginUnavailable) {
+	if st.DiscardUnaccepted(ErrPluginUnavailable) {
 		return translateStreamSendErr(sendErr)
 	}
 	<-st.Done()

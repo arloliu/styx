@@ -316,6 +316,67 @@ func TestStreamTable_FailAll_SplitsByPhase(t *testing.T) {
 	require.ErrorIs(t, pubOutcome.Err, dispatched, "a published stream fails outcome-unknown")
 }
 
+// Test that FailAll classifies an opener PUBLISHED but whose OPEN send is not yet
+// confirmed as dispatched (stream-protocol.md §7.2's crash split). The opener
+// publishes SUBMITTED -> PUBLISHED before it hands the OPEN to the transport, so
+// while its send is in flight the phase is already PUBLISHED even though the wire
+// fate is unresolved. A teardown winning here must classify it OUTCOME_UNKNOWN
+// (never retryable): the peer may have accepted and executed the open. The
+// emission-deferral flag (openSendPending, set by OpenClient) that keeps the send
+// window's terminal from emitting must not leak into retryability, which the frozen
+// split fixes by phase alone.
+func TestStreamTable_FailAll_ClassifiesPublishedUnsentAsDispatched(t *testing.T) {
+	rt := &recordingTransport{}
+	tbl := NewStreamTable(64, rt)
+	t.Cleanup(func() { _ = tbl.Close() })
+
+	// Admit as the opener (its send-pending flag is set at admission) and publish
+	// before the send, leaving the send unconfirmed — the window a teardown can race.
+	pub, err := tbl.OpenClient(1, StreamConfig{Credits: 4, Deadline: time.Second})
+	require.NoError(t, err)
+	require.True(t, pub.Publish())
+
+	dispatched := errors.New("outcome unknown")
+	notDispatched := errors.New("plugin unavailable")
+	tbl.FailAll(dispatched, notDispatched)
+
+	oc, ok := pub.Outcome()
+	require.True(t, ok)
+	require.ErrorIs(t, oc.Err, dispatched,
+		"a teardown that wins while a published open's send is in flight must classify it dispatched")
+	require.NotErrorIs(t, oc.Err, notDispatched)
+}
+
+// Test that a locally-initiated terminal winning before the opener has sent its
+// STREAM_OPEN — the window between admission and Publish — emits NO teardown frames.
+// The opener's send-pending flag is established atomically with admission (OpenClient,
+// before the deadline watcher can run), so the terminal reads it set and defers its
+// §9.1 emission; nothing was sent, so nothing is owed and OpenStream returns the
+// outcome. If the flag were established only after admission a terminal in this window
+// would emit a data-lane STREAM_ERR for an open that never reached the wire, unordered
+// after any STREAM_OPEN — the orphan-making frame this defers.
+func TestStreamTable_LocalTerminalBeforeSend_EmitsNoFrames(t *testing.T) {
+	rt := &recordingTransport{}
+	tbl := NewStreamTable(64, rt)
+	t.Cleanup(func() { _ = tbl.Close() })
+
+	st, err := tbl.OpenClient(1, StreamConfig{Credits: 4, Deadline: time.Second})
+	require.NoError(t, err)
+
+	// A locally-initiated cancel wins the terminal from SUBMITTED, before any Publish
+	// or send — exactly the pre-send interleaving the flag exists to cover.
+	mapCancelToTerminal(st, nil)
+	<-st.Done()
+
+	oc, ok := st.Outcome()
+	require.True(t, ok)
+	require.Equal(t, OutcomeCanceled, oc.Code)
+	require.Zero(t, rt.countOfKind(transport.FrameCancel),
+		"a terminal before the opener's send owes no CANCEL — nothing reached the wire (§9.1/§7.4)")
+	require.Zero(t, rt.countOfKind(transport.FrameStreamErr),
+		"and no data-lane STREAM_ERR, which would orphan a stream the peer never opened")
+}
+
 // Test that a locally-initiated cancel emits the teardown pair, while a losing
 // concurrent transition emits nothing (stream-protocol.md §7.2, §9.1).
 func TestStream_MapCancel_EmitsTeardownPair(t *testing.T) {

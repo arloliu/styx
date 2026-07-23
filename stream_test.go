@@ -228,10 +228,10 @@ func TestOpenStream_UnknownMethod_RejectedAsMethodNotFound(t *testing.T) {
 	st, err := cc.OpenStream(ctx, "echo.Echo", "Missing")
 	require.NoError(t, err, "the open publishes optimistically; the rejection arrives as a STREAM_ERR")
 
-	// Then RecvMsg surfaces the rejection, and StreamError maps it to the sentinel.
+	// Then RecvMsg surfaces the rejection as the styx sentinel directly, with no
+	// caller-side StreamError wrapping.
 	_, recvErr := st.RecvMsg(ctx)
-	require.Error(t, recvErr)
-	require.ErrorIs(t, StreamError(recvErr), ErrMethodNotFound)
+	require.ErrorIs(t, recvErr, ErrMethodNotFound)
 }
 
 // Test that OpenStream returns ErrPluginUnavailable when the ClientConn has no

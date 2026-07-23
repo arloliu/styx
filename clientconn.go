@@ -11,6 +11,7 @@ import (
 
 	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/lifecycle"
+	"github.com/arloliu/styx/internal/observeq"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/transport"
 	"github.com/arloliu/styx/observe"
@@ -21,13 +22,19 @@ import (
 // ClientConn is a connection to a single running plugin, accepted by
 // generated service client constructors (a grpc.ClientConnInterface
 // analog).
+//
+// A ClientConn is safe for concurrent use by multiple goroutines: Invoke,
+// InvokeID, and the OpenStream/OpenStreamID/OpenServerStreamID stream-open
+// methods may all be called concurrently, mirroring grpc.ClientConn. Each
+// *Stream a stream-open returns carries its own narrower goroutine rule — see
+// Stream.
 type ClientConn struct {
 	name  string
 	state atomic.Pointer[connState] // nil until a plugin instance is live; Invoke reports ErrPluginUnavailable
 	// metrics is the host's shared MetricsSink dispatcher, or nil when no sink
 	// is configured. It is the Invoke hot path's enabled gate: a nil pointer
 	// means the disabled path allocates, closes over, and submits nothing.
-	metrics *observe.Dispatcher[observe.MetricsSink]
+	metrics *observeq.Dispatcher[observe.MetricsSink]
 	// trReleaseMu orders the periodic reporter's transport-capability reads against
 	// transport release: the reporter holds the read side across a tick's capability
 	// reads, and releaseTransportGuarded takes the write side around the release, so
@@ -249,8 +256,17 @@ func runReadLoop(state *connState) {
 		// teardown owner, not here) — see streamPlane.teardown. A generation wired
 		// without a streaming half (streaming not negotiated) has nothing to tear
 		// down.
+		//
+		// Split by dispatch state exactly as the unary table does below: a PUBLISHED
+		// stream may have executed on the peer, so its outcome is genuinely unknown
+		// and must never be silently retried (ErrOutcomeUnknown, non-retryable); a
+		// SUBMITTED-but-unpublished stream provably never reached the peer, so it is
+		// safely retryable (ErrPluginUnavailable). This is the same at-most-once
+		// argument for every read-loop exit — reload retirement, graceful shutdown,
+		// peer crash, or poison — so the split is universal, not reload-only. cause is
+		// still consulted below for the escalate/no-escalate decision.
 		if state.streams != nil {
-			state.streams.teardown(cause)
+			state.streams.teardown(ErrOutcomeUnknown, ErrPluginUnavailable)
 		}
 
 		// If this side DETECTED a data-plane fault — a conformance poison, or a

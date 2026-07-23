@@ -14,6 +14,7 @@ import (
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/control/controlpb"
 	"github.com/arloliu/styx/internal/lifecycle"
+	"github.com/arloliu/styx/internal/observeq"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/transport"
@@ -39,10 +40,22 @@ const controlServePoll = 50 * time.Millisecond
 // drives the plugin side of the handshake, attaches the data-plane
 // transport, runs the serving loop, and exits when the host disconnects or
 // sends Shutdown.
+//
+// Register the plugin's services, stream handlers, and reload hooks — and set
+// any handler-panic policy with SetContinueAfterPanic — BEFORE calling Serve.
+// Each Register* method and SetContinueAfterPanic is individually safe for
+// concurrent use, but the serving session snapshots the registered services,
+// stream handlers, reload hooks, and panic policy once when it starts, so a
+// registration or policy change made after Serve has begun does not affect the
+// running session. Serve is called once.
 type PluginServer struct {
-	mu          sync.Mutex
-	services    map[uint64]registeredService // keyed by ServiceID
-	reloadHooks lifecycle.PluginReloadHooks  // populated by reload_hooks.go's Register* methods
+	mu       sync.Mutex
+	services map[uint64]registeredService // keyed by ServiceID
+	// reloadHooks holds what reload_hooks.go's Register* methods populate under
+	// s.mu. The serving session copies it once at start (snapshotReloadHooks) and
+	// reads only that copy, so a post-Serve registration cannot reach — or race —
+	// the running session's restore and reload paths.
+	reloadHooks lifecycle.PluginReloadHooks
 	// streamHandlers maps a streaming method's FNV-1a-64 service/method hashes to
 	// its registration (declared shape + handler), populated by
 	// RegisterStreamHandler. The serve loop invokes the matching handler when a
@@ -52,7 +65,7 @@ type PluginServer struct {
 	// metrics is the plugin-side MetricsSink dispatcher, or nil when no sink is
 	// configured (the enabled gate). metricsInterval is the periodic reporter's
 	// cadence.
-	metrics         *observe.Dispatcher[observe.MetricsSink]
+	metrics         *observeq.Dispatcher[observe.MetricsSink]
 	metricsInterval time.Duration
 
 	// continueAfterPanic is the handler-panic policy, set by SetContinueAfterPanic
@@ -106,7 +119,7 @@ func NewPluginServer(opts ...PluginServerOption) *PluginServer {
 		metricsInterval: resolveMetricsInterval(cfg.interval),
 	}
 	if cfg.metrics != nil {
-		s.metrics = observe.NewDispatcher(cfg.metrics, metricsBufferSize)
+		s.metrics = observeq.NewDispatcher(cfg.metrics, metricsBufferSize)
 	}
 
 	return s
@@ -197,8 +210,16 @@ func (s *PluginServer) serve(ctx context.Context) error {
 func (s *PluginServer) runServing(
 	ctx context.Context, conn *control.Conn, tr transport.Transport, streaming bool,
 ) error {
+	// Snapshot the reload hooks once, at serving-session start, under s.mu — the
+	// same immutable-copy discipline the services, stream handlers, and panic
+	// policy follow below. Every session path reads only this snapshot: the
+	// successor restore here, and the reload dispatch runServingControl runs. A
+	// Register* call made after Serve began therefore cannot affect the running
+	// session, and no session path reads the live fields unsynchronized.
+	reloadHooks := s.snapshotReloadHooks()
+
 	if isReloadSuccessor() {
-		if err := lifecycle.ServeRestore(ctx, conn, s.reloadHooks.Restorer); err != nil {
+		if err := lifecycle.ServeRestore(ctx, conn, reloadHooks.Restorer); err != nil {
 			_ = tr.Close()
 
 			return fmt.Errorf("styx: serve: restore: %w", err)
@@ -288,7 +309,7 @@ func (s *PluginServer) runServing(
 	// would never see the fault and never restart it.
 	ctrlDone := make(chan error, 1)
 	progress := newHeartbeatProgress(tr, leases)
-	go func() { ctrlDone <- s.runServingControl(ctx, conn, progress) }()
+	go func() { ctrlDone <- s.runServingControl(ctx, conn, progress, reloadHooks) }()
 
 	var ctrlErr error
 	select {
@@ -355,17 +376,39 @@ func (s *PluginServer) runServing(
 // teardown).
 var errServingDataPlaneDied = errors.New("styx: serving data plane died")
 
+// snapshotReloadHooks returns an immutable copy of the registered reload hooks,
+// taken under s.mu. The Mutators slice is copied into fresh backing storage so a
+// later RegisterMutator append can neither mutate this snapshot nor race a
+// serving path iterating it; Saver and Restorer are single values a later
+// registration only replaces, never mutates in place. The serving session takes
+// this once at start and reads only the result, which is what honors the
+// PluginServer contract that a post-Serve registration cannot affect a running
+// session.
+func (s *PluginServer) snapshotReloadHooks() lifecycle.PluginReloadHooks {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return lifecycle.PluginReloadHooks{
+		Mutators: append([]lifecycle.Mutator(nil), s.reloadHooks.Mutators...),
+		Saver:    s.reloadHooks.Saver,
+		Restorer: s.reloadHooks.Restorer,
+	}
+}
+
 // runServingControl runs the plugin's control-plane serving phase on conn: it
 // starts the heartbeat sender, runs the control dispatch loop, tears the
 // heartbeat sender down, and — on a graceful shutdown or a completed reload —
 // sends a best-effort ShutdownAck. A successor's predecessor-state restore has
 // already happened in runServing, before the data-plane reader launched, so it
-// is not repeated here.
+// is not repeated here. reloadHooks is the session snapshot runServing took at
+// start; the reload dispatch below reads only it, never the live fields.
 //
 // It returns nil when the host shut the plugin down gracefully or a
 // successful reload retired it (the process should exit 0), and a non-nil
 // error on a host crash/disconnect or a protocol violation (exit 1).
-func (s *PluginServer) runServingControl(ctx context.Context, conn *control.Conn, progress *heartbeatProgress) error {
+func (s *PluginServer) runServingControl(
+	ctx context.Context, conn *control.Conn, progress *heartbeatProgress, reloadHooks lifecycle.PluginReloadHooks,
+) error {
 	// The heartbeat sender is the only other goroutine that Sends on conn.
 	// control.Conn permits one in-flight Send, and a reload's ServeReload also
 	// Sends on conn, so the dispatch loop pauses this sender for the duration
@@ -374,7 +417,7 @@ func (s *PluginServer) runServingControl(ctx context.Context, conn *control.Conn
 	hb := newHeartbeatSender(conn, heartbeatInterval(), progress)
 	hb.start(ctx)
 
-	err := s.dispatchControl(ctx, conn, hb)
+	err := s.dispatchControl(ctx, conn, hb, reloadHooks)
 
 	hb.stop()
 
@@ -404,7 +447,9 @@ func (s *PluginServer) runServingControl(ctx context.Context, conn *control.Conn
 //
 // Heartbeat acks and any other legal-in-serving message are ignored, exactly
 // as the passive disconnect wait did before reload dispatch existed.
-func (s *PluginServer) dispatchControl(ctx context.Context, conn *control.Conn, hb *heartbeatSender) error {
+func (s *PluginServer) dispatchControl(
+	ctx context.Context, conn *control.Conn, hb *heartbeatSender, reloadHooks lifecycle.PluginReloadHooks,
+) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -446,7 +491,7 @@ func (s *PluginServer) dispatchControl(ctx context.Context, conn *control.Conn, 
 		case control.KindShutdown:
 			return nil // graceful shutdown; caller acks + tears down + exits 0.
 		case control.KindDrain:
-			retire, err := s.handleReload(ctx, conn, hb, msg)
+			retire, err := s.handleReload(ctx, conn, hb, msg, reloadHooks)
 			if err != nil {
 				return err
 			}
@@ -470,10 +515,11 @@ func (s *PluginServer) dispatchControl(ctx context.Context, conn *control.Conn, 
 // heartbeats resumed, keep serving).
 func (s *PluginServer) handleReload(
 	ctx context.Context, conn *control.Conn, hb *heartbeatSender, drainMsg *controlpb.ControlMessage,
+	reloadHooks lifecycle.PluginReloadHooks,
 ) (retire bool, err error) {
 	hb.pause()
 
-	outcome, err := lifecycle.ServeReloadAfterDrain(ctx, conn, drainMsg, s.reloadHooks)
+	outcome, err := lifecycle.ServeReloadAfterDrain(ctx, conn, drainMsg, reloadHooks)
 	if err != nil {
 		return false, err
 	}

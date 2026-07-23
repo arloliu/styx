@@ -62,9 +62,11 @@ type Label struct {
 // calls a sink method directly from a hot path — every call arrives on a single
 // dispatcher goroutine per sink — but a user may share one sink between the host
 // and plugin sides of a process, so two dispatcher goroutines can call it at
-// once. A slow or panicking implementation never stalls or crashes Styx: the
-// dispatcher delivers off the hot path, drops under backpressure, and recovers
-// panics (see Dispatcher).
+// once. A slow or panicking implementation never stalls or crashes Styx: sink
+// calls are delivered off the hot path through a bounded per-sink queue that
+// drops the oldest pending observations under sustained backpressure rather than
+// blocking a caller, and a panic in a sink method is recovered so it never
+// propagates into Styx.
 type MetricsSink interface {
 	// ObserveLatency records one observation of a latency-shaped metric.
 	ObserveLatency(metric string, d time.Duration, labels ...Label)

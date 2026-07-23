@@ -36,17 +36,18 @@ func mapCancelToTerminal(s *Stream, cause error) StreamOutcome {
 	return attempt
 }
 
-// FailAll terminates every open stream, splitting by live phase exactly as
-// table.go's FailAll splits unary calls (stream-protocol.md §7.2, §9). A
-// still-SUBMITTED stream was provably never dispatched and fails with
-// notDispatchedErr (the retryable class); a PUBLISHED stream's outcome is
-// genuinely unknown and fails with dispatchedErr (never retryable). A stream
-// that has carried any STREAM_MSG is PUBLISHED by definition. These are observed
-// terminations, so no teardown frame is emitted.
+// FailAll terminates every open stream, splitting by the frozen crash rule exactly
+// as table.go's FailAll splits unary calls (stream-protocol.md §7.2's crash split):
+// a still-SUBMITTED stream is REJECTED — not dispatched, retryable
+// (notDispatchedErr) — and a PUBLISHED stream is OUTCOME_UNKNOWN — its outcome is
+// genuinely unknown, never retryable (dispatchedErr). The opener publishes before it
+// hands the OPEN to the transport, so an accepted open is already PUBLISHED and a
+// teardown that wins while the OPEN is on the wire can never see the retryable
+// SUBMITTED phase. These are observed terminations, so no teardown frame is emitted.
 //
-// The two-attempt ordering handles the publication race: try SUBMITTED first;
-// if it loses the stream was PUBLISHED, so PUBLISHED next. An already-terminal
-// stream is skipped by both (first-terminal-wins).
+// The two-attempt ordering handles the publication race: try SUBMITTED first; if it
+// loses the stream had advanced to PUBLISHED, so the dispatched attempt covers it.
+// An already-terminal stream is skipped by both (first-terminal-wins).
 func (t *StreamTable) FailAll(dispatchedErr, notDispatchedErr error) {
 	for _, s := range t.snapshot() {
 		if s.terminate(StreamOutcome{Code: OutcomeCrashed, Err: notDispatchedErr}, 0, false, streamSubmitted) {
@@ -58,8 +59,10 @@ func (t *StreamTable) FailAll(dispatchedErr, notDispatchedErr error) {
 
 // OnPeerCrash fails every open stream with a crash outcome, mirroring the unary
 // crash fan-out (stream-protocol.md §9). Both phase classes surface as
-// OutcomeCrashed; the retryable/not distinction is carried by the crash error
-// the styx boundary supplies.
+// OutcomeCrashed with the SAME crash error — it is the same-error fan-out for a
+// caller that does not distinguish dispatch state. A teardown that must preserve
+// the retryable/not distinction (the host opener side) calls FailAll directly
+// with the two-error split instead.
 func (t *StreamTable) OnPeerCrash(crash error) {
 	t.FailAll(crash, crash)
 }

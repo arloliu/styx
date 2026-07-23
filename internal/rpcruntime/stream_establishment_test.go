@@ -86,10 +86,10 @@ func TestStreamTable_DispatchTeardownCancel_ValidatesCode(t *testing.T) {
 	require.NoError(t, tbl.DispatchTeardownCancel(999, rpcruntime.StatusCodeStreamIncompatible))
 }
 
-// DiscardBeforePublish frees a still-SUBMITTED stream's S_max slot immediately, so
-// a failed STREAM_OPEN does not leak table capacity until its deadline
+// DiscardUnaccepted frees an unaccepted STREAM_OPEN's S_max slot immediately, so a
+// failed STREAM_OPEN does not leak table capacity until its deadline
 // (stream-protocol.md §7.4).
-func TestStreamTable_DiscardBeforePublish_FreesCapacity(t *testing.T) {
+func TestStreamTable_DiscardUnaccepted_FreesCapacity(t *testing.T) {
 	tbl := rpcruntime.NewStreamTable(1, &fakeTransport{}) // S_max = 1
 	t.Cleanup(func() { _ = tbl.Close() })
 
@@ -101,9 +101,9 @@ func TestStreamTable_DiscardBeforePublish_FreesCapacity(t *testing.T) {
 	_, err = tbl.Open(2, rpcruntime.ClientStream, rpcruntime.StreamConfig{Credits: 4, Deadline: time.Minute})
 	require.ErrorIs(t, err, rpcruntime.ErrStreamsAtCapacity)
 
-	// Discarding the SUBMITTED stream frees the slot immediately.
-	st.DiscardBeforePublish(rpcruntime.ErrStreamTableClosed)
-	require.Equal(t, 0, tbl.Len(), "a discarded pre-publication stream frees its slot at once")
+	// Discarding the unaccepted stream frees the slot immediately.
+	st.DiscardUnaccepted(rpcruntime.ErrStreamTableClosed)
+	require.Equal(t, 0, tbl.Len(), "a discarded unaccepted open frees its slot at once")
 
 	_, err = tbl.Open(3, rpcruntime.ClientStream, rpcruntime.StreamConfig{Credits: 4, Deadline: time.Minute})
 	require.NoError(t, err, "capacity is restored, so a fresh open succeeds")

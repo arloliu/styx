@@ -1,4 +1,4 @@
-package observe
+package observeq
 
 // SetAfterRLockHook installs a test-only seam that runs inside Submit just after
 // the read lock is acquired and before the stopped check. It lets a test park a
