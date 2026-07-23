@@ -30,5 +30,16 @@ jobs:
             .linter.go.sum
             .buf.go.sum
 
+      # The protoc-gen-go-styx generator tests exec protoc directly; the
+      # hosted runner does not ship it. Pinned to the version the tests
+      # are developed against.
+      - name: Install protoc
+        env:
+          PROTOC_VERSION: "30.2"
+        run: |
+          curl -sSLo /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local 'bin/protoc' 'include/*'
+          protoc --version
+
       - name: Run make ci (lint, vet, test)
         run: make ci
