@@ -56,8 +56,8 @@ linters:
     - prealloc # preallocate slice capacity
 
     # -- Module hygiene --
-    - gomoddirectives # go.mod directive hygiene
-    - gomodguard      # blocked / replace modules
+    - gomoddirectives  # go.mod directive hygiene
+    - gomodguard_v2    # blocked / replace modules
 
     # -- Meta-linters (umbrella) --
     - gocritic # large opinionated check suite
@@ -97,21 +97,20 @@ linters:
     gocyclo:
       min-complexity: 30
 
-    gomodguard:
+    gomodguard_v2:
       blocked:
-        modules:
-          - github.com/golang/protobuf:
-              recommendations:
-                - google.golang.org/protobuf
-              reason: see https://developers.google.com/protocol-buffers/docs/reference/go/faq#modules
-          - github.com/satori/go.uuid:
-              recommendations:
-                - github.com/google/uuid
-              reason: satori's package is not maintained
-          - github.com/gofrs/uuid:
-              recommendations:
-                - github.com/google/uuid
-              reason: gofrs' package is not a Go module
+        - module: github.com/golang/protobuf
+          recommendations:
+            - google.golang.org/protobuf
+          reason: see https://developers.google.com/protocol-buffers/docs/reference/go/faq#modules
+        - module: github.com/satori/go.uuid
+          recommendations:
+            - github.com/google/uuid
+          reason: satori's package is not maintained
+        - module: github.com/gofrs/uuid
+          recommendations:
+            - github.com/google/uuid
+          reason: gofrs' package is not a Go module
 
     govet:
       enable-all: true
