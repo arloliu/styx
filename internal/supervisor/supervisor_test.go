@@ -1012,13 +1012,27 @@ func TestSupervisor_FreshShmRegionPerGeneration_NoLeakAcrossRestarts(t *testing.
 		"shm resources leaked across generations: before=%d after=%d", fdsBefore, countOpenFDs(t))
 }
 
+// countRegionMappings counts the shared-memory region mappings currently held by
+// this process, by matching the region memfd's name in /proc/self/maps. Each
+// CreateRegion/OpenRegion mapping is one such line, so a leaked munmap (which the
+// fd count alone cannot catch, since Region.Close closes the fd even if Munmap
+// fails) shows up as a surviving line.
+func countRegionMappings(t *testing.T) int {
+	t.Helper()
+	data, err := os.ReadFile("/proc/self/maps")
+	require.NoError(t, err)
+
+	return strings.Count(string(data), "styx-shm-region")
+}
+
 // Test that the host-side shared-memory attach closes exactly what it owns when a
 // deterministic failure is injected after EACH construction step — region create,
 // each eventfd create, after the fd transfer, after the local attach, and at the
-// ack receive. After every per-step abort the host process's open fd count returns
-// exactly to its pre-attach value, with no leak: because Region.Close and
-// Transport.Close release the mapping and its fd together, an exact fd count also
-// proves no mapping is leaked. The crash-window variants of these edges are the
+// ack receive. After every per-step abort the host process's open fd count AND its
+// region mapping count both return exactly to their pre-attach values, with no
+// leak. The fd count and the mapping count are asserted separately because
+// Region.Close closes the fd even if its Munmap fails, so an fd count alone cannot
+// prove the mapping was released. The crash-window variants of these edges are the
 // chaos suite's job; these are the deterministic unit-level counts.
 func TestSupervisor_AttachSHM_PerStepFailure_ClosesExactlyWhatItOwns(t *testing.T) {
 	steps := []string{"region-create", "hp-eventfd", "ph-eventfd", "send-fds", "attach", "ack-recv"}
@@ -1046,10 +1060,12 @@ func TestSupervisor_AttachSHM_PerStepFailure_ClosesExactlyWhatItOwns(t *testing.
 			tuple := control.Tuple{Transport: "shm", LayoutVersion: 1, Codec: "proto", Features: map[string]bool{}}
 
 			fdsBefore := countOpenFDs(t)
+			mapsBefore := countRegionMappings(t)
 			aerr := sup.AttachSHMForTest(t.Context(), hostConn, 7, tuple)
 
 			require.ErrorIs(t, aerr, injected, "the attach must abort at the injected step")
-			require.Equal(t, fdsBefore, countOpenFDs(t), "step %q leaked a host fd (and thus a mapping)", step)
+			require.Equal(t, fdsBefore, countOpenFDs(t), "step %q leaked a host fd", step)
+			require.Equal(t, mapsBefore, countRegionMappings(t), "step %q leaked a region mapping", step)
 		})
 	}
 }

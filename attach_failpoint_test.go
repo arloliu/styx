@@ -2,6 +2,8 @@ package styx_test
 
 import (
 	"errors"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/arloliu/styx"
@@ -12,6 +14,19 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
+
+// countRegionMappings counts the shared-memory region mappings this process holds,
+// by matching the region memfd's name in /proc/self/maps. Each CreateRegion or
+// OpenRegion mapping is one line, so a leaked munmap (which the fd count cannot
+// catch, since Region.Close closes the fd even if Munmap fails) shows up here as a
+// surviving line. A small local copy, mirroring internal/supervisor's own.
+func countRegionMappings(t *testing.T) int {
+	t.Helper()
+	data, err := os.ReadFile("/proc/self/maps")
+	require.NoError(t, err)
+
+	return strings.Count(string(data), "styx-shm-region")
+}
 
 // leanLayoutForAttachTest is a small valid shared-memory geometry (the lean
 // device-gateway profile) for the plugin-side per-step attach test's scripted
@@ -34,11 +49,12 @@ func leanLayoutForAttachTest() shm.Layout {
 // a deterministic failure is injected after EACH construction step — after the fd
 // receive, after each eventfd wrapper, after the local attach, and at the ack
 // send. A scripted host sends a real region and two eventfds over SCM_RIGHTS; the
-// plugin receives them, aborts at the injected step, and its process fd count
-// returns exactly to the pre-attach value. Because the region and transport close
-// release each mapping with its fd, an exact fd count also proves no mapping leak.
-// The crash-window variants are the chaos suite's job; these are the deterministic
-// unit-level counts.
+// plugin receives them, aborts at the injected step, and its process fd count AND
+// region mapping count both return exactly to their pre-attach values. The two are
+// asserted separately because Region.Close closes the fd even if its Munmap fails,
+// so an fd count alone cannot prove the mapping was released. The crash-window
+// variants are the chaos suite's job; these are the deterministic unit-level
+// counts.
 func TestPluginServer_PluginAttachSHM_PerStepFailure_ClosesExactlyWhatItOwns(t *testing.T) {
 	steps := []string{"recv-fds", "hp-wrap", "ph-wrap", "attach", "ack-send"}
 	for _, step := range steps {
@@ -82,10 +98,12 @@ func TestPluginServer_PluginAttachSHM_PerStepFailure_ClosesExactlyWhatItOwns(t *
 			tuple := control.Tuple{Transport: "shm", LayoutVersion: 1, Codec: "proto", Features: map[string]bool{}}
 
 			fdsBefore := countOpenFDs(t)
+			mapsBefore := countRegionMappings(t) // includes the scripted host's own region mapping
 			aerr := srv.PluginAttachSHMForTest(t.Context(), pluginConn, tuple)
 
 			require.ErrorIs(t, aerr, injected, "the attach must abort at the injected step")
-			require.Equal(t, fdsBefore, countOpenFDs(t), "step %q leaked a plugin fd (and thus a mapping)", step)
+			require.Equal(t, fdsBefore, countOpenFDs(t), "step %q leaked a plugin fd", step)
+			require.Equal(t, mapsBefore, countRegionMappings(t), "step %q leaked a region mapping", step)
 		})
 	}
 }
