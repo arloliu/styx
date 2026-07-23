@@ -3,6 +3,7 @@ package styx
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -356,13 +357,40 @@ func TestServeOneFrame_RetiresReservation_OnTransportErrorEdges(t *testing.T) {
 	}
 }
 
-// Test a REAL parked reader is certified quiescent. A live serve loop blocks in the
-// non-destructive readiness wait with nothing on the wire, holding no reservation;
-// waitQuiescent must certify it. Then, to prove the reader was genuinely parked and
-// alive (not dead or mid-frame), a unary request is sent and its reply observed — the
-// reader could only produce it by waking from that park.
-func TestServeLoop_ParkedReaderCertifiedQuiescent_ThenServesFrame(t *testing.T) {
-	client, plugin := newStreamingTransportPairForTest(t)
+// readSignalTransport wraps a reserving transport and signals the first time the serve
+// loop enters RecvReserving, so a test can block until the reader has provably committed
+// to the read (and, with nothing on the wire, is parked in the readiness wait) before it
+// asserts quiescence. It forwards the reserving and prober capabilities to the inner
+// transport unchanged.
+type readSignalTransport struct {
+	transport.Transport
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (t *readSignalTransport) RecvReserving(ctx context.Context, reserve func()) (transport.Frame, error) {
+	t.once.Do(func() { close(t.entered) })
+	rr, _ := t.Transport.(transport.ReservingReceiver)
+
+	return rr.RecvReserving(ctx, reserve)
+}
+
+func (t *readSignalTransport) ReadableNow() bool {
+	p, _ := t.Transport.(transport.InboundQueueProber)
+
+	return p.ReadableNow()
+}
+
+// Test a REAL parked reader is certified quiescent WHILE it is parked. The test blocks
+// until the serve loop has entered RecvReserving — with nothing on the wire it is then
+// in the non-destructive readiness wait, holding no reservation — and only then asserts
+// quiescence, so certification provably happens while the reader is parked, not before
+// its goroutine reached the read. It then proves the reader was parked-and-alive by
+// sending a request and observing the reply: the reader could only produce it by waking
+// from that park.
+func TestServeLoop_ParkedReaderCertifiedQuiescent_WhileInReadinessWait(t *testing.T) {
+	client, inner := newStreamingTransportPairForTest(t)
+	plugin := &readSignalTransport{Transport: inner, entered: make(chan struct{})}
 	coord := newDrainCoordinator()
 	leases := rpcruntime.NewLeaseTable()
 
@@ -371,10 +399,12 @@ func TestServeLoop_ParkedReaderCertifiedQuiescent_ThenServesFrame(t *testing.T) 
 		defer close(done)
 		_ = runServeLoop(t.Context(), plugin, rpcruntime.NewDispatcher(), nil, nil, coord)
 	}()
-	t.Cleanup(func() { _ = plugin.Close(); <-done })
+	t.Cleanup(func() { _ = inner.Close(); <-done })
 
-	// The reader is parked in the readiness wait: no frame is on the wire, so it holds
-	// no reservation and has consumed nothing. The predicate certifies quiescent.
+	// Block until the reader has entered RecvReserving: with nothing on the wire it is
+	// now parked in the readiness wait, holding no reservation and having consumed
+	// nothing. Certification therefore happens while the reader is provably parked.
+	<-plugin.entered
 	require.NoError(t, coord.waitQuiescent(t.Context(), plugin, leases, clearTaint),
 		"a reader parked in the readiness wait, holding no reservation, is quiescent")
 
@@ -463,49 +493,46 @@ func (t *reportingGateTransport) Recv(ctx context.Context) (transport.Frame, err
 func (t *reportingGateTransport) Close() error { return nil }
 
 // Test the acceptance-unknown cutoff join through the real sendStreamOpen and the real
-// AdmissionGate.Close: an enqueued STREAM_OPEN transfers its admission-barrier Leave to
-// the publish callback, so the reload cutoff cannot complete until that open publishes;
-// firing the callback then releases the barrier and the cutoff completes. The cross-
-// process tail (cutoff -> DrainAck under load) is the zero-drop integration test; this
-// captures the host-side seam the reviewer called out, end to end rather than at the
-// writer alone.
+// AdmissionGate.Close as ONE continuous interleaving: an enqueued STREAM_OPEN transfers
+// its admission-barrier Leave to the publish callback; the cutoff, running concurrently,
+// blocks on that outstanding open; the callback then fires the Leave; and the blocked
+// cutoff unblocks and completes — the point at which the drain may proceed to DrainAck.
+// The cross-process cutoff -> DrainAck-under-load tail is the zero-drop integration test;
+// this captures the host-side seam end to end rather than at the writer alone.
 func TestSendStreamOpen_CutoffJoinsAcceptanceUnknownOpen(t *testing.T) {
 	openFrame := transport.Frame{CallID: 1, Kind: transport.FrameStreamOpen}
 
-	t.Run("enqueued open holds the cutoff until its publish callback fires", func(t *testing.T) {
+	t.Run("cutoff blocks on the enqueued open, then its callback releases it", func(t *testing.T) {
 		c := &ClientConn{}
 		c.admission.Open()
 		require.True(t, c.admission.Enter())
 
 		tr := newReportingGateTransport(true)
-		err := c.sendStreamOpen(context.Background(), tr, openFrame)
-		require.ErrorIs(t, err, context.Canceled, "an enqueued open reports its acceptance-unknown ctx error")
-		<-tr.report // the callback the writer will fire at publish; NOT fired yet
+		require.ErrorIs(t, c.sendStreamOpen(t.Context(), tr, openFrame), context.Canceled,
+			"an enqueued open reports its acceptance-unknown ctx error")
+		stashed := <-tr.report // the writer's publish callback; NOT fired yet
 
-		// The barrier is still held by the un-fired callback, so a cutoff cannot join it
-		// and blocks until its own deadline. This proves sendStreamOpen did NOT release
-		// the Leave inline on the enqueued path.
-		blockedCtx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
-		defer cancel()
-		require.ErrorIs(t, c.admission.Close(blockedCtx), context.DeadlineExceeded,
-			"cutoff must not complete while an accepted-but-unpublished open holds the barrier")
-	})
+		// The cutoff runs concurrently and must block: the enqueued-but-unpublished open
+		// still holds the admission barrier through the callback.
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- c.admission.Close(t.Context()) }()
 
-	t.Run("firing the publish callback releases the barrier so cutoff completes", func(t *testing.T) {
-		c := &ClientConn{}
-		c.admission.Open()
-		require.True(t, c.admission.Enter())
+		// Once the gate reads closed, Close has passed its active check and is parked in
+		// the join wait (it holds the lock across both, so observing closed proves it).
+		require.Eventually(t, func() bool { return !c.admission.IsOpen() }, time.Second, time.Millisecond,
+			"cutoff marks the gate closed before joining in-flight publishers")
+		// With the barrier still held (only the un-fired callback can release it), the
+		// cutoff cannot have completed — this is a barrier invariant, not a timing bet.
+		select {
+		case <-closeDone:
+			t.Fatal("cutoff completed while an accepted-but-unpublished open still held the barrier")
+		default:
+		}
 
-		tr := newReportingGateTransport(true)
-		require.ErrorIs(t, c.sendStreamOpen(context.Background(), tr, openFrame), context.Canceled)
-		stashed := <-tr.report
-
-		// The writer publishes the enqueued open: the callback fires the barrier Leave.
+		// The writer publishes: the callback fires the barrier Leave, and the blocked
+		// cutoff joins and completes — the drain may now proceed to DrainAck.
 		stashed(true)
-
-		// The cutoff now joins with no caller in flight and completes immediately.
-		require.NoError(t, c.admission.Close(t.Context()),
-			"the callback's Leave releases the barrier, so the cutoff joins and completes")
+		require.NoError(t, <-closeDone, "the callback's Leave releases the cutoff, which then completes")
 	})
 
 	t.Run("an open that never enqueued releases the barrier inline", func(t *testing.T) {
@@ -514,7 +541,7 @@ func TestSendStreamOpen_CutoffJoinsAcceptanceUnknownOpen(t *testing.T) {
 		require.True(t, c.admission.Enter())
 
 		tr := newReportingGateTransport(false)
-		require.Error(t, c.sendStreamOpen(context.Background(), tr, openFrame),
+		require.Error(t, c.sendStreamOpen(t.Context(), tr, openFrame),
 			"a never-enqueued open surfaces its send error")
 
 		// enqueued=false: sendStreamOpen released inline, so no caller is in flight and the

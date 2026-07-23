@@ -58,6 +58,7 @@ type fakeReloadTarget struct {
 	successorPromoted *atomic.Bool
 
 	drainSent            atomic.Bool
+	drainDeadlineNanos   atomic.Int64 // the absolute deadline the host transmitted in Drain
 	resumeReceived       atomic.Bool
 	restoreSeen          atomic.Bool
 	promoted             atomic.Bool
@@ -189,6 +190,8 @@ func (f *fakeReloadTarget) handle(kind control.MessageKind, msg *controlpb.Contr
 	// obligation to answer in its current state.
 	switch kind {
 	case control.KindDrain:
+		f.drainDeadlineNanos.Store(msg.GetDrain().GetDeadlineUnixNano())
+
 		return f.handleDrain()
 	case control.KindSaveStateAck:
 		sum := msg.GetSaveStateAck().GetChecksum()
@@ -468,6 +471,42 @@ func TestTransaction_AwaitResumeAckBeforeReopeningAdmission_OnDrainAckPhaseDeadl
 	require.False(t, old.admissionOpenAtResume.Load(),
 		"admission must not reopen until the old instance's Resume is acked")
 	require.True(t, admission.IsOpen(), "a completed rollback must leave admission open again")
+}
+
+// Test the drain deadline the host transmits is strictly earlier than the instant the
+// host itself stops waiting, even when the caller context — not the DrainAck budget —
+// is the binding deadline. Otherwise a caller with an earlier deadline would time the
+// host into rollback while the plugin was still entitled to ack, letting a DrainAck
+// race the rollback that expects only ResumeAck.
+func TestTransaction_Drain_TransmitsDeadlineStrictlyBeforeHostWait_UnderTightCaller(t *testing.T) {
+	admission := &lifecycle.AdmissionGate{}
+	admission.Open()
+
+	old := newFakeReloadTarget(t, admission)
+	old.snapshotPayload = []byte("device gateway session state")
+	old.start(t)
+	successor := newFakeReloadTarget(t, admission)
+	successor.isSuccessor = true
+	successor.start(t)
+	spawnNew := func(context.Context) (lifecycle.ReloadTarget, error) { return successor, nil }
+
+	// The DrainAck budget is large, so the caller's earlier deadline is the binding wait.
+	tx := lifecycle.NewTransaction(old, spawnNew, lifecycle.DefaultPhaseDeadlines, admission)
+
+	callerDeadline := time.Now().Add(3 * time.Second)
+	ctx, cancel := context.WithDeadline(t.Context(), callerDeadline)
+	defer cancel()
+
+	_, err := tx.Run(ctx)
+	require.NoError(t, err)
+
+	require.True(t, old.drainSent.Load(), "the drain phase must have sent Drain")
+	transmitted := old.drainDeadlineNanos.Load()
+	require.Less(t, transmitted, callerDeadline.UnixNano(),
+		"the transmitted deadline must be strictly earlier than the host's effective wait")
+	gap := time.Duration(callerDeadline.UnixNano() - transmitted)
+	require.GreaterOrEqual(t, gap, 500*time.Millisecond,
+		"the transmitted deadline must trail the host wait by a real margin, not a sliver")
 }
 
 // Test transaction holding admission closed until the old instance acks Resume during rollback

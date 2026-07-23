@@ -431,6 +431,67 @@ func TestTransport_Recv_DiscardsStaleGenerationDescriptor(t *testing.T) {
 	require.Equal(t, uint64(1), ep.plugin.staleDiscarded)
 }
 
+// Test that RecvReserving takes NO reservation for a stale-generation descriptor it
+// discards, and that while the stale descriptor is still on the ring the queue reports
+// readable. This connects the transport's stale-discard path to the drain predicate:
+// the discard reserves nothing (no ingress-reservation leak the drain could never
+// clear), and step (a)'s ReadableNow blocks certification for as long as the stale
+// frame sits unconsumed (§15). Only the frame actually delivered reserves.
+func TestTransport_RecvReserving_StaleDiscard_TakesNoReservation(t *testing.T) {
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	producer := hpProducer(t, ep.region)
+
+	// A stale descriptor one generation behind, carrying a garbage payload span that
+	// would fault if the consumer wrongly dereferenced it.
+	stale := makeDesc(ring.KindUnaryReq, 1, 6)
+	stale.SetPayloadOffset(0xFFFFFFF0)
+	stale.SetPayloadLength(0xFFFF)
+	stale.SetAllocSeq(123)
+	require.NoError(t, producer.Push(stale))
+
+	// While the stale descriptor sits unconsumed on the ring, the queue is readable: the
+	// drain predicate's step (a) blocks certification, so a stale frame still in flight
+	// is never mistaken for a quiesced session.
+	require.True(t, ep.plugin.ReadableNow(), "an unconsumed descriptor keeps the queue readable")
+
+	// A valid descriptor-only CANCEL after it, so RecvReserving has a deliverable frame.
+	require.NoError(t, producer.Push(makeDesc(ring.KindCancel, 2, 7)))
+
+	var reserves int
+	f, err := ep.plugin.RecvReserving(t.Context(), func() { reserves++ })
+	require.NoError(t, err)
+	require.Equal(t, transport.FrameCancel, f.Kind)
+	require.Equal(t, uint64(2), f.CallID)
+
+	// The stale discard took NO reservation; only the delivered CANCEL did — no leak.
+	require.Equal(t, 1, reserves, "only the delivered frame reserves; the stale discard never does")
+	require.Equal(t, uint64(1), ep.plugin.staleDiscarded)
+	require.False(t, ep.plugin.ReadableNow(), "the queue is drained once both descriptors are consumed")
+}
+
+// Test that the teardown gate takes NO reservation: a deliverable frame present when the
+// region is torn down is stopped before its ring-head advance (§9/§16), so reserve never
+// fires. This connects the transport's fail-closed teardown path to the drain predicate:
+// the gate leaks no reservation, and ReadableNow keeps reporting readable off a fatally
+// failed session, so the predicate never certifies a torn-down region as quiescent.
+func TestTransport_RecvReserving_TeardownGate_TakesNoReservation(t *testing.T) {
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	producer := hpProducer(t, ep.region)
+
+	// A deliverable frame is waiting to be dispatched...
+	require.NoError(t, producer.Push(makeDesc(ring.KindCancel, 5, 7)))
+	// ...but the region is torn down before it is: the fail-closed gate stops the drain
+	// before the deliverable advance, so reserve never fires.
+	require.True(t, ep.plugin.poison.Set(PoisonBadGeometry))
+
+	require.True(t, ep.plugin.ReadableNow(), "a torn-down region never confirms empty")
+
+	var reserves int
+	_, err := ep.plugin.RecvReserving(t.Context(), func() { reserves++ })
+	require.Error(t, err, "a torn-down region surfaces a teardown error, not a frame")
+	require.Equal(t, 0, reserves, "the teardown gate stops the drain before any reservation")
+}
+
 // Test the checksum feature end to end: when negotiated, a payload round-trips
 // and is verified; a byte corrupted after stamping is detected and NOT
 // delivered (the poison protocol is elsewhere, so Recv returns errChecksum, not
