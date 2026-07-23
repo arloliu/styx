@@ -81,12 +81,40 @@ func TestValidateStartupCapacity_StrictNamedCases(t *testing.T) {
 	require.ErrorIs(t, ValidateStartupCapacity(c0, 33, false, true), ErrStrictCapacity,
 		"class-0's reserved slab-zero must make 33 fail")
 
-	// A class with far more slabs than max_data_inflight never causes rejection:
-	// only the binding (smallest) reachable class matters. Here the 4096 class has
-	// 1000 slabs, well above 26, so it is not the one that fails.
-	require.Contains(t, ValidateStartupCapacity(
+	// The binding class is the true minimum-usable-count class, which need not be
+	// the first, the last, or class 0: here a MIDDLE class (4096) has the fewest
+	// usable slabs (10), so it is the one named — a class with more slabs, even a
+	// smaller or larger one, never binds. Under the ABI's ascending, distinct-size
+	// invariant every class is a serving class for some payload, so there is no
+	// unreachable class to exempt: taking the minimum over all classes is exactly
+	// the minimum over reachable classes.
+	middleBinds := ValidateStartupCapacity(
 		symmetricLayout(4096, 256, []shm.SizeClass{
-			{SlabSize: 64, SlabCount: 4096}, {SlabSize: 4096, SlabCount: 1000}, {SlabSize: 1 << 20, SlabCount: 26},
-		}), 100, false, true).Error(),
-		"1048576", "a high-count class must not be the one named; the 1 MiB class binds")
+			{SlabSize: 64, SlabCount: 4096}, {SlabSize: 4096, SlabCount: 10}, {SlabSize: 1 << 20, SlabCount: 26},
+		}), 20, false, true)
+	require.ErrorIs(t, middleBinds, ErrStrictCapacity)
+	require.Contains(t, middleBinds.Error(), "slab_size 4096",
+		"the middle class with the fewest slabs binds, not the first, last, or class 0")
+	require.NotContains(t, middleBinds.Error(), "1048576", "a higher-count class is never the one named")
+}
+
+// Test that ValidateStartupCapacity rejects an empty size-class table with a typed
+// configuration error rather than panicking, guarding the per-frame-fit and STRICT
+// arithmetic that reads slab_size[last] before CreateRegion's structural
+// validation runs (shm-abi.md §2 requires at least one class per direction).
+func TestValidateStartupCapacity_RejectsEmptyClassTable(t *testing.T) {
+	empty := shm.Layout{
+		RingCapacity:     512,
+		LifecycleReserve: 32,
+		Arenas: [2]shm.ArenaGeometry{
+			shm.HostToPlugin: {Classes: nil},
+			shm.PluginToHost: {Classes: nil},
+		},
+	}
+
+	require.NotPanics(t, func() {
+		err := ValidateStartupCapacity(empty, 32, false, false)
+		require.ErrorIs(t, err, ErrCapacity)
+		require.Contains(t, err.Error(), "size-class table is empty")
+	})
 }

@@ -110,6 +110,15 @@ func (g ShmGeometry) toLayout() shm.Layout {
 	hp := src.HostToPlugin
 	ph := src.PluginToHost
 	switch {
+	case len(hp) == 0 && len(ph) == 0:
+		// A custom ring geometry (RingCapacity/LifecycleReserve set) that left both
+		// class tables empty is not the full zero value, so it did not take the
+		// default profile above. The ABI requires at least one class per direction,
+		// and this form is documented to select the default profile's classes — so
+		// apply them here, keeping the caller's custom ring geometry. Without this
+		// both arenas would be empty and slabSizeLast would index Classes[-1].
+		def := GeometryDefault()
+		hp, ph = def.HostToPlugin, def.PluginToHost
 	case len(hp) == 0:
 		hp = ph
 	case len(ph) == 0:

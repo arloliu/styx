@@ -469,6 +469,19 @@ func ValidateAcknowledgedTuple(hostOffer Offer, ack *controlpb.HelloAck) (Tuple,
 	pluginOffer := HelloToOffer(ack.GetPluginOffer())
 	pluginServices := serviceVersionsFromAck(ack)
 
+	// Reject a duplicate service advertisement before any fd is created: a service
+	// must appear at most once. Negotiate's checkServices indexes the advertised
+	// versions into a map, so a forged ack repeating a service name would otherwise
+	// be silently collapsed (a later entry overwriting an earlier one) and pass the
+	// recompute-and-compare below.
+	if dup, ok := firstDuplicateService(pluginServices); ok {
+		return Tuple{}, &IncompatibleError{
+			HostOffer:   hostOffer,
+			PluginOffer: pluginOffer,
+			Reason:      fmt.Sprintf("acknowledged tuple: service %q advertised more than once", dup),
+		}
+	}
+
 	recomputed, err := Negotiate(hostOffer, pluginOffer, pluginServices)
 	if err != nil {
 		var ie *IncompatibleError
@@ -503,6 +516,22 @@ func tupleEqual(a, b Tuple) bool {
 		a.LayoutVersion == b.LayoutVersion &&
 		a.Codec == b.Codec &&
 		maps.Equal(a.Features, b.Features)
+}
+
+// firstDuplicateService returns the first service name that appears more than
+// once in svs, and whether one was found. It preserves the pre-collapse view a
+// map cannot: checkServices later indexes these into a map, so a duplicate would
+// otherwise be invisible to the recompute-and-compare.
+func firstDuplicateService(svs []ServiceVersion) (string, bool) {
+	seen := make(map[string]struct{}, len(svs))
+	for _, sv := range svs {
+		if _, dup := seen[sv.Service]; dup {
+			return sv.Service, true
+		}
+		seen[sv.Service] = struct{}{}
+	}
+
+	return "", false
 }
 
 // serviceVersionsFromAck projects the plugin's advertised service versions off a

@@ -135,6 +135,16 @@ func ValidateStartupCapacity(layout shm.Layout, maxInflight int, checksum, stric
 		return fmt.Errorf("shm: max_data_inflight %d must be positive: %w", maxInflight, ErrCapacity)
 	}
 
+	// The ABI requires at least one size class per direction (shm-abi.md §2). Guard
+	// it before the per-frame-fit and STRICT checks read slab_size[last], so an
+	// empty class table is a typed configuration error, never an index-out-of-range
+	// panic ahead of CreateRegion's structural validation.
+	for dir := range layout.Arenas {
+		if len(layout.Arenas[dir].Classes) == 0 {
+			return fmt.Errorf("shm: direction %d: size-class table is empty: %w", dir, ErrCapacity)
+		}
+	}
+
 	budget := int(layout.RingCapacity) - int(layout.LifecycleReserve)
 	if maxInflight > budget {
 		return fmt.Errorf("shm: max_data_inflight %d exceeds data budget C-R = %d: %w",

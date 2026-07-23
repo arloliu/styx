@@ -484,6 +484,18 @@ func TestValidateAcknowledgedTuple_RejectsForgedAck(t *testing.T) {
 				ack.GetPluginOffer().Transports = []string{"uds"}
 			},
 		},
+		{
+			name: "duplicate service advertisement",
+			tamper: func(ack *controlpb.HelloAck) {
+				// The same service advertised twice: checkServices would collapse the
+				// duplicate into a map (a later entry overwriting an earlier one), so
+				// the recompute-and-compare cannot see it — it must be rejected up front.
+				ack.Services = []*controlpb.ServiceVersion{
+					{Service: "echo.Echo", Version: 1},
+					{Service: "echo.Echo", Version: 2},
+				}
+			},
+		},
 	}
 
 	for _, tc := range cases {
