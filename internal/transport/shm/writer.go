@@ -141,6 +141,14 @@ type writer struct {
 	// (shm-abi.md §5).
 	checksum bool
 
+	// maxStored is the largest stored length (payload plus per-frame overhead) this
+	// writer's outbound arena can hold — its largest slab_size (shm-abi.md §18). The
+	// build-time payload guard bounds the message against it (minus overhead) rather
+	// than the fixed uds framing constant, so a valid geometry whose largest class
+	// exceeds 1 MiB works. It is 0 only in isolated unit tests with no attached
+	// region, which fall back to the uds framing limit.
+	maxStored uint32
+
 	// signal runs the §12 producer signal after each successful publish: it wakes
 	// a parked consumer via the outbound eventfd. It is injected so isolated tests
 	// pass a no-op; production wires the real park-state/eventfd/poison/shutdown
@@ -873,23 +881,31 @@ func wirePayload(f transport.Frame) []byte {
 // continuous traffic never leaks (§6). ErrExhausted is typed backpressure
 // (retry later); ErrTooLarge is a terminal reject.
 func (w *writer) stampPayload(i intent, d ring.Descriptor, wire []byte) (ring.Descriptor, buildStatus) {
+	crcTrailer := 0
+	if w.checksum {
+		crcTrailer = crc32TrailerLen
+	}
+
 	// The transport surface bounds payload length before submit, so this is a
 	// defensive fail-closed guard against a caller bug: without it an oversize
 	// length would truncate in the uint32 cast, alloc a too-small slab, and panic
 	// in the copy below inside the writer goroutine. Reject it terminally instead.
-	// MaxFrameSize is far below math.MaxUint32, so past this guard every uint32
-	// cast is safe.
+	// The bound is this direction's derived max_payload (its largest slab minus
+	// overhead, shm-abi.md §18), so a valid geometry whose largest class exceeds
+	// 1 MiB is not rejected here; it falls back to the uds framing constant only in
+	// isolated tests with no attached region (maxStored 0). Both are far below
+	// math.MaxUint32, so past this guard every uint32 cast is safe.
 	msgLen := len(wire)
-	if msgLen > transport.MaxFrameSize {
+	maxMsg := transport.MaxFrameSize
+	if w.maxStored != 0 {
+		maxMsg = int(w.maxStored) - crcTrailer
+	}
+	if msgLen > maxMsg {
 		w.report(i, transport.ErrPayloadTooLarge)
 
 		return d, buildFailed
 	}
 
-	crcTrailer := 0
-	if w.checksum {
-		crcTrailer = crc32TrailerLen
-	}
 	storedLen := msgLen + crcTrailer
 
 	// Head-gated reclaim before reserving: free slabs the consumer's head has

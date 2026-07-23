@@ -359,3 +359,19 @@ func TestHost_Events_DeliversLatestGaveUp_AfterBurst_WithWedgedReader(t *testing
 	require.Len(t, dropped, 1)
 	require.Positive(t, dropped[0], "expected the informational burst to be counted as dropped")
 }
+
+// TestExternalGeometryFixture_Compiles builds the external-module fixture under
+// testdata/externalgeometry, which imports the public styx module from OUTSIDE it
+// and configures every public shared-memory geometry form (ShmGeometry, the
+// GeometryDefault/GeometryLean profile helpers, and the PluginSpec Transport /
+// Geometry / MaxDataInflight / StrictCapacity knobs). Successful compilation is
+// the assertion: an external user cannot import internal/shm, so the public
+// geometry API must expose no internal types. It is built, never run.
+func TestExternalGeometryFixture_Compiles(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "externalgeometry")
+	cmd := exec.Command("go", "build", "-o", out, ".")
+	cmd.Dir = "testdata/externalgeometry"
+	combined, err := cmd.CombinedOutput()
+	require.NoError(t, err,
+		"the external-module geometry fixture must compile against the public API alone:\n%s", string(combined))
+}

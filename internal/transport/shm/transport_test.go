@@ -1962,3 +1962,40 @@ func TestTransport_CountersResetToZero_AcrossGenerationChange(t *testing.T) {
 		require.Zero(t, tr.WakeupSyscalls())
 	}
 }
+
+// Test that the derived per-direction payload limit governs, not the old fixed
+// 1 MiB constant: an explicit geometry whose largest class exceeds 1 MiB attaches
+// and round-trips a payload above 1 MiB (both the pre-submit guard and the
+// writer's stamp guard honor the derived limit), while a payload above the
+// direction's derived limit still fails with the typed ErrPayloadTooLarge.
+func TestTransport_PayloadAboveOneMiB_RoundTrips_WhenGeometryAllows(t *testing.T) {
+	const twoMiB = 2 << 20
+	classes := []shm.SizeClass{{SlabSize: 64, SlabCount: 4}, {SlabSize: twoMiB, SlabCount: 2}}
+	layout := shm.Layout{
+		Generation:       3,
+		RingCapacity:     64,
+		LifecycleReserve: 8,
+		Arenas: [2]shm.ArenaGeometry{
+			shm.HostToPlugin: {Classes: classes},
+			shm.PluginToHost: {Classes: classes},
+		},
+	}
+	// MaxPayload 0 => derive the per-direction limit (2 MiB) from the geometry.
+	ep := newEndpoints(t, layout, Config{MaxInflight: 4, DataQueueDepth: 8, LifecycleQueueDepth: 8})
+
+	// A 1.5 MiB payload — above the old fixed 1 MiB limit — round-trips intact.
+	big := make([]byte, 3*(1<<20)/2)
+	for i := range big {
+		big[i] = byte(i)
+	}
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: big}))
+	got := recvOne(t, ep.plugin)
+	require.Equal(t, big, got.Payload)
+
+	// A payload above the direction's derived limit (2 MiB) still fails with the
+	// typed error, rejected at Send before any write.
+	err := ep.host.Send(t.Context(),
+		transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq, Payload: make([]byte, twoMiB+1)})
+	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+}

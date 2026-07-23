@@ -103,3 +103,89 @@ func validateCapacityInvariant(cfg Config, layout shm.Layout) error {
 func slabSizeLast(a shm.ArenaGeometry) uint32 {
 	return a.Classes[len(a.Classes)-1].SlabSize
 }
+
+// ErrStrictCapacity is returned by ValidateStartupCapacity when a geometry fails
+// the frozen ABI's optional STRICT certification (shm-abi.md §18): the selected
+// peak concurrency exceeds some reachable size class's usable slab count, so an
+// admitted data call could hit arena exhaustion. It is an opt-in refusal (only
+// under StrictCapacity), distinct from the two mandatory checks' ErrCapacity, and
+// its message names the offending class. Callers match it with errors.Is.
+var ErrStrictCapacity = errors.New("shm: geometry fails STRICT capacity certification")
+
+// ValidateStartupCapacity enforces the frozen ABI's startup capacity rules
+// (shm-abi.md §18) against the host-selected maxInflight, meant to run at spawn
+// configuration BEFORE the region is created so an over-admitting geometry is
+// refused up front (a fail-fast mirror of the same two mandatory checks Attach's
+// validateCapacityInvariant re-enforces on the mapped region):
+//
+//   - Mandatory (i) deadlock-freedom: maxInflight <= C - R.
+//   - Mandatory (ii) per-frame fit: each direction's largest slab is big enough to
+//     hold a positive payload after the negotiated overhead (slab_size[last] >
+//     overhead), which shm-abi.md §1's slab_size[last] >= 4096 rule already
+//     guarantees; checked defensively.
+//   - Optional STRICT (only when strict is set): maxInflight <= the usable slab
+//     count of every reachable size class, per direction (class 0 subtracts the
+//     reserved slab-zero, shm-abi.md §6). When it holds, no admitted data call can
+//     ever hit arena exhaustion. A failure names the binding class and returns
+//     ErrStrictCapacity; a non-STRICT geometry that fails this is still valid and
+//     simply experiences typed backpressure under load, so it is refused ONLY
+//     under the opt-in.
+func ValidateStartupCapacity(layout shm.Layout, maxInflight int, checksum, strict bool) error {
+	if maxInflight <= 0 {
+		return fmt.Errorf("shm: max_data_inflight %d must be positive: %w", maxInflight, ErrCapacity)
+	}
+
+	budget := int(layout.RingCapacity) - int(layout.LifecycleReserve)
+	if maxInflight > budget {
+		return fmt.Errorf("shm: max_data_inflight %d exceeds data budget C-R = %d: %w",
+			maxInflight, budget, ErrCapacity)
+	}
+
+	overhead := 0
+	if checksum {
+		overhead = crc32TrailerLen
+	}
+	for dir := range layout.Arenas {
+		if int(slabSizeLast(layout.Arenas[dir])) <= overhead {
+			return fmt.Errorf("shm: direction %d: largest slab cannot hold a positive payload after overhead %d: %w",
+				dir, overhead, ErrCapacity)
+		}
+	}
+
+	if !strict {
+		return nil
+	}
+
+	// STRICT holds iff max_data_inflight does not exceed the SMALLEST usable slab
+	// count across a direction's reachable classes (shm-abi.md §18). Find that
+	// binding class per direction and, if it is exceeded, name it — the
+	// most-constrained class, not merely the first one that fails.
+	for dir := range layout.Arenas {
+		classes := layout.Arenas[dir].Classes
+		bindClass, bindUsable := 0, usableSlabs(classes[0], 0)
+		for ci := 1; ci < len(classes); ci++ {
+			if u := usableSlabs(classes[ci], ci); u < bindUsable {
+				bindClass, bindUsable = ci, u
+			}
+		}
+		if maxInflight > bindUsable {
+			return fmt.Errorf(
+				"shm: STRICT: direction %d class %d (slab_size %d) has %d usable slabs < max_data_inflight %d: %w",
+				dir, bindClass, classes[bindClass].SlabSize, bindUsable, maxInflight, ErrStrictCapacity)
+		}
+	}
+
+	return nil
+}
+
+// usableSlabs returns a size class's usable slab count: its slab_count, with class
+// 0's reserved slab-zero subtracted (payload_offset 0 means "no slab", shm-abi.md
+// §6).
+func usableSlabs(c shm.SizeClass, classIndex int) int {
+	usable := int(c.SlabCount)
+	if classIndex == 0 {
+		usable--
+	}
+
+	return usable
+}

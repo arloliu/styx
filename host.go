@@ -102,6 +102,33 @@ type PluginSpec struct {
 	// it; the default (false) offers streaming as optional, so a non-streaming
 	// plugin still negotiates unary calls.
 	RequireStreaming bool
+
+	// Transport selects this plugin's data-plane transport: "shm" pins the
+	// shared-memory transport (a plugin that cannot speak it fails the handshake,
+	// never a silent downgrade to uds), "uds" pins Unix-domain sockets, and "auto"
+	// (also the empty-string default) offers both with the shared-memory transport
+	// preferred, falling back to uds only when the plugin does not offer it.
+	Transport string
+
+	// Geometry is the host-authored shared-memory region geometry, used when the
+	// shared-memory transport is negotiated. The zero value selects the default
+	// profile (GeometryDefault); a profile helper (GeometryDefault, GeometryLean)
+	// or an explicit ShmGeometry overrides it. Ignored for the uds transport.
+	Geometry ShmGeometry
+
+	// MaxDataInflight is the host-selected peak concurrent data frames, carried to
+	// the plugin so both sides admit identically (shm-abi.md §18). Zero falls back
+	// to the geometry's data budget C − R. Ignored for the uds transport.
+	MaxDataInflight int
+
+	// StrictCapacity opts into the frozen ABI's optional STRICT certification
+	// (shm-abi.md §18): the transport additionally requires MaxDataInflight not to
+	// exceed any reachable size class's usable slab count, so no admitted data call
+	// can ever hit arena exhaustion. A geometry that fails STRICT is refused at
+	// spawn with a typed error naming the offending class. Off by default; a
+	// non-STRICT geometry is still valid and simply experiences typed backpressure
+	// under load. Ignored for the uds transport.
+	StrictCapacity bool
 }
 
 // ServiceRequirement is the host's declared acceptable version range for
@@ -308,8 +335,16 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 		Restart:          spec.Restart,
 		Services:         toControlServiceRequirements(spec.Services),
 		RequireStreaming: spec.RequireStreaming,
-		OnHeartbeatMiss:  h.heartbeatMissHook(spec.Name),
-		OnRestart:        h.restartHook(spec.Name),
+		// The public default (empty Transport) is "auto": offer the shared-memory
+		// transport, preferred, with a uds fallback. The host authors geometry
+		// (converted from the public ShmGeometry) and selects peak concurrency and
+		// the optional STRICT certification.
+		Transport:       resolveTransport(spec.Transport),
+		ShmLayout:       spec.Geometry.toLayout(),
+		MaxDataInflight: spec.MaxDataInflight,
+		StrictCapacity:  spec.StrictCapacity,
+		OnHeartbeatMiss: h.heartbeatMissHook(spec.Name),
+		OnRestart:       h.restartHook(spec.Name),
 		// The reload transaction drives the SAME admission gate a caller's
 		// Invoke checks, so a cutoff a reload begins is the cutoff Invoke
 		// observes. internal/supervisor never names *ClientConn; it holds only
@@ -830,6 +865,19 @@ func translateEventErr(name string, err error) error {
 	}
 
 	return errors.New(err.Error())
+}
+
+// resolveTransport maps a PluginSpec.Transport value to the supervisor's
+// transport preference, defaulting the empty string to "auto" — so a plugin with
+// no explicit choice offers the shared-memory transport preferred, with a uds
+// fallback. Any other value passes through: "shm" pins shared memory, "uds" pins
+// Unix-domain sockets, and an unrecognized value degrades to uds at the offer.
+func resolveTransport(t string) string {
+	if t == "" {
+		return "auto"
+	}
+
+	return t
 }
 
 // toControlServiceRequirements projects PluginSpec.Services into

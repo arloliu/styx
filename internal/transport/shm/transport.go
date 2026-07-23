@@ -473,6 +473,9 @@ func newTransport(region regionHandle, layout shm.Layout, p AttachParams) (*Tran
 	}
 
 	w := attachNewWriter(outRing, outArena, p.Config, gen.Truncated(), uint64(layout.RingCapacity), sig.signal, poison)
+	// The writer's build-time payload guard bounds against this direction's largest
+	// slab (its derived max_payload), not the fixed uds framing constant.
+	w.maxStored = slabSizeLast(layout.Arenas[outDir])
 
 	// Per-direction max_payload: the largest slab minus the negotiated per-frame
 	// overhead (4 for the CRC32C trailer when checksum is negotiated; trace is out
@@ -554,7 +557,11 @@ func (t *Transport) Send(ctx context.Context, f transport.Frame) error {
 	// intent.wire), so the bytes validated here and the bytes eventually stamped
 	// are identical.
 	wire := wirePayload(f)
-	if len(wire) > int(t.maxPayload) || len(wire) > transport.MaxFrameSize {
+	// Bound the frame by the negotiated per-direction max_payload derived from the
+	// region geometry (shm-abi.md §18), NOT the uds framing constant: a valid
+	// shared-memory geometry whose largest class exceeds 1 MiB must be able to
+	// carry a payload above 1 MiB.
+	if len(wire) > int(t.maxPayload) {
 		return transport.ErrPayloadTooLarge
 	}
 

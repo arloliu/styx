@@ -10,9 +10,14 @@ import (
 	"time"
 )
 
-// MaxFrameSize bounds Payload length; a larger Payload is rejected by
-// Send before any write with a typed error.
-const MaxFrameSize = 1 << 20 // 1 MiB, matching the largest benchmark payload size
+// MaxFrameSize is the uds transport's framing limit: it bounds Payload length
+// over Unix-domain sockets, where a larger Payload is rejected by Send before any
+// write with a typed error. It is NOT an ABI limit for the shared-memory
+// transport, which bounds each direction's payload by its derived per-direction
+// max_payload (the largest size class minus per-frame overhead, shm-abi.md §18) —
+// so a shared-memory geometry with a size class above 1 MiB carries payloads
+// above 1 MiB. The constant matches the largest benchmark payload size.
+const MaxFrameSize = 1 << 20 // 1 MiB
 
 // ErrUnimplementedFrameKind is returned by Send/Recv for a frame kind this
 // transport does not carry under layout_version 1: an out-of-range byte a

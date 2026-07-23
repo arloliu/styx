@@ -283,6 +283,13 @@ type Config struct {
 	// (shm-abi.md §18). Zero falls back to the geometry's data budget C - R.
 	MaxDataInflight int
 
+	// StrictCapacity opts into the frozen ABI's optional STRICT certification
+	// (shm-abi.md §18): the shared-memory attach additionally requires the selected
+	// peak concurrency not to exceed any reachable size class's usable slab count,
+	// refusing to spawn with a typed error naming the offending class. Off by
+	// default (the two mandatory ABI checks still apply).
+	StrictCapacity bool
+
 	// ResetWindow restores the restart budget — the restart policy's reset
 	// window: once an instance has stayed continuously Ready
 	// for at least ResetWindow, a subsequent crash's restart bookkeeping
@@ -1143,6 +1150,16 @@ func (s *Supervisor) attachSHM(
 ) (tr transport.Transport, res *shmHostResources, err error) {
 	layout := s.cfg.ShmLayout
 	layout.Generation = generation // a fresh region per generation (never reused)
+	maxInflight := s.shmMaxDataInflight(layout)
+
+	// Enforce the two mandatory ABI capacity checks (and opt-in STRICT) at spawn
+	// configuration, before any region is created, so an over-admitting geometry
+	// is refused up front (shm-abi.md §18).
+	if verr := shmtransport.ValidateStartupCapacity(
+		layout, maxInflight, tuple.Features["checksum"], s.cfg.StrictCapacity,
+	); verr != nil {
+		return nil, nil, fmt.Errorf("supervisor: handshake: shm capacity: %w", verr)
+	}
 
 	region, rerr := shm.CreateRegion(layout)
 	if rerr != nil {
@@ -1176,7 +1193,6 @@ func (s *Supervisor) attachSHM(
 	}()
 
 	regionSize := region.Layout().RegionSize
-	maxInflight := s.shmMaxDataInflight(layout)
 
 	attachMsg := &controlpb.ControlMessage{
 		Body: &controlpb.ControlMessage_AttachRegion{
