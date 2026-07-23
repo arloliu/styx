@@ -15,6 +15,7 @@ import (
 
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/lifecycle"
+	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/stretchr/testify/require"
 )
@@ -845,4 +846,91 @@ func TestHostOffer_RequiresStreaming_FromConfig(t *testing.T) {
 	}
 	_, err := control.Negotiate(required.HostOfferForTest(), pluginNoStream, nil)
 	require.Error(t, err, "a non-streaming plugin fails the handshake against a streaming-required host")
+}
+
+// leanShmLayout is a small valid shared-memory geometry for the cross-process
+// attach tests: C = 512 ring slots, R = 32 reserved, and a 512 B / 4096 B class
+// table per direction (region ~0.6 MiB). Generation is left 0; attachSHM stamps
+// the real per-instance generation.
+func leanShmLayout() shm.Layout {
+	classes := []shm.SizeClass{{SlabSize: 512, SlabCount: 64}, {SlabSize: 4096, SlabCount: 64}}
+
+	return shm.Layout{
+		RingCapacity:     512,
+		LifecycleReserve: 32,
+		Arenas: [2]shm.ArenaGeometry{
+			shm.HostToPlugin: {Classes: classes},
+			shm.PluginToHost: {Classes: classes},
+		},
+	}
+}
+
+// countOpenFDs counts this process's open file descriptors via /proc/self/fd, so
+// a test can assert the host closed the region and both eventfds it created for a
+// shared-memory attach — no fd leak after teardown.
+func countOpenFDs(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
+
+	return len(entries)
+}
+
+// Test that a host configured for the shared-memory transport negotiates it and
+// attaches CROSS-PROCESS to a real spawned plugin: both sides transfer the region
+// and two eventfds over the control conn, both Attach, and the instance reaches
+// Ready. Tearing it down closes every host-owned fd (the original region and both
+// eventfds) with no leak — the ownership contract, exercised end to end.
+func TestSupervisor_AttachesSharedMemoryCrossProcess_ThenTearsDownWithoutLeak(t *testing.T) {
+	// Given: a host pinned to the shared-memory transport with a valid geometry.
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	cfg := supervisor.Config{
+		Spec:              lifecycle.Spec{Path: fixtureReadyPlugin},
+		Restart:           supervisor.RestartPolicy{Max: 0},
+		HeartbeatInterval: 100 * time.Millisecond,
+		Transport:         "shm",
+		ShmLayout:         leanShmLayout(),
+		MaxDataInflight:   32,
+		// Mirror the styx layer's own teardown wiring (wireConnState): the
+		// transport's Close (which stops the writer, unmaps the transport's
+		// duplicate region, and closes its duplicated fd) is the caller's
+		// responsibility via ReadyHooks.JoinGoroutines. The supervisor closes the
+		// ORIGINAL region and the two eventfds itself (shmHostResources).
+		OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
+			return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	fdsBefore := countOpenFDs(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// When: the instance reaches Ready — the cross-process shared-memory attach
+	// (region + two eventfds over SCM_RIGHTS, both ends attached, ack-after-
+	// construct) has completed.
+	first := requireEvent(t, ch)
+	second := requireEvent(t, ch)
+	require.Equal(t, supervisor.EventStarting, first.Kind)
+	require.Equal(t, supervisor.EventReady, second.Kind,
+		"a shared-memory host and a real plugin must negotiate shm and attach cross-process")
+
+	// Then: Stop tears the instance down, Run returns, and every host-owned fd
+	// (region + two eventfds) is released — the fd count returns to its baseline.
+	require.NoError(t, sup.Stop(t.Context()))
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Stop")
+	}
+
+	require.Eventually(t, func() bool { return countOpenFDs(t) <= fdsBefore }, 2*time.Second, 20*time.Millisecond,
+		"host leaked fds after shared-memory teardown (region/eventfds not closed): before=%d after=%d",
+		fdsBefore, countOpenFDs(t))
 }

@@ -30,6 +30,15 @@ const (
 	// RPC (stream-protocol.md §11.1). Both offers list it as supported; the
 	// acknowledged tuple carries streaming=true only when both sides do.
 	featureStreaming = "streaming"
+
+	// shmDataQueueDepth and shmLifecycleQueueDepth size the plugin-side
+	// shared-memory writer's two bounded in-process submission queues (shm.Config,
+	// process-local — each side sets its own, no negotiation). They mirror the
+	// host-side defaults: a data queue deep enough to pipeline a burst of
+	// concurrent submissions ahead of the single writer, and a smaller lifecycle
+	// queue (a lifecycle intent is bounded per in-flight call, shm-abi.md §18b).
+	shmDataQueueDepth      = 256
+	shmLifecycleQueueDepth = 64
 )
 
 // HostConfig configures a Host before Start.

@@ -17,7 +17,9 @@ import (
 func (s *Supervisor) HandshakeAndAttachForTest(
 	ctx context.Context, conn *control.Conn, generation uint64,
 ) (transport.Transport, bool, error) {
-	return s.handshakeAndAttach(ctx, conn, generation)
+	hs, err := s.handshakeAndAttach(ctx, conn, generation)
+
+	return hs.tr, hs.streaming, err
 }
 
 // FakeInstance is a test-built stand-in for one spawned instance: the control

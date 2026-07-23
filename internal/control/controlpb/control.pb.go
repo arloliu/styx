@@ -789,8 +789,13 @@ type AttachRegion struct {
 	LayoutSize    uint64                 `protobuf:"varint,2,opt,name=layout_size,json=layoutSize,proto3" json:"layout_size,omitempty"`
 	LayoutVersion uint32                 `protobuf:"varint,3,opt,name=layout_version,json=layoutVersion,proto3" json:"layout_version,omitempty"`
 	FdCount       uint32                 `protobuf:"varint,4,opt,name=fd_count,json=fdCount,proto3" json:"fd_count,omitempty"` // declared fd count carried via SCM_RIGHTS
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// max_data_inflight is the host-selected peak concurrent data frames the
+	// plugin must configure its admission with, so both sides build the same
+	// MaxInflight (shm-abi.md §18's deadlock-freedom bound is C - R; the host may
+	// select any value at or below it). Carried only on a shared-memory attach.
+	MaxDataInflight uint32 `protobuf:"varint,5,opt,name=max_data_inflight,json=maxDataInflight,proto3" json:"max_data_inflight,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *AttachRegion) Reset() {
@@ -847,6 +852,13 @@ func (x *AttachRegion) GetLayoutVersion() uint32 {
 func (x *AttachRegion) GetFdCount() uint32 {
 	if x != nil {
 		return x.FdCount
+	}
+	return 0
+}
+
+func (x *AttachRegion) GetMaxDataInflight() uint32 {
+	if x != nil {
+		return x.MaxDataInflight
 	}
 	return 0
 }
@@ -1657,7 +1669,7 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\bservices\x18\n" +
 	" \x03(\v2\x1c.styx.control.ServiceVersionR\bservices\x12/\n" +
 	"\x13incompatible_reason\x18\v \x01(\tR\x12incompatibleReason\x126\n" +
-	"\fplugin_offer\x18\f \x01(\v2\x13.styx.control.HelloR\vpluginOffer\"\x91\x01\n" +
+	"\fplugin_offer\x18\f \x01(\v2\x13.styx.control.HelloR\vpluginOffer\"\xbd\x01\n" +
 	"\fAttachRegion\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\x04R\n" +
@@ -1665,7 +1677,8 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\vlayout_size\x18\x02 \x01(\x04R\n" +
 	"layoutSize\x12%\n" +
 	"\x0elayout_version\x18\x03 \x01(\rR\rlayoutVersion\x12\x19\n" +
-	"\bfd_count\x18\x04 \x01(\rR\afdCount\"\x11\n" +
+	"\bfd_count\x18\x04 \x01(\rR\afdCount\x12*\n" +
+	"\x11max_data_inflight\x18\x05 \x01(\rR\x0fmaxDataInflight\"\x11\n" +
 	"\x0fAttachRegionAck\"\x8c\x01\n" +
 	"\x12ActiveHandlerLease\x12\x17\n" +
 	"\acall_id\x18\x01 \x01(\x04R\x06callId\x12&\n" +

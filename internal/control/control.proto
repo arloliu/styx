@@ -94,6 +94,11 @@ message AttachRegion {
   uint64 layout_size = 2;
   uint32 layout_version = 3;
   uint32 fd_count = 4; // declared fd count carried via SCM_RIGHTS
+  // max_data_inflight is the host-selected peak concurrent data frames the
+  // plugin must configure its admission with, so both sides build the same
+  // MaxInflight (shm-abi.md §18's deadlock-freedom bound is C - R; the host may
+  // select any value at or below it). Carried only on a shared-memory attach.
+  uint32 max_data_inflight = 5;
 }
 message AttachRegionAck {}
 

@@ -13,11 +13,13 @@ import (
 	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/control/controlpb"
+	"github.com/arloliu/styx/internal/event"
 	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/observeq"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/transport"
+	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 	"github.com/arloliu/styx/observe"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
@@ -172,21 +174,26 @@ func (s *PluginServer) Serve() error {
 func (s *PluginServer) serve(ctx context.Context) error {
 	conn := control.NewConn(controlChildFD, firstGeneration)
 
-	streaming, err := s.pluginHandshake(ctx, conn)
+	tuple, err := s.pluginHandshake(ctx, conn)
 	if err != nil {
 		_ = conn.Close()
 
 		return fmt.Errorf("styx: serve: handshake: %w", err)
 	}
 
-	tr, err := s.pluginAttach(ctx, conn, streaming)
+	tr, shmRes, err := s.pluginAttach(ctx, conn, tuple)
 	if err != nil {
 		_ = conn.Close()
 
 		return fmt.Errorf("styx: serve: attach: %w", err)
 	}
 
-	err = s.runServing(ctx, conn, tr, streaming)
+	err = s.runServing(ctx, conn, tr, tuple.Features[featureStreaming])
+	// runServing has released the data-plane transport (its own duplicate region
+	// mapping + fd) before returning; the two received eventfds — which the
+	// transport does not own (shm.AttachParams) — are the plugin's to close now,
+	// after nothing can touch them. A no-op for uds (shmRes nil).
+	shmRes.close()
 	_ = conn.Close()
 
 	return err
@@ -550,11 +557,11 @@ func isReloadSuccessor() bool {
 // before Serve exits, so the host can translate the failure into a typed
 // *styx.IncompatibleError instead of only observing a connection
 // loss indistinguishable from any other crash.
-func (s *PluginServer) pluginHandshake(ctx context.Context, conn *control.Conn) (streaming bool, err error) {
+func (s *PluginServer) pluginHandshake(ctx context.Context, conn *control.Conn) (control.Tuple, error) {
 	helloMsg, err := recvControl(ctx, conn, control.StateHandshaking, control.KindHello,
 		control.ReplyDeadlines[control.KindHello])
 	if err != nil {
-		return false, err
+		return control.Tuple{}, err
 	}
 
 	hello := helloMsg.GetHello()
@@ -569,18 +576,19 @@ func (s *PluginServer) pluginHandshake(ctx context.Context, conn *control.Conn) 
 		rejectMsg := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_HelloAck{HelloAck: rejectAck}}
 		_ = sendControl(ctx, conn, rejectMsg, control.ReplyDeadlines[control.KindHello])
 
-		return false, err
+		return control.Tuple{}, err
 	}
 
 	ack := control.TupleToHelloAck(tuple, hello.GetNonce(), control.PluginIdentity{}, services, offer)
 	ackMsg := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_HelloAck{HelloAck: ack}}
 	if err := sendControl(ctx, conn, ackMsg, control.ReplyDeadlines[control.KindHello]); err != nil {
-		return false, err
+		return control.Tuple{}, err
 	}
 
-	// The acknowledged streaming state fixes the data-plane header shape both
-	// sides derive from the same tuple (stream-protocol.md §2.4).
-	return tuple.Features[featureStreaming], nil
+	// The acknowledged tuple fixes the data-plane transport and, for streaming,
+	// the uds header shape — both sides derive them from this same tuple
+	// (stream-protocol.md §2.4; shm-abi.md §19).
+	return tuple, nil
 }
 
 // incompatibleReason extracts the best available reason string from a
@@ -604,10 +612,48 @@ func incompatibleReason(err error) string {
 	return err.Error()
 }
 
-// pluginAttach performs the plugin side of AttachRegion -> AttachRegionAck:
-// it receives the data-plane fd over the control socket (via SCM_RIGHTS),
-// acknowledges, and wraps the fd in a UDS transport.
+// pluginShmResources are the plugin-side received eventfds the transport does NOT
+// own (shm.AttachParams), which the plugin closes at teardown after the transport
+// has been released. The received raw region fd is not here: it is closed
+// immediately after shm.Attach dups it. nil for a uds instance.
+type pluginShmResources struct {
+	hpEFD *event.EventFD // host->plugin: the plugin's inbound
+	phEFD *event.EventFD // plugin->host: the plugin's outbound
+}
+
+// close closes both received eventfd wrappers (each NewEventFDFromFD took
+// ownership of its fd). Safe on nil.
+func (r *pluginShmResources) close() {
+	if r == nil {
+		return
+	}
+	_ = r.hpEFD.Close()
+	_ = r.phEFD.Close()
+}
+
+// pluginAttach performs the plugin side of AttachRegion -> AttachRegionAck,
+// dispatching on the negotiated transport. It sends the ack only AFTER the
+// data-plane transport is fully constructed and teardown ownership is installed,
+// so a host that observes the ack may treat the generation as attached — for both
+// shared-memory and uds. It returns the transport, the plugin-owned resources to
+// close at teardown (nil for uds), and any error.
 func (s *PluginServer) pluginAttach(
+	ctx context.Context, conn *control.Conn, tuple control.Tuple,
+) (transport.Transport, *pluginShmResources, error) {
+	if tuple.Transport == control.TransportSHM {
+		return s.pluginAttachSHM(ctx, conn, tuple)
+	}
+
+	tr, err := s.pluginAttachUDS(ctx, conn, tuple.Features[featureStreaming])
+
+	return tr, nil, err
+}
+
+// pluginAttachUDS receives the single data-plane fd over the control socket (via
+// SCM_RIGHTS), wraps it in a uds Transport, and only then acknowledges — so the
+// ack means the transport is constructed, the same contract the shared-memory
+// path holds. streaming fixes the uds header shape (stream-protocol.md §2.4).
+func (s *PluginServer) pluginAttachUDS(
 	ctx context.Context, conn *control.Conn, streaming bool,
 ) (transport.Transport, error) {
 	_, fds, err := recvControlFDs(ctx, conn, control.StateAttaching, control.KindAttachRegion, 1,
@@ -619,19 +665,6 @@ func (s *PluginServer) pluginAttach(
 	// received count, so exactly one fd is present here.
 	dataFD := fds[0]
 
-	ackMsg := &controlpb.ControlMessage{
-		Body: &controlpb.ControlMessage_AttachRegionAck{AttachRegionAck: &controlpb.AttachRegionAck{}},
-	}
-	if err := sendControl(ctx, conn, ackMsg, control.ReplyDeadlines[control.KindAttachRegion]); err != nil {
-		_ = unix.Close(dataFD)
-
-		return nil, err
-	}
-
-	// streaming is the acknowledged state pluginHandshake resolved from the
-	// negotiated tuple; it fixes the uds header shape for the whole connection.
-	// The host derives the same value from the same tuple, so the two header
-	// shapes always agree (stream-protocol.md §2.4).
 	tr, err := transport.NewUDSTransport(dataFD, streaming)
 	if err != nil {
 		_ = unix.Close(dataFD)
@@ -639,7 +672,114 @@ func (s *PluginServer) pluginAttach(
 		return nil, fmt.Errorf("wrap data-plane transport: %w", err)
 	}
 
+	// Ack only after the transport is constructed, so the host's ack means
+	// "attached" (stream-protocol.md §2.4).
+	ackMsg := &controlpb.ControlMessage{
+		Body: &controlpb.ControlMessage_AttachRegionAck{AttachRegionAck: &controlpb.AttachRegionAck{}},
+	}
+	if err := sendControl(ctx, conn, ackMsg, control.ReplyDeadlines[control.KindAttachRegion]); err != nil {
+		_ = tr.Close()
+
+		return nil, err
+	}
+
 	return tr, nil
+}
+
+// pluginAttachSHM receives the region fd and two eventfds over the control socket,
+// attaches the plugin end of the shared-memory region, and only then acknowledges.
+// The received raw region fd is passed directly to shm.Attach (which dups and
+// seal-checks it via OpenRegion — the plugin never opens the region twice) and
+// closed immediately after; each eventfd is wrapped with NewEventFDFromFD, which
+// takes ownership of its fd. max_data_inflight on AttachRegion fixes MaxInflight so
+// both sides admit identically; the per-direction payload limit is derived from
+// the region header (no wire field). The ack is sent last, after full construction
+// and teardown-ownership installation (the ready-ack linearization).
+func (s *PluginServer) pluginAttachSHM(
+	ctx context.Context, conn *control.Conn, tuple control.Tuple,
+) (tr transport.Transport, res *pluginShmResources, err error) {
+	msg, fds, rerr := recvControlFDs(ctx, conn, control.StateAttaching, control.KindAttachRegion, 3,
+		control.ReplyDeadlines[control.KindAttachRegion])
+	if rerr != nil {
+		return nil, nil, rerr
+	}
+	// RecvFDs transferred ownership of all three fds to us and cross-checked the
+	// declared fd_count (3). Fixed order, mirroring the host's SendFDs: region,
+	// host->plugin eventfd, plugin->host eventfd.
+	regionFD, hpFD, phFD := fds[0], fds[1], fds[2]
+	// Until each fd is handed to an owner below, this holds the still-raw ones so
+	// an early return closes exactly what has not yet been taken over.
+	rawOpen := map[int]bool{regionFD: true, hpFD: true, phFD: true}
+	defer func() {
+		for fd, open := range rawOpen {
+			if open {
+				_ = unix.Close(fd)
+			}
+		}
+	}()
+
+	hpEFD, eerr := event.NewEventFDFromFD(hpFD)
+	if eerr != nil {
+		return nil, nil, fmt.Errorf("wrap host->plugin eventfd: %w", eerr)
+	}
+	rawOpen[hpFD] = false // hpEFD owns it now
+	defer func() {
+		if err != nil {
+			_ = hpEFD.Close()
+		}
+	}()
+
+	phEFD, eerr := event.NewEventFDFromFD(phFD)
+	if eerr != nil {
+		return nil, nil, fmt.Errorf("wrap plugin->host eventfd: %w", eerr)
+	}
+	rawOpen[phFD] = false // phEFD owns it now
+	defer func() {
+		if err != nil {
+			_ = phEFD.Close()
+		}
+	}()
+
+	ar := msg.GetAttachRegion()
+	cfg := shmtransport.Config{
+		MaxInflight:         int(ar.GetMaxDataInflight()),
+		MaxPayload:          0, // derive per-direction from the region header
+		DataQueueDepth:      shmDataQueueDepth,
+		LifecycleQueueDepth: shmLifecycleQueueDepth,
+		Checksum:            tuple.Features["checksum"],
+	}
+	pluginTr, terr := shmtransport.Attach(shmtransport.AttachParams{
+		RegionFD:     regionFD,
+		ExpectedSize: ar.GetLayoutSize(),
+		Role:         shmtransport.RolePlugin,
+		InboundEFD:   hpEFD, // plugin consumes host->plugin
+		OutboundEFD:  phEFD, // plugin produces plugin->host
+		Config:       cfg,
+	})
+	// shm.Attach dup'd the region fd (or cleaned up its own handle on failure); the
+	// plugin's raw copy is closed here either way, never opening the region twice.
+	rawOpen[regionFD] = false
+	_ = unix.Close(regionFD)
+	if terr != nil {
+		return nil, nil, fmt.Errorf("attach shm plugin: %w", terr)
+	}
+	defer func() {
+		if err != nil {
+			_ = pluginTr.Close()
+		}
+	}()
+
+	// Teardown ownership installed (the returned res); ack only now, last.
+	ackMsg := &controlpb.ControlMessage{
+		Body: &controlpb.ControlMessage_AttachRegionAck{AttachRegionAck: &controlpb.AttachRegionAck{}},
+	}
+	if serr := sendControl(ctx, conn, ackMsg, control.ReplyDeadlines[control.KindAttachRegion]); serr != nil {
+		err = serr // trip the deferred cleanups above (transport + both eventfds)
+
+		return nil, nil, serr
+	}
+
+	return pluginTr, &pluginShmResources{hpEFD: hpEFD, phEFD: phEFD}, nil
 }
 
 // serviceVersions projects the registered services into the version list the

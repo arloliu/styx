@@ -15,8 +15,11 @@ import (
 
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/control/controlpb"
+	"github.com/arloliu/styx/internal/event"
 	"github.com/arloliu/styx/internal/lifecycle"
+	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/transport"
+	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 	pubsupervisor "github.com/arloliu/styx/supervisor"
 	"golang.org/x/sys/unix"
 )
@@ -36,11 +39,26 @@ type RestartPolicy = pubsupervisor.RestartPolicy
 const (
 	m1ProtocolVersion uint32 = 1
 	transportUDS             = "uds"
+	transportSHM             = "shm"
 	codecProto               = "proto"
 	// featureStreaming is the stable handshake feature-flag name for streaming
 	// RPC (stream-protocol.md §11.1), offered as supported so a streaming-capable
 	// plugin negotiates the streaming header shape.
 	featureStreaming = "streaming"
+
+	// transportAuto is the Config.Transport value that offers both transports with
+	// the shared-memory transport preferred; "shm" pins it and "uds" (or the empty
+	// default) offers only uds.
+	transportAuto = "auto"
+
+	// shmDataQueueDepth and shmLifecycleQueueDepth size the shared-memory writer's
+	// two bounded in-process submission queues (shm.Config, process-local — each
+	// side sets its own, no negotiation). The data queue is sized to pipeline a
+	// burst of concurrent submissions ahead of the single writer; the lifecycle
+	// queue is smaller, since a lifecycle intent (CANCEL / coalesced STREAM_ACK) is
+	// bounded per in-flight call (shm-abi.md §18b).
+	shmDataQueueDepth      = 256
+	shmLifecycleQueueDepth = 64
 )
 
 // DefaultHeartbeatInterval is the plugin's fixed heartbeat SEND cadence and
@@ -244,6 +262,26 @@ type Config struct {
 	// it from a public PluginSpec option; the default (false) offers streaming as
 	// optional.
 	RequireStreaming bool
+
+	// Transport selects the data-plane transport this host offers: "shm" pins the
+	// shared-memory transport (a plugin that cannot speak it fails the handshake,
+	// never a silent downgrade), "auto" offers both with the shared-memory
+	// transport preferred and falls back to uds only when the plugin does not offer
+	// it, and "uds" (also the current empty-string default) offers only uds. The
+	// styx layer sets it from a public PluginSpec option.
+	Transport string
+
+	// ShmLayout is the host-authored shared-memory region geometry (ring capacity,
+	// lifecycle reserve, per-direction size classes) used to create a fresh region
+	// per generation when the shared-memory transport is negotiated. The host
+	// authors geometry; the plugin reads it from the region header at attach.
+	// Its Generation field is overwritten per spawn with the instance generation.
+	ShmLayout shm.Layout
+
+	// MaxDataInflight is the host-selected peak concurrent data frames, carried to
+	// the plugin on AttachRegion so both sides configure the same admission bound
+	// (shm-abi.md §18). Zero falls back to the geometry's data budget C - R.
+	MaxDataInflight int
 
 	// ResetWindow restores the restart budget — the restart policy's reset
 	// window: once an instance has stayed continuously Ready
@@ -704,7 +742,7 @@ func (s *Supervisor) newLiveInstance(
 	captureDone := make(chan struct{})
 	go func() { defer close(captureDone); capture.Run(captureCtx) }()
 
-	tr, streaming, hsErr := s.handshakeAndAttach(handshakeCtx, conn, generation)
+	hs, hsErr := s.handshakeAndAttach(handshakeCtx, conn, generation)
 	if hsErr != nil {
 		cancelCapture()
 		state, _ := proc.Kill()
@@ -715,6 +753,7 @@ func (s *Supervisor) newLiveInstance(
 
 		return nil, crashReason(stderrTail, hsErr, exitStatus, exitStatusKnown)
 	}
+	tr, streaming, shmRes := hs.tr, hs.streaming, hs.shmRes
 
 	li := &liveInstance{
 		conn: conn, generation: generation, stderrTail: stderrTail,
@@ -737,16 +776,25 @@ func (s *Supervisor) newLiveInstance(
 		cancelCapture()
 
 		td := &lifecycle.Teardown{
-			StopAdmission:    noopIfNil(li.hooks.StopAdmission),
-			FailInFlight:     noopErrIfNil(li.hooks.FailInFlight),
-			JoinGoroutines:   noopIfNil(li.hooks.JoinGoroutines),
-			Unmap:            func() {},
+			StopAdmission:  noopIfNil(li.hooks.StopAdmission),
+			FailInFlight:   noopErrIfNil(li.hooks.FailInFlight),
+			JoinGoroutines: noopIfNil(li.hooks.JoinGoroutines),
+			// Step 4 (after the join stopped the writer and released the transport's
+			// own duplicate region): munmap and close the ORIGINAL region the host
+			// created. Join-before-unmap holds — every goroutine that could touch the
+			// mapping was joined in step 3 (shmHostResources' ownership contract). A
+			// no-op for uds (shmRes nil).
+			Unmap:            shmRes.closeRegion,
 			Process:          proc,
 			ControlConn:      conn,
 			ShutdownDeadline: shutdownDeadline,
 			CloseFDs: func() {
 				_ = conn.Close()
 				closeStdio(proc)
+				// The two host eventfd wrappers are the host's to close (they are not
+				// owned by the transport); by here every goroutine that used them is
+				// joined. A no-op for uds.
+				shmRes.closeEventFDs()
 			},
 		}
 		err := td.Run(tctx)
@@ -907,30 +955,40 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 // code because internal/supervisor must not import the public styx package
 // (this package's layering doc), so each side reimplements the exchange
 // against its own control.Conn.
+// handshakeResult bundles what a completed handshake-and-attach hands back: the
+// data-plane transport, the acknowledged streaming state, and the host-owned
+// shared-memory resources to close at teardown (nil for uds). It is a single
+// return value so the function stays within the result-count limit.
+type handshakeResult struct {
+	tr        transport.Transport
+	streaming bool
+	shmRes    *shmHostResources
+}
+
 func (s *Supervisor) handshakeAndAttach(
 	ctx context.Context, conn *control.Conn, generation uint64,
-) (transport.Transport, bool, error) {
+) (handshakeResult, error) {
 	nonce, err := randomNonce()
 	if err != nil {
-		return nil, false, err
+		return handshakeResult{}, err
 	}
 
 	hello := &controlpb.ControlMessage{
 		Body: &controlpb.ControlMessage_Hello{Hello: control.OfferToHello(s.hostOffer(), nonce)},
 	}
 	if err := sendControl(ctx, conn, hello, control.ReplyDeadlines[control.KindHello]); err != nil {
-		return nil, false, fmt.Errorf("supervisor: handshake: send Hello: %w", err)
+		return handshakeResult{}, fmt.Errorf("supervisor: handshake: send Hello: %w", err)
 	}
 
 	ackMsg, err := recvControl(ctx, conn, control.StateHandshaking, control.KindHelloAck,
 		control.ReplyDeadlines[control.KindHello])
 	if err != nil {
-		return nil, false, fmt.Errorf("supervisor: handshake: recv HelloAck: %w", err)
+		return handshakeResult{}, fmt.Errorf("supervisor: handshake: recv HelloAck: %w", err)
 	}
 
 	ack := ackMsg.GetHelloAck()
 	if verr := control.VerifyNonce(nonce, ack.GetNonce()); verr != nil {
-		return nil, false, fmt.Errorf("supervisor: handshake: %w", verr)
+		return handshakeResult{}, fmt.Errorf("supervisor: handshake: %w", verr)
 	}
 
 	// A rejection reply (control.IncompatibleToHelloAck, sent by
@@ -939,7 +997,7 @@ func (s *Supervisor) handshakeAndAttach(
 	// instead of forcing the host to fall back to an undifferentiated
 	// connection loss below or a bare Reason string.
 	if reason, pluginOffer, rejected := control.HelloAckIncompatible(ack); rejected {
-		return nil, false, &control.IncompatibleError{
+		return handshakeResult{}, &control.IncompatibleError{
 			HostOffer: s.hostOffer(), PluginOffer: pluginOffer, Reason: reason,
 		}
 	}
@@ -952,31 +1010,80 @@ func (s *Supervisor) handshakeAndAttach(
 	if verr != nil {
 		var ie *control.IncompatibleError
 		if errors.As(verr, &ie) {
-			return nil, false, ie
+			return handshakeResult{}, ie
 		}
 
-		return nil, false, fmt.Errorf("supervisor: handshake: validate acknowledged tuple: %w", verr)
+		return handshakeResult{}, fmt.Errorf("supervisor: handshake: validate acknowledged tuple: %w", verr)
 	}
 	if tuple.Codec != codecProto {
-		return nil, false, fmt.Errorf("supervisor: handshake: negotiated codec=%q unsupported", tuple.Codec)
+		return handshakeResult{}, fmt.Errorf("supervisor: handshake: negotiated codec=%q unsupported", tuple.Codec)
 	}
 
 	streaming := tuple.Features[featureStreaming]
-	tr, err := s.attach(ctx, conn, generation, streaming)
+	tr, shmRes, err := s.attach(ctx, conn, generation, tuple)
+	if err != nil {
+		return handshakeResult{}, err
+	}
 
-	return tr, streaming, err
+	return handshakeResult{tr: tr, streaming: streaming, shmRes: shmRes}, nil
 }
 
-// attach performs the host side of AttachRegion -> AttachRegionAck: it
-// creates the data-plane socketpair, passes the plugin's end over the
-// control socket via SCM_RIGHTS, waits for the ack, and wraps the
-// host-side fd in a uds Transport. generation is stamped on the
-// AttachRegion message as a fresh per-restart region generation (for now,
-// a fresh transport socketpair each time; the generation number itself
-// only gains meaning once SHM support lands). streaming is the acknowledged
-// state of the streaming feature from the negotiated tuple, fixing the uds
-// header shape for the connection (stream-protocol.md §2.4).
+// shmHostResources are the host-side shared-memory resources the transport does
+// NOT own — the original memfd Region (from CreateRegion) and the two eventfds —
+// which the supervisor must close at instance teardown, after join-before-unmap,
+// exactly once (the ownership contract in shm.AttachParams and the design's
+// teardown-ordering section). The transport's own duplicate Region (and its
+// duplicated fd) are released by Transport.Close in the teardown's join step; these
+// are the resources left over. nil for a uds instance.
+type shmHostResources struct {
+	region *shm.Region    // original mapping + memfd fd
+	hpEFD  *event.EventFD // host->plugin: host's outbound, plugin's inbound
+	phEFD  *event.EventFD // plugin->host: host's inbound, plugin's outbound
+}
+
+// closeRegion munmaps the original region and closes its memfd fd (the teardown's
+// unmap step). Safe on nil.
+func (r *shmHostResources) closeRegion() {
+	if r == nil {
+		return
+	}
+	_ = r.region.Close()
+}
+
+// closeEventFDs closes both host eventfd wrappers (the teardown's fd-close step).
+// Safe on nil.
+func (r *shmHostResources) closeEventFDs() {
+	if r == nil {
+		return
+	}
+	_ = r.hpEFD.Close()
+	_ = r.phEFD.Close()
+}
+
+// attach performs the host side of AttachRegion -> AttachRegionAck, dispatching
+// on the negotiated transport: the shared-memory path creates a per-generation
+// region and two eventfds and transfers all three fds, the uds path a socketpair.
+// It returns the constructed transport, the host-owned shared-memory resources to
+// close at teardown (nil for uds), and any error.
 func (s *Supervisor) attach(
+	ctx context.Context, conn *control.Conn, generation uint64, tuple control.Tuple,
+) (transport.Transport, *shmHostResources, error) {
+	streaming := tuple.Features[featureStreaming]
+	if tuple.Transport == transportSHM {
+		return s.attachSHM(ctx, conn, generation, tuple)
+	}
+
+	tr, err := s.attachUDS(ctx, conn, generation, streaming)
+
+	return tr, nil, err
+}
+
+// attachUDS is the Unix-domain-socket attach: it creates the data-plane
+// socketpair, passes the plugin's end over the control socket via SCM_RIGHTS,
+// waits for the ack, and wraps the host-side fd in a uds Transport. streaming is
+// the acknowledged state of the streaming feature, fixing the uds header shape
+// (stream-protocol.md §2.4).
+func (s *Supervisor) attachUDS(
 	ctx context.Context, conn *control.Conn, generation uint64, streaming bool,
 ) (tr transport.Transport, err error) {
 	pair, perr := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
@@ -1019,6 +1126,135 @@ func (s *Supervisor) attach(
 	return tr, nil
 }
 
+// attachSHM is the shared-memory attach: it creates a fresh region for this
+// generation and two eventfds, transfers all three fds over the control conn via
+// SCM_RIGHTS, waits for the ack, and attaches the host end. The plugin sees the
+// ack only after it has fully constructed its own end (pluginserver's
+// ack-after-construct), so a returned transport means both ends are attached to
+// the same generation's region.
+//
+// Every partial-construction failure closes exactly what it already owns; on
+// success the returned shmHostResources carries the original region and both
+// eventfds for the teardown path to close (they are NOT owned by the transport,
+// per shm.AttachParams). max_data_inflight is host-selected and carried on
+// AttachRegion so both sides configure the same MaxInflight (shm-abi.md §18).
+func (s *Supervisor) attachSHM(
+	ctx context.Context, conn *control.Conn, generation uint64, tuple control.Tuple,
+) (tr transport.Transport, res *shmHostResources, err error) {
+	layout := s.cfg.ShmLayout
+	layout.Generation = generation // a fresh region per generation (never reused)
+
+	region, rerr := shm.CreateRegion(layout)
+	if rerr != nil {
+		return nil, nil, fmt.Errorf("supervisor: handshake: create region: %w", rerr)
+	}
+	defer func() {
+		// On any failure, close everything created here that the caller will not
+		// receive. On success these are handed to res for teardown.
+		if err != nil {
+			_ = region.Close()
+		}
+	}()
+
+	hpEFD, eerr := event.NewEventFD()
+	if eerr != nil {
+		return nil, nil, fmt.Errorf("supervisor: handshake: h->p eventfd: %w", eerr)
+	}
+	defer func() {
+		if err != nil {
+			_ = hpEFD.Close()
+		}
+	}()
+	phEFD, eerr := event.NewEventFD()
+	if eerr != nil {
+		return nil, nil, fmt.Errorf("supervisor: handshake: p->h eventfd: %w", eerr)
+	}
+	defer func() {
+		if err != nil {
+			_ = phEFD.Close()
+		}
+	}()
+
+	regionSize := region.Layout().RegionSize
+	maxInflight := s.shmMaxDataInflight(layout)
+
+	attachMsg := &controlpb.ControlMessage{
+		Body: &controlpb.ControlMessage_AttachRegion{
+			AttachRegion: &controlpb.AttachRegion{
+				Generation:      generation,
+				LayoutSize:      regionSize,
+				LayoutVersion:   tuple.LayoutVersion,
+				FdCount:         3,
+				MaxDataInflight: uint32(maxInflight), //nolint:gosec // bounded by C-R, a small ring capacity
+			},
+		},
+	}
+
+	// SendFDs retains ownership of the caller's descriptors (it never closes
+	// them); the plugin receives fresh SCM_RIGHTS dups. The three fds travel in a
+	// fixed order the plugin mirrors: region, host->plugin eventfd, plugin->host
+	// eventfd.
+	sctx, cancel := context.WithTimeout(ctx, control.ReplyDeadlines[control.KindAttachRegion])
+	sendErr := conn.SendFDs(sctx, attachMsg, []int{region.FD(), hpEFD.FD(), phEFD.FD()})
+	cancel()
+	if sendErr != nil {
+		return nil, nil, fmt.Errorf("supervisor: handshake: send AttachRegion: %w", sendErr)
+	}
+
+	// The host attaches its own end BEFORE waiting for the ack: attach is local
+	// and cannot depend on the plugin, and doing it here means a construction
+	// failure is caught before the ack wait. shm.Attach opens (and seal-checks, via
+	// OpenRegion Phase 1) its own duplicate of the region fd; the host retains the
+	// original region and both eventfds for teardown.
+	hostTr, terr := shmtransport.Attach(shmtransport.AttachParams{
+		RegionFD:     region.FD(),
+		ExpectedSize: regionSize,
+		Role:         shmtransport.RoleHost,
+		InboundEFD:   phEFD, // host consumes plugin->host
+		OutboundEFD:  hpEFD, // host produces host->plugin
+		Config:       s.shmConfig(maxInflight, tuple),
+	})
+	if terr != nil {
+		return nil, nil, fmt.Errorf("supervisor: handshake: attach shm host: %w", terr)
+	}
+	defer func() {
+		if err != nil {
+			_ = hostTr.Close()
+		}
+	}()
+
+	if _, aerr := recvControl(ctx, conn, control.StateAttaching, control.KindAttachRegionAck,
+		control.ReplyDeadlines[control.KindAttachRegion]); aerr != nil {
+		return nil, nil, fmt.Errorf("supervisor: handshake: recv AttachRegionAck: %w", aerr)
+	}
+
+	return hostTr, &shmHostResources{region: region, hpEFD: hpEFD, phEFD: phEFD}, nil
+}
+
+// shmMaxDataInflight resolves the host-selected peak concurrency: Config's value
+// when positive, else the geometry's data budget C - R (shm-abi.md §18).
+func (s *Supervisor) shmMaxDataInflight(layout shm.Layout) int {
+	if s.cfg.MaxDataInflight > 0 {
+		return s.cfg.MaxDataInflight
+	}
+
+	return int(layout.RingCapacity) - int(layout.LifecycleReserve)
+}
+
+// shmConfig builds the host-side shm.Config: the host-selected MaxInflight, the
+// negotiated checksum feature, the process-local queue depths, and a zero
+// MaxPayload so the transport derives each direction's payload limit from the
+// region header (both sides derive identically, no wire field).
+func (s *Supervisor) shmConfig(maxInflight int, tuple control.Tuple) shmtransport.Config {
+	return shmtransport.Config{
+		MaxInflight:         maxInflight,
+		MaxPayload:          0, // derive per-direction from the region geometry
+		DataQueueDepth:      shmDataQueueDepth,
+		LifecycleQueueDepth: shmLifecycleQueueDepth,
+		Checksum:            tuple.Features["checksum"],
+	}
+}
+
 // hostOffer is the host's negotiation offer: the fixed protocol/
 // transport/codec support (the host-side mirror of styx/pluginserver.go's
 // m1PluginOffer) plus Config.Services, this Supervisor's per-service version
@@ -1028,13 +1264,34 @@ func (s *Supervisor) attach(
 // ErrIncompatible rather than the incompatibility surfacing at the first OpenStream
 // (stream-protocol.md §11.2).
 func (s *Supervisor) hostOffer() control.Offer {
+	transports, layoutVersions := s.offeredTransports()
+
 	return control.Offer{
-		ProtocolMin: m1ProtocolVersion,
-		ProtocolMax: m1ProtocolVersion,
-		Transports:  []string{transportUDS},
-		Codecs:      []string{codecProto},
-		Features:    []control.FeatureFlag{{Name: featureStreaming, Required: s.cfg.RequireStreaming}},
-		Services:    s.cfg.Services,
+		ProtocolMin:    m1ProtocolVersion,
+		ProtocolMax:    m1ProtocolVersion,
+		Transports:     transports,
+		Codecs:         []string{codecProto},
+		Features:       []control.FeatureFlag{{Name: featureStreaming, Required: s.cfg.RequireStreaming}},
+		Services:       s.cfg.Services,
+		LayoutVersions: layoutVersions,
+	}
+}
+
+// offeredTransports maps Config.Transport to the transport list the host
+// advertises and the layout-version set that rides alongside it. It advertises a
+// non-empty layout-version set only when the shared-memory transport is offered
+// (shm-abi.md §19): "shm" pins shared-memory (no uds fallback), "auto" offers both
+// with shared-memory preferred (control.Negotiate's lexicographic tie-break picks
+// "shm" over "uds" when both are common), and "uds" (also the empty-string
+// default) offers only uds.
+func (s *Supervisor) offeredTransports() (transports []string, layoutVersions []uint32) {
+	switch s.cfg.Transport {
+	case transportSHM:
+		return []string{transportSHM}, []uint32{control.ShmLayoutVersion}
+	case transportAuto:
+		return []string{transportSHM, transportUDS}, []uint32{control.ShmLayoutVersion}
+	default: // "uds" or "" — uds only, no layout-version set
+		return []string{transportUDS}, nil
 	}
 }
 

@@ -474,14 +474,25 @@ func newTransport(region regionHandle, layout shm.Layout, p AttachParams) (*Tran
 
 	w := attachNewWriter(outRing, outArena, p.Config, gen.Truncated(), uint64(layout.RingCapacity), sig.signal, poison)
 
-	// max_payload for the inbound direction: the largest slab minus the negotiated
-	// per-frame overhead (4 for the CRC32C trailer when checksum is negotiated;
-	// trace is out of scope, never +32), shm-abi.md §18.
+	// Per-direction max_payload: the largest slab minus the negotiated per-frame
+	// overhead (4 for the CRC32C trailer when checksum is negotiated; trace is out
+	// of scope, never +32), shm-abi.md §18. Both directions derive from the shared
+	// region header, so the two sides reach the identical limit with no wire field
+	// — the sending side's outbound limit equals the receiving side's inbound
+	// limit for that direction. Config.MaxPayload, when non-zero, may only lower
+	// the outbound limit (a caller's explicit ceiling); zero means "derive from
+	// geometry", which is what a cross-process attach uses, since the plugin has
+	// no geometry to derive from until Attach has opened the region.
 	overhead := uint32(0)
 	if p.Config.Checksum {
 		overhead = crc32TrailerLen
 	}
 	inClasses := layout.Arenas[inDir].Classes
+
+	maxPayload := slabSizeLast(layout.Arenas[outDir]) - overhead
+	if p.Config.MaxPayload != 0 && p.Config.MaxPayload < maxPayload {
+		maxPayload = p.Config.MaxPayload
+	}
 
 	return &Transport{
 		region:            region,
@@ -500,7 +511,7 @@ func newTransport(region regionHandle, layout shm.Layout, p AttachParams) (*Tran
 		clock:             clock,
 		gen:               gen,
 		checksum:          p.Config.Checksum,
-		maxPayload:        p.Config.MaxPayload,
+		maxPayload:        maxPayload,
 		maxRecvPayload:    slabSizeLast(layout.Arenas[inDir]) - overhead,
 	}, nil
 }
