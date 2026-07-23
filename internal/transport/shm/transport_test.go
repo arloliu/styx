@@ -18,6 +18,7 @@ import (
 	"github.com/arloliu/styx/internal/ring"
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/transport"
+	"golang.org/x/sys/unix"
 )
 
 // roundTripLayout is a small valid geometry with usable slabs in both classes:
@@ -2009,17 +2010,28 @@ func TestTransport_PayloadAboveOneMiB_RoundTrips_WhenGeometryAllows(t *testing.T
 func TestTransport_Close_Idempotent_NoDoubleCloseAfterFDReuse(t *testing.T) {
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
 
-	require.NoError(t, ep.host.Close()) // closes the transport's duplicated region fd
+	// The exact numeric fd the transport's Close releases (its duplicated region fd).
+	regionFD := ep.host.region.FD()
+	require.Positive(t, regionFD)
+	require.NoError(t, ep.host.Close()) // frees regionFD
 
-	// Reuse the freed fd number with a fresh open, then close the transport again:
-	// a non-idempotent Close would close this reused fd out from under its owner.
-	reused, err := os.Open(os.DevNull)
+	// Deterministically install a fresh file at that EXACT former fd number via
+	// dup2, so the reused-number condition is forced, not left to lowest-free-fd
+	// chance: a non-idempotent second Close would now close this unrelated file.
+	tmp, err := unix.Open(os.DevNull, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = reused.Close() })
+	if tmp != regionFD {
+		// The open landed elsewhere; move it onto the exact former region fd number.
+		require.NoError(t, unix.Dup2(tmp, regionFD))
+		_ = unix.Close(tmp)
+	}
+	// Either way, regionFD now names /dev/null.
+	t.Cleanup(func() { _ = unix.Close(regionFD) })
 
 	require.NotPanics(t, func() { _ = ep.host.Close() }, "a second Close must be a no-op")
 
-	// The reused fd is still valid — the second Close did not touch it.
-	_, statErr := reused.Stat()
-	require.NoError(t, statErr, "the second Close must not have closed a reused fd number")
+	// The reused fd number is still valid — the second Close did not close it.
+	var st unix.Stat_t
+	require.NoError(t, unix.Fstat(regionFD, &st),
+		"the second Close closed the reused fd number — a double-close of a reused fd")
 }
