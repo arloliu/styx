@@ -283,9 +283,10 @@ func (tx *Transaction) Run(ctx context.Context) (ReloadTarget, error) {
 	// doc).
 	if err := tx.drain(ctx); err != nil {
 		phase := PhaseDrainAck
-		if errors.Is(err, errDrainBudgetTooSmall) {
-			// Drain was never sent, so the plugin never froze: reopen admission like any
-			// other cutoff-phase abort, without sending Resume to an unfrozen instance.
+		if errors.Is(err, errDrainNotCommitted) {
+			// Drain never reached the plugin (send failed, or the budget was too small),
+			// so it never froze: reopen admission like any other cutoff-phase abort,
+			// without sending Resume to an unfrozen instance.
 			phase = PhaseCutoff
 		}
 
@@ -338,23 +339,33 @@ func (tx *Transaction) Run(ctx context.Context) (ReloadTarget, error) {
 // delivery and scheduling latency; a second is ample. When the whole wait is shorter
 // than a second (a small configured budget, or a tight caller deadline), the margin is
 // halved into the budget instead, keeping the transmitted deadline strictly in the
-// future while preserving the ordering.
+// future while preserving the ordering; a budget under 2ns is rejected as no drain at
+// all, so the halved margin is always at least 1ns and the ordering stays strict.
 const drainAckHostMargin = 1 * time.Second
 
-// errDrainBudgetTooSmall marks a drain the caller context left no time to run: the
-// host's effective wait is already in the past, so Drain was never sent and the plugin
-// never froze. Run rolls back as a cutoff abort (reopen admission, no Resume to an
-// instance that was never asked to freeze).
-var errDrainBudgetTooSmall = errors.New("lifecycle: reload: caller deadline too small for a drain")
+// errDrainNotCommitted marks a drain that never reached the plugin: the caller budget
+// left no room to run one, or the Drain send failed before the datagram was delivered.
+// The plugin never received Drain and never froze, so Run rolls back as a cutoff abort
+// (reopen admission, no Resume to an instance that was never asked to freeze).
+var errDrainNotCommitted = errors.New("lifecycle: reload: drain not committed")
 
 // drain runs phase 2: send Drain carrying its absolute deadline, then wait for the
-// plugin's DrainAck. The transmitted deadline is derived from the host's OWN effective
-// wait — the configured DrainAck budget clamped to the caller context — minus the
-// host-ack margin (halved into the budget when the wait is shorter than the margin).
-// The invariant this establishes: the deadline the plugin sees is always strictly
-// earlier than the deadline the host waits to, under ANY caller context. Transmitting
-// now+DrainAck instead would let a caller context with an earlier deadline time the
-// host into rollback while the plugin was still entitled to ack.
+// plugin's DrainAck. Two invariants govern it.
+//
+// Deadline: the transmitted deadline is derived from the host's OWN effective wait —
+// the configured DrainAck budget clamped to the caller context — minus the host-ack
+// margin (halved into the budget when the wait is shorter than the margin), so the
+// deadline the plugin sees is always strictly earlier than the deadline the host waits
+// to, under ANY caller context.
+//
+// Commitment: the Send of Drain is the commitment point — a control datagram is atomic,
+// so a Send error means the plugin never received Drain. BEFORE Send (a send failure or
+// a budget too small to run a drain) the reload aborts without any wire exchange, like a
+// cutoff abort. AFTER a successful Send the host is committed: it awaits DrainAck on an
+// UNCANCELABLE wait bounded by the transmitted deadline plus margin, so caller
+// cancellation never abandons a plugin that froze and is still entitled to ack. The
+// result is that caller cancellation can never produce a Resume to an unfrozen peer nor
+// a rollback that races an entitled acker.
 func (tx *Transaction) drain(ctx context.Context) error {
 	// The host's effective wait: its own DrainAck budget, never past the caller's
 	// deadline (WithDeadline would clamp there anyway; computing it explicitly lets the
@@ -364,33 +375,46 @@ func (tx *Transaction) drain(ctx context.Context) error {
 	if d, ok := ctx.Deadline(); ok && d.Before(hostWait) {
 		hostWait = d
 	}
+	// A budget under 2ns cannot place the transmitted deadline strictly between now and
+	// hostWait with a >=1ns margin on each side: there is no drain to run. Abort before
+	// sending Drain so the plugin never freezes.
 	budget := hostWait.Sub(now)
-	if budget <= 0 {
-		// The caller context is already at or past its deadline: no drain can run. Abort
-		// before sending Drain so the plugin never freezes.
-		return errDrainBudgetTooSmall
+	if budget < 2 {
+		return fmt.Errorf("lifecycle: reload: caller deadline too small: %w", errDrainNotCommitted)
 	}
 	// Keep the transmitted deadline strictly before hostWait AND strictly in the future,
 	// even for a sub-margin budget: halve the margin into the budget rather than let it
 	// push the transmitted deadline into the past (which would strand a real plugin's
-	// freeze under an already-expired context).
+	// freeze under an already-expired context). budget >= 2ns keeps the halved margin
+	// >= 1ns, so transmitted stays strictly earlier than hostWait.
 	margin := drainAckHostMargin
 	if margin >= budget {
 		margin = budget / 2
 	}
 	transmitted := hostWait.Add(-margin)
 
-	dctx, cancel := context.WithDeadline(ctx, hostWait)
-	defer cancel()
-
-	msg := &controlpb.ControlMessage{
+	// Commitment point. Bound the send by hostWait and let the caller context abort it:
+	// a failure here means the datagram was not delivered, so it is a pre-commitment
+	// abort — classified errDrainNotCommitted, NOT a drain-ack rollback that would Resume
+	// an unfrozen peer.
+	sctx, scancel := context.WithDeadline(ctx, hostWait)
+	err := tx.old.Control().Send(sctx, &controlpb.ControlMessage{
 		Body: &controlpb.ControlMessage_Drain{Drain: &controlpb.Drain{DeadlineUnixNano: transmitted.UnixNano()}},
-	}
-	if err := tx.old.Control().Send(dctx, msg); err != nil {
-		return fmt.Errorf("lifecycle: reload: send Drain: %w", err)
+	})
+	scancel()
+	if err != nil {
+		return fmt.Errorf("lifecycle: reload: send Drain: %w: %w", err, errDrainNotCommitted)
 	}
 
-	if _, err := recvExpected(dctx, tx.old.Control(), control.StateDraining, control.KindDrainAck); err != nil {
+	// Committed: the plugin has Drain and will freeze. Await DrainAck on a wait bounded
+	// by hostWait (= transmitted + margin) but detached from the caller's cancellation,
+	// so a caller cancel cannot abandon a plugin still entitled to ack. hostWait is
+	// already clamped to the caller budget, so honoring it never hangs the caller past
+	// the deadline the ordering invariant established. A timeout here is a genuine
+	// post-commitment failure that rolls back with Resume.
+	rctx, rcancel := context.WithDeadline(context.WithoutCancel(ctx), hostWait)
+	defer rcancel()
+	if _, err := recvExpected(rctx, tx.old.Control(), control.StateDraining, control.KindDrainAck); err != nil {
 		return fmt.Errorf("lifecycle: reload: await DrainAck: %w", err)
 	}
 
