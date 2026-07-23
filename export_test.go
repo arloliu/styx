@@ -47,7 +47,7 @@ func InProcessStreamPairForTest(s *PluginServer) (*ClientConn, func(), error) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = runServeLoop(context.Background(), pluginTr, dispatcher, srv, nil)
+		_ = runServeLoop(context.Background(), pluginTr, dispatcher, srv, nil, nil)
 	}()
 
 	cc := newClientConn("p", rpcruntime.NewTable(firstGeneration), clientTr, codec.Proto{})
@@ -78,7 +78,7 @@ func (s *PluginServer) RunServingControlForTest(ctx context.Context, conn *contr
 	// sequence-only Heartbeat, exactly the prior behavior. The reload-hook
 	// snapshot is taken here, before the control loop starts, exactly as
 	// runServing takes it at serving-session start in production.
-	return s.runServingControl(ctx, conn, newHeartbeatProgress(nil, nil), s.snapshotReloadHooks())
+	return s.runServingControl(ctx, conn, newHeartbeatProgress(nil, nil), s.snapshotReloadHooks(), nil)
 }
 
 // RunServingForTest re-exports runServing for pluginserver_test (external test

@@ -154,7 +154,7 @@ func setupUnaryPanicHarness(t *testing.T, continueAfterPanic bool) *unaryPanicHa
 
 	clientTr, pluginTr := newInProcessTransportPairForTest(t)
 	serveResult := make(chan error, 1)
-	go func() { serveResult <- runServeLoop(context.Background(), pluginTr, dispatcher, nil, pc) }()
+	go func() { serveResult <- runServeLoop(context.Background(), pluginTr, dispatcher, nil, pc, nil) }()
 
 	cc := newClientConn("p", rpcruntime.NewTable(firstGeneration), clientTr, codec.Proto{})
 
@@ -279,7 +279,7 @@ func setupStreamPanicHarness(t *testing.T, continueAfterPanic bool) *streamPanic
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		serveResult <- runServeLoop(context.Background(), pluginTr, d, srv, pc)
+		serveResult <- runServeLoop(context.Background(), pluginTr, d, srv, pc, nil)
 	}()
 	t.Cleanup(func() {
 		_ = pluginTr.Close()
@@ -585,7 +585,7 @@ func setupInterleaveHarness(t *testing.T) *interleaveHarness {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		serveResult <- runServeLoop(context.Background(), pluginTr, d, srv, pc)
+		serveResult <- runServeLoop(context.Background(), pluginTr, d, srv, pc, nil)
 	}()
 	t.Cleanup(func() {
 		release()
@@ -779,7 +779,7 @@ func setupUnaryInterleaveHarness(t *testing.T) *unaryInterleaveHarness {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		serveResult <- runServeLoop(context.Background(), pluginTr, dispatcher, srv, pc)
+		serveResult <- runServeLoop(context.Background(), pluginTr, dispatcher, srv, pc, nil)
 	}()
 	t.Cleanup(func() {
 		release()

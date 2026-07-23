@@ -41,6 +41,17 @@ type StateRestorer interface {
 	RestoreState(ctx context.Context, formatVersion uint32, data []byte) error
 }
 
+// DrainWaitFunc blocks until every data-plane call accepted before the host's
+// cutoff has finished on this instance — its response has reached the transport —
+// or its context (the drain deadline) is done. ServeReloadAfterDrain calls it
+// after freezing mutators and before acking Drain, so the ack certifies BOTH
+// mutable-state freeze AND accepted-call quiescence (the design of record's
+// conjunction, docs/specs/2026-07-16-styx-design.md hot-reload section). It is
+// supplied by the serving session (which owns the reservation count, the obligation
+// table, and the data-plane transport the quiescence predicate reads); nil in a
+// caller that has no data plane to quiesce (a control-only test seam).
+type DrainWaitFunc func(ctx context.Context) error
+
 // PluginReloadHooks bundles what styx.PluginServer registers for hot-reload.
 // It is kept package-internal (not part of the public styx.PluginServer
 // struct directly) so this file's control-message loop and the public
@@ -87,12 +98,14 @@ const (
 // phase until after DrainAck arrives, so nothing past this point may still
 // be governed by the drain deadline.
 //
-// DrainAck presently certifies mutator quiescence only: it is sent once the
-// mutators are frozen, and data-plane calls accepted before the host's cutoff
-// may still be in flight on this instance when the ack goes out. Waiting for
-// every accepted call to finish before acknowledging drain — the completion
-// the design of record requires (docs/specs/2026-07-16-styx-design.md) — is
-// deferred work not yet wired into this loop.
+// DrainAck certifies BOTH mutator-freeze AND accepted-call quiescence: after
+// freezing the mutators it waits (waitDrained, bounded by the drain deadline) for
+// every data-plane call accepted before the host's cutoff to finish on this
+// instance — its response reached the transport — and only then acks. Nothing
+// accepted before the cutoff is silently dropped: an accepted call completes on
+// this instance before DrainAck, or was never admitted (the design of record's
+// completion requirement, docs/specs/2026-07-16-styx-design.md hot-reload section).
+// If quiescence is not reached by the deadline, drain fails and the host rolls back.
 //
 // Once DrainAck has gone out — never before — it always sends a snapshot:
 // hooks.Saver's output when one is registered, or an empty payload when
@@ -131,13 +144,15 @@ const (
 // violation and is returned as an error wrapping control.ErrProtocolViolation.
 // Any receive failure that is not the connection cleanly ending or ctx
 // being done is likewise returned, wrapped, rather than treated as success.
-func ServeReload(ctx context.Context, conn *control.Conn, hooks PluginReloadHooks) (ReloadOutcome, error) {
+func ServeReload(
+	ctx context.Context, conn *control.Conn, hooks PluginReloadHooks, waitDrained DrainWaitFunc,
+) (ReloadOutcome, error) {
 	drainMsg, err := recvExpected(ctx, conn, control.StateServing, control.KindDrain)
 	if err != nil {
 		return ReloadRetired, fmt.Errorf("lifecycle: reload: await Drain: %w", err)
 	}
 
-	return ServeReloadAfterDrain(ctx, conn, drainMsg, hooks)
+	return ServeReloadAfterDrain(ctx, conn, drainMsg, hooks, waitDrained)
 }
 
 // ServeReloadAfterDrain runs the reload pass whose Drain has already been
@@ -149,6 +164,7 @@ func ServeReload(ctx context.Context, conn *control.Conn, hooks PluginReloadHook
 // full behavior is documented on ServeReload.
 func ServeReloadAfterDrain(
 	ctx context.Context, conn *control.Conn, drainMsg *controlpb.ControlMessage, hooks PluginReloadHooks,
+	waitDrained DrainWaitFunc,
 ) (ReloadOutcome, error) {
 	deadline := time.Unix(0, drainMsg.GetDrain().GetDeadlineUnixNano())
 	dctx, cancel := context.WithDeadline(ctx, deadline)
@@ -157,6 +173,21 @@ func ServeReloadAfterDrain(
 		cancel()
 
 		return ReloadRetired, err
+	}
+
+	// Accepted-call quiescence, before the ack: wait until every data-plane call
+	// accepted before the host's cutoff has finished on this instance, bounded by the
+	// drain deadline (dctx). This closes the gap where DrainAck certified only
+	// mutator-freeze and an accepted call could still be in flight — the ack now means
+	// both are true. A timeout (or any non-nil return) fails the drain, and the host's
+	// existing rollback path runs unchanged. nil waitDrained (a control-only test
+	// seam with no data plane) skips the wait.
+	if waitDrained != nil {
+		if err := waitDrained(dctx); err != nil {
+			cancel()
+
+			return ReloadRetired, fmt.Errorf("lifecycle: reload: await call quiescence: %w", err)
+		}
 	}
 
 	drainAck := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_DrainAck{DrainAck: &controlpb.DrainAck{}}}

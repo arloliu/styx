@@ -132,7 +132,7 @@ func runServeReload(t *testing.T, conn *control.Conn, hooks lifecycle.PluginRelo
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := lifecycle.ServeReload(t.Context(), conn, hooks)
+		_, err := lifecycle.ServeReload(t.Context(), conn, hooks, nil)
 		done <- err
 	}()
 
@@ -146,7 +146,7 @@ func runServeReloadResult(t *testing.T, conn *control.Conn, hooks lifecycle.Plug
 
 	done := make(chan reloadResult, 1)
 	go func() {
-		outcome, err := lifecycle.ServeReload(t.Context(), conn, hooks)
+		outcome, err := lifecycle.ServeReload(t.Context(), conn, hooks, nil)
 		done <- reloadResult{outcome: outcome, err: err}
 	}()
 

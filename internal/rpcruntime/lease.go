@@ -57,6 +57,13 @@ type LeaseTable struct {
 	mu          sync.Mutex
 	active      map[uint64]Lease
 	obligations map[uint64]struct{}
+	// obligationClosedHook, when set, is invoked (without the lock held) after each
+	// obligation close, so a reload drain coordinator can re-evaluate quiescence
+	// when a response that was owed is finally handed to the transport — including a
+	// stream obligation that closes on a handler/finisher goroutine, not the reader
+	// loop. Set once at serving-session start (SetObligationClosedHook), nil
+	// otherwise. It must be non-blocking.
+	obligationClosedHook func()
 }
 
 // NewLeaseTable returns an empty LeaseTable.
@@ -111,11 +118,39 @@ func (t *LeaseTable) Release(callID uint64) {
 // CloseObligation drops callID's response obligation, recording that its
 // response/terminal frame has been handed to the transport. A close of an unknown
 // or already-closed call ID is a harmless no-op, so it is safe to call from every
-// terminal-frame handoff path that may fire for one call.
+// terminal-frame handoff path that may fire for one call. After releasing the
+// lock it invokes any obligation-closed hook so a drain coordinator can re-evaluate
+// quiescence (the hook is called even for a no-op close — a spurious re-evaluation
+// is harmless).
 func (t *LeaseTable) CloseObligation(callID uint64) {
 	t.mu.Lock()
 	delete(t.obligations, callID)
+	hook := t.obligationClosedHook
 	t.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+}
+
+// SetObligationClosedHook installs fn to be called (without the lock) after each
+// obligation close. It is set once at serving-session start, before any obligation
+// can close, so the plain field it stores under the lock is race-free. Passing nil
+// clears it.
+func (t *LeaseTable) SetObligationClosedHook(fn func()) {
+	t.mu.Lock()
+	t.obligationClosedHook = fn
+	t.mu.Unlock()
+}
+
+// OpenObligationCount reports the number of currently-open response obligations —
+// the count the reload drain predicate uses to require that every accepted call's
+// response has reached the transport before DrainAck.
+func (t *LeaseTable) OpenObligationCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return len(t.obligations)
 }
 
 // Snapshot returns a copy of the currently-live leases for heartbeat assembly.

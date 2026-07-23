@@ -58,7 +58,7 @@ func startStreamPluginWithLeases(
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = runServeLoop(context.Background(), pluginTr, d, srv, nil)
+		_ = runServeLoop(context.Background(), pluginTr, d, srv, nil, nil)
 	}()
 	t.Cleanup(func() {
 		_ = pluginTr.Close()

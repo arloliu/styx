@@ -450,17 +450,23 @@ func (c *ClientConn) openStreamByID(
 	// emission (openSendPending) and the owed pair is driven below, ordered after the
 	// OPEN — the phase is already PUBLISHED but the wire fate is still this call's to
 	// resolve.
-	if sendErr := state.tr.Send(st.Context(), f); sendErr != nil {
-		c.admission.Leave()
-
+	// sendStreamOpen publishes the OPEN and resolves the admission-barrier Leave: on a
+	// transport with an acceptance-unknown window (shared memory), an enqueued OPEN
+	// hands the Leave to the write completion so the cutoff joins this open through
+	// its definitive publish/discard — never releasing the barrier before the enqueued
+	// OPEN is actually published; on the uds transport (definitive) it Leaves inline.
+	if sendErr := c.sendStreamOpen(st.Context(), state.tr, f); sendErr != nil {
 		// resolveOpenSendErr never yields a live stream — it discards or terminates the
 		// published-but-unsent stream and surfaces the outcome, so OpenStream returns no
-		// wrapper.
+		// wrapper. The Leave is already resolved by sendStreamOpen (inline for uds/an
+		// unenqueued shm OPEN; owned by the completion callback for an enqueued one).
 		return nil, resolveOpenSendErr(state, st, sendErr)
 	}
-	// The OPEN reached the transport: release the publication barrier now, before the
-	// send-confirm arbitration below (whose terminal wait cutoff must not join).
-	c.admission.Leave()
+	// The OPEN reached the transport; the barrier was released by sendStreamOpen
+	// (inline on success for uds/an unenqueued OPEN, or synchronously by the
+	// completion callback for a definitively-published enqueued OPEN) — released
+	// before the send-confirm arbitration below, whose terminal wait cutoff must not
+	// join.
 	// Confirm the OPEN send against a terminal that may have won DURING it — the
 	// deadline watcher, a local cancel, or a fast peer STREAM_ERR/STREAM_CLOSE/
 	// completion the reader dispatched while the send was in flight (stream-protocol.md
@@ -478,6 +484,41 @@ func (c *ClientConn) openStreamByID(
 	}
 
 	return newClientStream(st, state.codec), nil
+}
+
+// sendStreamOpen publishes the STREAM_OPEN and resolves the admission-barrier
+// Leave, returning the send error (nil on success). Leave ownership is decided
+// solely by the transport's capability and the enqueued result, never by an
+// inline-vs-callback race:
+//
+//   - A transport.ReportingSender (the shared-memory transport, which has an
+//     acceptance-unknown window where a context-canceled send publishes only
+//     later): the completion callback owns the Leave for an enqueued OPEN,
+//     UNCONDITIONALLY — it fires at the intent's definitive publish or discard, so
+//     the reload cutoff (admission.Close) joins this open through its resolution
+//     rather than releasing before it is published. An OPEN that never enqueued
+//     (a pre-enqueue rejection) leaves inline on that error path.
+//   - A plain Send (the uds transport, whose Send is definitive): Leave inline on
+//     both success and failure, exactly as before.
+//
+// admission.Leave is a non-blocking release (a brief lock, a counter decrement, and
+// a possible channel close — no I/O, no send), so it is safe for the shared-memory
+// writer goroutine to run as the completion callback.
+func (c *ClientConn) sendStreamOpen(ctx context.Context, tr transport.Transport, f transport.Frame) error {
+	if rs, ok := tr.(transport.ReportingSender); ok {
+		enqueued, err := rs.SendReporting(ctx, f, func(bool) { c.admission.Leave() })
+		if !enqueued {
+			// No intent exists; the callback never fires. Release inline on this path.
+			c.admission.Leave()
+		}
+		// enqueued: the callback owns the Leave unconditionally — do not release here.
+		return err
+	}
+
+	err := tr.Send(ctx, f)
+	c.admission.Leave()
+
+	return err
 }
 
 // translateStreamOutcomeErr maps a stream that reached a terminal outcome before

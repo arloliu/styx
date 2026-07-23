@@ -265,6 +265,13 @@ func (s *PluginServer) runServing(
 	// streaming handler panic raises (see panic_policy.go).
 	panicPolicy := newPanicController(s.continueAfterPanic.Load())
 
+	// One drain coordinator per serving session: the reader loop maintains its
+	// ingress reservation, and a reload's DrainAck waits on its quiescence predicate.
+	// An obligation closing on a handler/finisher goroutine pokes it so the predicate
+	// re-evaluates when an owed response finally reaches the transport.
+	coord := newDrainCoordinator()
+	leases.SetObligationClosedHook(coord.poke)
+
 	dispatcher := rpcruntime.NewDispatcher()
 	dispatcher.SetLeaseTable(leases)
 	s.mu.Lock()
@@ -286,6 +293,24 @@ func (s *PluginServer) runServing(
 	if streaming {
 		srv = newStreamServer(tr, streamHandlers, codec.Proto{}, leases)
 		srv.setPanicController(panicPolicy)
+	}
+
+	// taintClear reports whether the session's fatal/taint word is clear — no
+	// handler-panic taint and no connection-fatal stream fault. The drain predicate
+	// checks it (step (c)) so a required-fatal session can never be certified
+	// quiesced: the taint store precedes the terminal obligation close, so a taint
+	// that a panic recorded before its last obligation closed is always observed.
+	taintClear := func() bool {
+		if panicPolicy != nil && panicPolicy.shouldTerminate() {
+			return false
+		}
+
+		return srv == nil || srv.plane.streams.FatalErr() == nil
+	}
+	// waitDrained is the accepted-call quiescence gate DrainAck passes through,
+	// bounded by the caller's (drain-deadline) context.
+	waitDrained := func(dctx context.Context) error {
+		return coord.waitQuiescent(dctx, tr, leases, taintClear)
 	}
 
 	// A cancelable context so a data-plane death can stop the control loop below.
@@ -325,7 +350,7 @@ func (s *PluginServer) runServing(
 	var readPoisoned atomic.Bool
 	go func() {
 		defer close(readDone)
-		if runServeLoop(ctx, tr, dispatcher, srv, panicPolicy) != nil {
+		if runServeLoop(ctx, tr, dispatcher, srv, panicPolicy, coord) != nil {
 			readPoisoned.Store(true)
 		}
 	}()
@@ -337,7 +362,7 @@ func (s *PluginServer) runServing(
 	// would never see the fault and never restart it.
 	ctrlDone := make(chan error, 1)
 	progress := newHeartbeatProgress(tr, leases)
-	go func() { ctrlDone <- s.runServingControl(ctx, conn, progress, reloadHooks) }()
+	go func() { ctrlDone <- s.runServingControl(ctx, conn, progress, reloadHooks, waitDrained) }()
 
 	var ctrlErr error
 	select {
@@ -436,6 +461,7 @@ func (s *PluginServer) snapshotReloadHooks() lifecycle.PluginReloadHooks {
 // error on a host crash/disconnect or a protocol violation (exit 1).
 func (s *PluginServer) runServingControl(
 	ctx context.Context, conn *control.Conn, progress *heartbeatProgress, reloadHooks lifecycle.PluginReloadHooks,
+	waitDrained lifecycle.DrainWaitFunc,
 ) error {
 	// The heartbeat sender is the only other goroutine that Sends on conn.
 	// control.Conn permits one in-flight Send, and a reload's ServeReload also
@@ -445,7 +471,7 @@ func (s *PluginServer) runServingControl(
 	hb := newHeartbeatSender(conn, heartbeatInterval(), progress)
 	hb.start(ctx)
 
-	err := s.dispatchControl(ctx, conn, hb, reloadHooks)
+	err := s.dispatchControl(ctx, conn, hb, reloadHooks, waitDrained)
 
 	hb.stop()
 
@@ -477,6 +503,7 @@ func (s *PluginServer) runServingControl(
 // as the passive disconnect wait did before reload dispatch existed.
 func (s *PluginServer) dispatchControl(
 	ctx context.Context, conn *control.Conn, hb *heartbeatSender, reloadHooks lifecycle.PluginReloadHooks,
+	waitDrained lifecycle.DrainWaitFunc,
 ) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -519,7 +546,7 @@ func (s *PluginServer) dispatchControl(
 		case control.KindShutdown:
 			return nil // graceful shutdown; caller acks + tears down + exits 0.
 		case control.KindDrain:
-			retire, err := s.handleReload(ctx, conn, hb, msg, reloadHooks)
+			retire, err := s.handleReload(ctx, conn, hb, msg, reloadHooks, waitDrained)
 			if err != nil {
 				return err
 			}
@@ -543,11 +570,11 @@ func (s *PluginServer) dispatchControl(
 // heartbeats resumed, keep serving).
 func (s *PluginServer) handleReload(
 	ctx context.Context, conn *control.Conn, hb *heartbeatSender, drainMsg *controlpb.ControlMessage,
-	reloadHooks lifecycle.PluginReloadHooks,
+	reloadHooks lifecycle.PluginReloadHooks, waitDrained lifecycle.DrainWaitFunc,
 ) (retire bool, err error) {
 	hb.pause()
 
-	outcome, err := lifecycle.ServeReloadAfterDrain(ctx, conn, drainMsg, reloadHooks)
+	outcome, err := lifecycle.ServeReloadAfterDrain(ctx, conn, drainMsg, reloadHooks, waitDrained)
 	if err != nil {
 		return false, err
 	}
@@ -940,7 +967,7 @@ var errServeLoopHandlerPanicked = errors.New("styx: serve loop terminated after 
 // that policy and may be nil for a caller that does not exercise panic recovery.
 func runServeLoop(
 	ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher, srv *streamServer,
-	panicPolicy *panicController,
+	panicPolicy *panicController, coord *drainCoordinator,
 ) error {
 	// One releaser for the whole loop: dispatch is inline on this single goroutine, so
 	// the unary admission release is reused per call rather than allocated per request.
@@ -954,107 +981,157 @@ func runServeLoop(
 			srv.plane.probeDrain()
 		}
 
-		f, err := tr.Recv(ctx)
-		if err != nil {
-			if isFrameLocalRecvErr(err) {
-				// Frame-local (a malformed status body or an unimplemented-kind
-				// frame from a buggy/hostile peer): the stream is still
-				// synchronized, so skip this frame and keep serving rather than
-				// silently killing an otherwise-healthy serving loop. See
-				// isFrameLocalRecvErr.
-				continue
-			}
-
-			if errors.Is(err, transport.ErrPoisoned) {
-				// A torn/invalid inbound frame poisoned the transport: the data plane
-				// desynced under a possibly-healthy control plane. Fail the whole
-				// instance (like a self-initiated conformance poison) so the host
-				// supervisor observes the process die and restarts it (design §9's
-				// poison teardown), rather than parking on the still-live control loop.
-				return errServeLoopPoisoned
-			}
-
-			return nil // peer close / ErrClosed / ctx: not a self-initiated poison
-		}
-
-		// Coarse admission fence: once a recovered handler panic has tainted the session
-		// under the default policy, drop every further frame before routing it into
-		// dispatch. This is the lock-free fast path for an already-established taint — it
-		// fences data and teardown frames for an already-open stream too, which the
-		// production teardown then reaps. It does NOT by itself close the check-to-admission
-		// race for a NEW call: a streaming panic taints from its own handler goroutine and
-		// could store the taint just after this load returns false. That window is closed
-		// per admission by the gated check the admission paths take (routeStreamFrame's
-		// STREAM_OPEN gate; dispatchNonStreamFrame's unary admission gate, held through
-		// handler entry), which linearizes the taint store against the admission. The
-		// unary panic path is unaffected — it sends
-		// its reply and returns its own sentinel from dispatchNonStreamFrame before the loop
-		// reaches this check again. Opted in (ContinueAfterPanic), no taint is ever
-		// recorded, so neither this nor the gated checks ever fire.
-		if panicPolicy != nil && panicPolicy.shouldTerminate() {
-			return errServeLoopHandlerPanicked
-		}
-
-		// A STREAM_OPEN is admitted by the accept half; the four STREAM_* data kinds
-		// route to the stream table; a CANCEL is a stream teardown only when its
-		// call ID names a live stream (decided by lookup, not the control value),
-		// otherwise it is a unary cancel; everything else is a unary request.
-		switch {
-		case isStreamKind(f.Kind):
-			if srv == nil {
-				// Feature-absent, fail-closed (stream-protocol.md §11.2): streaming
-				// was not negotiated, so any STREAM_* frame is a conformance
-				// violation. Poison the connection.
-				stopTransportWriter(tr)
-
-				return errServeLoopPoisoned
-			}
-			fenced, derr := routeStreamFrame(srv, f, panicPolicy)
-			if fenced {
-				// A streaming panic tainted the session between the coarse fence above and
-				// this open's gated admission: fence the open and terminate for a controlled
-				// restart, exactly as the coarse fence would have on a later iteration.
-				return errServeLoopHandlerPanicked
-			}
-			if derr != nil {
-				// A conformance violation on a LIVE stream poisons the connection
-				// (stream-protocol.md §8.1): stopWriter marks the table closing and
-				// stops the writer, tearing the serving loop down WITHOUT releasing the
-				// region; runServing's teardown then joins the finishers before the
-				// region is released. Marking closing before the stop keeps a released
-				// finisher from recording a false Fatal during this teardown.
-				srv.plane.stopWriter()
-
-				return errServeLoopPoisoned
-			}
-		case f.Kind == transport.FrameCancel && srv != nil && srv.plane.streams.HasLiveStream(f.CallID):
-			// A CANCEL naming a live stream is a stream teardown (§9.1); its
-			// discriminant (0 or any non-teardown code) poisons, a legal code
-			// terminates. A CANCEL for any other call ID falls to the unary path.
-			if derr := srv.plane.dispatchStreamFrame(f); derr != nil {
-				// A conformance violation on a LIVE stream poisons the connection: mark
-				// the table closing before the writer stop so a released finisher does
-				// not record a false Fatal during this teardown (§8.1/§9).
-				srv.plane.stopWriter()
-
-				return errServeLoopPoisoned
-			}
-		case f.Kind == transport.FrameCancel && srv == nil && f.Control != 0:
-			// Feature-absent (§11.2): a nonzero control word is illegal on any frame
-			// when streaming was not negotiated. Poison.
-			stopTransportWriter(tr)
-
-			return errServeLoopPoisoned
-		default:
-			stop, err := dispatchNonStreamFrame(ctx, tr, d, f, panicPolicy, releaser)
-			if err != nil {
-				return err
-			}
-			if stop {
-				return nil // peer close / ErrClosed / ctx: not a self-initiated poison
-			}
+		done, loopErr := serveOneFrame(ctx, tr, d, srv, panicPolicy, releaser, coord)
+		if done {
+			return loopErr
 		}
 	}
+}
+
+// recvReserving receives one frame under the ingress-reservation contract: when the
+// transport implements ReservingReceiver (both production transports do), reserve
+// fires inside it after readiness commits and before the first destructive read.
+// A test double without the capability falls back to plain Recv and takes no
+// reservation (the predicate then rests on ReadableNow and obligations alone).
+func recvReserving(ctx context.Context, tr transport.Transport, reserve func()) (transport.Frame, error) {
+	if rr, ok := tr.(transport.ReservingReceiver); ok {
+		return rr.RecvReserving(ctx, reserve)
+	}
+
+	return tr.Recv(ctx)
+}
+
+// serveOneFrame reads and disposes exactly one data-plane frame under the ingress
+// reservation, returning done=true (with loopErr) when runServeLoop must return.
+// reserve fires before the frame leaves transport custody; the deferred retire
+// drops it after the frame's SYNCHRONOUS disposition — on EVERY exit path,
+// including the EOF/connection-close edge where a uds EOF-readiness commit reserved
+// before the read hit EOF — so ingressPending never leaks and the reservation
+// covers the frame until it is accounted (an obligation opened, existing stream/call
+// state routed, or an error disposed). This is the reader-boundary discharge of the
+// drainCoordinator invariant: open-then-retire (a unary request or STREAM_OPEN
+// opens its keyed obligation before this returns), and error-then-retire for the
+// local-error/stale/EOF/poison edges.
+// disposeRecvErr maps a RecvReserving error to the serve loop's exit decision.
+func disposeRecvErr(err error) (done bool, loopErr error) {
+	if isFrameLocalRecvErr(err) {
+		// Frame-local (a malformed status body or an unimplemented-kind frame from a
+		// buggy/hostile peer): the stream is still synchronized, so skip this frame and
+		// keep serving rather than silently killing an otherwise-healthy serving loop.
+		// See isFrameLocalRecvErr.
+		return false, nil
+	}
+	if errors.Is(err, transport.ErrPoisoned) {
+		// A torn/invalid inbound frame poisoned the transport: the data plane desynced
+		// under a possibly-healthy control plane. Fail the whole instance (like a
+		// self-initiated conformance poison) so the host supervisor observes the process
+		// die and restarts it (the design-of-record's poison teardown), rather
+		// than parking on the still-live control loop.
+		return true, errServeLoopPoisoned
+	}
+
+	return true, nil // peer close / ErrClosed / ctx: not a self-initiated poison
+}
+
+func serveOneFrame(
+	ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher, srv *streamServer,
+	panicPolicy *panicController, releaser *admitReleaser, coord *drainCoordinator,
+) (done bool, loopErr error) {
+	reserved := false
+	reserve := func() {
+		reserved = true
+		if coord != nil {
+			coord.reserve()
+		}
+	}
+	defer func() {
+		if reserved && coord != nil {
+			coord.retire()
+		}
+	}()
+
+	f, err := recvReserving(ctx, tr, reserve)
+	if err != nil {
+		return disposeRecvErr(err)
+	}
+
+	// Coarse admission fence: once a recovered handler panic has tainted the session
+	// under the default policy, drop every further frame before routing it into
+	// dispatch. This is the lock-free fast path for an already-established taint — it
+	// fences data and teardown frames for an already-open stream too, which the
+	// production teardown then reaps. It does NOT by itself close the check-to-admission
+	// race for a NEW call: a streaming panic taints from its own handler goroutine and
+	// could store the taint just after this load returns false. That window is closed
+	// per admission by the gated check the admission paths take (routeStreamFrame's
+	// STREAM_OPEN gate; dispatchNonStreamFrame's unary admission gate, held through
+	// handler entry), which linearizes the taint store against the admission. The unary
+	// panic path is unaffected — it sends its reply and returns its own sentinel from
+	// dispatchNonStreamFrame. Opted in (ContinueAfterPanic), no taint is ever recorded,
+	// so neither this nor the gated checks ever fire.
+	if panicPolicy != nil && panicPolicy.shouldTerminate() {
+		return true, errServeLoopHandlerPanicked
+	}
+
+	// A STREAM_OPEN is admitted by the accept half; the four STREAM_* data kinds route
+	// to the stream table; a CANCEL is a stream teardown only when its call ID names a
+	// live stream (decided by lookup, not the control value), otherwise it is a unary
+	// cancel; everything else is a unary request.
+	switch {
+	case isStreamKind(f.Kind):
+		if srv == nil {
+			// Feature-absent, fail-closed (stream-protocol.md §11.2): streaming was not
+			// negotiated, so any STREAM_* frame is a conformance violation. Poison.
+			stopTransportWriter(tr)
+
+			return true, errServeLoopPoisoned
+		}
+		fenced, derr := routeStreamFrame(srv, f, panicPolicy)
+		if fenced {
+			// A streaming panic tainted the session between the coarse fence above and
+			// this open's gated admission: fence the open and terminate for a controlled
+			// restart, exactly as the coarse fence would have on a later iteration.
+			return true, errServeLoopHandlerPanicked
+		}
+		if derr != nil {
+			// A conformance violation on a LIVE stream poisons the connection
+			// (stream-protocol.md §8.1): stopWriter marks the table closing and stops
+			// the writer, tearing the serving loop down WITHOUT releasing the region;
+			// runServing's teardown then joins the finishers before the region is
+			// released. Marking closing before the stop keeps a released finisher from
+			// recording a false Fatal during this teardown.
+			srv.plane.stopWriter()
+
+			return true, errServeLoopPoisoned
+		}
+	case f.Kind == transport.FrameCancel && srv != nil && srv.plane.streams.HasLiveStream(f.CallID):
+		// A CANCEL naming a live stream is a stream teardown (§9.1); its discriminant
+		// (0 or any non-teardown code) poisons, a legal code terminates. A CANCEL for
+		// any other call ID falls to the unary path.
+		if derr := srv.plane.dispatchStreamFrame(f); derr != nil {
+			// A conformance violation on a LIVE stream poisons the connection: mark the
+			// table closing before the writer stop so a released finisher does not record
+			// a false Fatal during this teardown (§8.1/§9).
+			srv.plane.stopWriter()
+
+			return true, errServeLoopPoisoned
+		}
+	case f.Kind == transport.FrameCancel && srv == nil && f.Control != 0:
+		// Feature-absent (§11.2): a nonzero control word is illegal on any frame when
+		// streaming was not negotiated. Poison.
+		stopTransportWriter(tr)
+
+		return true, errServeLoopPoisoned
+	default:
+		stop, derr := dispatchNonStreamFrame(ctx, tr, d, f, panicPolicy, releaser)
+		if derr != nil {
+			return true, derr
+		}
+		if stop {
+			return true, nil // peer close / ErrClosed / ctx: not a self-initiated poison
+		}
+	}
+
+	return false, nil // keep serving; retire runs via the defer above
 }
 
 // admitReleaser drops the unary admission read side exactly once per admitted call.

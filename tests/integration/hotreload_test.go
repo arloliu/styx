@@ -178,33 +178,31 @@ func TestHotReload_CompleteInFlightCallOnOldInstance_UnderLoad(t *testing.T) {
 	}
 	require.True(t, sawNew, "load must have reached the new instance after the reload settled")
 
-	// Each worker runs its calls sequentially, so at the single admission cutoff at
-	// most one call per worker can be in flight and later reaped with an unknown
-	// outcome — the tolerated drops are bounded by the worker count. A strict
-	// zero-drop bound is not assertable yet: the plugin-side drain frees mutable
-	// state without joining accepted data-plane calls, so a call still running when
-	// the predecessor is reaped has a genuinely unknown outcome (the deferred-gap note
-	// on DrainAck in internal/lifecycle/plugin_reload.go). Both generations are still
-	// required to serve — the gated call and probe on the old, sawNew on the new.
-	require.LessOrEqual(t, totalDropped, callers,
-		"more in-flight calls were reaped with an unknown outcome (%d) than workers (%d) to have them in flight",
-		totalDropped, callers)
+	// No accepted call is dropped across the reload: DrainAck now certifies
+	// accepted-call quiescence as well as mutator-freeze, so every call the plugin
+	// accepted before the cutoff finishes on the predecessor before it is reaped —
+	// none is left running when the old instance is torn down. A unary Send is
+	// definitive (it publishes under a background context before its admission
+	// barrier releases), so the cutoff joins every admitted call through publication,
+	// and the plugin-side drain then joins every accepted call through its response
+	// (internal/lifecycle/plugin_reload.go's ServeReloadAfterDrain). Both generations
+	// are still exercised — the gated call and probe on the old, sawNew on the new.
+	require.Zero(t, totalDropped,
+		"an accepted call was reaped with an unknown outcome across the reload: the drain must join it")
 }
 
 // runLoadCaller drives one background caller until ctx is canceled, recording every
 // pid it saw, the count of its calls the reload reaped with an unknown outcome, and
-// the first failure a correct reload should never produce. A load call may fail in
-// exactly two ways a correct reload produces, both benign:
+// the first failure a correct reload should never produce. A load call may be
+// refused, but never dropped, by a correct reload:
 //   - ErrDrained: refused at the admission cutoff, provably never dispatched and
-//     safe to retry.
-//   - ErrOutcomeUnknown: dispatched to the old instance, which the reload then
-//     reaped before the response returned. The plugin-side drain frees mutable
-//     state without joining accepted data-plane calls, so a call still running when
-//     the predecessor is torn down has a genuinely unknown outcome (the deferred-gap
-//     note on DrainAck in internal/lifecycle/plugin_reload.go). Counted in
-//     droppedInFlight so the caller can bound the total; the gated call proves the
-//     property directly by finishing before that teardown, and an unlucky load call
-//     caught by it is not a splice, just an unknown outcome.
+//     safe to retry. Benign, not a drop.
+//   - ErrOutcomeUnknown: dispatched to the old instance and reaped before its
+//     response returned. Counted in droppedInFlight — and now expected to be zero,
+//     because DrainAck joins accepted-call quiescence: a call the plugin accepted
+//     before the cutoff finishes on the predecessor before it is reaped (see the
+//     zero-drop assertion in TestHotReload_CompleteInFlightCallOnOldInstance_
+//     UnderLoad and ServeReloadAfterDrain).
 //
 // Any other failure — or a response whose pid does not parse or whose body is not
 // the exact request sent — is a defect the test goroutine surfaces via badErr. The
