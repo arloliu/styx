@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -1998,4 +1999,27 @@ func TestTransport_PayloadAboveOneMiB_RoundTrips_WhenGeometryAllows(t *testing.T
 	err := ep.host.Send(t.Context(),
 		transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq, Payload: make([]byte, twoMiB+1)})
 	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+}
+
+// Test that Transport.Close is idempotent and never double-closes the duplicated
+// region fd, even after that fd number has been reused by a later open. The
+// sync.Once guard makes the second Close a no-op, so it cannot close an unrelated
+// fd that reused the freed number — the FD-reuse double-close guard the ownership
+// contract requires.
+func TestTransport_Close_Idempotent_NoDoubleCloseAfterFDReuse(t *testing.T) {
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+	require.NoError(t, ep.host.Close()) // closes the transport's duplicated region fd
+
+	// Reuse the freed fd number with a fresh open, then close the transport again:
+	// a non-idempotent Close would close this reused fd out from under its owner.
+	reused, err := os.Open(os.DevNull)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reused.Close() })
+
+	require.NotPanics(t, func() { _ = ep.host.Close() }, "a second Close must be a no-op")
+
+	// The reused fd is still valid — the second Close did not touch it.
+	_, statErr := reused.Stat()
+	require.NoError(t, statErr, "the second Close must not have closed a reused fd number")
 }

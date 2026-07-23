@@ -422,3 +422,57 @@ func TestHost_ShmPinned_FailsHandshake_AgainstUDSOnlyPlugin(t *testing.T) {
 	require.ErrorAs(t, err, &incompatible)
 	require.ErrorIs(t, h.Plugin("udsonly").Invoke(t.Context(), "svc", "M", nil, nil), styx.ErrPluginUnavailable)
 }
+
+// Test the D1 no-downgrade rule for an attach failure AFTER a successful
+// shared-memory negotiation: an shm-pinned host whose selected peak concurrency
+// exceeds the geometry's data budget (C - R) negotiates shm, then fails the
+// mandatory capacity check at attach. That is a spawn failure surfaced on the
+// event stream — never a silent downgrade to uds — and no serving instance is
+// produced.
+func TestHost_ShmAttachFailsAfterNegotiation_IsSpawnFailure_NoDowngrade(t *testing.T) {
+	events := make(chan styx.Event, 32)
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{
+			Name:            "ready",
+			Path:            fixtureReadyPlugin,
+			Transport:       "shm",
+			Geometry:        styx.GeometryLean(), // C = 512, R = 32 => C - R = 480
+			MaxDataInflight: 1000,                // exceeds the data budget: negotiates shm, fails attach
+		}},
+	})
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// Drain events onto a buffered channel so the failure is observable.
+	go func() {
+		for ev := range h.Events() {
+			select {
+			case events <- ev:
+			default:
+			}
+		}
+	}()
+
+	err := h.Start(t.Context())
+
+	// The attach failure surfaces (from the event stream) as Start's error, naming
+	// the capacity budget it violated.
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "budget", "the spawn failure must carry the capacity-budget reason")
+
+	// No downgrade to uds: the plugin is not serving.
+	require.ErrorIs(t, h.Plugin("ready").Invoke(t.Context(), "svc", "M", nil, nil), styx.ErrPluginUnavailable)
+
+	// The failure was reported on the event stream (a terminal GaveUp).
+	require.Eventually(t, func() bool {
+		for {
+			select {
+			case ev := <-events:
+				if ev.Kind == styx.EventGaveUp || ev.Kind == styx.EventCrashed {
+					return true
+				}
+			default:
+				return false
+			}
+		}
+	}, 5*time.Second, 20*time.Millisecond, "the attach failure must be reported on the supervisor event stream")
+}
