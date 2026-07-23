@@ -3,6 +3,7 @@ package styx
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -231,6 +232,54 @@ func TestServeLoop_RetiresReservationOnEOF(t *testing.T) {
 
 	require.EqualValues(t, 0, coord.ingressPending.Load(),
 		"a reservation taken on the EOF-readiness commit must be retired as the loop exits")
+}
+
+// Test the REAL drain predicate certifies a parked reader WHILE it is provably held at
+// the readiness boundary. A live serve loop's reader is held there via the transport's
+// wait-entry seam — before any destructive read, so it holds no reservation — and
+// waitQuiescent (the full predicate: the two-phase re-check plus the obligation and taint
+// checks) runs and certifies quiescent CONCURRENTLY with the held reader, not just at a
+// separately-constructed idle state. The reader is then released and a request round-trip
+// proves it was parked and alive.
+func TestServeLoop_WaitQuiescentCertifies_WhileReaderHeldAtBoundary(t *testing.T) {
+	client, plugin := newStreamingTransportPairForTest(t)
+
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	var arriveOnce, releaseOnce sync.Once
+	restore := transport.SetReadinessWaitHookForTest(func() {
+		arriveOnce.Do(func() { close(arrived) })
+		<-release // held at the readiness boundary until the test releases it
+	})
+	t.Cleanup(restore)
+	releaseReader := func() { releaseOnce.Do(func() { close(release) }) }
+
+	coord := newDrainCoordinator()
+	leases := rpcruntime.NewLeaseTable()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = runServeLoop(t.Context(), plugin, rpcruntime.NewDispatcher(), nil, nil, coord)
+	}()
+	// Free a held reader before joining, or the join would deadlock on a reader parked in
+	// the seam rather than in the (closeable) peek.
+	t.Cleanup(func() { releaseReader(); _ = plugin.Close(); <-done })
+
+	// The serve loop's reader is HELD at the readiness boundary: no frame has been read,
+	// so it holds no reservation. Run the real certification while it is held.
+	<-arrived
+	qctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, coord.waitQuiescent(qctx, plugin, leases, clearTaint),
+		"the drain predicate must certify a reader held at the readiness boundary as quiescent")
+
+	// Release the reader and prove it was parked-and-alive: a request round-trips (unknown
+	// service -> an error reply carrying the same call id).
+	releaseReader()
+	require.NoError(t, client.Send(t.Context(), unaryReqFrame(55)))
+	reply, err := client.Recv(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, uint64(55), reply.CallID)
 }
 
 // kindName is a readable subtest label for a frame kind.

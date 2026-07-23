@@ -54,6 +54,21 @@ var peekSyscall = unix.Recvmsg
 // production: one predictable nil check per readiness wait.
 var readinessWaitHook func()
 
+// SetReadinessWaitHookForTest installs a hook waitReadable invokes immediately before it
+// blocks in the readiness peek, and returns a restore func. It is a TEST SEAM: nil in
+// production (the hook is never set outside tests), so the readiness wait runs unchanged.
+// It lets a test hold a reserving reader at the readiness boundary — before any
+// destructive read, where it provably holds no reservation — and assert the drain
+// predicate certifies it quiescent while it is held. It lives in this non-test file so
+// the drain predicate's own package (the root styx package) can drive it; internal/
+// packages are not public API, so exporting a test seam here is layering-safe.
+func SetReadinessWaitHookForTest(fn func()) (restore func()) {
+	prev := readinessWaitHook
+	readinessWaitHook = fn
+
+	return func() { readinessWaitHook = prev }
+}
+
 // UDSTransport implements Transport over an already-connected SOCK_STREAM
 // socket. Concurrency contract: writeMu serializes concurrent Send calls
 // so their header+body writes can never interleave. This IS load-bearing:
