@@ -217,6 +217,8 @@ var (
 	_ transport.InboundQueueProber      = (*Transport)(nil)
 	_ transport.FrameCounter            = (*Transport)(nil)
 	_ transport.ByteCounter             = (*Transport)(nil)
+	_ transport.ReservingReceiver       = (*Transport)(nil)
+	_ transport.ReportingSender         = (*Transport)(nil)
 	_ transport.ArenaOccupancyReporter  = (*Transport)(nil)
 	_ transport.RingDepthReporter       = (*Transport)(nil)
 	_ transport.WakeupSyscallCounter    = (*Transport)(nil)
@@ -582,6 +584,41 @@ func (t *Transport) Send(ctx context.Context, f transport.Frame) error {
 	return err
 }
 
+// SendReporting is Send with the ReportingSender contract for the stream-open
+// admission barrier: it registers onReport on the data-lane intent and returns
+// whether the intent was enqueued. A pre-enqueue rejection (closed / poisoned /
+// shut-down region, or a payload over the derived per-direction limit) returns
+// enqueued=false with the definitive error, so the caller releases inline; an
+// enqueued send returns enqueued=true and the writer's single report invokes
+// onReport at the intent's definitive resolution — closing the acceptance-unknown
+// window where a ctx-canceled send publishes only later (see
+// AcceptanceUnknown/transport.ReportingSender). It is used for STREAM_OPEN only, a
+// data-lane frame; the lane's ctx arm is what creates the gap this closes.
+func (t *Transport) SendReporting(
+	ctx context.Context, f transport.Frame, onReport func(published bool),
+) (enqueued bool, err error) {
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+
+	if t.closed {
+		return false, transport.ErrClosed
+	}
+	if terr := t.teardownError(); terr != nil {
+		return false, terr
+	}
+	wire := wirePayload(f)
+	if len(wire) > int(t.maxPayload) {
+		return false, transport.ErrPayloadTooLarge
+	}
+
+	enqueued, err = t.outbound.submitReporting(ctx, f, onReport)
+	if errors.Is(err, ErrBackpressure) {
+		return enqueued, fmt.Errorf("%w: %w", transport.ErrBackpressure, err)
+	}
+
+	return enqueued, err
+}
+
 // AcceptanceUnknown reports whether a failed Send left the frame's acceptance
 // unknown (transport.AcceptanceClassifier). On the shared-memory data lane submit
 // enqueues the intent and then waits on the writer's report or the caller's
@@ -654,6 +691,23 @@ func (t *Transport) ReadableNow() bool {
 // words) throughout, including while blocked, so Close must not unmap while
 // any of that is in flight (see Transport.closeMu's doc).
 func (t *Transport) Recv(ctx context.Context) (transport.Frame, error) {
+	return t.recvCore(ctx, nil)
+}
+
+// RecvReserving is Recv with the ReservingReceiver contract: reserve is invoked
+// exactly once, immediately before the deliverable frame's ring-head advance —
+// the shared-memory custody boundary (the Advance releases the ring slot to the
+// producer, shm-abi.md §9). The waiter's readiness wait and the stale-discard
+// path advance no deliverable frame and hold no reservation; a ctx-cancel /
+// shutdown that consumes nothing never reserves. See transport.ReservingReceiver
+// for the invariant this discharges.
+func (t *Transport) RecvReserving(ctx context.Context, reserve func()) (transport.Frame, error) {
+	return t.recvCore(ctx, reserve)
+}
+
+// recv is the shared Recv/RecvReserving core. reserve, when non-nil, fires once
+// before the deliverable frame's Advance (the destructive custody boundary).
+func (t *Transport) recvCore(ctx context.Context, reserve func()) (transport.Frame, error) {
 	t.closeMu.RLock()
 	defer t.closeMu.RUnlock()
 
@@ -671,7 +725,7 @@ func (t *Transport) Recv(ctx context.Context) (transport.Frame, error) {
 			return transport.Frame{}, err
 		}
 
-		f, ok, err := t.drain(newTail)
+		f, ok, err := t.drain(newTail, reserve)
 		if err != nil {
 			return transport.Frame{}, t.poisonOnConformanceFault(err)
 		}
@@ -693,7 +747,7 @@ func (t *Transport) Recv(ctx context.Context) (transport.Frame, error) {
 // dispatch/advance of a deliverable frame, so teardown landing between the
 // waiter observing work and dispatch wins the race — the frame is not delivered
 // and the head is not advanced (§14/§16).
-func (t *Transport) drain(newTail uint64) (transport.Frame, bool, error) {
+func (t *Transport) drain(newTail uint64, reserve func()) (transport.Frame, bool, error) {
 	for t.lastSeen != newTail {
 		// Fail-closed gate before each peek: a poisoned or shutting-down region
 		// consumes nothing more (shm-abi.md §9).
@@ -718,6 +772,14 @@ func (t *Transport) drain(newTail uint64) (transport.Frame, bool, error) {
 				// slot is never released as consumed.
 				if err := t.teardownError(); err != nil {
 					return transport.Frame{}, false, err
+				}
+				// Publication-before-read reservation (transport.ReservingReceiver):
+				// fire reserve on the reader goroutine immediately before the Advance
+				// that releases this slot — the custody boundary — so the reservation
+				// is live before the frame leaves transport custody. Only a delivered
+				// frame reserves; a stale discard below never reaches here.
+				if reserve != nil {
+					reserve()
 				}
 				t.inboundRing.Advance() // reclaim signal, after copy-out (§9)
 				t.lastSeen++

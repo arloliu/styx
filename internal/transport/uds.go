@@ -38,8 +38,9 @@ const controlWordSize = 8
 const pollInterval = 50 * time.Millisecond
 
 var (
-	_ Transport    = (*UDSTransport)(nil)
-	_ FrameCounter = (*UDSTransport)(nil)
+	_ Transport         = (*UDSTransport)(nil)
+	_ FrameCounter      = (*UDSTransport)(nil)
+	_ ReservingReceiver = (*UDSTransport)(nil)
 )
 
 // peekSyscall is a seam over the non-blocking MSG_PEEK recv the drain probe uses,
@@ -224,12 +225,43 @@ func (t *UDSTransport) AcceptanceUnknown(err error) bool {
 // context.Canceled/context.DeadlineExceeded); only later calls see
 // ErrClosed.
 func (t *UDSTransport) Recv(ctx context.Context) (Frame, error) {
+	return t.recvCore(ctx, nil)
+}
+
+// RecvReserving is Recv with the ReservingReceiver contract: it first does a
+// non-destructive readiness wait (a blocking MSG_PEEK that consumes nothing), then
+// invokes reserve exactly once — after readiness commits and BEFORE the header
+// read, the uds custody boundary — then reads the frame. A ctx-cancel or close
+// that interrupts the readiness wait consumes nothing and never reserves. See
+// transport.ReservingReceiver for the invariant this discharges.
+func (t *UDSTransport) RecvReserving(ctx context.Context, reserve func()) (Frame, error) {
+	return t.recvCore(ctx, reserve)
+}
+
+// recv is the shared Recv/RecvReserving core. When reserve is non-nil, it fires
+// once after the non-destructive readiness wait commits and before the first
+// destructive read.
+func (t *UDSTransport) recvCore(ctx context.Context, reserve func()) (Frame, error) {
 	if err := ctx.Err(); err != nil {
 		return Frame{}, err
 	}
 
 	if t.closed.Load() {
 		return Frame{}, ErrClosed
+	}
+
+	// The reserving path (reserve != nil) does a non-destructive readiness wait so
+	// reserve precedes the first destructive read (transport.ReservingReceiver):
+	// block until a byte is peekable — or a peer-close EOF is pending — consuming
+	// nothing, then reserve, then read. An interruption (ctx or close) consumed
+	// nothing and produces no reservation. Plain Recv (reserve == nil) skips the
+	// readiness peek and reads directly, keeping its original single-syscall,
+	// allocation-free-baseline path.
+	if reserve != nil {
+		if err := t.waitReadable(ctx); err != nil {
+			return Frame{}, err
+		}
+		reserve()
 	}
 
 	r := &fdReader{t: t, ctx: ctx}
@@ -380,6 +412,54 @@ func (t *UDSTransport) ReadableNow() bool {
 		}
 
 		return true // any other error: unknown; the next Recv surfaces it. Conservative: not drained
+	}
+}
+
+// waitReadable blocks until this connection's inbound queue has a byte available
+// (or a peer-close EOF is pending), consuming nothing, or ctx is done or the
+// transport is closed. It is the non-destructive readiness wait RecvReserving
+// performs before its reserve call, so a reservation is published before any byte
+// of the frame is read (the uds custody boundary). It uses a blocking MSG_PEEK
+// recv bounded by the same poll timeout the destructive reads use, so a bare ctx
+// cancel is observed within one poll. It returns nil on a readiness commit — a
+// peekable byte (the next Recv reads a frame) or an n==0 EOF (the next Recv
+// surfaces io.EOF and tears down); the destructive read that follows sees the same
+// byte, since the peek removed none.
+//
+// It is called only from the single reader goroutine, before that reader's own
+// destructive read, so it never races that read; a concurrent ReadableNow probe
+// from another goroutine is also a non-consuming MSG_PEEK and does not contend.
+func (t *UDSTransport) waitReadable(ctx context.Context) error {
+	var b [1]byte
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if t.closed.Load() {
+			return ErrClosed
+		}
+		if err := setSocketTimeout(ctx, t.fd, unix.SO_RCVTIMEO); err != nil {
+			return err
+		}
+
+		// Blocking peek (no MSG_DONTWAIT): SO_RCVTIMEO bounds it, so it returns
+		// EAGAIN on a poll expiry (loop and recheck ctx) rather than blocking a
+		// whole ctx deadline the way a bare recv would.
+		_, _, _, _, err := peekSyscall(t.fd, b[:], nil, unix.MSG_PEEK)
+		if err == nil {
+			return nil // a byte is peekable, or a peer-close EOF is pending: readiness committed.
+		}
+		if errors.Is(err, unix.EINTR) {
+			continue // a signal interrupted the peek; retry — not a queue state.
+		}
+		if t.closed.Load() {
+			return ErrClosed
+		}
+		if isTimeoutErrno(err) {
+			continue // poll expired without data; loop rechecks ctx.
+		}
+
+		return fmt.Errorf("transport: readiness wait: %w", err)
 	}
 }
 

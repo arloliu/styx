@@ -255,6 +255,63 @@ type AcceptanceClassifier interface {
 	AcceptanceUnknown(err error) bool
 }
 
+// ReservingReceiver is an optional Transport capability that makes
+// publication-before-read enforceable at the transport↔reader seam, rather than
+// leaving it to reader-loop convention. RecvReserving behaves exactly like Recv
+// except that it invokes reserve EXACTLY ONCE per produced Recv result, AFTER
+// readiness commits to consumption and BEFORE the first destructive operation on
+// the inbound stream (uds: before the header read; shm: before the ring-head
+// advance). It does NOT invoke reserve when a call is interrupted before any
+// readiness commits (a ctx-cancel or closed transport that consumed nothing).
+//
+// The reader passes reserve = func(){ ingressPending.Add(1) } (a release-store)
+// and, after the frame's complete synchronous disposition, retires with a paired
+// ingressPending.Add(-1). The load-bearing, falsifiable invariant this seam exists
+// to guarantee: over the window from a frame leaving transport custody until its
+// disposition is accounted (an obligation opened, existing state routed, or an
+// error disposed), the reservation is live — so a quiescence signal that samples
+// (ingressPending>0 ∨ obligations>0 ∨ ReadableNow) can never see a gap over a frame
+// that has left custody. Because reserve's store precedes the destructive op, a
+// preemption between dequeue and accounting cannot defeat it, and a reader parked
+// in the readiness wait holds no reservation and has consumed nothing.
+//
+// Both production transports implement it; a transport lacking it is uds/shm only
+// in tests.
+type ReservingReceiver interface {
+	// RecvReserving is Recv that invokes reserve exactly once per produced result,
+	// after readiness commits and before the first destructive read. See the
+	// interface doc for the reservation invariant.
+	RecvReserving(ctx context.Context, reserve func()) (Frame, error)
+}
+
+// ReportingSender is an optional Transport capability whose SendReporting closes
+// the acceptance-unknown gap for a send whose acceptance the transport cannot make
+// definitive synchronously (the shared-memory data lane: an enqueued intent whose
+// caller returns on ctx-cancel before the writer reports). onReport is invoked
+// EXACTLY ONCE when the enqueued send resolves — published (true), or discarded /
+// disposed at teardown (false) — riding the transport's own single-report-per-send
+// delivery; it MUST be non-blocking and may run on a transport-internal goroutine.
+//
+// Leave-ownership is decided SOLELY by the enqueued return, with no arbitration
+// state: enqueued == false means no send exists, onReport never fires, and the
+// caller performs any admission-barrier release inline on the error path; enqueued
+// == true means onReport owns that release UNCONDITIONALLY — whether the report
+// fires synchronously before SendReporting returns (a definitive success, or a
+// post-enqueue discard whose error SendReporting also returns), after a
+// context-error return (acceptance-unknown), or at teardown. No path ever chooses
+// between inline and callback for an enqueued send, so report-before-return,
+// context-before-report, and simultaneous arrival are the same path, and
+// exactly-once is inherited from the single report per send.
+//
+// A transport that omits it (uds, whose Send is definitive — no acceptance-unknown
+// gap) is handled by the caller with plain Send and an inline release.
+type ReportingSender interface {
+	// SendReporting is Send that returns whether the frame was enqueued and, for an
+	// enqueued frame, invokes onReport exactly once at its resolution. See the
+	// interface doc for the Leave-ownership invariant.
+	SendReporting(ctx context.Context, f Frame, onReport func(published bool)) (enqueued bool, err error)
+}
+
 // FrameCounter is an optional Transport capability exposing cumulative counts of
 // the frames this transport has successfully sent and received. The supervisor's
 // heartbeat-as-progress-contract reads them as the data-plane progress signal:

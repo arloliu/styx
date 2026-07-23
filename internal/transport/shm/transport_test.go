@@ -1522,7 +1522,7 @@ func TestTransport_Recv_ShutdownWinsRaceBeforeDispatch(t *testing.T) {
 	require.NoError(t, hpProducer(t, ep.region).Push(makeDesc(ring.KindCancel, 5, 7)))
 	atomic.StoreUint32(ep.plugin.shutdownPtr, 1)
 
-	f, ok, err := ep.plugin.drain(ep.plugin.lastSeen + 1)
+	f, ok, err := ep.plugin.drain(ep.plugin.lastSeen+1, nil)
 
 	require.ErrorIs(t, err, transport.ErrClosed)
 	require.False(t, ok)
@@ -1584,7 +1584,7 @@ func TestTransport_Recv_ShutdownWinsRace_AfterCopyBeforeDispatch(t *testing.T) {
 		shutdown: ep.plugin.shutdownPtr,
 	}
 
-	f, ok, err := ep.plugin.drain(ep.plugin.lastSeen + 1)
+	f, ok, err := ep.plugin.drain(ep.plugin.lastSeen+1, nil)
 
 	require.ErrorIs(t, err, transport.ErrClosed)
 	require.False(t, ok)
@@ -2034,4 +2034,36 @@ func TestTransport_Close_Idempotent_NoDoubleCloseAfterFDReuse(t *testing.T) {
 	var st unix.Stat_t
 	require.NoError(t, unix.Fstat(regionFD, &st),
 		"the second Close closed the reused fd number — a double-close of a reused fd")
+}
+
+// Test the ReservingReceiver contract on the shared-memory transport: reserve
+// fires exactly once for a delivered frame, ordered before the ring-head advance
+// that releases the slot (the custody boundary), and does not fire when a
+// canceled context consumes nothing.
+func TestTransport_RecvReserving_ReservesOncePerDeliveredFrame(t *testing.T) {
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 7, Kind: transport.FrameUnaryReq, Payload: []byte("hi")}))
+
+	var reserves int
+	f, err := ep.plugin.RecvReserving(t.Context(), func() { reserves++ })
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), f.CallID)
+	require.Equal(t, 1, reserves, "reserve fires exactly once for a delivered frame")
+}
+
+// Test that RecvReserving reserves nothing when its context is already canceled:
+// the waiter returns before any frame is drained, so nothing left custody and no
+// reservation is taken.
+func TestTransport_RecvReserving_NoReserveWhenNothingConsumed(t *testing.T) {
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	var reserves int
+	_, err := ep.plugin.RecvReserving(ctx, func() { reserves++ })
+	require.Error(t, err)
+	require.Zero(t, reserves, "no reservation is taken when nothing is consumed")
 }

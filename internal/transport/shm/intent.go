@@ -89,6 +89,12 @@ type intent struct {
 	// context cancel. This is the crux of the completion protocol: a caller that
 	// returned early can never wedge the writer.
 	done chan error
+	// onReport, when non-nil, is invoked exactly once when this intent resolves —
+	// published (true), or discarded / disposed at teardown (false) — from the
+	// same single report call that delivers on done (transport.ReportingSender).
+	// It must be non-blocking (it may run on the writer goroutine). nil for an
+	// ordinary submit that has no completion callback.
+	onReport func(published bool)
 }
 
 // mapKind maps a transport frame kind to its ring descriptor kind and reports

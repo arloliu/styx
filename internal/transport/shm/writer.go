@@ -391,6 +391,36 @@ func (w *writer) submit(ctx context.Context, frame transport.Frame, l lane) erro
 	}
 }
 
+// submitReporting is submit for the data lane with a completion callback
+// (transport.ReportingSender), used for the stream-open admission barrier. It
+// registers onReport on the intent and enqueues all-or-nothing: enqueued reports
+// whether the intent reached the queue. When enqueued the writer's single report
+// invokes onReport at the intent's resolution (publish/discard/teardown) — so a
+// caller that returns on ctx-cancel after enqueue still has its callback fire.
+// When not enqueued, no intent exists and onReport never fires. The enqueued path
+// waits on the report or the caller's context exactly like submit's data lane.
+func (w *writer) submitReporting(
+	ctx context.Context, frame transport.Frame, onReport func(published bool),
+) (enqueued bool, err error) {
+	i := intent{frame: frame, lane: laneData, wire: wirePayload(frame), done: make(chan error, 1), onReport: onReport}
+
+	if eerr := w.enqueue(ctx, i, laneData); eerr != nil {
+		// All-or-nothing (LS2, enqueue's doc): a non-nil return provably pushed no
+		// intent, so onReport was never registered on a live intent and can never fire.
+		return false, eerr
+	}
+
+	select {
+	case rerr := <-i.done:
+		// Resolved: report already ran (and invoked onReport). enqueued so the
+		// callback owns any Leave — the caller must not release inline.
+		return true, rerr
+	case <-ctx.Done():
+		// Acceptance-unknown: the intent stays enqueued; onReport fires later.
+		return true, ctx.Err()
+	}
+}
+
 // enqueue places i on its lane's queue, honoring the admission mode and the close
 // protocol. It holds the read lock across the send so stop's write lock (taken
 // only after shutdown is closed) waits for it, keeping run's drain race-free.
@@ -1177,5 +1207,13 @@ func (w *writer) report(i intent, err error) {
 	select {
 	case i.done <- err:
 	default:
+	}
+	// The single per-intent completion point (transport.ReportingSender): a nil
+	// err is a successful publish, any other is a discard or teardown disposal.
+	// Delivered after the done send, but ownership of the caller's admission Leave
+	// is fixed by the enqueued return, not by which arrives first, so the ordering
+	// is not load-bearing (see SendReporting). Non-blocking by contract.
+	if i.onReport != nil {
+		i.onReport(err == nil)
 	}
 }

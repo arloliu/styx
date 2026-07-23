@@ -1946,3 +1946,98 @@ func TestWriter_BackpressureEdge_OrdersUnderAdmissionLock(t *testing.T) {
 	require.Equal(t, uint64(1), w.backpressureEdges(),
 		"two consecutive rejections around one parked decision are exactly one episode")
 }
+
+// Test the ReportingSender completion callback on the writer's submitReporting:
+// an enqueued intent whose caller returns on ctx-cancel (the acceptance-unknown
+// window) reports enqueued=true and the callback fires exactly once, later, when
+// the writer resolves the intent — never before.
+func TestWriter_SubmitReporting_EnqueuedCallbackFiresOnResolve(t *testing.T) {
+	// Given a constructed-but-not-running writer, so an enqueued data intent's
+	// completion never arrives on its own.
+	w := newWriterFromParts(&recordRing{}, noArena{}, 1, 1, admitBlock)
+
+	var reports []bool
+	type res struct {
+		enqueued bool
+		err      error
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan res, 1)
+	record := func(published bool) { reports = append(reports, published) }
+	go func() {
+		enq, err := w.submitReporting(ctx, dataReqFrame(1), record)
+		done <- res{enq, err}
+	}()
+
+	// Wait until the intent has enqueued (deterministic: the cap-1 data queue has
+	// space and nothing drains it, so this converges), THEN cancel — so the cancel
+	// wins the WAIT arm, not the enqueue arm.
+	require.Eventually(t, func() bool { return len(w.dataQueue) == 1 }, 2*time.Second, time.Millisecond)
+	cancel()
+	r := recvWithinRes(t, done)
+
+	// Then the intent enqueued, ctx wins (acceptance-unknown), and the callback has
+	// NOT fired — the intent is not yet resolved.
+	require.True(t, r.enqueued, "the intent reached the queue")
+	require.ErrorIs(t, r.err, context.Canceled, "ctx wins after enqueue: acceptance-unknown")
+	require.Empty(t, reports, "onReport must not fire before the writer resolves the intent")
+
+	// When the writer later resolves the enqueued intent as published.
+	got := <-w.dataQueue
+	w.report(got, nil)
+
+	// Then the callback fired exactly once with published=true.
+	require.Equal(t, []bool{true}, reports, "onReport fires once with published=true on resolve")
+}
+
+// recvWithinRes reads one result from ch or fails the test on timeout.
+func recvWithinRes[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(2 * time.Second):
+		t.Fatal("submitReporting did not return")
+		panic("unreachable")
+	}
+}
+
+// Test that a submitReporting whose intent never enqueues (a full reject-mode data
+// queue) reports enqueued=false and never fires the callback — the caller owns any
+// release inline on that error path (the Leave-ownership invariant).
+func TestWriter_SubmitReporting_NotEnqueued_CallbackNeverFires(t *testing.T) {
+	// Given a reject-mode writer whose data queue (cap 1) is already full.
+	w := newWriterFromParts(&recordRing{}, noArena{}, 1, 1, admitReject)
+	w.dataQueue <- dataIntent(1)
+
+	var fired bool
+	enqueued, err := w.submitReporting(t.Context(), dataReqFrame(2), func(bool) { fired = true })
+
+	require.False(t, enqueued, "a rejected submission did not enqueue")
+	require.ErrorIs(t, err, ErrBackpressure)
+	require.False(t, fired, "onReport must never fire for a submission that never enqueued")
+}
+
+// Test the exactly-once completion invariant at the writer's report seam: report
+// invokes onReport once, with published=true on a nil (publish) and published=false
+// on any error (discard / teardown). This is the single per-intent delivery the
+// ReportingSender Leave-ownership contract rides on.
+func TestWriter_Report_InvokesOnReportOnce(t *testing.T) {
+	w := newWriterFromParts(&recordRing{}, noArena{}, 1, 1, admitBlock)
+
+	var pub []bool
+	published := intent{
+		frame: dataReqFrame(1), lane: laneData, done: make(chan error, 1),
+		onReport: func(p bool) { pub = append(pub, p) },
+	}
+	w.report(published, nil)
+	require.Equal(t, []bool{true}, pub, "a nil report is a successful publish")
+
+	var disc []bool
+	discarded := intent{
+		frame: dataReqFrame(2), lane: laneData, done: make(chan error, 1),
+		onReport: func(p bool) { disc = append(disc, p) },
+	}
+	w.report(discarded, transport.ErrClosed)
+	require.Equal(t, []bool{false}, disc, "a teardown/discard report is not a publish")
+}

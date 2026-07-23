@@ -1000,3 +1000,27 @@ func TestUDSTransport_ReadableNow_ConfirmsEmptyOnlyWhenDrained(t *testing.T) {
 	require.NoError(t, b.Close())
 	require.True(t, b.ReadableNow(), "a closed transport never reports a confirmed-drained queue")
 }
+
+// Test the ReservingReceiver contract on the uds transport: RecvReserving does a
+// non-destructive readiness wait, fires reserve exactly once before the header
+// read (the custody boundary), and returns the frame; a canceled context consumes
+// nothing and reserves nothing.
+func TestUDS_RecvReserving_ReservesBeforeRead(t *testing.T) {
+	a, b := newTestTransportPair(t)
+
+	req := transport.Frame{CallID: 5, Kind: transport.FrameUnaryReq, Payload: []byte("x")}
+	require.NoError(t, a.Send(t.Context(), req))
+
+	var reserves int
+	f, err := b.RecvReserving(t.Context(), func() { reserves++ })
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), f.CallID)
+	require.Equal(t, 1, reserves, "reserve fires exactly once before the frame read")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	reserves = 0
+	_, err = b.RecvReserving(ctx, func() { reserves++ })
+	require.Error(t, err)
+	require.Zero(t, reserves, "a canceled readiness wait consumes nothing and reserves nothing")
+}
