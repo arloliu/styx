@@ -282,7 +282,14 @@ func (tx *Transaction) Run(ctx context.Context) (ReloadTarget, error) {
 	// in flight when the ack arrives (internal/lifecycle/plugin_reload.go's ServeReload
 	// doc).
 	if err := tx.drain(ctx); err != nil {
-		return nil, tx.rollback(ctx, PhaseDrainAck, nil, err)
+		phase := PhaseDrainAck
+		if errors.Is(err, errDrainBudgetTooSmall) {
+			// Drain was never sent, so the plugin never froze: reopen admission like any
+			// other cutoff-phase abort, without sending Resume to an unfrozen instance.
+			phase = PhaseCutoff
+		}
+
+		return nil, tx.rollback(ctx, phase, nil, err)
 	}
 
 	// Phase 3: snapshot. The plugin produces it, the host verifies it.
@@ -318,30 +325,66 @@ func (tx *Transaction) Run(ctx context.Context) (ReloadTarget, error) {
 	return successor, nil
 }
 
-// drainAckHostMargin is how much longer than the plugin's own drain deadline the
-// host keeps listening for DrainAck. The absolute deadline carried in Drain bounds the
-// plugin's freeze, quiescence wait, and DrainAck send; the host must not declare a
-// timeout and enter rollback while the plugin is still inside that deadline and about
-// to ack, or a DrainAck could arrive after the host expects only ResumeAck — a
-// protocol failure. Waiting strictly longer makes the two outcomes mutually exclusive:
-// a plugin that acks always acks before the host gives up, and a plugin that misses
-// its deadline has already stopped trying to ack (it awaits Resume) before the host
-// rolls back. Both processes share one host wall clock, so the margin only has to
-// cover DrainAck's local-socket delivery and scheduling latency; a second is ample and
-// negligible against the multi-second drain deadline.
+// drainAckHostMargin is how much sooner the plugin's transmitted drain deadline falls
+// than the instant the host stops waiting for DrainAck. The absolute deadline carried
+// in Drain bounds the plugin's freeze, quiescence wait, and DrainAck send; the host
+// must not declare a timeout and enter rollback while the plugin is still inside that
+// deadline and about to ack, or a DrainAck could arrive after the host expects only
+// ResumeAck — a protocol failure. Deriving the transmitted deadline as the host's own
+// wait minus this margin makes the two outcomes mutually exclusive: a plugin that acks
+// always acks before the host gives up, and a plugin that misses its deadline has
+// stopped trying to ack (it awaits Resume) before the host rolls back. Both processes
+// share one host wall clock, so the margin only has to cover DrainAck's local-socket
+// delivery and scheduling latency; a second is ample. When the whole wait is shorter
+// than a second (a small configured budget, or a tight caller deadline), the margin is
+// halved into the budget instead, keeping the transmitted deadline strictly in the
+// future while preserving the ordering.
 const drainAckHostMargin = 1 * time.Second
 
-// drain runs phase 2: send Drain carrying its absolute deadline, then wait
-// for the plugin's DrainAck. The host's own receive deadline is that absolute deadline
-// plus drainAckHostMargin, so it outlasts the plugin's send deadline and a late ack
-// cannot race the host into rollback (see drainAckHostMargin).
+// errDrainBudgetTooSmall marks a drain the caller context left no time to run: the
+// host's effective wait is already in the past, so Drain was never sent and the plugin
+// never froze. Run rolls back as a cutoff abort (reopen admission, no Resume to an
+// instance that was never asked to freeze).
+var errDrainBudgetTooSmall = errors.New("lifecycle: reload: caller deadline too small for a drain")
+
+// drain runs phase 2: send Drain carrying its absolute deadline, then wait for the
+// plugin's DrainAck. The transmitted deadline is derived from the host's OWN effective
+// wait — the configured DrainAck budget clamped to the caller context — minus the
+// host-ack margin (halved into the budget when the wait is shorter than the margin).
+// The invariant this establishes: the deadline the plugin sees is always strictly
+// earlier than the deadline the host waits to, under ANY caller context. Transmitting
+// now+DrainAck instead would let a caller context with an earlier deadline time the
+// host into rollback while the plugin was still entitled to ack.
 func (tx *Transaction) drain(ctx context.Context) error {
-	deadline := time.Now().Add(tx.deadlines.DrainAck)
-	dctx, cancel := context.WithDeadline(ctx, deadline.Add(drainAckHostMargin))
+	// The host's effective wait: its own DrainAck budget, never past the caller's
+	// deadline (WithDeadline would clamp there anyway; computing it explicitly lets the
+	// transmitted deadline track the SAME instant the host will actually stop waiting).
+	now := time.Now()
+	hostWait := now.Add(tx.deadlines.DrainAck)
+	if d, ok := ctx.Deadline(); ok && d.Before(hostWait) {
+		hostWait = d
+	}
+	budget := hostWait.Sub(now)
+	if budget <= 0 {
+		// The caller context is already at or past its deadline: no drain can run. Abort
+		// before sending Drain so the plugin never freezes.
+		return errDrainBudgetTooSmall
+	}
+	// Keep the transmitted deadline strictly before hostWait AND strictly in the future,
+	// even for a sub-margin budget: halve the margin into the budget rather than let it
+	// push the transmitted deadline into the past (which would strand a real plugin's
+	// freeze under an already-expired context).
+	margin := drainAckHostMargin
+	if margin >= budget {
+		margin = budget / 2
+	}
+	transmitted := hostWait.Add(-margin)
+
+	dctx, cancel := context.WithDeadline(ctx, hostWait)
 	defer cancel()
 
 	msg := &controlpb.ControlMessage{
-		Body: &controlpb.ControlMessage_Drain{Drain: &controlpb.Drain{DeadlineUnixNano: deadline.UnixNano()}},
+		Body: &controlpb.ControlMessage_Drain{Drain: &controlpb.Drain{DeadlineUnixNano: transmitted.UnixNano()}},
 	}
 	if err := tx.old.Control().Send(dctx, msg); err != nil {
 		return fmt.Errorf("lifecycle: reload: send Drain: %w", err)
