@@ -601,6 +601,90 @@ func TestAdmissionGate_ReportClosed_UntilOpened(t *testing.T) {
 	gate.Open()
 	require.True(t, gate.IsOpen())
 
-	gate.Close()
+	require.NoError(t, gate.Close(context.Background()))
 	require.False(t, gate.IsOpen())
+}
+
+// Test cutoff joining an admitted-but-not-yet-published caller: Close marks the
+// gate closed and then blocks on the publication barrier until the caller that
+// already passed admission publishes (Leaves), so when Close returns every
+// admitted call is on the wire. Without the join, Close would return while the
+// caller is still parked between admission and publication -- the window DrainAck
+// must not certify past.
+func TestAdmissionGate_CloseJoinsAdmittedCaller_UntilLeave(t *testing.T) {
+	// Given an open gate with a caller parked inside its admission-to-publication
+	// span (Enter returned true; the caller is counted in flight, modeling a request
+	// marshaled but not yet sent).
+	gate := &lifecycle.AdmissionGate{}
+	gate.Open()
+	require.True(t, gate.Enter())
+
+	// When cutoff runs on another goroutine, bounded generously.
+	closed := make(chan struct{})
+	var closeReturned atomic.Bool
+	var closeErr error
+	go func() {
+		closeErr = gate.Close(context.Background())
+		closeReturned.Store(true)
+		close(closed)
+	}()
+
+	// Then Close has marked the gate closed (IsOpen observes it) and is blocked on
+	// the join behind the in-flight caller -- it cannot have returned while an
+	// admitted caller has not yet published.
+	require.Eventually(t, func() bool { return !gate.IsOpen() }, time.Second, time.Millisecond,
+		"Close must mark the gate closed before joining publishers")
+	require.False(t, closeReturned.Load(),
+		"Close must block on the publication barrier while an admitted caller is in flight")
+
+	// When the caller publishes and releases.
+	gate.Leave()
+
+	// Then Close returns nil: every admitted caller has published.
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close must return once the admitted caller releases the publication barrier")
+	}
+	require.True(t, closeReturned.Load())
+	require.NoError(t, closeErr)
+
+	// A caller arriving after cutoff observes closed and is refused without publishing.
+	require.False(t, gate.Enter())
+}
+
+// Test cutoff returning its deadline error rather than wedging when an admitted
+// caller cannot publish within the bound, then reopening cleanly. This is the
+// bounded-cutoff path: the reload runs inline on the supervisor heartbeat loop, so
+// an unbounded join would freeze the owner that must classify and restart a wedged
+// instance. On expiry Close leaves the gate closed and reopening admits again,
+// while the still-wedged publisher's later Leave strands no one.
+func TestAdmissionGate_CloseReturnsDeadlineError_WhenPublisherCannotJoin(t *testing.T) {
+	// Given an open gate with a caller wedged inside its admission-to-publication
+	// span (Enter returned true; it never Leaves within the bound, modeling a
+	// backpressured publish to a peer that has stopped reading).
+	gate := &lifecycle.AdmissionGate{}
+	gate.Open()
+	require.True(t, gate.Enter())
+
+	// When cutoff runs bounded by a short deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// Then Close returns the deadline error without completing the join, and the
+	// gate is left closed for the caller's reopen-on-failure.
+	require.ErrorIs(t, gate.Close(ctx), context.DeadlineExceeded,
+		"cutoff must be bounded, never wedge the supervisor loop it runs on")
+	require.False(t, gate.IsOpen())
+
+	// When the reload fails back and reopens admission.
+	gate.Open()
+
+	// Then a new caller admits again -- reopening is the failure-recovery path.
+	require.True(t, gate.Enter(), "reopening after a failed cutoff must admit callers again")
+	gate.Leave()
+
+	// And the originally-wedged publisher's late Leave strands no one (no panic, no
+	// hang): its join channel was dropped on expiry.
+	gate.Leave()
 }

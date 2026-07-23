@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/arloliu/styx/internal/control"
@@ -43,8 +43,10 @@ const (
 	// PhaseCutoff stops admitting new calls. It is host-local, so aborting
 	// here is trivial: nothing is frozen and no successor exists.
 	PhaseCutoff Phase = iota
-	// PhaseDrainAck waits for the plugin to finish every accepted call and
-	// freeze its mutable state.
+	// PhaseDrainAck waits for the plugin to freeze its mutable state.
+	// DrainAck presently certifies mutator quiescence only: a call accepted
+	// before cutoff may still be in flight on the plugin when the ack arrives
+	// (internal/lifecycle/plugin_reload.go's ServeReload doc).
 	PhaseDrainAck
 	// PhaseSnapshot waits for the sealed snapshot memfd and verifies it.
 	PhaseSnapshot
@@ -55,11 +57,13 @@ const (
 	PhasePromote
 )
 
-// PhaseDeadlines bounds the three phases that wait on the peer. PhaseCutoff
-// has no deadline because it is host-local, with no wire round trip;
-// PhasePromote has none because by then both instances have already answered
-// and only local work remains. DefaultPhaseDeadlines is a conservative
-// fallback for a caller that supplies no per-plugin values of its own.
+// PhaseDeadlines bounds the phases that can wait. PhaseCutoff has no field of its
+// own — it is host-local with no wire round trip — but Transaction.Run still bounds
+// its publication join by the DrainAck deadline, so the cutoff cannot wedge the
+// supervisor loop it runs on even under an unbounded caller context. PhasePromote
+// has no deadline because by then both instances have already answered and only
+// local work remains. DefaultPhaseDeadlines is a conservative fallback for a caller
+// that supplies no per-plugin values of its own.
 type PhaseDeadlines struct {
 	DrainAck        time.Duration
 	Snapshot        time.Duration
@@ -76,23 +80,131 @@ var DefaultPhaseDeadlines = PhaseDeadlines{
 	RestoreValidate: 30 * time.Second,
 }
 
-// AdmissionGate is the single atomic switch the cutoff phase flips closed
-// and that either a rollback or a successful promote flips back open. It is
-// never held across a wire round trip: a caller blocked on admission waits
-// on its own context, never on whoever is driving the reload.
+// AdmissionGate is the cutoff switch the cutoff phase flips closed and that
+// either a rollback or a successful promote flips back open, paired with a
+// publication barrier that joins the admitted-but-not-yet-published callers to
+// cutoff. A caller registers (Enter) from its admission check THROUGH publishing
+// its request to the transport, then releases (Leave); Close (cutoff) marks the
+// gate closed and then waits, bounded, for the in-flight publisher count to reach
+// zero, so when Close returns nil every caller that observed the gate open has
+// already published, and every later caller observes closed and is refused before
+// publishing anything. That is the boundary DrainAck relies on: the plugin never
+// sees a pre-cutoff request arrive after cutoff has completed, because cutoff does
+// not complete until all such requests are on the wire
+// (docs/specs/2026-07-16-styx-design.md's cutoff-then-drain ordering, where
+// in-flight requests either complete on this instance or were never admitted).
 //
 // The zero value is closed, so a gate is never accidentally permissive
 // before its owner has wired up routing.
-type AdmissionGate struct{ open atomic.Bool }
+type AdmissionGate struct {
+	mu   sync.Mutex
+	open bool
+	// active counts callers inside their admission-to-publication span (between
+	// Enter and Leave). Close joins them by waiting for it to reach zero.
+	active int
+	// drained is non-nil only while a Close is waiting; the Leave that brings
+	// active to zero closes it, waking that Close. It is dropped when the wait
+	// ends (either resolution) so a later Leave never closes a channel no one awaits.
+	drained chan struct{}
+}
 
-// Close stops new calls from being admitted.
-func (g *AdmissionGate) Close() { g.open.Store(false) }
+// Enter registers a caller inside the publication barrier and reports whether the
+// gate is open. On true the caller is counted and MUST release with Leave once its
+// request has been handed to the transport (published) or it has decided not to
+// publish — never across the response wait, whose duration cutoff must not join.
+// On false the gate is closed, nothing is held, and the caller must refuse the
+// call without publishing.
+func (g *AdmissionGate) Enter() bool {
+	g.mu.Lock()
+	if !g.open {
+		g.mu.Unlock()
 
-// Open resumes admitting new calls.
-func (g *AdmissionGate) Open() { g.open.Store(true) }
+		return false
+	}
+	g.active++
+	g.mu.Unlock()
 
-// IsOpen reports whether new calls are currently admitted.
-func (g *AdmissionGate) IsOpen() bool { return g.open.Load() }
+	return true
+}
+
+// Leave releases the registration taken by an Enter that returned true. The Leave
+// that brings the in-flight count to zero wakes a Close waiting on the join.
+func (g *AdmissionGate) Leave() {
+	g.mu.Lock()
+	g.active--
+	if g.active == 0 && g.drained != nil {
+		close(g.drained)
+		g.drained = nil
+	}
+	g.mu.Unlock()
+}
+
+// Close stops new calls from being admitted and then joins every caller that
+// passed admission through its publication, bounded by ctx. Marking closed first
+// means a caller whose Enter has not yet acquired the lock observes closed and
+// refuses; the wait then blocks until every caller already inside its
+// admission-to-publication span has published and released. When Close returns
+// nil, every pre-cutoff request is on the transport and no later request ever
+// will be.
+//
+// The join is bounded because the cutoff runs inline on the supervisor's single
+// heartbeat-loop goroutine, so an unbounded wait would freeze the very owner that
+// must otherwise classify and restart a wedged instance. A caller's span ends at
+// the transport Send that hands off its request: that Send drains as the plugin
+// keeps serving (the serve loop reads throughout), a dead peer fails it promptly,
+// and only a live peer that has stopped reading holds it. On ctx expiry Close
+// returns the error WITHOUT completing the join and leaves the gate closed; the
+// caller reopens (Open) and fails the reload, and the ordinary cutoff-phase
+// rollback restores service. A caller still wedged in its span is not stranded —
+// its later Leave simply finds no waiter.
+func (g *AdmissionGate) Close(ctx context.Context) error {
+	g.mu.Lock()
+	g.open = false
+	if g.active == 0 {
+		g.mu.Unlock()
+
+		return nil
+	}
+	done := make(chan struct{})
+	g.drained = done
+	g.mu.Unlock()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		g.mu.Lock()
+		// Drop the pending-join channel so the Leave that eventually brings the
+		// count to zero does not close a channel no one is waiting on.
+		if g.drained == done {
+			g.drained = nil
+		}
+		g.mu.Unlock()
+
+		return ctx.Err()
+	}
+}
+
+// Open resumes admitting new calls. It is also the reopen-on-failure path: after a
+// cutoff whose join could not complete within its bound, reopening clears the
+// closed flag so callers admit again, while any still-wedged publisher drains on
+// its own without stranding a caller.
+func (g *AdmissionGate) Open() {
+	g.mu.Lock()
+	g.open = true
+	g.mu.Unlock()
+}
+
+// IsOpen reports whether new calls are currently admitted. It is the plain switch
+// read for observability and tests; admission on a call path goes through
+// Enter/Leave.
+func (g *AdmissionGate) IsOpen() bool {
+	g.mu.Lock()
+	v := g.open
+	g.mu.Unlock()
+
+	return v
+}
 
 // ReloadTarget is the narrow seam this package needs from a plugin
 // instance. It is deliberately independent of the public styx package so
@@ -149,14 +261,25 @@ func NewTransaction(
 // because the old instance stopped answering, which returns an error
 // wrapping ErrReloadCrashEquivalent and deliberately leaves admission closed.
 func (tx *Transaction) Run(ctx context.Context) (ReloadTarget, error) {
-	// Phase 1: cutoff. Host-local, so an abort here reverses instantly.
-	tx.admission.Close()
+	// Phase 1: cutoff. Closing admission joins the admitted-but-unpublished
+	// callers, bounded so this cutoff — run inline on the supervisor heartbeat
+	// loop — can never wedge that loop even if the caller passed an unbounded
+	// context. A join that cannot complete in time is a pre-drain failure: rollback
+	// reopens admission and restores service, exactly as any other cutoff-phase
+	// abort does.
+	cctx, cancelCutoff := context.WithTimeout(ctx, tx.deadlines.DrainAck)
+	err := tx.admission.Close(cctx)
+	cancelCutoff()
+	if err != nil {
+		return nil, tx.rollback(ctx, PhaseCutoff, nil, fmt.Errorf("lifecycle: reload: cutoff: %w", err))
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, tx.rollback(ctx, PhaseCutoff, nil, fmt.Errorf("lifecycle: reload: cutoff: %w", err))
 	}
 
-	// Phase 2: drain. The plugin acks only once every accepted call has
-	// finished and its mutable state is frozen.
+	// Phase 2: drain. The plugin acks once its mutable state is frozen; an
+	// accepted call may still be in flight on the plugin when the ack arrives
+	// (internal/lifecycle/plugin_reload.go's ServeReload doc).
 	if err := tx.drain(ctx); err != nil {
 		return nil, tx.rollback(ctx, PhaseDrainAck, nil, err)
 	}

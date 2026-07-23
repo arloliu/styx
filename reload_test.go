@@ -137,7 +137,7 @@ func TestClientConn_FailNewCallsAsRetryable_WhileAdmissionCutOff(t *testing.T) {
 	cc.admission.Open()
 
 	// When: the cutoff phase closes the gate.
-	cc.admission.Close()
+	require.NoError(t, cc.admission.Close(context.Background()))
 	resp := &wrapperspb.StringValue{}
 	err := cc.Invoke(t.Context(), "test.Echo", "Say", wrapperspb.String("hello"), resp)
 
@@ -198,6 +198,38 @@ func TestWireConnState_StopAdmission_NoopAfterRoutingMovesToLaterGeneration(t *t
 	// Then: it still owns cc's routing, so it tears down for real.
 	require.False(t, cc.admission.IsOpen())
 	require.Nil(t, cc.state.Load())
+}
+
+// Test the teardown-path cutoff bounding its publication join so a wedged plugin
+// that has stopped reading cannot hang teardown before it reaches the later steps
+// that unblock the publisher. An unbounded join here would deadlock: it would wait
+// for a publisher only the fail-in-flight / transport-stop steps can release.
+func TestWireConnState_StopAdmission_BoundsPublicationJoin_WhenPublisherWedged(t *testing.T) {
+	// Given a small teardown bound so the test does not wait the production default.
+	orig := teardownAdmissionCloseBound
+	teardownAdmissionCloseBound = 100 * time.Millisecond
+	t.Cleanup(func() { teardownAdmissionCloseBound = orig })
+
+	cc := &ClientConn{name: "echo"}
+	tr, _ := newInProcessTransportPairForTest(t)
+	hooks := wireConnState(cc, supervisor.Instance{Transport: tr, Generation: 1})
+
+	// And a wedged publisher holding the admission read side that never leaves — a
+	// live plugin that stopped reading, pinning an admitted caller's Send.
+	require.True(t, cc.admission.Enter())
+	t.Cleanup(cc.admission.Leave)
+
+	// When teardown step 1 fires against that wedged publisher.
+	done := make(chan struct{})
+	go func() { defer close(done); hooks.StopAdmission() }()
+
+	// Then the bounded join returns rather than hanging.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("teardown cutoff did not bound its publication join; it hung on a wedged publisher")
+	}
+	require.False(t, cc.admission.IsOpen(), "teardown leaves admission closed and proceeds")
 }
 
 // Test Reload reporting a typed error for a plugin this Host does not manage

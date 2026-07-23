@@ -211,6 +211,148 @@ func TestTransport_SendRecv_RoundTripsUnaryFrame_BetweenTwoAttachedEnds(t *testi
 	}
 }
 
+// slotTouchRecordingRing is an inboundReader that records whether the descriptor
+// slot was ever touched (via Peek), while answering emptiness from a head/tail-only
+// flag. It proves ReadableNow observes emptiness without reading a slot.
+type slotTouchRecordingRing struct {
+	empty      bool
+	peekCalled atomic.Bool
+}
+
+func (r *slotTouchRecordingRing) Peek() (ring.Descriptor, ring.PeekStatus) {
+	r.peekCalled.Store(true)
+
+	return ring.Descriptor{}, ring.PeekEmpty
+}
+func (r *slotTouchRecordingRing) Advance()     {}
+func (r *slotTouchRecordingRing) Tail() uint64 { return 0 }
+func (r *slotTouchRecordingRing) Empty() bool  { return r.empty }
+
+// Test ReadableNow confirming the inbound queue empty only when it is, so neither
+// live caller (the heartbeat's InboundReadable report or the stream reader's
+// credit drain-boundary probe) ever treats a non-empty ring as drained: an empty
+// ring reports not-readable, a published-but-unconsumed frame reports readable, and
+// once the reader drains it the ring reports not-readable again. The probe is
+// non-consuming (Ring.Empty, a head/tail check), so the reader's own Recv still
+// delivers the frame.
+func TestTransport_ReadableNow_ConfirmsInboundEmptyOnlyWhenDrained(t *testing.T) {
+	// Given a host and plugin attached to one region, with the plugin's inbound
+	// queue empty.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+	// Then a drained inbound queue is confirmed empty (not readable).
+	require.False(t, ep.plugin.ReadableNow(), "an empty inbound ring must be confirmed empty")
+
+	// When the host publishes a frame the plugin has not yet consumed.
+	want := transport.Frame{CallID: 9, Kind: transport.FrameUnaryReq, Payload: []byte("queued")}
+	require.NoError(t, ep.host.Send(t.Context(), want))
+
+	// Then the plugin's inbound queue is readable — the probe never confirms empty
+	// while a pre-cutoff frame is queued.
+	require.Eventually(t, ep.plugin.ReadableNow, 2*time.Second, time.Millisecond,
+		"a published-but-unconsumed frame must report readable")
+
+	// When the reader consumes the frame.
+	got, err := ep.plugin.Recv(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, want.CallID, got.CallID)
+
+	// Then the drained queue is confirmed empty again.
+	require.False(t, ep.plugin.ReadableNow(), "a consumed queue must be confirmed empty again")
+}
+
+// Test that ReadableNow observes emptiness from the head and tail sequence
+// words ONLY, never a descriptor-slot read: reading a slot concurrently with the
+// single Recv consumer violates the ring's one-consumer contract (the consumer can
+// advance the slot and the producer reuse it under the probe). A recording ring
+// fails the test if ReadableNow ever peeks a descriptor.
+func TestTransport_ReadableNow_ObservesEmptinessWithoutTouchingSlots(t *testing.T) {
+	// Given a healthy region whose inbound ring records any descriptor-slot touch.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	rec := &slotTouchRecordingRing{empty: true}
+	ep.plugin.inboundRing = rec
+
+	// When the drain probe observes the empty queue.
+	require.False(t, ep.plugin.ReadableNow(), "an empty ring is confirmed drained")
+
+	// Then it did so without reading a descriptor slot.
+	require.False(t, rec.peekCalled.Load(),
+		"the drain probe must observe emptiness from head/tail only, never a descriptor-slot read")
+}
+
+// Test ReadableNow observing emptiness safely alongside the single Recv consumer
+// over the real region — the heartbeat-assembly goroutine's arrangement, where the
+// probe runs concurrently while the serve loop is parked in (or draining) Recv.
+// Each round keeps at most one frame in flight, so the consumer is genuinely
+// parked in Recv while the probe spins; the probe touches only the head and tail
+// sequence words, so the pairing stays race-clean. (`-race` sees in-process races
+// only; it cannot prove cross-process safety — shm-abi.md §3/§7's seq_cst head/tail
+// edges do.)
+func TestTransport_ReadableNow_SafeConcurrentWithRecv(t *testing.T) {
+	// Given a plugin consumer parked in Recv and a drain probe spinning against it.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	const rounds = 30
+
+	got := make(chan struct{}, 1)
+	go func() {
+		for range rounds {
+			if _, err := ep.plugin.Recv(t.Context()); err != nil {
+				return
+			}
+			got <- struct{}{}
+		}
+	}()
+
+	probeStop := make(chan struct{})
+	probeDone := make(chan struct{})
+	go func() {
+		defer close(probeDone)
+		for {
+			select {
+			case <-probeStop:
+				return
+			default:
+				_ = ep.plugin.ReadableNow()
+				runtime.Gosched()
+			}
+		}
+	}()
+
+	// When the host delivers frames one at a time while the probe runs.
+	for i := range rounds {
+		require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
+			CallID: uint64(i + 1), Kind: transport.FrameUnaryReq, Payload: []byte("x"),
+		}))
+		select {
+		case <-got:
+		case <-time.After(5 * time.Second):
+			t.Fatal("consumer did not receive a frame while the probe ran concurrently")
+		}
+	}
+
+	// Then every frame round-tripped with no data race on the ring's head/tail words.
+	close(probeStop)
+	<-probeDone
+}
+
+// Test ReadableNow reporting readable once the region is shutting down, even with
+// an empty ring: StopWriter sets the shutdown word without setting the closed flag,
+// and neither live caller may mistake a fatally-failed session for a normal empty
+// queue. Checking only the closed flag would report the empty ring not-readable and
+// let a caller treat a shutting-down session as cleanly drained.
+func TestTransport_ReadableNow_ReportsReadable_WhenShuttingDown(t *testing.T) {
+	// Given a host and plugin with an empty inbound queue.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	require.False(t, ep.plugin.ReadableNow(), "an empty inbound ring is confirmed drained")
+
+	// When the region is shut down (shutdown word set, region not yet closed).
+	require.NoError(t, ep.plugin.StopWriter())
+
+	// Then the probe reports readable: a shutting-down session vetoes quiescence.
+	require.True(t, ep.plugin.ReadableNow(),
+		"a shutting-down region must not confirm drained, even with an empty ring")
+}
+
 // Test that the five STREAM_* kinds round-trip host->plugin over the real
 // region, carrying the stream control word in the descriptor's reserved word
 // (offset 56, stream-protocol.md §2.1/§2.2). The transport is stream-unaware:
@@ -1410,6 +1552,7 @@ func (r *shutdownOnPeekRing) Advance() {
 	panic("drain advanced the head past the post-copy shutdown gate")
 }
 func (r *shutdownOnPeekRing) Tail() uint64 { return 1 }
+func (r *shutdownOnPeekRing) Empty() bool  { return r.peeked }
 
 // Test the §9 fail-closed shutdown gate AFTER copy-out but before dispatch: a
 // frame that the top gate already admitted (shutdown clear) must still not be

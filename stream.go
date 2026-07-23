@@ -296,21 +296,41 @@ func (c *ClientConn) OpenServerStreamID(
 func (c *ClientConn) openStreamByID(
 	ctx context.Context, serviceID, methodID uint64, opts ...StreamOption,
 ) (*Stream, error) {
+	// Fast-fail when routing is fully detached: a torn-down instance nulls c.state,
+	// and "unavailable" takes precedence over a closed-admission "draining". This
+	// reads only whether routing is gone at this instant; the value is not retained
+	// for routing (that load is below, inside the barrier).
+	if c.state.Load() == nil {
+		return nil, ErrPluginUnavailable
+	}
+	// The hot-reload cutoff refuses a new stream before it is ever admitted or
+	// published, exactly as Invoke does — provably not dispatched, so retryable.
+	// Enter holds the publication barrier's read side from this check THROUGH the
+	// STREAM_OPEN Send below, so cutoff cannot complete until this open is
+	// published; every early return before that Send releases it.
+	if !c.admission.Enter() {
+		return nil, ErrDrained
+	}
+	// Select the routing state INSIDE the admission barrier, after Enter, for the
+	// same reason as the unary path: cutoff joins every admitted caller before a
+	// successor is promoted, so this pre-cutoff open publishes through the
+	// pre-cutoff instance and never through a transport retired by a later promotion.
 	state := c.state.Load()
 	if state == nil {
+		c.admission.Leave()
+
 		return nil, ErrPluginUnavailable
 	}
 	if state.streams == nil {
 		// This connection generation has no streaming half — the streaming feature
 		// was not negotiated, so a stream cannot be opened.
+		c.admission.Leave()
+
 		return nil, ErrIncompatible
 	}
-	// The hot-reload cutoff refuses a new stream before it is ever admitted or
-	// published, exactly as Invoke does — provably not dispatched, so retryable.
-	if !c.admission.IsOpen() {
-		return nil, ErrDrained
-	}
 	if err := ctx.Err(); err != nil {
+		c.admission.Leave()
+
 		return nil, translateCtxErr(err)
 	}
 
@@ -338,6 +358,8 @@ func (c *ClientConn) openStreamByID(
 		budget = time.Until(deadline)
 	}
 	if budget <= 0 {
+		c.admission.Leave()
+
 		return nil, ErrDeadlineExceeded
 	}
 	cfg.Deadline = budget
@@ -345,6 +367,8 @@ func (c *ClientConn) openStreamByID(
 	callID := state.table.NextID()
 	st, err := state.streams.streams.Open(callID, rpcruntime.ClientStream, cfg)
 	if err != nil {
+		c.admission.Leave()
+
 		return nil, translateStreamOpenErr(err)
 	}
 
@@ -373,10 +397,15 @@ func (c *ClientConn) openStreamByID(
 	// STREAM_OPEN desynchronizes the peer's framing regardless, so poison is the right
 	// disposition there, not a lingering half-frame.
 	if sendErr := state.tr.Send(st.Context(), f); sendErr != nil {
+		c.admission.Leave()
+
 		// resolveOpenSendErr never yields a live stream — it discards or terminates the
 		// SUBMITTED stream and surfaces the outcome, so OpenStream returns no wrapper.
 		return nil, resolveOpenSendErr(state, st, sendErr)
 	}
+	// The OPEN reached the transport: release the publication barrier now, before
+	// the Publish arbitration below (whose terminal wait cutoff must not join).
+	c.admission.Leave()
 	// The OPEN reached the transport. Publish arbitrates against termination
 	// (stream-protocol.md §7.4): any terminal transition — the deadline watcher, a
 	// local cancel, or a fast peer STREAM_ERR/STREAM_CLOSE/completion the reader
@@ -932,21 +961,29 @@ func (s *streamServer) onStreamOpen(f transport.Frame) error {
 func (s *streamServer) runHandler(reg streamHandlerReg, st *rpcruntime.Stream) {
 	recovered, err := s.invokeStreamHandler(reg, newServerStream(st, s.codec))
 	if recovered != nil {
-		// The handler panicked and the tight recover boundary caught it. Terminate
-		// this stream with the panic outcome through the SAME handler-error
-		// termination path a returned error takes (the terminal-CAS winner enqueues the
-		// data-lane STREAM_ERR on the bounded emitter). Its send is best-effort: teardown
-		// may win before it reaches the peer, and the frozen protocol permits dropping a
-		// handler-error STREAM_ERR (stream-protocol.md §9.1/§10.2), so the peer usually
-		// but not always sees a *PluginPanicError rather than a stream that lingers to its
-		// deadline. Then apply the panic policy: under the default it taints the process
-		// and signals controlled termination; opted in, the server keeps serving. The
-		// panic never unwinds past this point.
-		st.TerminateHandlerError(panicStatus(recovered))
 		if s.panicPolicy == nil {
-			panic(recovered) // no serving session policy: preserve crash-on-panic.
+			// No serving session policy: preserve crash-on-panic, after emitting the
+			// handler-error terminal so a peer still observes the fault.
+			st.TerminateHandlerError(panicStatus(recovered))
+			panic(recovered)
 		}
-		s.panicPolicy.recordStreamPanic()
+		// The handler panicked and the tight recover boundary caught it. Under the
+		// default policy, store the session taint FIRST — before enqueuing the panic
+		// terminal — so the session is marked failed before that terminal can reach
+		// the peer: the taint store linearizes against new-call admission, so a call
+		// the peer issues in response to this terminal is refused rather than
+		// dispatched onto a session that is tearing down (see recordStreamPanicTaint).
+		// Then terminate this stream with the panic outcome through the SAME
+		// handler-error termination path a returned error takes (the terminal-CAS
+		// winner enqueues the data-lane STREAM_ERR on the bounded emitter). Its send is
+		// best-effort: teardown may win before it reaches the peer, and the frozen
+		// protocol permits dropping a handler-error STREAM_ERR
+		// (stream-protocol.md §9.1/§10.2), so the peer usually but not always sees a
+		// *PluginPanicError rather than a stream that lingers to its deadline. Finally
+		// signal controlled termination. The panic never unwinds past this point.
+		s.panicPolicy.recordStreamPanicTaint()
+		st.TerminateHandlerError(panicStatus(recovered))
+		s.panicPolicy.signalStreamTerminate()
 
 		return
 	}

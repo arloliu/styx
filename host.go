@@ -436,6 +436,14 @@ func (h *Host) publish(e Event) {
 	h.bus.Publish(e)
 }
 
+// teardownAdmissionCloseBound bounds the publication join the teardown-path cutoff
+// waits on, so a wedged plugin that has stopped reading cannot hold the join open
+// forever before teardown reaches the later steps that unblock the publisher. It
+// matches internal/lifecycle.Teardown's own goroutine-join bound. It is a var, not
+// a const, only so a test can shorten it. Package-internal; never reassigned in
+// production.
+var teardownAdmissionCloseBound = 5 * time.Second
+
 // wireConnState builds a fresh connState from a newly-Ready
 // supervisor.Instance and installs it onto cc, starting its read loop. It
 // is the restart-time analogue of newClientConn: newClientConn wires a
@@ -489,7 +497,17 @@ func wireConnState(cc *ClientConn, inst supervisor.Instance) supervisor.ReadyHoo
 		// already serving.
 		StopAdmission: func() {
 			if cc.state.CompareAndSwap(state, nil) {
-				cc.admission.Close()
+				// Teardown-path cutoff: join in-flight publishers, bounded. This is
+				// teardown step 1, before the step-2 fail-in-flight and the transport
+				// stop that unblock a publisher. A live-but-wedged plugin that has
+				// stopped reading holds an admitted caller's Send, so an unbounded join
+				// here would wait for a publisher that only the later teardown steps can
+				// release — a deadlock against the teardown that must reach them. On
+				// expiry teardown proceeds regardless: fail-in-flight and the transport
+				// stop free the publisher, and the gate join is then moot.
+				ctx, cancel := context.WithTimeout(context.Background(), teardownAdmissionCloseBound)
+				defer cancel()
+				_ = cc.admission.Close(ctx)
 			}
 		},
 		// Same split-by-dispatch-state reasoning as the earlier teardown

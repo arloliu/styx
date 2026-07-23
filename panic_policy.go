@@ -67,11 +67,11 @@ type panicController struct {
 	// through handler ENTRY: for a unary call it opens the obligation and runs the
 	// dispatch up to the handler frame, releasing at the top of that frame immediately
 	// before the application handler runs; for a STREAM_OPEN it registers and launches
-	// the handler on its own goroutine, releasing once launched. recordStreamPanic holds
-	// the write side across the taint store. So an admission that began before the store
-	// completes first and counts as an already-in-flight call — terminated by the
+	// the handler on its own goroutine, releasing once launched. recordStreamPanicTaint
+	// holds the write side across the taint store. So an admission that began before the
+	// store completes first and counts as an already-in-flight call — terminated by the
 	// existing teardown fan-out — while every admission that begins after
-	// recordStreamPanic returns observes the taint and is fenced, and no fresh handler
+	// recordStreamPanicTaint returns observes the taint and is fenced, and no fresh handler
 	// begins after the store returns. The read side is a session-wide serialization
 	// point, not a per-stream one, so it must never be held across handler EXECUTION:
 	// the unary reader releases it at handler entry before the handler runs, and a
@@ -92,7 +92,7 @@ type panicController struct {
 	terminate     chan struct{}
 	terminateOnce sync.Once
 
-	// beforeTaintStore, when non-nil, runs in recordStreamPanic once the session is
+	// beforeTaintStore, when non-nil, runs in recordStreamPanicTaint once the session is
 	// known to be tainting, immediately before the write side of the admission gate is
 	// acquired. It is a test-only ordering seam that lets a test observe the taint store
 	// poised at the write-side acquire — past the slow panic unwind — so it can prove a
@@ -100,7 +100,7 @@ type panicController struct {
 	// and has no runtime cost there.
 	beforeTaintStore func()
 
-	// afterTaintStore, when non-nil, runs in recordStreamPanic immediately after the
+	// afterTaintStore, when non-nil, runs in recordStreamPanicTaint immediately after the
 	// taint store, still under the write side of the admission gate. It is a test-only
 	// ordering seam that records the store's completion in a log ordered against the
 	// admission release: because it runs under the write side, and a release records
@@ -147,31 +147,43 @@ func (pc *panicController) recordUnaryPanic() {
 	}
 }
 
-// recordStreamPanic records that a streaming handler panicked. It runs only after
-// the stream's panic status has been enqueued on the bounded emitter through the
-// handler-error termination path — enqueued, not necessarily sent, since teardown
-// may win and the frozen protocol permits dropping that STREAM_ERR. Under the
-// default policy it both taints the session and closes the terminate signal to
-// wake the serving supervisor — the handler goroutine cannot tear the session down
-// itself without deadlocking against its own join.
-func (pc *panicController) recordStreamPanic() {
+// recordStreamPanicTaint records that a streaming handler panicked, storing the
+// session taint under the default policy. It is called BEFORE the stream's panic
+// terminal is enqueued, so the session is marked failed before that terminal can
+// reach the peer: a call the peer issues in response to the terminal observes the
+// taint and is refused rather than dispatched onto a session that is tearing down.
+// Opted in, it is a no-op and the server keeps serving.
+//
+// The store takes the write side of the admission gate, which linearizes against
+// the reader's read-side admission, so once this returns no admission that begins
+// later can dispatch a new call (see admitGate, beginAdmit). The terminate signal
+// is closed separately, by signalStreamTerminate after the terminal is enqueued.
+func (pc *panicController) recordStreamPanicTaint() {
 	if pc.continueAfterPanic {
 		return
 	}
 	if pc.beforeTaintStore != nil {
 		pc.beforeTaintStore()
 	}
-	// Store the taint under the write side of the admission gate: this linearizes
-	// against the reader's read-side admission, so once this returns no admission that
-	// begins later can dispatch a new call (see admitGate, beginAdmit). Close the
-	// terminate signal only after the store, so an observer woken by the signal — the
-	// serving supervisor, or a test — always sees the taint already established.
 	pc.admitGate.Lock()
 	pc.tainted.Store(true)
 	if pc.afterTaintStore != nil {
 		pc.afterTaintStore()
 	}
 	pc.admitGate.Unlock()
+}
+
+// signalStreamTerminate closes the terminate signal to wake the serving
+// supervisor — the handler goroutine cannot tear the session down itself without
+// deadlocking against its own join. It runs after recordStreamPanicTaint and
+// after the panic terminal has been enqueued (its send is best-effort; teardown
+// may win and the frozen protocol permits dropping that STREAM_ERR). The taint is
+// already stored when this closes, so an observer woken by the signal always sees
+// the taint already established. Opted in, it is a no-op.
+func (pc *panicController) signalStreamTerminate() {
+	if pc.continueAfterPanic {
+		return
+	}
 	pc.terminateOnce.Do(func() { close(pc.terminate) })
 }
 

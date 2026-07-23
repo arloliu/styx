@@ -641,8 +641,8 @@ func TestPluginServer_FenceDispatch_LinearizesAdmissionWithTaintStore(t *testing
 	}
 
 	// Prove the read side is genuinely held before any taint writer exists. The
-	// panicking handler is still gated on letFeedPanic, so recordStreamPanic has not run
-	// and no write side is pending; the only goroutine that takes this gate before the
+	// panicking handler is still gated on letFeedPanic, so recordStreamPanicTaint has not
+	// run and no write side is pending; the only goroutine that takes this gate before the
 	// panic is released is this parked reader's read side (nothing else in the harness
 	// touches admitGate). A write-side probe must therefore fail. Sequencing this ahead
 	// of the panic kills a narrowed read side deterministically — the parked reader would
@@ -839,8 +839,8 @@ func TestPluginServer_LinearizeUnaryAdmissionWithTaintStore(t *testing.T) {
 	}
 
 	// Prove the read side is genuinely held before any taint writer exists. The
-	// panicking Feed handler is still gated on letFeedPanic, so recordStreamPanic has not
-	// run and no write side is pending; the only goroutine that takes this gate before the
+	// panicking Feed handler is still gated on letFeedPanic, so recordStreamPanicTaint has
+	// not run and no write side is pending; the only goroutine that takes this gate before the
 	// panic is released is this parked reader's read side (nothing else in the harness
 	// touches admitGate). A write-side probe must therefore fail. Sequencing this ahead of
 	// the panic kills a narrowed read side deterministically — the parked reader would hold

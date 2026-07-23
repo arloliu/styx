@@ -83,6 +83,10 @@ type inboundReader interface {
 	Peek() (ring.Descriptor, ring.PeekStatus)
 	Advance()
 	Tail() uint64
+	// Empty reports whether the ring holds no descriptor, from the head and tail
+	// sequence words only (no descriptor-slot read), so the non-consuming drain
+	// probe can observe emptiness safely alongside the single consumer.
+	Empty() bool
 }
 
 var _ inboundReader = (*ring.Ring)(nil)
@@ -191,6 +195,7 @@ var (
 	_ transport.Transport               = (*Transport)(nil)
 	_ transport.WriterStopper           = (*Transport)(nil)
 	_ transport.BackpressureEdgeCounter = (*Transport)(nil)
+	_ transport.InboundQueueProber      = (*Transport)(nil)
 )
 
 // BackpressureEdges reports the cumulative count of transitions into reject-mode
@@ -487,6 +492,44 @@ func (t *Transport) Send(ctx context.Context, f transport.Frame) error {
 // the caller relies on.
 func (t *Transport) AcceptanceUnknown(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// ReadableNow reports whether the inbound ring is NOT confirmed empty — the
+// non-consuming probe transport.InboundQueueProber defines. It observes
+// emptiness from the inbound ring's head and tail sequence words ONLY
+// (Ring.Empty, two seq_cst index loads), never reading a descriptor slot, so it
+// cannot race the single Recv consumer for a slot the consumer may concurrently
+// advance and the producer reuse. Two live callers rely on that: the
+// heartbeat-assembly goroutine probes it concurrently with the reader parked in
+// — or actively draining — Recv to fill Heartbeat.InboundReadable alongside the
+// consumed-frame count (pluginserver.go's heartbeat), and the connection reader's
+// own loop probes it between Recv calls to arm an owed stream-credit drain-boundary
+// ACK (stream.go's probeDrain, stream-protocol.md §4.6). Both touch only the
+// head/tail words each side owns or reads by contract (shm-abi.md §3/§7).
+//
+// It confirms empty ONLY when the live region's ring is empty. A non-empty ring, a
+// corrupt depth (Empty is false when tail-head exceeds capacity), a closed region,
+// or a poisoned/shutting-down region all report readable — the conservative
+// direction, so neither caller ever treats a queue it cannot positively confirm
+// empty as drained, and a fatally-failed session (poison or graceful-shutdown word
+// set without Close, as StopWriter leaves it) reports readable rather than a clean
+// empty.
+//
+// It holds the closing gate's read side for the observation, since the ring lives
+// in the mapped region Close unmaps (see Transport.closeMu's doc); a concurrent
+// Close finds closed already set and reports readable rather than touching the region.
+func (t *Transport) ReadableNow() bool {
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+
+	if t.closed {
+		return true // the next Recv surfaces ErrClosed; never confirm drained off a closing region.
+	}
+	if t.teardownError() != nil {
+		return true // poisoned or shutting down: never confirm empty off a fatally-failed session.
+	}
+
+	return !t.inboundRing.Empty()
 }
 
 // Recv waits for inbound work, drains descriptors from the inbound ring in

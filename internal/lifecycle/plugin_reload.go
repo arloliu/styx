@@ -87,6 +87,13 @@ const (
 // phase until after DrainAck arrives, so nothing past this point may still
 // be governed by the drain deadline.
 //
+// DrainAck presently certifies mutator quiescence only: it is sent once the
+// mutators are frozen, and data-plane calls accepted before the host's cutoff
+// may still be in flight on this instance when the ack goes out. Waiting for
+// every accepted call to finish before acknowledging drain — the completion
+// the design of record requires (docs/specs/2026-07-16-styx-design.md) — is
+// deferred work not yet wired into this loop.
+//
 // Once DrainAck has gone out — never before — it always sends a snapshot:
 // hooks.Saver's output when one is registered, or an empty payload when
 // not, sealed into a memfd via internal/shm.BuildSnapshot and handed to the

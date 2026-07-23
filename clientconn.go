@@ -419,25 +419,50 @@ func (c *ClientConn) InvokeID(ctx context.Context, serviceID, methodID uint64, r
 // invokeByID is the shared core of Invoke and InvokeID: it submits and publishes a
 // unary request routed by the precomputed serviceID/methodID hashes.
 func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64, req, resp proto.Message) error {
-	state := c.state.Load()
-	if state == nil {
+	// Fast-fail when routing is fully detached: a torn-down or crashed instance
+	// nulls c.state, and that "unavailable" outcome takes precedence over a
+	// closed-admission "draining" outcome. This reads only whether routing is gone
+	// at this instant; the value is not retained for routing (that load is below,
+	// inside the barrier), so it cannot carry a stale predecessor past a promotion.
+	if c.state.Load() == nil {
 		return ErrPluginUnavailable
 	}
 
 	// The cutoff phase of a hot-reload closes admission before the running
 	// instance freezes. Refusing here - before the call is ever submitted to
 	// the Table or published to the transport - is what makes the refusal
-	// provably not-dispatched, and so safely retryable.
-	if !c.admission.IsOpen() {
+	// provably not-dispatched, and so safely retryable. Enter holds the
+	// publication barrier's read side from this check THROUGH the transport Send
+	// below, so cutoff (AdmissionGate.Close) cannot complete until this request is
+	// published: an admitted call is never left unpublished behind a cutoff.
+	if !c.admission.Enter() {
 		return ErrDrained
 	}
 
+	// Select the routing state INSIDE the admission barrier, after Enter. Cutoff
+	// joins every admitted caller before the reload promotes a successor, so while
+	// this caller holds the read side c.state cannot advance past the pre-cutoff
+	// instance this pre-cutoff call belongs to. Loading it for routing BEFORE Enter
+	// would let a caller paused between the load and Enter resume after a later
+	// generation was promoted and admission reopened, then publish its stale
+	// predecessor state through the retired transport.
+	state := c.state.Load()
+	if state == nil {
+		c.admission.Leave()
+
+		return ErrPluginUnavailable
+	}
+
 	if err := ctx.Err(); err != nil {
+		c.admission.Leave()
+
 		return translateCtxErr(err)
 	}
 
 	payload, err := state.codec.Marshal(req)
 	if err != nil {
+		c.admission.Leave()
+
 		return fmt.Errorf("styx: invoke: marshal request: %w", err)
 	}
 
@@ -484,6 +509,11 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 			state.table.OutcomeUnknown(callID, cause)
 		}
 	}
+	// The request has been published (or Publish lost to a racing terminal, so
+	// nothing is owed on the wire): release the publication barrier BEFORE the
+	// response wait. Cutoff joins publication, never the response, so the read
+	// side is never held across wait below.
+	c.admission.Leave()
 
 	result, waitErr := wait(ctx)
 	if waitErr != nil {

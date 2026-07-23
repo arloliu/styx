@@ -71,7 +71,7 @@ func (r *fakeRouter) onReady(inst supervisor.Instance) supervisor.ReadyHooks {
 		// ownership CAS from host.go's wireConnState, replicated.
 		StopAdmission: func() {
 			if r.state.CompareAndSwap(st, nil) {
-				r.admission.Close()
+				_ = r.admission.Close(context.Background())
 			}
 		},
 	}
