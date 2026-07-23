@@ -22,6 +22,36 @@ func (s *Supervisor) HandshakeAndAttachForTest(
 	return hs.tr, hs.streaming, err
 }
 
+// SetAttachSHMFailAtForTest installs a per-step failpoint for attachSHM (host
+// side) and returns a restore func for defer. The callback runs after each named
+// construction step; a non-nil return aborts the attach there, so a test can
+// assert the exact per-step cleanup. Production leaves the seam nil.
+func SetAttachSHMFailAtForTest(f func(step string) error) func() {
+	prev := attachSHMFailAt
+	attachSHMFailAt = f
+
+	return func() { attachSHMFailAt = prev }
+}
+
+// AttachSHMForTest drives the host-side shared-memory attach against conn and
+// tuple, closing any resources it returns (so a success path never leaks in a
+// test) and returning only the error. With a failpoint installed it exercises a
+// single partial-construction edge; the caller asserts fd/mapping counts around it.
+func (s *Supervisor) AttachSHMForTest(
+	ctx context.Context, conn *control.Conn, generation uint64, tuple control.Tuple,
+) error {
+	tr, res, err := s.attachSHM(ctx, conn, generation, tuple)
+	if tr != nil {
+		_ = tr.Close()
+	}
+	if res != nil {
+		res.closeRegion()
+		res.closeEventFDs()
+	}
+
+	return err
+}
+
 // FakeInstance is a test-built stand-in for one spawned instance: the control
 // conn the heartbeat loop will own, the promote closure that installs routing
 // (returning teardown hooks), and the teardown closure that drains and "reaps"

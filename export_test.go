@@ -212,3 +212,30 @@ func (pc *panicController) tryAdmitWriteLock() bool {
 func IncompatibleReason(err error) string {
 	return incompatibleReason(err)
 }
+
+// SetPluginAttachSHMFailAtForTest installs a per-step failpoint for
+// pluginAttachSHM and returns a restore func for defer. The callback runs after
+// each named construction step; a non-nil return aborts the attach there, so a
+// test can assert the exact per-step cleanup. Production leaves the seam nil.
+func SetPluginAttachSHMFailAtForTest(f func(step string) error) func() {
+	prev := pluginAttachSHMFailAt
+	pluginAttachSHMFailAt = f
+
+	return func() { pluginAttachSHMFailAt = prev }
+}
+
+// PluginAttachSHMForTest drives the plugin-side shared-memory attach against conn
+// and tuple, closing any resources it returns (so a success path never leaks in a
+// test) and returning only the error. With a failpoint installed it exercises a
+// single partial-construction edge; the caller asserts fd/mapping counts around it.
+func (s *PluginServer) PluginAttachSHMForTest(ctx context.Context, conn *control.Conn, tuple control.Tuple) error {
+	tr, res, err := s.pluginAttachSHM(ctx, conn, tuple)
+	if tr != nil {
+		_ = tr.Close()
+	}
+	if res != nil {
+		res.close()
+	}
+
+	return err
+}

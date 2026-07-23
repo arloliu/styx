@@ -1162,6 +1162,23 @@ func (s *Supervisor) attachUDS(
 // eventfds for the teardown path to close (they are NOT owned by the transport,
 // per shm.AttachParams). max_data_inflight is host-selected and carried on
 // AttachRegion so both sides configure the same MaxInflight (shm-abi.md §18).
+// attachSHMFailAt, when non-nil, is called after each named construction step of
+// attachSHM; a non-nil return aborts the attach at that step so a test can assert
+// the exact per-step cleanup. nil in production, adding only negligible cold-path
+// overhead: six nil-checked hook calls on the attach path per spawn, and nothing
+// else. Set only via the test seam in export_test.go.
+var attachSHMFailAt func(step string) error
+
+// attachFailStep consults the failpoint for a named step. It is a no-op returning
+// nil in production.
+func attachFailStep(step string) error {
+	if attachSHMFailAt != nil {
+		return attachSHMFailAt(step)
+	}
+
+	return nil
+}
+
 func (s *Supervisor) attachSHM(
 	ctx context.Context, conn *control.Conn, generation uint64, tuple control.Tuple,
 ) (tr transport.Transport, res *shmHostResources, err error) {
@@ -1189,6 +1206,9 @@ func (s *Supervisor) attachSHM(
 			_ = region.Close()
 		}
 	}()
+	if err = attachFailStep("region-create"); err != nil {
+		return nil, nil, err
+	}
 
 	hpEFD, eerr := event.NewEventFD()
 	if eerr != nil {
@@ -1199,6 +1219,9 @@ func (s *Supervisor) attachSHM(
 			_ = hpEFD.Close()
 		}
 	}()
+	if err = attachFailStep("hp-eventfd"); err != nil {
+		return nil, nil, err
+	}
 	phEFD, eerr := event.NewEventFD()
 	if eerr != nil {
 		return nil, nil, fmt.Errorf("supervisor: handshake: p->h eventfd: %w", eerr)
@@ -1208,6 +1231,9 @@ func (s *Supervisor) attachSHM(
 			_ = phEFD.Close()
 		}
 	}()
+	if err = attachFailStep("ph-eventfd"); err != nil {
+		return nil, nil, err
+	}
 
 	regionSize := region.Layout().RegionSize
 
@@ -1233,6 +1259,9 @@ func (s *Supervisor) attachSHM(
 	if sendErr != nil {
 		return nil, nil, fmt.Errorf("supervisor: handshake: send AttachRegion: %w", sendErr)
 	}
+	if err = attachFailStep("send-fds"); err != nil {
+		return nil, nil, err
+	}
 
 	// The host attaches its own end BEFORE waiting for the ack: attach is local
 	// and cannot depend on the plugin, and doing it here means a construction
@@ -1255,6 +1284,12 @@ func (s *Supervisor) attachSHM(
 			_ = hostTr.Close()
 		}
 	}()
+	if err = attachFailStep("attach"); err != nil {
+		return nil, nil, err
+	}
+	if err = attachFailStep("ack-recv"); err != nil {
+		return nil, nil, err
+	}
 
 	if _, aerr := recvControl(ctx, conn, control.StateAttaching, control.KindAttachRegionAck,
 		control.ReplyDeadlines[control.KindAttachRegion]); aerr != nil {

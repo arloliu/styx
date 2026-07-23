@@ -716,6 +716,23 @@ func (s *PluginServer) pluginAttachUDS(
 // both sides admit identically; the per-direction payload limit is derived from
 // the region header (no wire field). The ack is sent last, after full construction
 // and teardown-ownership installation (the ready-ack linearization).
+// pluginAttachSHMFailAt, when non-nil, is called after each named construction
+// step of pluginAttachSHM; a non-nil return aborts the attach at that step so a
+// test can assert the exact per-step cleanup. nil in production, adding only
+// negligible cold-path overhead: five nil-checked hook calls on the attach path
+// per attach, and nothing else. Set only via the test seam.
+var pluginAttachSHMFailAt func(step string) error
+
+// pluginAttachFailStep consults the failpoint for a named step. A no-op returning
+// nil in production.
+func pluginAttachFailStep(step string) error {
+	if pluginAttachSHMFailAt != nil {
+		return pluginAttachSHMFailAt(step)
+	}
+
+	return nil
+}
+
 func (s *PluginServer) pluginAttachSHM(
 	ctx context.Context, conn *control.Conn, tuple control.Tuple,
 ) (tr transport.Transport, res *pluginShmResources, err error) {
@@ -738,6 +755,9 @@ func (s *PluginServer) pluginAttachSHM(
 			}
 		}
 	}()
+	if err = pluginAttachFailStep("recv-fds"); err != nil {
+		return nil, nil, err
+	}
 
 	hpEFD, eerr := event.NewEventFDFromFD(hpFD)
 	if eerr != nil {
@@ -749,6 +769,9 @@ func (s *PluginServer) pluginAttachSHM(
 			_ = hpEFD.Close()
 		}
 	}()
+	if err = pluginAttachFailStep("hp-wrap"); err != nil {
+		return nil, nil, err
+	}
 
 	phEFD, eerr := event.NewEventFDFromFD(phFD)
 	if eerr != nil {
@@ -760,6 +783,9 @@ func (s *PluginServer) pluginAttachSHM(
 			_ = phEFD.Close()
 		}
 	}()
+	if err = pluginAttachFailStep("ph-wrap"); err != nil {
+		return nil, nil, err
+	}
 
 	ar := msg.GetAttachRegion()
 	cfg := shmtransport.Config{
@@ -789,6 +815,12 @@ func (s *PluginServer) pluginAttachSHM(
 			_ = pluginTr.Close()
 		}
 	}()
+	if err = pluginAttachFailStep("attach"); err != nil {
+		return nil, nil, err
+	}
+	if err = pluginAttachFailStep("ack-send"); err != nil {
+		return nil, nil, err
+	}
 
 	// Teardown ownership installed (the returned res); ack only now, last.
 	ackMsg := &controlpb.ControlMessage{
