@@ -34,6 +34,20 @@
 // make NO cross-process race claim. Only the in-process harness orchestration
 // runs under the race detector.
 //
+// # Randomized layers
+//
+// Above the deterministic matrix, two seeded layers add breadth. A single-fault
+// layer SIGKILLs at a randomly chosen window each iteration. A multi-fault layer
+// composes 2+ data-plane window faults per seeded run — a chain of heterogeneous
+// crash/poison sessions against the one persistent host — and asserts the host's fd
+// count returns exactly to baseline across the whole composition, the no-accumulation
+// interaction a single fault cannot reach. Both log their seed (and the multi-fault
+// layer its full composition) so any failing run is replayable; the same seed always
+// reproduces the same sequence. Setting STYX_CHAOS_SOAK to any non-empty value opts
+// into a longer budget (more runs, longer compositions) for a local soak; unset — the
+// default, including CI — keeps the layers fast, scaling only iteration counts, never
+// the per-fault bounds.
+//
 // # Scope boundary: windows covered elsewhere, and one still open here
 //
 // Three scenarios that once could not be exercised at all — the host integrates the
