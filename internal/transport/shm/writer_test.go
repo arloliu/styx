@@ -1969,10 +1969,12 @@ func TestWriter_SubmitReporting_EnqueuedCallbackFiresOnResolve(t *testing.T) {
 		done <- res{enq, err}
 	}()
 
-	// Wait until the intent has enqueued (deterministic: the cap-1 data queue has
-	// space and nothing drains it, so this converges), THEN cancel — so the cancel
-	// wins the WAIT arm, not the enqueue arm.
-	require.Eventually(t, func() bool { return len(w.dataQueue) == 1 }, 2*time.Second, time.Millisecond)
+	// Receive the intent off the data queue to synchronize on the enqueue — a
+	// deterministic handoff rather than a timed poll: the receive blocks until the
+	// submit has pushed the intent, and holding it here also stands in for the writer
+	// draining it. Once it is off the queue the submit is provably past enqueue, so the
+	// cancel below wins the WAIT arm, not the enqueue arm.
+	got := <-w.dataQueue
 	cancel()
 	r := recvWithinRes(t, done)
 
@@ -1983,7 +1985,6 @@ func TestWriter_SubmitReporting_EnqueuedCallbackFiresOnResolve(t *testing.T) {
 	require.Empty(t, reports, "onReport must not fire before the writer resolves the intent")
 
 	// When the writer later resolves the enqueued intent as published.
-	got := <-w.dataQueue
 	w.report(got, nil)
 
 	// Then the callback fired exactly once with published=true.

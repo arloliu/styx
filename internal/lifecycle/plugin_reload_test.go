@@ -153,6 +153,23 @@ func runServeReloadResult(t *testing.T, conn *control.Conn, hooks lifecycle.Plug
 	return done
 }
 
+// runServeReloadWithWait launches ServeReload with a custom accepted-call
+// quiescence wait — the wait ServeReload runs after freezing mutators and before
+// DrainAck — so a test can drive the quiescence gate's timeout path.
+func runServeReloadWithWait(
+	t *testing.T, conn *control.Conn, hooks lifecycle.PluginReloadHooks, waitDrained lifecycle.DrainWaitFunc,
+) <-chan reloadResult {
+	t.Helper()
+
+	done := make(chan reloadResult, 1)
+	go func() {
+		outcome, err := lifecycle.ServeReload(t.Context(), conn, hooks, waitDrained)
+		done <- reloadResult{outcome: outcome, err: err}
+	}()
+
+	return done
+}
+
 // sendDrain sends a Drain message with a generous deadline, so tests never
 // race ServeReload's own deadline handling.
 func sendDrain(t *testing.T, hostConn *control.Conn) {
@@ -449,6 +466,57 @@ func TestServeReload_WaitForHostResume_WhenSaveStateFails(t *testing.T) {
 	require.Equal(t, control.KindResumeAck, kind)
 	require.Equal(t, []string{"only:freeze", "only:resume"}, log.snapshot())
 	require.NoError(t, <-done)
+}
+
+// Test ServeReload waiting for the host's Resume, restarting its mutators, and
+// acking -- rather than tearing the instance down -- when accepted-call quiescence is
+// not reached within the drain deadline. A quiescence timeout is a phase-2 deadline
+// miss on an otherwise-healthy, frozen instance, not a freeze failure: no DrainAck goes
+// out, the host rolls back on its own DrainAck-wait timeout by sending Resume, and this
+// instance must resume and keep serving. Tearing down instead would strand the host's
+// rollback into a crash-equivalent and drop the live predecessor.
+func TestServeReload_WaitForHostResume_WhenQuiescenceTimesOut(t *testing.T) {
+	// Given: a quiescence wait that never converges -- it blocks until its own deadline
+	// (the drain deadline) and returns that error, standing in for a call still in
+	// flight when the deadline expires.
+	hostConn, pluginConn := newReloadConnPair(t)
+	log := &callLog{}
+	hooks := lifecycle.PluginReloadHooks{
+		Mutators: []lifecycle.Mutator{&loggingMutator{name: "only", log: log}},
+	}
+	neverQuiesces := func(ctx context.Context) error {
+		<-ctx.Done()
+
+		return ctx.Err()
+	}
+	done := runServeReloadWithWait(t, pluginConn, hooks, neverQuiesces)
+
+	// When: the drain deadline is only a few milliseconds out, so the wait times out and
+	// the plugin withholds DrainAck.
+	deadline := time.Now().Add(20 * time.Millisecond)
+	drainMsg := &controlpb.ControlMessage{
+		Body: &controlpb.ControlMessage_Drain{Drain: &controlpb.Drain{DeadlineUnixNano: deadline.UnixNano()}},
+	}
+	require.NoError(t, hostConn.Send(t.Context(), drainMsg))
+
+	// The host sees no DrainAck and rolls back the same way it would for any phase-2
+	// deadline miss: it sends Resume (buffered until the plugin's wait expires and it
+	// begins reading for the outcome).
+	resumeMsg := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_Resume{Resume: &controlpb.Resume{}}}
+	require.NoError(t, hostConn.Send(t.Context(), resumeMsg))
+	resumeAck, err := hostConn.Recv(t.Context())
+	require.NoError(t, err)
+
+	// Then: the instance restarted its mutators, acked Resume, and reports
+	// ReloadRolledBack so the serve loop keeps serving.
+	kind, ok := control.KindOf(resumeAck)
+	require.True(t, ok)
+	require.Equal(t, control.KindResumeAck, kind)
+	require.Equal(t, []string{"only:freeze", "only:resume"}, log.snapshot())
+	res := <-done
+	require.NoError(t, res.err)
+	require.Equal(t, lifecycle.ReloadRolledBack, res.outcome,
+		"a quiescence-timeout rollback must report ReloadRolledBack so the serve loop keeps serving")
 }
 
 // Test ServeReload returning nil, without ever seeing Resume, when the
