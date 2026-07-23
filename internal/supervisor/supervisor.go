@@ -783,9 +783,26 @@ func (s *Supervisor) newLiveInstance(
 		cancelCapture()
 
 		td := &lifecycle.Teardown{
-			StopAdmission:  noopIfNil(li.hooks.StopAdmission),
-			FailInFlight:   noopErrIfNil(li.hooks.FailInFlight),
-			JoinGoroutines: noopIfNil(li.hooks.JoinGoroutines),
+			StopAdmission: noopIfNil(li.hooks.StopAdmission),
+			FailInFlight:  noopErrIfNil(li.hooks.FailInFlight),
+			// Step 3 joins every goroutine that can touch the mapping and releases
+			// the transport. Transport ownership is installed here, NOT delegated to
+			// the routing-promotion hooks: the transport's writer exists from Attach,
+			// before promotion, so a reload rollback of an unpromoted successor must
+			// still stop it and unmap the transport's own duplicate region (for shm)
+			// or close the transport fd (for uds). The routing hooks run first (a
+			// no-op when the instance was never promoted); then the transport is
+			// released unconditionally. Close is idempotent (sync.Once), so a
+			// promoted instance — whose hooks already released the transport — closes
+			// once, and an unpromoted successor is released here and nowhere else.
+			// Join-before-unmap holds: the writer is stopped before the Unmap step
+			// below frees the original region.
+			JoinGoroutines: func() {
+				noopIfNil(li.hooks.JoinGoroutines)()
+				if tr != nil {
+					_ = tr.Close()
+				}
+			},
 			// Step 4 (after the join stopped the writer and released the transport's
 			// own duplicate region): munmap and close the ORIGINAL region the host
 			// created. Join-before-unmap holds — every goroutine that could touch the
