@@ -10,22 +10,10 @@ import (
 
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/lifecycle"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
-
-// countOpenFDs counts this process's open fds by reading /proc/self/fd. It
-// mirrors the helper introduced in internal/control's fds_test.go; that one
-// lives in a different (internal) package's _test file and cannot be
-// imported across packages, so it is re-implemented here.
-func countOpenFDs(t *testing.T) int {
-	t.Helper()
-
-	entries, err := os.ReadDir("/proc/self/fd")
-	require.NoError(t, err)
-
-	return len(entries)
-}
 
 // spawnBlockingChild spawns the deathsig_helper (which blocks forever and
 // ignores the control socket, so teardown always exercises the SIGKILL
@@ -102,7 +90,7 @@ func TestTeardown_Run_BlocksUntilProcessReaped(t *testing.T) {
 // Test Teardown.Run leaving no fd leak across a full teardown cycle.
 func TestTeardown_Run_LeavesNoFDLeak(t *testing.T) {
 	// Given
-	before := countOpenFDs(t)
+	before := testutil.CountOpenFDs(t)
 	proc, conn := spawnBlockingChild(t)
 	td := newReapingTeardown(proc, conn, 100*time.Millisecond)
 
@@ -110,7 +98,7 @@ func TestTeardown_Run_LeavesNoFDLeak(t *testing.T) {
 	require.NoError(t, td.Run(t.Context()))
 
 	// Then: the control socket Spawn opened is closed by step 6.
-	require.Equal(t, before, countOpenFDs(t), "teardown leaked a file descriptor")
+	require.Equal(t, before, testutil.CountOpenFDs(t), "teardown leaked a file descriptor")
 }
 
 // Test Teardown.Run falling back to SIGKILL when the graceful Shutdown

@@ -22,6 +22,7 @@ import (
 	"github.com/arloliu/styx/internal/event"
 	"github.com/arloliu/styx/internal/ring"
 	"github.com/arloliu/styx/internal/shm"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/arloliu/styx/internal/transport"
 	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 )
@@ -1135,7 +1136,7 @@ type resourceSample struct {
 func measureWindow(ctx context.Context, peerBin string, spec WindowSpec) (resourceSample, error) {
 	var rs resourceSample
 
-	base, err := fdCount()
+	base, err := testutil.OpenFDCount()
 	if err != nil {
 		return rs, err
 	}
@@ -1181,25 +1182,13 @@ func measureWindow(ctx context.Context, peerBin string, spec WindowSpec) (resour
 	}
 	rs.mappedTeardown = teardown
 
-	after, err := fdCount()
+	after, err := testutil.OpenFDCount()
 	if err != nil {
 		return rs, err
 	}
 	rs.fdAfterReap = after
 
 	return rs, nil
-}
-
-// fdCount returns the number of open descriptors this process holds, sampled
-// from /proc/self/fd — the same leak-detection primitive the transport's own
-// fd-leak tests use.
-func fdCount() (int, error) {
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		return 0, fmt.Errorf("chaos: read /proc/self/fd: %w", err)
-	}
-
-	return len(entries), nil
 }
 
 // regionIdentity returns the device major/minor and inode of the memfd behind

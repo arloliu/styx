@@ -6,17 +6,10 @@ import (
 
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/control/controlpb"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
-
-func countOpenFDs(t *testing.T) int {
-	t.Helper()
-	entries, err := os.ReadDir("/proc/self/fd")
-	require.NoError(t, err)
-
-	return len(entries)
-}
 
 // Test RecvFDs delivering exactly the fds SendFDs attached, with matching declared count
 func TestConn_SendFDsRecvFDs_DeliversExactFDSet(t *testing.T) {
@@ -40,7 +33,7 @@ func TestConn_SendFDsRecvFDs_DeliversExactFDSet(t *testing.T) {
 	// baseline is taken from here, not before it — the invariant under test
 	// is "the fd RecvFDs hands back, once the caller closes it, leaves no
 	// residue," not "w's own closing nets out."
-	before := countOpenFDs(t)
+	before := testutil.CountOpenFDs(t)
 	got, fds, err := b.RecvFDs(t.Context(), 4)
 
 	// Then
@@ -50,7 +43,7 @@ func TestConn_SendFDsRecvFDs_DeliversExactFDSet(t *testing.T) {
 	for _, fd := range fds {
 		_ = unix.Close(fd)
 	}
-	require.Equal(t, before, countOpenFDs(t)) // no leak after explicit close
+	require.Equal(t, before, testutil.CountOpenFDs(t)) // no leak after explicit close
 }
 
 // Test RecvFDs closing received fds and returning ErrProtocolViolation on a declared-count mismatch
@@ -79,12 +72,12 @@ func TestConn_RecvFDs_ClosesFDsAndErrors_OnCountMismatch(t *testing.T) {
 	// Snapshot after closing the sender's own copies, same reasoning as
 	// TestConn_SendFDsRecvFDs_DeliversExactFDSet above: w1/w2's lifecycle is
 	// orthogonal to what RecvFDs does with the fds it actually receives.
-	before := countOpenFDs(t)
+	before := testutil.CountOpenFDs(t)
 	_, _, err = b.RecvFDs(t.Context(), 4)
 
 	// Then
 	require.ErrorIs(t, err, control.ErrProtocolViolation)
-	require.Equal(t, before, countOpenFDs(t)) // received fds were closed, not leaked
+	require.Equal(t, before, testutil.CountOpenFDs(t)) // received fds were closed, not leaked
 }
 
 // Test RecvFDs setting CLOEXEC on every fd it returns (every fd is

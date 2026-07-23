@@ -11,6 +11,7 @@ import (
 	"github.com/arloliu/styx/internal/control/controlpb"
 	"github.com/arloliu/styx/internal/event"
 	"github.com/arloliu/styx/internal/shm"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -97,12 +98,12 @@ func TestPluginServer_PluginAttachSHM_PerStepFailure_ClosesExactlyWhatItOwns(t *
 
 			tuple := control.Tuple{Transport: "shm", LayoutVersion: 1, Codec: "proto", Features: map[string]bool{}}
 
-			fdsBefore := countOpenFDs(t)
+			fdsBefore := testutil.CountOpenFDs(t)
 			mapsBefore := countRegionMappings(t) // includes the scripted host's own region mapping
 			aerr := srv.PluginAttachSHMForTest(t.Context(), pluginConn, tuple)
 
 			require.ErrorIs(t, aerr, injected, "the attach must abort at the injected step")
-			require.Equal(t, fdsBefore, countOpenFDs(t), "step %q leaked a plugin fd", step)
+			require.Equal(t, fdsBefore, testutil.CountOpenFDs(t), "step %q leaked a plugin fd", step)
 			require.Equal(t, mapsBefore, countRegionMappings(t), "step %q leaked a region mapping", step)
 		})
 	}

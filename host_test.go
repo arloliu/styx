@@ -12,6 +12,7 @@ import (
 
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/internal/control"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -60,17 +61,6 @@ func TestMain(m *testing.M) {
 
 	m.Run()
 	_ = os.RemoveAll(dir)
-}
-
-// countOpenFDs counts this process's open fds via /proc/self/fd, used to
-// assert no fds leak across a plugin restart.
-func countOpenFDs(t *testing.T) int {
-	t.Helper()
-
-	entries, err := os.ReadDir("/proc/self/fd")
-	require.NoError(t, err)
-
-	return len(entries)
 }
 
 // processExists reports whether any process's /proc/<pid>/exe base name
@@ -152,7 +142,7 @@ func TestHost_Events_ReturnsNonNilChannel(t *testing.T) {
 // with no fd leak across the full lifecycle.
 func TestHost_StartStop_SpawnsReachesReadyAndReaps(t *testing.T) {
 	// Given
-	before := countOpenFDs(t)
+	before := testutil.CountOpenFDs(t)
 	h := styx.NewHost(styx.HostConfig{
 		Plugins: []styx.PluginSpec{{Name: "ready", Path: fixtureReadyPlugin}},
 	})
@@ -171,7 +161,7 @@ func TestHost_StartStop_SpawnsReachesReadyAndReaps(t *testing.T) {
 	// Then: the child is reaped (gone), and no fd leaked across the cycle.
 	require.Eventually(t, func() bool { return !processExists(t, "readyplugin") },
 		5*time.Second, 10*time.Millisecond, "plugin process must be reaped after Stop")
-	require.Equal(t, before, countOpenFDs(t), "Start/Stop lifecycle leaked a file descriptor")
+	require.Equal(t, before, testutil.CountOpenFDs(t), "Start/Stop lifecycle leaked a file descriptor")
 }
 
 // Test Host.Start translating a binary-identity pin mismatch to
@@ -307,7 +297,7 @@ func TestHost_Start_TranslatesIncompatible_OnRealServiceVersionMismatch(t *testi
 // binary never completes the handshake.
 func TestHost_Start_ReturnsError_WhenBinaryDoesNotHandshake(t *testing.T) {
 	// Given: /bin/true spawns fine but exits immediately without a handshake.
-	before := countOpenFDs(t)
+	before := testutil.CountOpenFDs(t)
 	h := styx.NewHost(styx.HostConfig{
 		Plugins: []styx.PluginSpec{{Name: "nohandshake", Path: "/bin/true"}},
 	})
@@ -317,7 +307,7 @@ func TestHost_Start_ReturnsError_WhenBinaryDoesNotHandshake(t *testing.T) {
 
 	// Then: Start reports the failure and left no fd (or zombie) behind.
 	require.Error(t, err)
-	require.Equal(t, before, countOpenFDs(t), "failed Start leaked a file descriptor")
+	require.Equal(t, before, testutil.CountOpenFDs(t), "failed Start leaked a file descriptor")
 
 	// And: the failure is reported as a public *styx.PluginCrashError, not
 	// an internal/supervisor type an external caller could never name —

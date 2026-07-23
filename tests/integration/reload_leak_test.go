@@ -1,25 +1,14 @@
 package integration_test
 
 import (
-	"os"
 	"testing"
 	"time"
 
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/examples/echo/echopb"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
-
-// countHostOpenFDs counts this host process's open file descriptors via
-// /proc/self/fd, so a test can prove a rolled-back reload successor's host-side
-// resources (its transport, region, and eventfds) were all released.
-func countHostOpenFDs(t *testing.T) int {
-	t.Helper()
-	entries, err := os.ReadDir("/proc/self/fd")
-	require.NoError(t, err)
-
-	return len(entries)
-}
 
 // Test that a reload that ROLLS BACK releases the unpromoted successor's attached
 // transport, with no host-side fd leak across repeated rollbacks. Each reload
@@ -53,7 +42,7 @@ func TestHotReloadRollback_ReleasesSuccessorTransport_NoFDLeak(t *testing.T) {
 	pid, err := sayPID(t, client, "warmup")
 	require.NoError(t, err)
 	require.Equal(t, originalPID, pid)
-	baseline := countHostOpenFDs(t)
+	baseline := testutil.CountOpenFDs(t)
 
 	// Several more rollbacks: each attaches and tears down a successor transport.
 	for range 4 {
@@ -66,7 +55,7 @@ func TestHotReloadRollback_ReleasesSuccessorTransport_NoFDLeak(t *testing.T) {
 		require.Equal(t, originalPID, pid, "a rolled-back reload must leave the original instance serving")
 	}
 
-	require.Eventually(t, func() bool { return countHostOpenFDs(t) <= baseline },
+	require.Eventually(t, func() bool { return testutil.CountOpenFDs(t) <= baseline },
 		3*time.Second, 20*time.Millisecond,
-		"rolled-back reload successors leaked host fds: baseline=%d now=%d", baseline, countHostOpenFDs(t))
+		"rolled-back reload successors leaked host fds: baseline=%d now=%d", baseline, testutil.CountOpenFDs(t))
 }

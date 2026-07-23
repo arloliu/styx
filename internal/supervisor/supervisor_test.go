@@ -18,6 +18,7 @@ import (
 	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/supervisor"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -867,17 +868,6 @@ func leanShmLayout() shm.Layout {
 	}
 }
 
-// countOpenFDs counts this process's open file descriptors via /proc/self/fd, so
-// a test can assert the host closed the region and both eventfds it created for a
-// shared-memory attach — no fd leak after teardown.
-func countOpenFDs(t *testing.T) int {
-	t.Helper()
-	entries, err := os.ReadDir("/proc/self/fd")
-	require.NoError(t, err)
-
-	return len(entries)
-}
-
 // Test that a host configured for the shared-memory transport negotiates it and
 // attaches CROSS-PROCESS to a real spawned plugin: both sides transfer the region
 // and two eventfds over the control conn, both Attach, and the instance reaches
@@ -907,7 +897,7 @@ func TestSupervisor_AttachesSharedMemoryCrossProcess_ThenTearsDownWithoutLeak(t 
 	}
 	sup := supervisor.New(cfg, bus)
 
-	fdsBefore := countOpenFDs(t)
+	fdsBefore := testutil.CountOpenFDs(t)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -932,9 +922,10 @@ func TestSupervisor_AttachesSharedMemoryCrossProcess_ThenTearsDownWithoutLeak(t 
 		t.Fatal("Run did not return after Stop")
 	}
 
-	require.Eventually(t, func() bool { return countOpenFDs(t) <= fdsBefore }, 2*time.Second, 20*time.Millisecond,
+	require.Eventually(t, func() bool { return testutil.CountOpenFDs(t) <= fdsBefore },
+		2*time.Second, 20*time.Millisecond,
 		"host leaked fds after shared-memory teardown (region/eventfds not closed): before=%d after=%d",
-		fdsBefore, countOpenFDs(t))
+		fdsBefore, testutil.CountOpenFDs(t))
 }
 
 // Test that each instance generation gets a FRESH shared-memory region, and that
@@ -974,7 +965,7 @@ func TestSupervisor_FreshShmRegionPerGeneration_NoLeakAcrossRestarts(t *testing.
 	}
 	sup := supervisor.New(cfg, bus)
 
-	fdsBefore := countOpenFDs(t)
+	fdsBefore := testutil.CountOpenFDs(t)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -1008,8 +999,9 @@ func TestSupervisor_FreshShmRegionPerGeneration_NoLeakAcrossRestarts(t *testing.
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after GaveUp")
 	}
-	require.Eventually(t, func() bool { return countOpenFDs(t) <= fdsBefore }, 2*time.Second, 20*time.Millisecond,
-		"shm resources leaked across generations: before=%d after=%d", fdsBefore, countOpenFDs(t))
+	require.Eventually(t, func() bool { return testutil.CountOpenFDs(t) <= fdsBefore },
+		2*time.Second, 20*time.Millisecond,
+		"shm resources leaked across generations: before=%d after=%d", fdsBefore, testutil.CountOpenFDs(t))
 }
 
 // countRegionMappings counts the shared-memory region mappings currently held by
@@ -1059,12 +1051,12 @@ func TestSupervisor_AttachSHM_PerStepFailure_ClosesExactlyWhatItOwns(t *testing.
 
 			tuple := control.Tuple{Transport: "shm", LayoutVersion: 1, Codec: "proto", Features: map[string]bool{}}
 
-			fdsBefore := countOpenFDs(t)
+			fdsBefore := testutil.CountOpenFDs(t)
 			mapsBefore := countRegionMappings(t)
 			aerr := sup.AttachSHMForTest(t.Context(), hostConn, 7, tuple)
 
 			require.ErrorIs(t, aerr, injected, "the attach must abort at the injected step")
-			require.Equal(t, fdsBefore, countOpenFDs(t), "step %q leaked a host fd", step)
+			require.Equal(t, fdsBefore, testutil.CountOpenFDs(t), "step %q leaked a host fd", step)
 			require.Equal(t, mapsBefore, countRegionMappings(t), "step %q leaked a region mapping", step)
 		})
 	}
