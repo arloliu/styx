@@ -81,9 +81,6 @@ func printReport(rep report) {
 
 		return
 	}
-	if !rep.repsOK {
-		fmt.Printf("WARNING: found %d repetitions per cell, baseline expects %d\n", rep.repsFound, rep.repsWant)
-	}
 	fmt.Println("Hard gates:")
 	for _, c := range rep.hard {
 		mark := "PASS"

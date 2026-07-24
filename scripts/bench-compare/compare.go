@@ -9,7 +9,15 @@
 // count all come from the baseline file, never from constants here.
 //
 // Comparing medians of N repetitions, not single runs, keeps hosted-runner noise
-// from tripping the gate: a lone slow repetition is absorbed by the median.
+// from tripping the gate: a lone slow repetition is absorbed by the median. Every
+// cell — normative and reference — must carry the full repetition count, and every
+// measurement must be present, finite, and positive, or the gate fails closed.
+//
+// Gaming-resistance scope (see evaluate): the ratio gates are common-mode-invariant
+// by construction, so a latency movement shared across both codebases on one runner
+// is environmental and shows up only in the advisory absolute deltas, not the hard
+// gates. Identity is instead anchored on the machine-invariant allocation counts,
+// which are hard-gated on the reference cells as well as the normative ones.
 package main
 
 import (
@@ -87,9 +95,19 @@ func loadBaseline(data []byte) (*baseline, error) {
 	if b.Policy.Reps <= 0 {
 		return nil, fmt.Errorf("baseline policy.reps must be positive, got %d", b.Policy.Reps)
 	}
+	if len(b.Policy.NormativeCells) == 0 {
+		return nil, errors.New("baseline policy.normative_cells is empty; the gate would run no hard checks")
+	}
+	if b.Policy.GRPCRef == "" || b.Policy.UDSRef == "" {
+		return nil, errors.New("baseline policy.grpc_ref and uds_ref must both be set")
+	}
 	for _, name := range append(append([]string{}, b.Policy.NormativeCells...), b.Policy.GRPCRef, b.Policy.UDSRef) {
-		if _, ok := b.Cells[name]; !ok {
+		c, ok := b.Cells[name]
+		if !ok {
 			return nil, fmt.Errorf("baseline policy references cell %q with no entry in cells", name)
+		}
+		if !isPositiveFinite(c.P50US) || !isPositiveFinite(c.P99US) || !isPositiveFinite(c.AllocsPerOp) {
+			return nil, fmt.Errorf("baseline cell %q has a missing, non-positive, or non-finite field", name)
 		}
 	}
 
@@ -118,8 +136,23 @@ func decodeBaseline(data []byte, b *baseline) error {
 	return nil
 }
 
-// parseResults reads JSONL result rows, skipping blank lines. A malformed row is
-// an error rather than a silent drop.
+// rawResult decodes a result row with pointer measurement fields, so a field that
+// is absent (nil) is distinguishable from one that is present and zero. A missing
+// measurement must be a hard error, not silently read as zero — a zero p50 would
+// make a ratio infinite and a zero allocs would look like an improvement.
+type rawResult struct {
+	Impl        string   `json:"impl"`
+	PayloadB    int      `json:"payload_bytes"`
+	Concurrency int      `json:"concurrency"`
+	P50Ns       *float64 `json:"p50_ns"`
+	P99Ns       *float64 `json:"p99_ns"`
+	AllocsPerOp *float64 `json:"allocs_per_op"`
+}
+
+// parseResults reads JSONL result rows, skipping blank lines. A row that is not
+// valid JSON, is missing a measurement, or carries a non-finite, non-positive
+// latency (or a negative allocation) is a hard error — the gate fails closed on
+// malformed input rather than treating a missing field as zero.
 func parseResults(r io.Reader) ([]result, error) {
 	var out []result
 	sc := bufio.NewScanner(r)
@@ -131,9 +164,13 @@ func parseResults(r io.Reader) ([]result, error) {
 		if text == "" {
 			continue
 		}
-		var res result
-		if err := json.Unmarshal([]byte(text), &res); err != nil {
+		var raw rawResult
+		if err := json.Unmarshal([]byte(text), &raw); err != nil {
 			return nil, fmt.Errorf("result line %d is not valid JSON: %w", line, err)
+		}
+		res, err := raw.validate()
+		if err != nil {
+			return nil, fmt.Errorf("result line %d (%s): %w", line, raw.Impl, err)
 		}
 		out = append(out, res)
 	}
@@ -142,6 +179,32 @@ func parseResults(r io.Reader) ([]result, error) {
 	}
 
 	return out, nil
+}
+
+// validate converts a decoded row to a result, requiring every measurement to be
+// present and finite: p50 and p99 strictly positive (a zero would corrupt a
+// ratio), allocations present and non-negative (a genuine reset to zero is a
+// legitimate improvement, not a missing field).
+func (raw rawResult) validate() (result, error) {
+	if raw.P50Ns == nil || raw.P99Ns == nil || raw.AllocsPerOp == nil {
+		return result{}, errors.New("missing p50_ns, p99_ns, or allocs_per_op")
+	}
+	if !isPositiveFinite(*raw.P50Ns) || !isPositiveFinite(*raw.P99Ns) {
+		return result{}, fmt.Errorf("p50_ns/p99_ns must be positive and finite, got %g/%g", *raw.P50Ns, *raw.P99Ns)
+	}
+	if math.IsNaN(*raw.AllocsPerOp) || math.IsInf(*raw.AllocsPerOp, 0) || *raw.AllocsPerOp < 0 {
+		return result{}, fmt.Errorf("allocs_per_op must be finite and non-negative, got %g", *raw.AllocsPerOp)
+	}
+
+	return result{
+		Impl: raw.Impl, PayloadB: raw.PayloadB, Concurrency: raw.Concurrency,
+		P50Ns: *raw.P50Ns, P99Ns: *raw.P99Ns, AllocsPerOp: *raw.AllocsPerOp,
+	}, nil
+}
+
+// isPositiveFinite reports whether f is a real, strictly positive number.
+func isPositiveFinite(f float64) bool {
+	return f > 0 && !math.IsInf(f, 0) && !math.IsNaN(f)
 }
 
 // median returns the median of vals (the mean of the two middle values for an even
@@ -186,12 +249,9 @@ type check struct {
 // report is the whole gate outcome: the hard checks that fail the merge, and the
 // advisory lines that are printed but never fail it.
 type report struct {
-	hard      []check
-	advisory  []check
-	fatal     string // set when the run could not be evaluated at all (missing cell)
-	repsOK    bool
-	repsWant  int
-	repsFound int
+	hard     []check
+	advisory []check
+	fatal    string // set when the run could not be evaluated at all (missing cell)
 }
 
 func (r report) failed() bool {
@@ -209,9 +269,20 @@ func (r report) failed() bool {
 
 // evaluate runs the gate over the measured results against the baseline. It never
 // invents a threshold: the floor, tolerance, and reference cells come from bl.
+//
+// Gaming-resistance scope. The ratio gates are common-mode-invariant by
+// construction: scaling every cell's latency equally leaves the ratios unchanged,
+// so a shared latency movement across both codebases (the styx transport and
+// hashicorp's gRPC plugin) on one runner does not trip them. That is deliberate —
+// a common-mode movement on a shared runner is environmental with high
+// probability, is surfaced by the advisory absolute deltas, and cannot be
+// hard-gated without a dedicated, quiet runner (a rolling per-runner baseline is
+// the future lever if it ever matters). Identity is anchored where it is
+// machine-invariant instead: allocations per operation are hard-gated on the
+// reference cells too, so a changed reference implementation that would silently
+// re-anchor the ratios fails the gate rather than passing.
 func evaluate(bl *baseline, results []result) report {
 	var rep report
-	rep.repsWant = bl.Policy.Reps
 
 	grpc, okG := cellMedianFor(results, bl.Policy.GRPCRef, bl.Policy.PayloadB, bl.Policy.Concurrency)
 	uds, okU := cellMedianFor(results, bl.Policy.UDSRef, bl.Policy.PayloadB, bl.Policy.Concurrency)
@@ -225,7 +296,15 @@ func evaluate(bl *baseline, results []result) report {
 
 		return rep
 	}
-	rep.repsFound = grpc.reps
+
+	// The reference cells owe the full repetition count and must keep their
+	// allocation identity, so regressing them cannot silently re-anchor the ratios.
+	rep.hard = append(rep.hard,
+		repsCheck(bl.Policy.GRPCRef, grpc.reps, bl.Policy.Reps),
+		repsCheck(bl.Policy.UDSRef, uds.reps, bl.Policy.Reps),
+		allocCheck(bl.Policy.GRPCRef, bl.Cells[bl.Policy.GRPCRef].AllocsPerOp, grpc.allocs),
+		allocCheck(bl.Policy.UDSRef, bl.Cells[bl.Policy.UDSRef].AllocsPerOp, uds.allocs),
+	)
 
 	for _, cell := range bl.Policy.NormativeCells {
 		cur, ok := cellMedianFor(results, cell, bl.Policy.PayloadB, bl.Policy.Concurrency)
@@ -236,20 +315,35 @@ func evaluate(bl *baseline, results []result) report {
 		}
 		base := bl.Cells[cell]
 
-		rep.hard = append(rep.hard, allocCheck(cell, base.AllocsPerOp, cur.allocs))
-		rep.hard = append(rep.hard, floorCheck(cell, bl.Policy.AbsoluteFloorRatio, grpc.p50US, cur.p50US))
-		rep.hard = append(rep.hard, ratioRegressionCheck(cell, bl.Policy.GRPCRef, bl.Policy.RelativeTolerance,
-			bl.Cells[bl.Policy.GRPCRef].P50US, base.P50US, grpc.p50US, cur.p50US))
-		rep.hard = append(rep.hard, ratioRegressionCheck(cell, bl.Policy.UDSRef, bl.Policy.RelativeTolerance,
-			bl.Cells[bl.Policy.UDSRef].P50US, base.P50US, uds.p50US, cur.p50US))
-
-		rep.advisory = append(rep.advisory, latencyAdvisory(cell, "p50", base.P50US, cur.p50US))
-		rep.advisory = append(rep.advisory, latencyAdvisory(cell, "p99", base.P99US, cur.p99US))
+		rep.hard = append(rep.hard,
+			repsCheck(cell, cur.reps, bl.Policy.Reps),
+			allocCheck(cell, base.AllocsPerOp, cur.allocs),
+			floorCheck(cell, bl.Policy.AbsoluteFloorRatio, grpc.p50US, cur.p50US),
+			ratioRegressionCheck(cell, bl.Policy.GRPCRef, bl.Policy.RelativeTolerance,
+				bl.Cells[bl.Policy.GRPCRef].P50US, base.P50US, grpc.p50US, cur.p50US),
+			ratioRegressionCheck(cell, bl.Policy.UDSRef, bl.Policy.RelativeTolerance,
+				bl.Cells[bl.Policy.UDSRef].P50US, base.P50US, uds.p50US, cur.p50US),
+		)
+		rep.advisory = append(rep.advisory,
+			latencyAdvisory(cell, "p50", base.P50US, cur.p50US),
+			latencyAdvisory(cell, "p99", base.P99US, cur.p99US))
 	}
 
-	rep.repsOK = rep.repsFound >= rep.repsWant
-
 	return rep
+}
+
+// repsCheck fails when a cell was sampled fewer times than the baseline's
+// repetition count. The gate compares medians of N repetitions to absorb noise, so
+// a cell with too few rows was never properly sampled; the count is enforced
+// independently for every cell rather than inferred from one.
+func repsCheck(cell string, got, want int) check {
+	if got >= want {
+		return check{name: cell + " reps", pass: true,
+			message: fmt.Sprintf("%s sampled %d times (need %d)", cell, got, want)}
+	}
+
+	return check{name: cell + " reps", pass: false,
+		message: fmt.Sprintf("%s sampled only %d times, need %d", cell, got, want)}
 }
 
 // allocCheck fails when the measured median allocations per operation rounds above

@@ -212,6 +212,100 @@ func TestEvaluate_MissingCellIsFatal(t *testing.T) {
 	}
 }
 
+// Test that too few repetitions is a hard failure, enforced independently for a
+// normative cell and for a reference cell — not inferred from one cell's count.
+func TestEvaluate_ShortRepCountFails(t *testing.T) {
+	// Normative cell short: only 2 shm rows against reps=3.
+	shmShort := evalRows(t, baselineRatio10, append(refRows(),
+		row("shm", 10, 20, 19), row("shm", 10, 20, 19))...)
+	if !shmShort.failed() {
+		t.Error("a normative cell with fewer than N repetitions must fail")
+	}
+
+	// Reference cell short: 2 grpc rows, full shm and uds.
+	grpcShort := evalRows(t, baselineRatio10,
+		row("grpc", 100, 200, 150), row("grpc", 100, 200, 150),
+		row("uds", 40, 80, 17), row("uds", 40, 80, 17), row("uds", 40, 80, 17),
+		row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))
+	if !grpcShort.failed() {
+		t.Error("a reference cell with fewer than N repetitions must fail")
+	}
+}
+
+// Test that a result row missing a measurement, or carrying a non-positive
+// latency, is a hard parse error rather than decoding a zero that would corrupt a
+// ratio or look like an allocation improvement.
+func TestParseResults_RejectsMissingAndNonFinite(t *testing.T) {
+	missingP50 := `{"impl":"shm","payload_bytes":64,"concurrency":1,"p99_ns":20000,"allocs_per_op":19}`
+	if _, err := parseResults(strings.NewReader(missingP50)); err == nil {
+		t.Error("a row missing p50_ns must be rejected")
+	}
+	missingAllocs := `{"impl":"shm","payload_bytes":64,"concurrency":1,"p50_ns":10000,"p99_ns":20000}`
+	if _, err := parseResults(strings.NewReader(missingAllocs)); err == nil {
+		t.Error("a row missing allocs_per_op must be rejected")
+	}
+	zeroP50 := `{"impl":"shm","payload_bytes":64,"concurrency":1,"p50_ns":0,"p99_ns":20000,"allocs_per_op":19}`
+	if _, err := parseResults(strings.NewReader(zeroP50)); err == nil {
+		t.Error("a zero p50_ns must be rejected (it would make a ratio infinite)")
+	}
+	negAllocs := `{"impl":"shm","payload_bytes":64,"concurrency":1,"p50_ns":10000,"p99_ns":20000,"allocs_per_op":-1}`
+	if _, err := parseResults(strings.NewReader(negAllocs)); err == nil {
+		t.Error("a negative allocs_per_op must be rejected")
+	}
+	// A present zero allocation is a legitimate reset, not a missing field.
+	zeroAllocs := `{"impl":"shm","payload_bytes":64,"concurrency":1,"p50_ns":10000,"p99_ns":20000,"allocs_per_op":0}`
+	if _, err := parseResults(strings.NewReader(zeroAllocs)); err != nil {
+		t.Errorf("a present zero allocation must be accepted (reset), got %v", err)
+	}
+}
+
+// Test that a reference cell whose allocation identity changed fails the gate: a
+// changed reference implementation would otherwise silently re-anchor the ratios.
+// Allocations per operation are machine-invariant, so this is a sound anchor.
+func TestEvaluate_ReferenceAllocsAnchor(t *testing.T) {
+	rep := evalRows(t, baselineRatio10,
+		row("grpc", 100, 200, 200), row("grpc", 100, 200, 200), row("grpc", 100, 200, 200), // 150 -> 200
+		row("uds", 40, 80, 17), row("uds", 40, 80, 17), row("uds", 40, 80, 17),
+		row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))
+
+	if !rep.failed() {
+		t.Fatal("a changed reference allocation count must fail the gate")
+	}
+	var grpcAllocFailed bool
+	for _, c := range rep.hard {
+		if c.name == "grpc allocs/op" && !c.pass {
+			grpcAllocFailed = true
+		}
+	}
+	if !grpcAllocFailed {
+		t.Error("the reference (grpc) allocation check must be the one that failed")
+	}
+}
+
+// Test the documented gaming-resistance scope: a common-mode latency movement —
+// every cell's p50 doubled, allocations unchanged — leaves every ratio and the
+// floor unchanged, so no hard gate trips; it surfaces only in the advisory absolute
+// delta. This is by construction (a shared-runner environmental shift), not a hole.
+func TestEvaluate_CommonModeLatencyIsAdvisoryOnly(t *testing.T) {
+	rep := evalRows(t, baselineRatio10,
+		row("grpc", 200, 400, 150), row("grpc", 200, 400, 150), row("grpc", 200, 400, 150),
+		row("uds", 80, 160, 17), row("uds", 80, 160, 17), row("uds", 80, 160, 17),
+		row("shm", 20, 40, 19), row("shm", 20, 40, 19), row("shm", 20, 40, 19))
+
+	if rep.failed() {
+		t.Fatalf("a common-mode latency movement must not trip a hard gate: %+v", rep.hard)
+	}
+	var sawDoubling bool
+	for _, c := range rep.advisory {
+		if strings.Contains(c.message, "+100.00%") {
+			sawDoubling = true
+		}
+	}
+	if !sawDoubling {
+		t.Error("the common-mode movement must show up in the advisory absolute delta")
+	}
+}
+
 // Test that a missing or malformed baseline is an error, never a silent pass.
 func TestLoadBaseline_MissingAndMalformed(t *testing.T) {
 	if _, err := loadBaseline([]byte("")); err == nil {
@@ -226,6 +320,25 @@ func TestLoadBaseline_MissingAndMalformed(t *testing.T) {
 	         "cells":{"shm":{"p50_us":10,"p99_us":20,"allocs_per_op":19}}}`
 	if _, err := loadBaseline([]byte(bad)); err == nil {
 		t.Error("a baseline missing a referenced cell must error")
+	}
+
+	// An empty normative_cells list would run zero hard checks: reject it.
+	empty := `{"policy":{"reps":3,"absolute_floor_ratio":7,"relative_tolerance":0.1,
+	          "normative_cells":[],"grpc_ref":"grpc","uds_ref":"uds","payload_bytes":64,"concurrency":1},
+	          "cells":{"grpc":{"p50_us":100,"p99_us":200,"allocs_per_op":150},
+	                   "uds":{"p50_us":40,"p99_us":80,"allocs_per_op":17}}}`
+	if _, err := loadBaseline([]byte(empty)); err == nil {
+		t.Error("an empty normative_cells list must error")
+	}
+
+	// A baseline cell with a missing (zero) field must error.
+	badCell := `{"policy":{"reps":3,"absolute_floor_ratio":7,"relative_tolerance":0.1,
+	            "normative_cells":["shm"],"grpc_ref":"grpc","uds_ref":"uds","payload_bytes":64,"concurrency":1},
+	            "cells":{"shm":{"p50_us":10,"p99_us":20,"allocs_per_op":19},
+	                     "grpc":{"p99_us":200,"allocs_per_op":150},
+	                     "uds":{"p50_us":40,"p99_us":80,"allocs_per_op":17}}}`
+	if _, err := loadBaseline([]byte(badCell)); err == nil {
+		t.Error("a baseline cell missing a field (p50_us) must error")
 	}
 }
 
