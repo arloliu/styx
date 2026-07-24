@@ -746,8 +746,9 @@ func (s *PluginServer) pluginAttachUDS(
 // pluginAttachSHMFailAt, when non-nil, is called after each named construction
 // step of pluginAttachSHM; a non-nil return aborts the attach at that step so a
 // test can assert the exact per-step cleanup. nil in production, adding only
-// negligible cold-path overhead: five nil-checked hook calls on the attach path
-// per attach, and nothing else. Set only via the test seam.
+// negligible cold-path overhead: six nil-checked hook calls on the attach path
+// per attach (the five pre-ack steps plus post-ack, after the ack is sent), and
+// nothing else. Set only via the test seam.
 var pluginAttachSHMFailAt func(step string) error
 
 // pluginAttachFailStep consults the failpoint for a named step. A no-op returning

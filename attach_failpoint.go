@@ -4,8 +4,9 @@ package styx
 
 // SetPluginAttachSHMFailAt installs a per-step hook fired after each named
 // construction step of the plugin-side shared-memory attach (pluginAttachSHM):
-// recv-fds, hp-wrap, ph-wrap, attach, and ack-send. A non-nil return aborts the
-// attach at that step.
+// recv-fds, hp-wrap, ph-wrap, attach, and ack-send (each before the ack reaches the
+// host), plus post-ack (after the ack is sent, so the host can already be Ready). A
+// non-nil return aborts the attach at that step.
 //
 // It exists only under -tags failpoint so a crash-window plugin fixture can install
 // a hook that os.Exit()s at a chosen step — modeling a plugin process dying

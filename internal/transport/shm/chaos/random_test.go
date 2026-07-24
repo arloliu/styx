@@ -120,10 +120,12 @@ func assertCorruptPoisons(t *testing.T, oc Outcome) {
 	require.True(t, oc.Poisoned, "a conformance fault must poison the region (shm-abi.md §16)")
 }
 
-// TestChaos_RandomizedMultiFault_ComposesWindowsNoAccumulation composes 2+ data-plane
-// window faults per seeded run — a chain of heterogeneous crash/poison sessions
-// against the one persistent host — and asserts each fault's own contract AND that
-// the host's open-fd count returns exactly to its pre-composition baseline. That
+// TestChaos_RandomizedMultiFault_ComposesWindowsNoAccumulation composes 2+ distinct
+// data-plane window faults per seeded run — a chain of independent sessions drawn from
+// the crash windows and the corruption fault (a given composition may be all crashes,
+// or mix in the corruption) against the one persistent host — and asserts each fault's
+// own contract AND that the host's open-fd count returns exactly to its pre-composition
+// baseline. That
 // no-accumulation property is the interaction a single-fault run cannot reach: an
 // ordering- or fault-type-mix-dependent host leak that no single window exposes shows
 // up only across a composition. The seed fixes the composition (same seed => same

@@ -8,9 +8,11 @@
 // attach window.
 //
 // Built with -tags failpoint: the plugin-side attach failpoint seam it installs
-// (styx.SetPluginAttachSHMFailAt) compiles only under that tag, and dying AT the
-// seam — before the plugin sends its AttachRegionAck — makes every window a
-// deterministic host-side attach failure with no timing to synchronize on.
+// (styx.SetPluginAttachSHMFailAt) compiles only under that tag. Dying AT a pre-ack
+// step — before the plugin sends its AttachRegionAck — makes that window a
+// deterministic host-side attach failure; dying at the post-ack step models a plugin
+// that dies just after the host has received the ack and reached Ready. Either way the
+// window is reached at the named step, with no timing to synchronize on.
 package main
 
 import (
