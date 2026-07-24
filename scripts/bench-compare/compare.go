@@ -109,12 +109,25 @@ func loadBaseline(data []byte) (*baseline, error) {
 		if !ok {
 			return nil, fmt.Errorf("baseline policy references cell %q with no entry in cells", name)
 		}
-		if !isPositiveFinite(c.P50US) || !isPositiveFinite(c.P99US) || !isPositiveFinite(c.AllocsPerOp) {
-			return nil, fmt.Errorf("baseline cell %q has a missing, non-positive, or non-finite field", name)
+		if err := validateBaselineCell(name, c); err != nil {
+			return nil, err
 		}
 	}
 
 	return &b, nil
+}
+
+// validateBaselineCell requires a baseline cell's latencies and allocations to be
+// present, strictly positive, and finite. A missing field decodes to zero and a
+// non-finite one to a non-finite float; both are rejected. It is a standalone
+// function so a test can witness the finiteness rejection directly, since JSON
+// cannot carry a NaN or an infinity to reach it through decoding.
+func validateBaselineCell(name string, c cellBaseline) error {
+	if !isPositiveFinite(c.P50US) || !isPositiveFinite(c.P99US) || !isPositiveFinite(c.AllocsPerOp) {
+		return fmt.Errorf("baseline cell %q has a missing, non-positive, or non-finite field", name)
+	}
+
+	return nil
 }
 
 // decodeBaseline decodes into b while tolerating the "_comment" documentation key.

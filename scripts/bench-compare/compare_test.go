@@ -234,9 +234,12 @@ func TestEvaluate_ShortRepCountFails(t *testing.T) {
 }
 
 // Test that result rows fail closed on every malformed shape: a missing
-// measurement, a non-finite latency or allocation (a huge literal decodes to
-// +Inf), a non-positive latency, or a negative allocation — while a present zero
-// allocation (a legitimate reset) and a well-formed row are accepted.
+// measurement, an out-of-range literal (1e999 — encoding/json rejects it before
+// decoding, itself a fail-closed rejection), a non-positive latency, or a negative
+// allocation — while a present zero allocation (a legitimate reset) and a
+// well-formed row are accepted. Actual non-finite floats (NaN/Inf) cannot appear
+// in JSON, so the finiteness checks in validate are witnessed directly in
+// TestRawResult_RejectsNonFinite.
 func TestParseResults_RejectsMissingAndNonFinite(t *testing.T) {
 	// rawRow builds a result row; an empty argument omits that field.
 	rawRow := func(p50, p99, allocs string) string {
@@ -261,9 +264,9 @@ func TestParseResults_RejectsMissingAndNonFinite(t *testing.T) {
 		{"missing p50_ns", rawRow("", "20000", "19"), true},
 		{"missing p99_ns", rawRow("10000", "", "19"), true},
 		{"missing allocs", rawRow("10000", "20000", ""), true},
-		{"inf p50_ns", rawRow("1e999", "20000", "19"), true},
-		{"inf p99_ns", rawRow("10000", "1e999", "19"), true},
-		{"inf allocs", rawRow("10000", "20000", "1e999"), true},
+		{"out-of-range p50_ns (decode error)", rawRow("1e999", "20000", "19"), true},
+		{"out-of-range p99_ns (decode error)", rawRow("10000", "1e999", "19"), true},
+		{"out-of-range allocs (decode error)", rawRow("10000", "20000", "1e999"), true},
 		{"zero p50_ns", rawRow("0", "20000", "19"), true},
 		{"negative p99_ns", rawRow("10000", "-5", "19"), true},
 		{"negative allocs", rawRow("10000", "20000", "-1"), true},
@@ -281,22 +284,55 @@ func TestParseResults_RejectsMissingAndNonFinite(t *testing.T) {
 	}
 }
 
-// Test the NaN branch directly: JSON cannot carry a NaN literal, so it cannot be
-// reached through parseResults, but validate must still reject a NaN measurement.
-func TestRawResult_RejectsNaN(t *testing.T) {
-	nan := math.NaN()
-	ok := 10000.0
-	for _, f := range []struct {
+// Test the finiteness branches directly: JSON cannot carry a NaN or an infinity —
+// a NaN literal is a decode error and an over-range literal like 1e999 is rejected
+// by encoding/json before decoding — so these values cannot reach validate through
+// parseResults. Production parsing invokes the same validate, so witnessing it here
+// with real non-finite floats proves the finiteness checks are load-bearing.
+func TestRawResult_RejectsNonFinite(t *testing.T) {
+	inf, ninf, nan, ok := math.Inf(1), math.Inf(-1), math.NaN(), 10000.0
+	cases := []struct {
 		name        string
-		p50, p99, a *float64
+		p50, p99, a float64
 	}{
-		{"nan p50", &nan, &ok, &ok},
-		{"nan p99", &ok, &nan, &ok},
-		{"nan allocs", &ok, &ok, &nan},
-	} {
-		raw := rawResult{Impl: "shm", PayloadB: 64, Concurrency: 1, P50Ns: f.p50, P99Ns: f.p99, AllocsPerOp: f.a}
+		{"nan p50", nan, ok, ok},
+		{"nan p99", ok, nan, ok},
+		{"nan allocs", ok, ok, nan},
+		{"+inf p50", inf, ok, ok},
+		{"+inf p99", ok, inf, ok},
+		{"+inf allocs", ok, ok, inf},
+		{"-inf p50", ninf, ok, ok},
+		{"-inf allocs", ok, ok, ninf},
+	}
+	for _, tc := range cases {
+		p50, p99, a := tc.p50, tc.p99, tc.a
+		raw := rawResult{Impl: "shm", PayloadB: 64, Concurrency: 1, P50Ns: &p50, P99Ns: &p99, AllocsPerOp: &a}
 		if _, err := raw.validate(); err == nil {
-			t.Errorf("%s: a NaN measurement must be rejected", f.name)
+			t.Errorf("%s: a non-finite measurement must be rejected", tc.name)
+		}
+	}
+}
+
+// Test the baseline cell validator directly with non-finite fields, for the same
+// reason: an infinity or NaN cannot be decoded from JSON into a cell, so the
+// finiteness rejection is witnessed by calling validateBaselineCell — the exact
+// function loadBaseline calls — with real non-finite floats.
+func TestValidateBaselineCell_RejectsNonFiniteAndNonPositive(t *testing.T) {
+	inf, nan := math.Inf(1), math.NaN()
+	cases := []struct {
+		name string
+		cell cellBaseline
+	}{
+		{"+inf p50", cellBaseline{P50US: inf, P99US: 20, AllocsPerOp: 19}},
+		{"+inf p99", cellBaseline{P50US: 10, P99US: inf, AllocsPerOp: 19}},
+		{"+inf allocs", cellBaseline{P50US: 10, P99US: 20, AllocsPerOp: inf}},
+		{"nan p50", cellBaseline{P50US: nan, P99US: 20, AllocsPerOp: 19}},
+		{"zero p50", cellBaseline{P50US: 0, P99US: 20, AllocsPerOp: 19}},
+		{"negative allocs", cellBaseline{P50US: 10, P99US: 20, AllocsPerOp: -1}},
+	}
+	for _, tc := range cases {
+		if err := validateBaselineCell("x", tc.cell); err == nil {
+			t.Errorf("%s: must be rejected", tc.name)
 		}
 	}
 }
@@ -402,15 +438,17 @@ func TestLoadBaseline_MissingAndMalformed(t *testing.T) {
 		t.Error("a baseline cell with a negative p50_us must error")
 	}
 
-	// A baseline cell with a non-finite latency (a huge literal decodes to +Inf)
-	// must error.
-	infLatency := `{"policy":{"reps":3,"absolute_floor_ratio":7,"relative_tolerance":0.1,
+	// A baseline cell with an out-of-range latency literal (1e999) must error:
+	// encoding/json rejects it while decoding the cells, a fail-closed rejection.
+	// The finiteness check itself is witnessed directly in
+	// TestValidateBaselineCell_RejectsNonFiniteAndNonPositive.
+	outOfRange := `{"policy":{"reps":3,"absolute_floor_ratio":7,"relative_tolerance":0.1,
 	               "normative_cells":["shm"],"grpc_ref":"grpc","uds_ref":"uds","payload_bytes":64,"concurrency":1},
 	               "cells":{"shm":{"p50_us":1e999,"p99_us":20,"allocs_per_op":19},
 	                        "grpc":{"p50_us":100,"p99_us":200,"allocs_per_op":150},
 	                        "uds":{"p50_us":40,"p99_us":80,"allocs_per_op":17}}}`
-	if _, err := loadBaseline([]byte(infLatency)); err == nil {
-		t.Error("a baseline cell with a non-finite p50_us must error")
+	if _, err := loadBaseline([]byte(outOfRange)); err == nil {
+		t.Error("a baseline cell with an out-of-range p50_us literal must error")
 	}
 }
 
