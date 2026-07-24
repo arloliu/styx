@@ -3,9 +3,35 @@ package shm
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
+
+// regionsCreated and regionsClosed count, process-wide, the shared-memory region
+// mappings this process has created and closed. Region create/close is a
+// per-generation cold path (never per RPC), so the two atomic increments add no
+// hot-path cost. RegionsCreated/RegionsClosed expose them so a leak test can assert
+// every mapping a run created was closed, without parsing /proc maps.
+var (
+	regionsCreated atomic.Int64
+	regionsClosed  atomic.Int64
+)
+
+// RegionsCreated returns the cumulative count of region mappings this process created.
+func RegionsCreated() int64 { return regionsCreated.Load() }
+
+// RegionsClosed returns the cumulative count of region mappings this process closed.
+func RegionsClosed() int64 { return regionsClosed.Load() }
+
+// newMappedRegion constructs a Region that holds a live mmap and counts it against the
+// created-region total. Every path that returns a Region with non-nil data goes through
+// it, so RegionsCreated stays paired with the RegionsClosed increment in Close.
+func newMappedRegion(fd int, data []byte, layout Layout) *Region {
+	regionsCreated.Add(1)
+
+	return &Region{fd: fd, data: data, layout: layout}
+}
 
 // ErrAttachRejected wraps every shm-abi.md §1 Phase 1 failure: the
 // size/seal gate run before any shared memory is touched (an undersized
@@ -157,7 +183,7 @@ func createSealedRegion(layout Layout) (*Region, error) {
 		return nil, fmt.Errorf("shm: CreateRegion: fcntl(F_ADD_SEALS): %w", err)
 	}
 
-	return &Region{fd: fd, data: data, layout: layout}, nil
+	return newMappedRegion(fd, data, layout), nil
 }
 
 // OpenRegion attaches to an existing sealed memfd received via SCM_RIGHTS.
@@ -269,10 +295,10 @@ func openRegionOwned(ownFD int, expectedSize uint64) (*Region, error) {
 		// a caller that needs to poison the region (shm-abi.md §1:296/§16)
 		// still can, before it Closes this Region (see this function's and
 		// OpenRegion's doc).
-		return &Region{fd: ownFD, data: data}, err
+		return newMappedRegion(ownFD, data, Layout{}), err
 	}
 
-	return &Region{fd: ownFD, data: data, layout: layout}, nil
+	return newMappedRegion(ownFD, data, layout), nil
 }
 
 // FD returns the region's memfd, e.g. for passing over SCM_RIGHTS.
@@ -347,6 +373,7 @@ func (r *Region) Close() error {
 
 	data := r.data
 	r.data = nil
+	regionsClosed.Add(1) // paired with newMappedRegion; only a region that actually mapped reaches here
 
 	munmapErr := unix.Munmap(data)
 	closeErr := unix.Close(r.fd)

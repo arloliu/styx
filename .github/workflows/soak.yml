@@ -1,0 +1,53 @@
+name: Soak
+
+# The soak drives the real cross-process attach path under sustained load for
+# hours and asserts that fds, goroutines, forced-GC heap, and mapped shared
+# memory regions all return to baseline. It is far too long for the per-push CI,
+# so it runs on a schedule and on demand.
+on:
+  schedule:
+    # 03:00 UTC daily.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Soak duration (Go duration string, e.g. 4h)"
+        required: false
+        default: "4h"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    name: soak
+    runs-on: ubuntu-latest
+    # The job ceiling sits comfortably above the 4h soak plus build and cooldown.
+    # Slightly above go test's -timeout=5h so a hang hits Go's timeout first
+    # (goroutine dump) rather than the runner's hard kill.
+    timeout-minutes: 310
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            .linter.go.sum
+            .buf.go.sum
+
+      - name: Run soak
+        env:
+          # Default to 4h; a manual run may override via the workflow input.
+          STYX_SOAK_DURATION: ${{ github.event.inputs.duration || '4h' }}
+        # The -timeout is set well above the soak duration so the settle loops and
+        # teardown always complete inside the go test budget.
+        run: go test ./tests/soak -run TestSoak -race -count=1 -v -timeout=5h
