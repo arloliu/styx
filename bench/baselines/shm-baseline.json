@@ -1,0 +1,19 @@
+{
+  "_comment": "Regression baseline for the shared-memory transport gate. Values are the recorded median-of-N numbers from bench/shm/REPORT.md's summary table (regime=default), for the 64-byte, concurrency-1 cells. Ratios used by the gate are computed from these p50 medians, not stored, so nothing here is a hand-picked ratio. To refresh, recapture a bench run and copy the medians bench/shm/REPORT.md records; do not hand-edit measured values.",
+  "policy": {
+    "payload_bytes": 64,
+    "concurrency": 1,
+    "reps": 10,
+    "absolute_floor_ratio": 7.0,
+    "relative_tolerance": 0.10,
+    "normative_cells": ["production-shm", "production-shm-sync"],
+    "grpc_ref": "grpc-uds",
+    "uds_ref": "production-uds"
+  },
+  "cells": {
+    "production-shm": {"p50_us": 2.11, "p99_us": 6.18, "allocs_per_op": 19.0},
+    "production-shm-sync": {"p50_us": 2.43, "p99_us": 6.86, "allocs_per_op": 17.0},
+    "production-uds": {"p50_us": 8.15, "p99_us": 21.15, "allocs_per_op": 17.0},
+    "grpc-uds": {"p50_us": 17.16, "p99_us": 86.26, "allocs_per_op": 158.0}
+  }
+}

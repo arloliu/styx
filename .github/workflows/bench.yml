@@ -1,0 +1,99 @@
+name: Benchmarks
+
+# The benchmark gate re-runs the shared-memory transport's small-payload cells and
+# compares their medians to the checked-in baseline, failing on an allocation
+# increase, a drop below the absolute speed floor versus gRPC-over-UDS, or a ratio
+# regression past tolerance. The scheduler-regime matrix re-runs the same cells
+# under constrained scheduling. Both are noise-sensitive and slower than the
+# per-push CI, so they run on a schedule and on demand, not on every push.
+on:
+  schedule:
+    # 04:00 UTC daily, offset from the soak's 03:00.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench-gate:
+    name: bench-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            .linter.go.sum
+            .buf.go.sum
+
+      - name: Run gated cells (N=10 repetitions)
+        run: |
+          # Start from an empty results directory so the compare below reads only
+          # this run's rows, never a checked-in historical file.
+          rm -f bench/results/shm-results-*.jsonl
+          go test ./bench/shm -run='^$' \
+            -bench='Benchmark(Unary|UDS|Baselines)/impl=(production-shm|production-shm-sync|production-uds|grpc-uds)/payload=64/concurrency=1' \
+            -benchmem -count=10
+
+      - name: Compare medians to baseline (hard gate)
+        run: |
+          latest=$(ls -t bench/results/shm-results-*.jsonl | head -1)
+          echo "comparing $latest"
+          go run ./scripts/bench-compare -baseline bench/baselines/shm-baseline.json "$latest"
+
+      - name: Upload result rows
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-gate-results
+          path: bench/results/shm-results-*.jsonl
+          if-no-files-found: ignore
+
+  regime-matrix:
+    name: regime (${{ matrix.regime }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # gomaxprocs1 and gc-churn need no privileges. cgroup2cpu needs user-scope
+        # cgroup delegation and skips with an annotation when the runner lacks it.
+        regime: [gomaxprocs1, gc-churn, cgroup2cpu]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            .linter.go.sum
+            .buf.go.sum
+
+      - name: Run regime
+        run: |
+          rm -f bench/results/shm-results-*.jsonl
+          scripts/bench-regime.sh "${{ matrix.regime }}"
+
+      - name: Upload result rows
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regime-${{ matrix.regime }}-results
+          path: bench/results/shm-results-*.jsonl
+          if-no-files-found: ignore

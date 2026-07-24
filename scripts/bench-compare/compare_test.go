@@ -1,0 +1,302 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// The fixtures below are synthetic — round numbers chosen to exercise the gate's
+// arithmetic, never presented as measured results. baselineRatio10 has a
+// shm-vs-grpc baseline ratio of 10x (regression bound 9x at 10% tolerance) and
+// baselineRatioNearFloor a ratio of 7.5x (bound 6.75x), so a measured ratio in
+// [6.75x, 7.0x) is within tolerance yet below the 7x absolute floor.
+const baselineRatio10 = `{
+  "policy": {"payload_bytes":64,"concurrency":1,"reps":3,"absolute_floor_ratio":7.0,
+             "relative_tolerance":0.10,"normative_cells":["shm"],"grpc_ref":"grpc","uds_ref":"uds"},
+  "cells": {
+    "shm":  {"p50_us":10,"p99_us":20,"allocs_per_op":19},
+    "grpc": {"p50_us":100,"p99_us":200,"allocs_per_op":150},
+    "uds":  {"p50_us":40,"p99_us":80,"allocs_per_op":17}
+  }
+}`
+
+const baselineRatioNearFloor = `{
+  "policy": {"payload_bytes":64,"concurrency":1,"reps":3,"absolute_floor_ratio":7.0,
+             "relative_tolerance":0.10,"normative_cells":["shm"],"grpc_ref":"grpc","uds_ref":"uds"},
+  "cells": {
+    "shm":  {"p50_us":10,"p99_us":20,"allocs_per_op":19},
+    "grpc": {"p50_us":75,"p99_us":150,"allocs_per_op":150},
+    "uds":  {"p50_us":40,"p99_us":80,"allocs_per_op":17}
+  }
+}`
+
+// row builds one JSONL result row at the fixed 64 B / c=1 gated cell.
+func row(impl string, p50us, p99us, allocs float64) string {
+	return fmt.Sprintf(
+		`{"impl":%q,"payload_bytes":64,"concurrency":1,"p50_ns":%g,"p99_ns":%g,"allocs_per_op":%g}`,
+		impl, p50us*1000, p99us*1000, allocs)
+}
+
+// evalRows parses a baseline and JSONL rows and runs the gate.
+func evalRows(t *testing.T, baselineJSON string, rows ...string) report {
+	t.Helper()
+	bl, err := loadBaseline([]byte(baselineJSON))
+	if err != nil {
+		t.Fatalf("loadBaseline: %v", err)
+	}
+	results, err := parseResults(strings.NewReader(strings.Join(rows, "\n")))
+	if err != nil {
+		t.Fatalf("parseResults: %v", err)
+	}
+
+	return evaluate(bl, results)
+}
+
+// refRows returns three clean repetitions each of the grpc and uds reference cells
+// at the baselineRatio10 baseline's values, so a test only needs to vary shm.
+func refRows() []string {
+	out := make([]string, 0, 6)
+	for range 3 {
+		out = append(out, row("grpc", 100, 200, 150), row("uds", 40, 80, 17))
+	}
+
+	return out
+}
+
+// Test that a clean run — shm at its baseline ratios and allocs — passes every
+// hard gate.
+func TestEvaluate_CleanRunPasses(t *testing.T) {
+	// Given / When
+	rows := append(refRows(), row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))
+	rep := evalRows(t, baselineRatio10, rows...)
+
+	// Then
+	if rep.failed() {
+		t.Fatalf("clean run must pass; report: %+v", rep.hard)
+	}
+}
+
+// Test the floor's exact bound: a measured ratio of exactly the 7x floor passes
+// (>= is inclusive), and just below it fails — isolated on the near-floor baseline
+// whose regression bound (6.75x) sits under the floor.
+func TestEvaluate_FloorExactBound(t *testing.T) {
+	// grpc 70us / shm 10us = 7.0x exactly.
+	pass := evalRows(t, baselineRatioNearFloor,
+		row("grpc", 70, 150, 150), row("grpc", 70, 150, 150), row("grpc", 70, 150, 150),
+		row("uds", 40, 80, 17), row("uds", 40, 80, 17), row("uds", 40, 80, 17),
+		row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))
+	if pass.failed() {
+		t.Fatalf("a ratio exactly at the floor must pass: %+v", pass.hard)
+	}
+
+	// grpc 69.9us / shm 10us = 6.99x, just below the floor.
+	fail := evalRows(t, baselineRatioNearFloor,
+		row("grpc", 69.9, 150, 150), row("grpc", 69.9, 150, 150), row("grpc", 69.9, 150, 150),
+		row("uds", 40, 80, 17), row("uds", 40, 80, 17), row("uds", 40, 80, 17),
+		row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))
+	if !fail.failed() {
+		t.Fatal("a ratio just below the floor must fail")
+	}
+}
+
+// Test the required case: a run within tolerance of the baseline ratio but below
+// the absolute floor must fail. On the near-floor baseline (baseline 7.5x, bound
+// 6.75x), a measured 6.99x is within tolerance yet under the 7x floor.
+func TestEvaluate_WithinToleranceButBelowFloorFails(t *testing.T) {
+	rep := evalRows(t, baselineRatioNearFloor,
+		row("grpc", 69.9, 150, 150), row("grpc", 69.9, 150, 150), row("grpc", 69.9, 150, 150),
+		row("uds", 40, 80, 17), row("uds", 40, 80, 17), row("uds", 40, 80, 17),
+		row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))
+
+	if !rep.failed() {
+		t.Fatal("within-tolerance-but-below-floor must fail the gate")
+	}
+	var floorFailed, regressionPassed bool
+	for _, c := range rep.hard {
+		if strings.Contains(c.name, "absolute floor") && !c.pass {
+			floorFailed = true
+		}
+		if strings.Contains(c.name, "ratio vs grpc") && c.pass {
+			regressionPassed = true
+		}
+	}
+	if !floorFailed {
+		t.Error("the floor check must be the one that failed")
+	}
+	if !regressionPassed {
+		t.Error("the regression check must pass (the run is within tolerance)")
+	}
+}
+
+// Test that a ratio that has regressed past the tolerance fails even while it
+// clears the absolute floor.
+func TestEvaluate_RatioRegressionFails(t *testing.T) {
+	// shm 12.5us: grpc 100/12.5 = 8x — above the 7x floor, below the 9x bound.
+	rows := append(refRows(), row("shm", 12.5, 25, 19), row("shm", 12.5, 25, 19), row("shm", 12.5, 25, 19))
+	rep := evalRows(t, baselineRatio10, rows...)
+
+	if !rep.failed() {
+		t.Fatal("an 8x ratio against a 9x regression bound must fail")
+	}
+	for _, c := range rep.hard {
+		if strings.Contains(c.name, "absolute floor") && !c.pass {
+			t.Error("the floor (7x) should still pass at 8x; only the regression bound should fail")
+		}
+	}
+}
+
+// Test allocations: an increase of a whole allocation fails, an equal count
+// passes, and sub-allocation float noise does not fail.
+func TestEvaluate_Allocs(t *testing.T) {
+	// Equal (19 -> 19) passes.
+	eq := evalRows(t, baselineRatio10, append(refRows(),
+		row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))...)
+	if eq.failed() {
+		t.Errorf("equal allocs must pass: %+v", eq.hard)
+	}
+
+	// Float noise (19.03) rounds to 19, passes.
+	noise := evalRows(t, baselineRatio10, append(refRows(),
+		row("shm", 10, 20, 19.03), row("shm", 10, 20, 19.03), row("shm", 10, 20, 19.03))...)
+	if noise.failed() {
+		t.Errorf("sub-allocation float noise must not fail: %+v", noise.hard)
+	}
+
+	// A whole extra allocation (20.1 -> 20) fails.
+	up := evalRows(t, baselineRatio10, append(refRows(),
+		row("shm", 10, 20, 20.1), row("shm", 10, 20, 20.1), row("shm", 10, 20, 20.1))...)
+	if !up.failed() {
+		t.Error("an added allocation must fail")
+	}
+}
+
+// Test that a counter reading far below the baseline — a fresh transport counting
+// from zero — is treated as a reset (an improvement), never a regression.
+func TestEvaluate_CounterResetNotRegression(t *testing.T) {
+	rep := evalRows(t, baselineRatio10, append(refRows(),
+		row("shm", 10, 20, 0), row("shm", 10, 20, 0), row("shm", 10, 20, 0))...)
+
+	if rep.failed() {
+		t.Fatalf("a reset-to-zero allocation counter must not fail: %+v", rep.hard)
+	}
+	for _, c := range rep.hard {
+		if strings.Contains(c.name, "allocs") && !strings.Contains(c.message, "not increased") {
+			t.Errorf("reset should read as not-increased, got %q", c.message)
+		}
+	}
+}
+
+// Test that the median absorbs a single noisy repetition: two clean reps and one
+// wild outlier still yield the clean median, so the gate passes.
+func TestEvaluate_NoisyRepetitionMedianAbsorbsOutlier(t *testing.T) {
+	rows := append(refRows(),
+		row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 50, 100, 19)) // one 5x-slow outlier
+	rep := evalRows(t, baselineRatio10, rows...)
+
+	if rep.failed() {
+		t.Fatalf("the median of [10,10,50] is 10us and must pass; a mean would not: %+v", rep.hard)
+	}
+}
+
+// Test that a missing normative cell is a fatal evaluation error, not a pass.
+func TestEvaluate_MissingCellIsFatal(t *testing.T) {
+	rep := evalRows(t, baselineRatio10, refRows()...) // no shm rows at all
+	if !rep.failed() {
+		t.Fatal("a run missing the normative cell must fail")
+	}
+	if rep.fatal == "" {
+		t.Error("a missing normative cell should be reported as fatal")
+	}
+}
+
+// Test that a missing or malformed baseline is an error, never a silent pass.
+func TestLoadBaseline_MissingAndMalformed(t *testing.T) {
+	if _, err := loadBaseline([]byte("")); err == nil {
+		t.Error("an empty baseline must error")
+	}
+	if _, err := loadBaseline([]byte("{not json")); err == nil {
+		t.Error("a malformed baseline must error")
+	}
+	// A baseline whose policy references a cell with no entry must error.
+	bad := `{"policy":{"reps":3,"absolute_floor_ratio":7,"relative_tolerance":0.1,
+	         "normative_cells":["shm"],"grpc_ref":"grpc","uds_ref":"uds","payload_bytes":64,"concurrency":1},
+	         "cells":{"shm":{"p50_us":10,"p99_us":20,"allocs_per_op":19}}}`
+	if _, err := loadBaseline([]byte(bad)); err == nil {
+		t.Error("a baseline missing a referenced cell must error")
+	}
+}
+
+// Test the regime guard: an installed 2.0-CPU quota verifies, while an absent
+// quota (cpu.max = "max ...") or a mismatched one is rejected — never a silent
+// pass.
+func TestVerifyCPUQuota(t *testing.T) {
+	if err := verifyCPUQuota(2.0, "200000 100000"); err != nil {
+		t.Errorf("a 2.0-CPU quota must verify: %v", err)
+	}
+	if err := verifyCPUQuota(2.0, "max 100000"); err == nil {
+		t.Error("an absent quota (max) must be rejected")
+	}
+	if err := verifyCPUQuota(2.0, "100000 100000"); err == nil {
+		t.Error("a 1.0-CPU quota must be rejected when 2.0 was requested")
+	}
+	if err := verifyCPUQuota(2.0, "garbage"); err == nil {
+		t.Error("a malformed cpu.max must be rejected")
+	}
+}
+
+// Test that the regime guard, wired through realMain, fails the whole run when the
+// requested cgroup quota is not installed — rather than proceeding as if it were.
+func TestRealMain_RegimeGuardFailsWhenQuotaAbsent(t *testing.T) {
+	dir := t.TempDir()
+
+	baselinePath := filepath.Join(dir, "baseline.json")
+	if err := os.WriteFile(baselinePath, []byte(baselineRatio10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resultsPath := filepath.Join(dir, "results.jsonl")
+	rows := append(refRows(), row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))
+	if err := os.WriteFile(resultsPath, []byte(strings.Join(rows, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Point the guard at a cpu.max that reports no quota installed.
+	cpuMaxPath := filepath.Join(dir, "cpu.max")
+	if err := os.WriteFile(cpuMaxPath, []byte("max 100000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := cgroupCPUMaxPath
+	cgroupCPUMaxPath = cpuMaxPath
+	defer func() { cgroupCPUMaxPath = orig }()
+
+	err := realMain(baselinePath, 2.0, []string{resultsPath})
+	if err == nil {
+		t.Fatal("the regime guard must fail the run when the quota is absent, not pass")
+	}
+	if !strings.Contains(err.Error(), "regime guard") {
+		t.Errorf("the failure should name the regime guard, got %v", err)
+	}
+}
+
+// Test that the same run passes once the quota is actually installed, proving the
+// guard gates on the environment rather than always failing.
+func TestRealMain_PassesWhenQuotaInstalled(t *testing.T) {
+	dir := t.TempDir()
+	baselinePath := filepath.Join(dir, "baseline.json")
+	_ = os.WriteFile(baselinePath, []byte(baselineRatio10), 0o644)
+	resultsPath := filepath.Join(dir, "results.jsonl")
+	rows := append(refRows(), row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))
+	_ = os.WriteFile(resultsPath, []byte(strings.Join(rows, "\n")), 0o644)
+
+	cpuMaxPath := filepath.Join(dir, "cpu.max")
+	_ = os.WriteFile(cpuMaxPath, []byte("200000 100000\n"), 0o644)
+	orig := cgroupCPUMaxPath
+	cgroupCPUMaxPath = cpuMaxPath
+	defer func() { cgroupCPUMaxPath = orig }()
+
+	if err := realMain(baselinePath, 2.0, []string{resultsPath}); err != nil {
+		t.Fatalf("a clean run under an installed quota must pass: %v", err)
+	}
+}
