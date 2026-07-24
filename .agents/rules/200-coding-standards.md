@@ -28,6 +28,16 @@ current task, plan step, or a PR/issue number.
 - Good: `// generation must be checked before dereferencing: a late write
   from a torn-down peer must never be read as current`
 
+Prefer `//` line comments; reserve block comments (`/* */`) for package docs
+that need paragraph structure, generated headers, or long usage text.
+
+Wrap multi-sentence comments at sentence or phrase boundaries (semantic
+linefeeds) instead of packing text to the column limit — see
+[Line length](#linter-enforced-limits-golangciyml) below. Don't rewrap a
+stable comment just to move its line breaks; only touch existing wrapping
+when you're already changing that comment's content, since a pure rewrap
+makes for a noisy, unreadable diff.
+
 ## Naming
 - Packages: short, lowercase. Exported `CamelCase`, unexported `camelCase`.
 - Receivers: short, consistent per type.
@@ -58,7 +68,8 @@ receiver) → unexported methods (by receiver).
 ## Linter-Enforced Limits (`.golangci.yml`)
 - Function length: warn at 100 lines, prefer < 50.
 - Cyclomatic complexity: keep well under 22.
-- Line length: 120 chars.
+- Line length: 120 chars (applies to comments too — wrap by meaning, see
+  [Comments](#comments) above, not by mechanically filling the column budget).
 - Blank line before a `return`/branch in blocks > 3 lines (`nlreturn`-style).
 - Never `//nolint` (once a linter config exists) to dodge these — refactor or
   justify the suppression.
