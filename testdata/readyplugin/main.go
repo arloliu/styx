@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	srv := styx.NewPluginServer()
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	if err := srv.Serve(); err != nil {
 		os.Exit(1)
 	}

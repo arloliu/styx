@@ -80,7 +80,7 @@ func (echoStreamServer) Chat(stream echopb.EchoStream_ChatServer) error {
 }
 
 func main() {
-	srv := styx.NewPluginServer()
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	echopb.RegisterEchoServer(srv, echoServer{})
 	echopb.RegisterEchoStreamServer(srv, echoStreamServer{})
 	if err := srv.Serve(); err != nil {

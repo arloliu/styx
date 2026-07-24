@@ -182,7 +182,7 @@ func TestOpenStreamID_RoutesIdenticallyToNameBased_ThroughInProcessPair(t *testi
 	// The IDs are the SAME hashes the name-based path computes.
 	serviceID, methodID := fnv64a(service), fnv64a(method)
 
-	srv := NewPluginServer()
+	srv := NewPluginServer(PluginServerConfig{})
 	srv.RegisterStreamHandlerID(serviceID, methodID, ClientStreamingShape, func(st *Stream) error {
 		got, err := st.RecvMsg(context.Background())
 		if err != nil {
@@ -339,7 +339,7 @@ func TestPluginOffer_RequiresStreaming_WhenHandlerRegistered(t *testing.T) {
 	}
 
 	// No stream handlers: streaming is offered as optional.
-	s := NewPluginServer()
+	s := NewPluginServer(PluginServerConfig{})
 	require.False(t, streamingRequired(s.pluginOffer()), "streaming is optional with no stream handlers")
 
 	// Registering a stream handler makes the plugin require streaming.

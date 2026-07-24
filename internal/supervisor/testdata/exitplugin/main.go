@@ -40,6 +40,6 @@ func main() {
 		os.Exit(code)
 	}()
 
-	srv := styx.NewPluginServer()
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	_ = srv.Serve()
 }

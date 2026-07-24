@@ -26,7 +26,7 @@ func (echoImpl) Say(_ context.Context, req *echopb.SayRequest) (*echopb.SayRespo
 }
 
 func main() {
-	srv := styx.NewPluginServer()
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	echopb.RegisterEchoServer(srv, echoImpl{})
 
 	if err := srv.Serve(); err != nil {

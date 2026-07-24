@@ -86,7 +86,7 @@ func TestPluginServer_PluginAttachSHM_PerStepFailure_ClosesExactlyWhatItOwns(t *
 			require.NoError(t, hostConn.SendFDs(t.Context(), attachMsg,
 				[]int{region.FD(), hpEFD.FD(), phEFD.FD()}))
 
-			srv := styx.NewPluginServer()
+			srv := styx.NewPluginServer(styx.PluginServerConfig{})
 			injected := errors.New("plugin attach failpoint")
 			t.Cleanup(styx.SetPluginAttachSHMFailAtForTest(func(s string) error {
 				if s == step {

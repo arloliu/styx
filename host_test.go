@@ -57,8 +57,9 @@ func TestMain(m *testing.M) {
 		panic("building versionedplugin fixture: " + err.Error() + "\n" + string(out))
 	}
 
-	// A plugin whose transport allowlist advertises only uds (WithTransports),
-	// used to prove the transport-selection fallback rule end to end.
+	// A plugin whose transport allowlist advertises only uds
+	// (PluginServerConfig.Transports), used to prove the transport-selection
+	// fallback rule end to end.
 	fixtureUDSOnlyPlugin = filepath.Join(dir, "udsonlyplugin")
 	uBuild := exec.Command("go", "build", "-o", fixtureUDSOnlyPlugin, "./testdata/udsonlyplugin")
 	if out, err := uBuild.CombinedOutput(); err != nil {

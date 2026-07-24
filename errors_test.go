@@ -61,9 +61,9 @@ func TestIsRetryable_PluginPanic_IndependentOfContinueAfterPanic(t *testing.T) {
 	panicErr := &PluginPanicError{Value: "boom"}
 
 	for _, continueAfterPanic := range []bool{false, true} {
-		// Given
-		srv := NewPluginServer()
-		srv.SetContinueAfterPanic(continueAfterPanic)
+		// A server built under each policy — unused by IsRetryable, which reads only
+		// the error; that independence is the property under test.
+		_ = NewPluginServer(PluginServerConfig{ContinueAfterPanic: continueAfterPanic})
 
 		// When / Then
 		require.False(t, IsRetryable(panicErr),

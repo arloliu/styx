@@ -32,6 +32,6 @@ func main() {
 		return nil
 	})
 
-	srv := styx.NewPluginServer()
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	_ = srv.Serve()
 }

@@ -255,10 +255,9 @@ func main() {
 		}()
 	}
 
-	srv := styx.NewPluginServer()
-	if envSet("STYX_ECHO_CONTINUE_AFTER_PANIC") {
-		srv.SetContinueAfterPanic(true)
-	}
+	srv := styx.NewPluginServer(styx.PluginServerConfig{
+		ContinueAfterPanic: envSet("STYX_ECHO_CONTINUE_AFTER_PANIC"),
+	})
 	if envSet("STYX_ECHO_RESTORE_FAIL") {
 		srv.RegisterStateRestorer(failingRestorer{})
 	}

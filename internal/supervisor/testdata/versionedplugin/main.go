@@ -30,7 +30,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	srv := styx.NewPluginServer()
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	srv.RegisterService(&styx.ServiceDesc{
 		ServiceName: "versiontest.Versioned",
 		ServiceID:   1,

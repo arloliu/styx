@@ -44,13 +44,13 @@ const controlServePoll = 50 * time.Millisecond
 // transport, runs the serving loop, and exits when the host disconnects or
 // sends Shutdown.
 //
-// Register the plugin's services, stream handlers, and reload hooks — and set
-// any handler-panic policy with SetContinueAfterPanic — BEFORE calling Serve.
-// Each Register* method and SetContinueAfterPanic is individually safe for
-// concurrent use, but the serving session snapshots the registered services,
-// stream handlers, reload hooks, and panic policy once when it starts, so a
-// registration or policy change made after Serve has begun does not affect the
-// running session. Serve is called once.
+// Register the plugin's services, stream handlers, and reload hooks BEFORE
+// calling Serve; the handler-panic policy and the transport allowlist are fixed
+// at construction through PluginServerConfig. Each Register* method is
+// individually safe for concurrent use, but the serving session snapshots the
+// registered services, stream handlers, and reload hooks once when it starts, so
+// a registration made after Serve has begun does not affect the running session.
+// Serve is called once.
 type PluginServer struct {
 	mu       sync.Mutex
 	services map[uint64]registeredService // keyed by ServiceID
@@ -71,53 +71,18 @@ type PluginServer struct {
 	metrics         *observeq.Dispatcher[observe.MetricsSink]
 	metricsInterval time.Duration
 
-	// continueAfterPanic is the handler-panic policy, set by SetContinueAfterPanic
-	// and read once when each serving session builds its panicController. Default
-	// (false) is the enterprise profile: a handler panic taints the process and
-	// terminates it. See panic_policy.go.
-	continueAfterPanic atomic.Bool
+	// continueAfterPanic is the handler-panic policy from PluginServerConfig, fixed
+	// at construction and read once when the serving session builds its
+	// panicController. Default (false) is the enterprise profile: a handler panic
+	// taints the process and terminates it. See panic_policy.go.
+	continueAfterPanic bool
 
 	// transports is the plugin's data-plane transport allowlist — the transports it
-	// advertises during negotiation, set once at construction from WithTransports
-	// (default both). It is the plugin's only data-plane knob; geometry and the
-	// transport preference are host-authored. Read-only after NewPluginServer.
+	// advertises during negotiation, set once at construction from
+	// PluginServerConfig.Transports (default both). It is the plugin's only
+	// data-plane knob; geometry and the transport preference are host-authored.
+	// Read-only after NewPluginServer.
 	transports []string
-}
-
-// PluginServerOption configures a PluginServer at construction. The zero-option
-// NewPluginServer() keeps the original behavior — no metrics.
-type PluginServerOption func(*pluginServerConfig)
-
-// pluginServerConfig accumulates the applied PluginServerOptions before
-// NewPluginServer resolves them onto the server.
-type pluginServerConfig struct {
-	metrics    observe.MetricsSink
-	interval   time.Duration
-	transports []string
-}
-
-// WithMetrics routes the plugin's built-in instrumentation to sink. nil (the
-// default) disables plugin-side metrics entirely.
-func WithMetrics(sink observe.MetricsSink) PluginServerOption {
-	return func(c *pluginServerConfig) { c.metrics = sink }
-}
-
-// WithMetricsInterval sets the periodic reporter's cadence. Zero (the default)
-// uses one second. Ignored when no metrics sink is configured.
-func WithMetricsInterval(d time.Duration) PluginServerOption {
-	return func(c *pluginServerConfig) { c.interval = d }
-}
-
-// WithTransports sets the plugin's data-plane transport allowlist — the transports
-// it advertises during handshake negotiation. The default (both "shm" and "uds")
-// lets the host pick per its own preference; pass only "uds" to advertise a
-// uds-only plugin, or only "shm" for a shared-memory-only one. This is the
-// plugin's SOLE data-plane knob: the region geometry and the transport preference
-// are host-authored on PluginSpec. An empty list restores the default. Unknown
-// names are simply never a common transport, so a host that offers only those
-// fails the handshake rather than silently downgrading.
-func WithTransports(transports ...string) PluginServerOption {
-	return func(c *pluginServerConfig) { c.transports = transports }
 }
 
 // registeredService pairs one RegisterService call's desc and impl for
@@ -127,22 +92,22 @@ type registeredService struct {
 	impl any
 }
 
-// NewPluginServer creates a PluginServer. Call RegisterService for each
-// generated service, then Serve. Options are optional; NewPluginServer() with
-// none configures no metrics.
-func NewPluginServer(opts ...PluginServerOption) *PluginServer {
-	cfg := pluginServerConfig{}
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+// NewPluginServer creates a PluginServer from cfg. Call RegisterService for each
+// generated service (and any stream handlers and reload hooks), then Serve. The
+// zero-value PluginServerConfig{} configures no metrics, the default panic
+// policy, and both transports. It panics if cfg.Transports names an unknown
+// transport (see PluginServerConfig.Transports).
+func NewPluginServer(cfg PluginServerConfig) *PluginServer {
+	validatePluginTransports(cfg.Transports)
 
 	s := &PluginServer{
-		services:        make(map[uint64]registeredService),
-		metricsInterval: resolveMetricsInterval(cfg.interval),
-		transports:      resolvePluginTransports(cfg.transports),
+		services:           make(map[uint64]registeredService),
+		metricsInterval:    resolveMetricsInterval(cfg.MetricsInterval),
+		transports:         resolvePluginTransports(cfg.Transports),
+		continueAfterPanic: cfg.ContinueAfterPanic,
 	}
-	if cfg.metrics != nil {
-		s.metrics = observeq.NewDispatcher(cfg.metrics, metricsBufferSize)
+	if cfg.Metrics != nil {
+		s.metrics = observeq.NewDispatcher(cfg.Metrics, metricsBufferSize)
 	}
 
 	return s
@@ -263,7 +228,7 @@ func (s *PluginServer) runServing(
 	// policy at session start. The unary dispatcher and the streaming accept half
 	// both record panics through it, and it carries the termination signal a
 	// streaming handler panic raises (see panic_policy.go).
-	panicPolicy := newPanicController(s.continueAfterPanic.Load())
+	panicPolicy := newPanicController(s.continueAfterPanic)
 
 	// One drain coordinator per serving session: the reader loop maintains its
 	// ingress reservation, and a reload's DrainAck waits on its quiescence predicate.
@@ -896,7 +861,7 @@ func defaultPluginTransports() []string {
 }
 
 // resolvePluginTransports returns the configured allowlist, or the default when
-// none was set (an empty or nil WithTransports).
+// none was set (an empty or nil PluginServerConfig.Transports).
 func resolvePluginTransports(transports []string) []string {
 	if len(transports) == 0 {
 		return defaultPluginTransports()

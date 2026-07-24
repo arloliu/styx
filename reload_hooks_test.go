@@ -28,7 +28,7 @@ func (fakeReloadStateRestorer) RestoreState(context.Context, uint32, []byte) err
 // ServeReload's Freeze/Resume ordering guarantee depends on it
 func TestPluginServer_RegisterMutator_PreserveRegistrationOrder(t *testing.T) {
 	// Given
-	s := NewPluginServer()
+	s := NewPluginServer(PluginServerConfig{})
 	first := fakeMutator{name: "first"}
 	second := fakeMutator{name: "second"}
 
@@ -43,7 +43,7 @@ func TestPluginServer_RegisterMutator_PreserveRegistrationOrder(t *testing.T) {
 // Test RegisterStateSaver storing the registered StateSaver for ServeReload to use
 func TestPluginServer_RegisterStateSaver_StoreSaver(t *testing.T) {
 	// Given
-	s := NewPluginServer()
+	s := NewPluginServer(PluginServerConfig{})
 	saver := fakeReloadStateSaver{}
 
 	// When
@@ -56,7 +56,7 @@ func TestPluginServer_RegisterStateSaver_StoreSaver(t *testing.T) {
 // Test RegisterStateRestorer storing the registered StateRestorer for ServeRestore to use
 func TestPluginServer_RegisterStateRestorer_StoreRestorer(t *testing.T) {
 	// Given
-	s := NewPluginServer()
+	s := NewPluginServer(PluginServerConfig{})
 	restorer := fakeReloadStateRestorer{}
 
 	// When
@@ -71,7 +71,7 @@ func TestPluginServer_RegisterStateRestorer_StoreRestorer(t *testing.T) {
 // methods
 func TestPluginServer_ReloadHooks_EmptyByDefault(t *testing.T) {
 	// Given / When
-	s := NewPluginServer()
+	s := NewPluginServer(PluginServerConfig{})
 
 	// Then
 	require.Empty(t, s.reloadHooks.Mutators)

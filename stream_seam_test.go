@@ -49,7 +49,7 @@ func TestRunServing_DataPlanePoison_Returns(t *testing.T) {
 	// the serve loop poisons the data plane itself.
 	dataTr := newRecordingStreamTransport(transport.Frame{CallID: 1, Kind: transport.FrameStreamMsg, Control: 1})
 
-	srv := NewPluginServer()
+	srv := NewPluginServer(PluginServerConfig{})
 	done := make(chan error, 1)
 	go func() { done <- srv.runServing(context.Background(), pluginConn, dataTr, false) }()
 

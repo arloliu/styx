@@ -8,10 +8,8 @@ import (
 	"github.com/arloliu/styx/internal/rpcruntime"
 )
 
-// SetContinueAfterPanic sets whether this server keeps serving after a handler
-// panic. It is an explicit opt-in: set it true only if every registered handler
-// guarantees its own isolation, because after a panic the process state is
-// whatever the panicking handler left behind.
+// The handler-panic policy is PluginServerConfig.ContinueAfterPanic, fixed at
+// construction and read once when the serving session builds its panicController.
 //
 // Default (false) is the enterprise profile. A handler panic — unary or
 // streaming — is recovered at the dispatch boundary, the panicking call is sent a
@@ -34,15 +32,13 @@ import (
 //     caller usually sees a *PluginPanicError but is not guaranteed to.
 //
 // With true the server recovers the panic, replies with the panic outcome, and
-// keeps serving; a later call succeeds. A panic in the Styx runtime itself
-// (outside handler frames) is never recovered by this policy under either
-// setting — the recovery boundary is drawn tightly around the handler invocation,
-// so a framework-internal panic still crashes the process unconditionally.
-//
-// Call it before Serve; a serving session reads the setting once when it starts.
-func (s *PluginServer) SetContinueAfterPanic(continueAfterPanic bool) {
-	s.continueAfterPanic.Store(continueAfterPanic)
-}
+// keeps serving; a later call succeeds. It is an explicit opt-in, safe only if
+// every registered handler guarantees its own isolation, because after a panic
+// the process state is whatever the panicking handler left behind. A panic in the
+// Styx runtime itself (outside handler frames) is never recovered by this policy
+// under either setting — the recovery boundary is drawn tightly around the handler
+// invocation, so a framework-internal panic still crashes the process
+// unconditionally.
 
 // panicController carries one serving session's handler-panic policy and the
 // termination signal its two dispatch paths raise. The unary and streaming paths

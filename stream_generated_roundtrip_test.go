@@ -71,7 +71,7 @@ func (echoStreamImpl) Chat(stream echopb.EchoStream_ChatServer) error {
 func newGeneratedStreamPair(t *testing.T) echopb.EchoStreamClient {
 	t.Helper()
 
-	srv := styx.NewPluginServer()
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	echopb.RegisterEchoStreamServer(srv, echoStreamImpl{})
 
 	cc, stop, err := styx.InProcessStreamPairForTest(srv)
@@ -104,7 +104,7 @@ func (s cancelObserverServer) Chat(stream echopb.EchoStream_ChatServer) error {
 // the budget. One generated shape is representative: all generated shapes share the
 // same open and wrapper path.
 func TestGeneratedStreaming_CallerCancelAndAbandon_TerminatesPeer(t *testing.T) {
-	srv := styx.NewPluginServer()
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	obs := cancelObserverServer{chatErr: make(chan error, 1)}
 	echopb.RegisterEchoStreamServer(srv, obs)
 

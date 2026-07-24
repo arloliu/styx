@@ -221,17 +221,23 @@ const (
 	BidiStreamingShape StreamShape = StreamShape(rpcruntime.BidiStreaming)
 )
 
-// StreamOption customizes a stream's StreamConfig before OpenStream publishes the
+// streamConfig is the opaque target a StreamOption mutates. It wraps the internal
+// rpcruntime.StreamConfig so the public StreamOption signature exposes no internal
+// type in godoc; callers only ever mint options through the With* helpers below,
+// so the wrapper's shape is not part of the API.
+type streamConfig struct{ rc *rpcruntime.StreamConfig }
+
+// StreamOption customizes a stream's configuration before OpenStream publishes the
 // STREAM_OPEN. Generated streaming client code composes these; a hand caller may
-// pass them directly.
-type StreamOption func(*rpcruntime.StreamConfig)
+// pass them directly. The only way to construct one is the With* helpers below.
+type StreamOption func(*streamConfig)
 
 // WithStreamCredits proposes a per-direction credit N for the stream. It is
 // clamped into (0, N_max] by OpenStream — a value of 0 or one above N_max
 // becomes N_max — so an opener never proposes a credit its accepter must reject
 // (stream-protocol.md §4.7).
 func WithStreamCredits(n uint32) StreamOption {
-	return func(cfg *rpcruntime.StreamConfig) { cfg.Credits = n }
+	return func(c *streamConfig) { c.rc.Credits = n }
 }
 
 // WithServerStreamRequest declares the stream server-streaming and attaches its
@@ -244,9 +250,9 @@ func WithStreamCredits(n uint32) StreamOption {
 // client-streaming or bidi opener omits this option and sends its first message
 // as a STREAM_MSG.
 func WithServerStreamRequest(request []byte) StreamOption {
-	return func(cfg *rpcruntime.StreamConfig) {
-		cfg.Shape = rpcruntime.ServerStreaming
-		cfg.OpenPayload = request
+	return func(c *streamConfig) {
+		c.rc.Shape = rpcruntime.ServerStreaming
+		c.rc.OpenPayload = request
 	}
 }
 
@@ -255,7 +261,7 @@ func WithServerStreamRequest(request []byte) StreamOption {
 // code express the method's direction set. A client-streaming opener needs no
 // option (it is the default shape).
 func WithBidiStream() StreamOption {
-	return func(cfg *rpcruntime.StreamConfig) { cfg.Shape = rpcruntime.BidiStreaming }
+	return func(c *streamConfig) { c.rc.Shape = rpcruntime.BidiStreaming }
 }
 
 // OpenStream opens a new stream call to the named method, mirroring Invoke's
@@ -370,8 +376,9 @@ func (c *ClientConn) openStreamByID(
 	// context). The budget is still resolved from the caller's deadline below, so this
 	// derivation keeps the same instant — it neither extends nor shrinks the budget.
 	cfg := rpcruntime.StreamConfig{Service: serviceID, Method: methodID, ParentCtx: ctx}
+	sc := streamConfig{rc: &cfg}
 	for _, opt := range opts {
-		opt(&cfg)
+		opt(&sc)
 	}
 	// Propose a credit bounded by N_max and never 0: the wire value 0 would mean
 	// 16, which an opener may only send if its own N_max is 16, so we always send

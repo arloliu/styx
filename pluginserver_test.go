@@ -20,10 +20,26 @@ import (
 	"github.com/arloliu/styx/internal/transport"
 )
 
+// Test NewPluginServer rejecting an unknown transport name at construction, so a
+// typo fails immediately rather than silently never matching any host offer.
+func TestNewPluginServer_PanicsOnUnknownTransport(t *testing.T) {
+	require.Panics(t, func() {
+		styx.NewPluginServer(styx.PluginServerConfig{Transports: []string{"tcp"}})
+	}, "an unknown transport name must fail at construction")
+
+	require.NotPanics(t, func() {
+		styx.NewPluginServer(styx.PluginServerConfig{Transports: []string{"uds", "shm"}})
+	}, "the known transports must be accepted")
+
+	require.NotPanics(t, func() {
+		styx.NewPluginServer(styx.PluginServerConfig{})
+	}, "the default (empty) allowlist must be accepted")
+}
+
 // Test PluginServer panicking when two registered services share a ServiceID
 func TestPluginServer_RegisterService_PanicsOnServiceIDCollision(t *testing.T) {
 	// Given
-	srv := styx.NewPluginServer()
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	descA := &styx.ServiceDesc{ServiceName: "a.A", ServiceID: 1}
 	descB := &styx.ServiceDesc{ServiceName: "b.B", ServiceID: 1}
 	srv.RegisterService(descA, struct{}{})
@@ -35,7 +51,7 @@ func TestPluginServer_RegisterService_PanicsOnServiceIDCollision(t *testing.T) {
 // Test PluginServer.RegisterService succeeding for distinct ServiceIDs
 func TestPluginServer_RegisterService_SucceedsForDistinctServiceIDs(t *testing.T) {
 	// Given
-	srv := styx.NewPluginServer()
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	descA := &styx.ServiceDesc{ServiceName: "a.A", ServiceID: 1}
 	descB := &styx.ServiceDesc{ServiceName: "b.B", ServiceID: 2}
 
@@ -138,7 +154,7 @@ func setupPluginServeTestHelper(t *testing.T) *pluginServeHelper {
 	return &pluginServeHelper{
 		t:          t,
 		require:    req,
-		srv:        styx.NewPluginServer(),
+		srv:        styx.NewPluginServer(styx.PluginServerConfig{}),
 		hostConn:   hostConn,
 		pluginConn: pluginConn,
 		pluginFD:   fds[1],
