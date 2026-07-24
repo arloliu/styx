@@ -11,13 +11,16 @@
 // Comparing medians of N repetitions, not single runs, keeps hosted-runner noise
 // from tripping the gate: a lone slow repetition is absorbed by the median. Every
 // cell — normative and reference — must carry the full repetition count, and every
-// measurement must be present, finite, and positive, or the gate fails closed.
+// measurement must be present and finite — latency strictly positive, allocations
+// non-negative (a present zero is a legitimate reset, not a missing field) — or the
+// gate fails closed.
 //
 // Gaming-resistance scope (see evaluate): the ratio gates are common-mode-invariant
 // by construction, so a latency movement shared across both codebases on one runner
-// is environmental and shows up only in the advisory absolute deltas, not the hard
-// gates. Identity is instead anchored on the machine-invariant allocation counts,
-// which are hard-gated on the reference cells as well as the normative ones.
+// is environmental with high probability and shows up only in the advisory absolute
+// deltas, not the hard gates. Identity is instead anchored on the machine-invariant
+// allocation counts, which are hard-gated on the reference cells as well as the
+// normative ones.
 package main
 
 import (

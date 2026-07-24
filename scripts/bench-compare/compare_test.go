@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -232,30 +233,71 @@ func TestEvaluate_ShortRepCountFails(t *testing.T) {
 	}
 }
 
-// Test that a result row missing a measurement, or carrying a non-positive
-// latency, is a hard parse error rather than decoding a zero that would corrupt a
-// ratio or look like an allocation improvement.
+// Test that result rows fail closed on every malformed shape: a missing
+// measurement, a non-finite latency or allocation (a huge literal decodes to
+// +Inf), a non-positive latency, or a negative allocation — while a present zero
+// allocation (a legitimate reset) and a well-formed row are accepted.
 func TestParseResults_RejectsMissingAndNonFinite(t *testing.T) {
-	missingP50 := `{"impl":"shm","payload_bytes":64,"concurrency":1,"p99_ns":20000,"allocs_per_op":19}`
-	if _, err := parseResults(strings.NewReader(missingP50)); err == nil {
-		t.Error("a row missing p50_ns must be rejected")
+	// rawRow builds a result row; an empty argument omits that field.
+	rawRow := func(p50, p99, allocs string) string {
+		parts := []string{`"impl":"shm"`, `"payload_bytes":64`, `"concurrency":1`}
+		if p50 != "" {
+			parts = append(parts, `"p50_ns":`+p50)
+		}
+		if p99 != "" {
+			parts = append(parts, `"p99_ns":`+p99)
+		}
+		if allocs != "" {
+			parts = append(parts, `"allocs_per_op":`+allocs)
+		}
+
+		return "{" + strings.Join(parts, ",") + "}"
 	}
-	missingAllocs := `{"impl":"shm","payload_bytes":64,"concurrency":1,"p50_ns":10000,"p99_ns":20000}`
-	if _, err := parseResults(strings.NewReader(missingAllocs)); err == nil {
-		t.Error("a row missing allocs_per_op must be rejected")
+	cases := []struct {
+		name    string
+		row     string
+		wantErr bool
+	}{
+		{"missing p50_ns", rawRow("", "20000", "19"), true},
+		{"missing p99_ns", rawRow("10000", "", "19"), true},
+		{"missing allocs", rawRow("10000", "20000", ""), true},
+		{"inf p50_ns", rawRow("1e999", "20000", "19"), true},
+		{"inf p99_ns", rawRow("10000", "1e999", "19"), true},
+		{"inf allocs", rawRow("10000", "20000", "1e999"), true},
+		{"zero p50_ns", rawRow("0", "20000", "19"), true},
+		{"negative p99_ns", rawRow("10000", "-5", "19"), true},
+		{"negative allocs", rawRow("10000", "20000", "-1"), true},
+		{"present zero allocs (reset)", rawRow("10000", "20000", "0"), false},
+		{"well-formed", rawRow("10000", "20000", "19"), false},
 	}
-	zeroP50 := `{"impl":"shm","payload_bytes":64,"concurrency":1,"p50_ns":0,"p99_ns":20000,"allocs_per_op":19}`
-	if _, err := parseResults(strings.NewReader(zeroP50)); err == nil {
-		t.Error("a zero p50_ns must be rejected (it would make a ratio infinite)")
+	for _, tc := range cases {
+		_, err := parseResults(strings.NewReader(tc.row))
+		if tc.wantErr && err == nil {
+			t.Errorf("%s: expected an error, got none", tc.name)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("%s: expected no error, got %v", tc.name, err)
+		}
 	}
-	negAllocs := `{"impl":"shm","payload_bytes":64,"concurrency":1,"p50_ns":10000,"p99_ns":20000,"allocs_per_op":-1}`
-	if _, err := parseResults(strings.NewReader(negAllocs)); err == nil {
-		t.Error("a negative allocs_per_op must be rejected")
-	}
-	// A present zero allocation is a legitimate reset, not a missing field.
-	zeroAllocs := `{"impl":"shm","payload_bytes":64,"concurrency":1,"p50_ns":10000,"p99_ns":20000,"allocs_per_op":0}`
-	if _, err := parseResults(strings.NewReader(zeroAllocs)); err != nil {
-		t.Errorf("a present zero allocation must be accepted (reset), got %v", err)
+}
+
+// Test the NaN branch directly: JSON cannot carry a NaN literal, so it cannot be
+// reached through parseResults, but validate must still reject a NaN measurement.
+func TestRawResult_RejectsNaN(t *testing.T) {
+	nan := math.NaN()
+	ok := 10000.0
+	for _, f := range []struct {
+		name        string
+		p50, p99, a *float64
+	}{
+		{"nan p50", &nan, &ok, &ok},
+		{"nan p99", &ok, &nan, &ok},
+		{"nan allocs", &ok, &ok, &nan},
+	} {
+		raw := rawResult{Impl: "shm", PayloadB: 64, Concurrency: 1, P50Ns: f.p50, P99Ns: f.p99, AllocsPerOp: f.a}
+		if _, err := raw.validate(); err == nil {
+			t.Errorf("%s: a NaN measurement must be rejected", f.name)
+		}
 	}
 }
 
@@ -339,6 +381,36 @@ func TestLoadBaseline_MissingAndMalformed(t *testing.T) {
 	                     "uds":{"p50_us":40,"p99_us":80,"allocs_per_op":17}}}`
 	if _, err := loadBaseline([]byte(badCell)); err == nil {
 		t.Error("a baseline cell missing a field (p50_us) must error")
+	}
+
+	// An empty reference name (grpc_ref or uds_ref) must error.
+	emptyRef := `{"policy":{"reps":3,"absolute_floor_ratio":7,"relative_tolerance":0.1,
+	             "normative_cells":["shm"],"grpc_ref":"","uds_ref":"uds","payload_bytes":64,"concurrency":1},
+	             "cells":{"shm":{"p50_us":10,"p99_us":20,"allocs_per_op":19},
+	                      "uds":{"p50_us":40,"p99_us":80,"allocs_per_op":17}}}`
+	if _, err := loadBaseline([]byte(emptyRef)); err == nil {
+		t.Error("an empty grpc_ref must error")
+	}
+
+	// A baseline cell with an explicit non-positive latency must error.
+	negLatency := `{"policy":{"reps":3,"absolute_floor_ratio":7,"relative_tolerance":0.1,
+	               "normative_cells":["shm"],"grpc_ref":"grpc","uds_ref":"uds","payload_bytes":64,"concurrency":1},
+	               "cells":{"shm":{"p50_us":-1,"p99_us":20,"allocs_per_op":19},
+	                        "grpc":{"p50_us":100,"p99_us":200,"allocs_per_op":150},
+	                        "uds":{"p50_us":40,"p99_us":80,"allocs_per_op":17}}}`
+	if _, err := loadBaseline([]byte(negLatency)); err == nil {
+		t.Error("a baseline cell with a negative p50_us must error")
+	}
+
+	// A baseline cell with a non-finite latency (a huge literal decodes to +Inf)
+	// must error.
+	infLatency := `{"policy":{"reps":3,"absolute_floor_ratio":7,"relative_tolerance":0.1,
+	               "normative_cells":["shm"],"grpc_ref":"grpc","uds_ref":"uds","payload_bytes":64,"concurrency":1},
+	               "cells":{"shm":{"p50_us":1e999,"p99_us":20,"allocs_per_op":19},
+	                        "grpc":{"p50_us":100,"p99_us":200,"allocs_per_op":150},
+	                        "uds":{"p50_us":40,"p99_us":80,"allocs_per_op":17}}}`
+	if _, err := loadBaseline([]byte(infLatency)); err == nil {
+		t.Error("a baseline cell with a non-finite p50_us must error")
 	}
 }
 
