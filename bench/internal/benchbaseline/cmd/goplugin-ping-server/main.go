@@ -1,5 +1,5 @@
-// Command goplugin-ping-server is the hashicorp/go-plugin server-side
-// helper for the GoPluginBaseline benchmark comparison point.
+// Command goplugin-ping-server is the helper binary used by GoPluginBaseline
+// to run the Ping service as a hashicorp/go-plugin server.
 package main
 
 import (

@@ -8,54 +8,40 @@ import (
 	"github.com/arloliu/styx/observe"
 )
 
-// PluginServerConfig configures a PluginServer before Serve. Pass it to
-// NewPluginServer; the zero value is the default — no metrics, the default
-// reporter cadence, taint-and-terminate on a handler panic, and both data-plane
-// transports advertised. It mirrors HostConfig on the host side: a plain struct
-// whose fields are all optional, fixed at construction and read-only for the
-// server's life. Transports is the plugin's sole data-plane knob; the region
-// geometry and the transport preference are host-authored on PluginSpec.
+// PluginServerConfig configures a PluginServer before Serve.
+// The zero value is valid: no metrics, default reporter cadence, default panic
+// policy, and both data-plane transports advertised.
+// Pass it to NewPluginServer (fields are read-only once set).
+//
+// Transports is the plugin's only data-plane configuration knob; the region
+// geometry and transport preference are host-authored via PluginSpec.
 type PluginServerConfig struct {
-	// Metrics optionally receives the plugin's built-in instrumentation. nil (the
-	// default) disables plugin-side metrics entirely — no dispatcher goroutine
-	// runs and no hot path allocates.
+	// Metrics optionally sends the plugin's built-in metrics to the sink.
+	// nil disables plugin-side metrics (no dispatcher goroutine, no hot-path allocation).
 	Metrics observe.MetricsSink
 
-	// MetricsInterval sets the periodic reporter's cadence. Zero (the default)
-	// uses one second. Ignored when Metrics is nil.
+	// MetricsInterval sets the periodic reporter cadence.
+	// Zero uses the default (one second).
+	// Ignored when Metrics is nil.
 	MetricsInterval time.Duration
 
 	// ContinueAfterPanic selects the handler-panic policy.
-	//
-	// false (the default) is the enterprise profile: a handler panic is
-	// recovered at the dispatch boundary, the panicking call is replied its
-	// panic outcome, and the process then taints and terminates so the
-	// supervisor restarts it per policy. That reply is guaranteed to a unary
-	// caller but best-effort to a streaming one, which may lose it to teardown
-	// — panic_policy.go documents the full delivery-guarantee split by call
-	// kind.
-	//
-	// true keeps the process serving after a handler panic — an explicit
-	// opt-in, safe only if every handler guarantees its own isolation, because
-	// after a panic the process state is whatever the panicking handler left
-	// behind.
-	//
+	// false (the default) is the enterprise profile: a panicking handler is
+	// recovered at the dispatch boundary and its call returns the panic outcome,
+	// then the process taints and terminates so the supervisor restarts it.
+	// true keeps the process serving after a panic — an explicit opt-in, safe only
+	// if every handler guarantees its own isolation, since process state after a
+	// panic is whatever the handler left behind.
 	// A panic in the Styx runtime itself (outside handler frames) is never
-	// recovered under either setting. The policy is read once when serving
-	// begins; see panic_policy.go.
+	// recovered under either setting.
 	ContinueAfterPanic bool
 
-	// Transports is the plugin's data-plane transport allowlist — the transports it
-	// advertises during handshake negotiation.
-	//
-	// nil or empty (the default) advertises both TransportSHM and TransportUDS,
-	// letting the host pick per its own preference. Set it to just
-	// []Transport{TransportUDS} for a uds-only plugin, or []Transport{TransportSHM}
-	// for a shared-memory-only one.
-	//
-	// Every entry must be a known transport (TransportSHM or TransportUDS);
-	// NewPluginServer panics on an unknown name, so a typo fails at construction
-	// rather than silently never matching any host offer.
+	// Transports is the data-plane transport allowlist advertised during handshake.
+	// nil or empty advertises both TransportSHM and TransportUDS, letting the host
+	// choose per its own preference.
+	// Set to []Transport{TransportUDS} for a uds-only plugin or
+	// []Transport{TransportSHM} for a shared-memory-only plugin.
+	// NewPluginServer panics on an unknown transport name.
 	Transports []Transport
 }
 

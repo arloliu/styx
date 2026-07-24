@@ -1,10 +1,10 @@
 // Package shmtest builds an in-process host/plugin shm.Transport pair for
 // tests: one memfd region, two cross-wired eventfds, and both ends attached
-// -- the construction seam that keeps a package testing against the shm
+// — the construction seam that keeps a package testing against the shm
 // transport as a black box (through transport.Transport alone) from having
 // to import internal/shm or internal/event itself. It exists because that
-// dance -- CreateRegion, two NewEventFDs, two cross-wired Attach calls, and
-// an ordered teardown -- has real invariants (shm-abi.md §14's eventfd
+// dance — CreateRegion, two NewEventFDs, two cross-wired Attach calls, and
+// an ordered teardown — has real invariants (shm-abi.md §14's eventfd
 // cross-wiring; Attach owns none of region/eventfds, so the caller must
 // close all three in the right order) that are easy to get subtly wrong by
 // hand, and internal/transport/shm/transport_test.go already had to solve

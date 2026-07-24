@@ -1,15 +1,12 @@
-// Command echo-host is examples/echo's host binary: it spawns the echo
-// plugin named by its first argument, declares the plugin's real generated
-// service-version requirement, logs every supervisor lifecycle event for
-// the life of the process, and calls Say once — printing the plugin's
-// response to stdout on success.
+// Command echo-host spawns the echo plugin, verifies its service
+// requirements, logs every lifecycle event, and calls Say once to
+// demonstrate the message round-trip.
 //
 // Usage: echo-host <path-to-echo-plugin-binary>
 //
-// tests/integration/echo_test.go builds and runs this binary against
-// examples/echo/plugin (and its examples/echo/plugin/crashy test-only
-// twin) to prove the example itself, not just the framework underneath
-// it, actually works end to end.
+// tests/integration/echo_test.go runs this binary against both
+// examples/echo/plugin and examples/echo/plugin/crashy to prove the
+// example works end-to-end, not just the framework.
 package main
 
 import (

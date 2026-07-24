@@ -8,30 +8,27 @@ import (
 	"sync/atomic"
 )
 
-// Sink receives captured lines; a Sink that blocks or is slow only
-// affects its own delivery (drops, counted), never the plugin.
+// Sink receives captured lines.
+// A blocked or slow Sink affects only its own delivery (drops are counted),
+// never the plugin itself.
 type Sink interface {
 	// WriteLine delivers one captured line from stream ("stdout" or "stderr").
 	WriteLine(stream string, line []byte)
 }
 
-// StdioCapture drains a plugin's stdout/stderr pipes into bounded,
-// per-line-capped buffers with explicit drop accounting — a blocked sink
-// drops output (counted) rather than filling the pipe and blocking the
-// plugin inside a write. Two dedicated goroutines (one per
-// stream) always read; a full downstream Sink never backs up into the
-// pipe itself.
+// StdioCapture drains a plugin's stdout/stderr pipes into bounded buffers
+// with per-line caps and explicit drop accounting.
+// A blocked Sink drops output (counted) rather than filling the pipe and
+// blocking the plugin during write.
+// Two goroutines (one per stream) always read; a full downstream Sink
+// never backs up into the pipe itself.
 //
-// Run's returned-ness tracks only the reading side: it returns once both
-// streams reach EOF/error (which happens once the caller closes the
-// underlying pipes — the same "Close unblocks the reader" pattern
-// internal/lifecycle.Teardown's JoinGoroutines step already uses for the
-// data-plane transport) or ctx is canceled. The two delivery-to-Sink
-// goroutines are deliberately NOT joined by Run: a permanently-blocked
-// Sink must never prevent Run from returning, matching the doc above —
-// "never the plugin." Each delivery goroutine still exits on its own,
-// promptly, once its queue is closed-and-drained or ctx is canceled; it
-// only leaks (harmlessly, until process exit) if the Sink itself never
+// Run returns once both streams reach EOF/error (after the caller closes
+// the pipes) or ctx is canceled, tracking only the reading side.
+// The two delivery-to-Sink goroutines are NOT joined by Run: a blocked
+// Sink must never prevent Run from returning.
+// Each delivery goroutine still exits on its own once its queue closes
+// and drains, or ctx is canceled; it only leaks if the Sink never
 // returns from WriteLine.
 type StdioCapture struct {
 	stdout, stderr io.Reader
@@ -78,16 +75,17 @@ func (c *StdioCapture) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-// DroppedCount returns the number of lines dropped so far for each stream
-// because its delivery queue was full — the downstream Sink was not
-// keeping up.
+// DroppedCount returns the number of lines dropped for each stream
+// because its delivery queue was full.
+// This happens when the downstream Sink is not keeping up with the read rate.
 func (c *StdioCapture) DroppedCount() (stdout, stderr uint64) {
 	return c.stdoutDropped.Load(), c.stderrDropped.Load()
 }
 
-// PanicCount returns the number of times c.sink.WriteLine has panicked so
-// far for each stream. A panicking Sink never crashes the host (see
-// deliverLoop) — this is the only signal that it happened.
+// PanicCount returns the number of times c.sink.WriteLine has panicked
+// for each stream.
+// A panicking Sink never crashes the host; this counter is the only signal
+// that a panic occurred.
 func (c *StdioCapture) PanicCount() (stdout, stderr uint64) {
 	return c.stdoutPanicked.Load(), c.stderrPanicked.Load()
 }

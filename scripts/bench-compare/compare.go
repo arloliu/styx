@@ -1,26 +1,20 @@
-// Command bench-compare gates a shared-memory benchmark run against a checked-in
-// baseline. It reads the harness's JSONL result rows (one per repetition), takes
-// the median of each gated cell across the repetitions, and enforces the merge
-// gate: allocations per operation must not increase, the shared-memory cells must
-// stay at or above the absolute speed floor versus the gRPC-over-UDS reference,
-// and the shm-vs-gRPC and shm-vs-UDS median ratios must not regress past the
-// baseline by more than the allowed tolerance. Absolute p50/p99 latency is
-// reported but not gated. The floor, tolerance, reference cells, and repetition
-// count all come from the baseline file, never from constants here.
+// Command bench-compare gates a shared-memory benchmark against a checked-in
+// baseline. It reads JSONL result rows from the harness (one per repetition),
+// computes the median of each cell across repetitions, and enforces merge gates:
+// allocations per operation must not increase; shared-memory cells must stay at
+// or above the absolute floor versus gRPC-over-UDS; and shm-vs-reference ratios
+// must not regress beyond the allowed tolerance. Absolute latency is reported but
+// not gated; all thresholds come from the baseline file, not from constants.
 //
-// Comparing medians of N repetitions, not single runs, keeps hosted-runner noise
-// from tripping the gate: a lone slow repetition is absorbed by the median. Every
-// cell — normative and reference — must carry the full repetition count, and every
-// measurement must be present and finite — latency strictly positive, allocations
-// non-negative (a present zero is a legitimate reset, not a missing field) — or the
-// gate fails closed.
+// Comparing medians of repetitions (not single runs) absorbs hosted-runner noise:
+// a single slow run is absorbed by the median. Every cell must provide the full
+// repetition count and all finite measurements, or the gate fails closed.
 //
-// Gaming-resistance scope (see evaluate): the ratio gates are common-mode-invariant
-// by construction, so a latency movement shared across both codebases on one runner
-// is environmental with high probability and shows up only in the advisory absolute
-// deltas, not the hard gates. Identity is instead anchored on the machine-invariant
-// allocation counts, which are hard-gated on the reference cells as well as the
-// normative ones.
+// Gaming-resistance scope: the ratio gates are common-mode-invariant by
+// construction, so latency movements shared across both codebases on one runner
+// show only in advisory deltas, not hard gates. Identity is anchored on
+// machine-invariant allocation counts, which are hard-gated on both reference and
+// normative cells.
 package main
 
 import (

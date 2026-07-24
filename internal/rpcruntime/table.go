@@ -23,14 +23,14 @@ var ErrCanceledLocally = errors.New("rpcruntime: call canceled locally")
 // error argument, so the Table owns this sentinel.
 var ErrDeadlineExceeded = errors.New("rpcruntime: call deadline exceeded")
 
-// CallState is a call's position in the state machine:
-//
-//	SUBMITTED -> {REJECTED | CANCELED | DEADLINE}          (terminal pre-publication)
-//	SUBMITTED -> PUBLISHED -> {COMPLETED | FAILED | CANCELED | DEADLINE | OUTCOME_UNKNOWN}
-//
+// CallState is a call's position in the state machine.
+// From SUBMITTED, a call can reach REJECTED, CANCELED, or DEADLINE
+// (terminal pre-publication).
+// From SUBMITTED, a call transitions to PUBLISHED, then from PUBLISHED can
+// reach COMPLETED, FAILED, CANCELED, DEADLINE, or OUTCOME_UNKNOWN.
 // Every transition is a single CompareAndSwap on call.state; the first CAS to
-// land from a live source state wins, and whichever transition wins is the
-// terminal one — there is no "undo".
+// land from a live source state wins.
+// Whichever transition wins is the terminal one — there is no "undo".
 type CallState int32
 
 const (
@@ -120,12 +120,13 @@ type call struct {
 	deadline time.Time // absolute, re-anchored from the budget at Submit time; zero means none
 }
 
-// Table is the per-ClientConn request table keyed by call ID, monotonic within
-// generation and never reused within it — the "no tombstones"
-// guarantee rests entirely on this: any Frame whose CallID is absent from calls
-// is by construction late-or-unknown, because a live ID is always present until
-// its terminal transition removes it, and a never-issued or already-terminal ID
-// is never re-issued within the same generation.
+// Table is the per-connection request table keyed by call ID.
+// Call IDs are monotonic within a generation and never reused within it.
+// The "no tombstones" guarantee rests entirely on this: any Frame whose CallID
+// is absent from calls is by construction late-or-unknown, because a live ID is
+// always present until its terminal transition removes it.
+// A never-issued or already-terminal ID is never re-issued within the same
+// generation.
 type Table struct {
 	generation uint64
 	nextID     atomic.Uint64
@@ -160,27 +161,26 @@ func (t *Table) NextID() uint64 {
 	return t.nextID.Add(1)
 }
 
-// Reanchor converts a remaining-duration deadline budget, as carried on the
-// wire (a deadline travels as remaining budget rather than an absolute time,
-// and is re-anchored to the receiver's monotonic clock), to an absolute
-// deadline using the LOCAL monotonic clock captured in receivedAt — never the
-// sender's clock, so
-// wall-clock skew or adjustment between processes can neither expire nor extend
-// a call. receivedAt must carry a monotonic reading (as time.Now() does) for the
-// result to be monotonic.
+// Reanchor converts a remaining-duration deadline budget (as carried on the
+// wire) to an absolute deadline using the LOCAL monotonic clock captured in
+// receivedAt — never the sender's clock, so wall-clock skew or adjustment
+// between processes can neither expire nor extend a call.
+// receivedAt must carry a monotonic reading (as time.Now() does) for the result
+// to be monotonic.
 func Reanchor(budget time.Duration, receivedAt time.Time) time.Time {
 	return receivedAt.Add(budget)
 }
 
-// Submit allocates a new call ID (monotonic, never reused within generation) and
-// registers it as StateSubmitted. It returns the ID and a wait function the
-// caller invokes (blocking on its ctx, the re-anchored deadline, or the eventual
-// Result) to retrieve the outcome — Submit itself never blocks.
-//
+// Submit allocates a new call ID (monotonic, never reused within generation)
+// and registers it as StateSubmitted.
+// It returns the ID and a wait function the caller invokes (blocking on its
+// ctx, the re-anchored deadline, or the eventual Result) to retrieve the
+// outcome.
+// Submit itself never blocks.
 // ctx is accepted for admission/tracing symmetry with the rest of the RPC
 // surface; the call's deadline derives from budget (the wire-carried remaining
-// budget), not from ctx, so an abandoned submit context does not by itself
-// cancel or expire the call.
+// budget), not from ctx.
+// An abandoned submit context does not by itself cancel or expire the call.
 func (t *Table) Submit(
 	ctx context.Context, budget time.Duration,
 ) (uint64, func(ctx context.Context) (Result, error)) {
@@ -225,13 +225,13 @@ func (t *Table) Submit(
 }
 
 // Publish transitions id from StateSubmitted to StatePublished via CAS, called
-// by the writer goroutine immediately before it emits the request Frame —
-// publication and the CAS are the same atomic decision point cancellation
-// races against. It returns false (and performs no transition) if id is not
-// currently StateSubmitted (already terminated — most commonly already
-// StateCanceled), which tells the writer goroutine to silently NOT emit the
-// Frame: a cancel that wins before PUBLISHED means the descriptor is never
-// written.
+// by the writer goroutine immediately before it emits the request Frame.
+// Publication and the CAS are the same atomic decision point cancellation races
+// against.
+// It returns false (and performs no transition) if id is not currently
+// StateSubmitted (already terminated, most commonly already StateCanceled), which
+// tells the writer goroutine to silently NOT emit the Frame.
+// A cancel that wins before PUBLISHED means the descriptor is never written.
 func (t *Table) Publish(id uint64) bool {
 	t.mu.Lock()
 	c, ok := t.calls[id]
@@ -245,10 +245,10 @@ func (t *Table) Publish(id uint64) bool {
 
 // Cancel transitions id to StateCanceled from either StateSubmitted
 // (pre-publication: no Frame is ever sent) or StatePublished (post-publication:
-// the caller must still separately emit a data-plane CANCEL Frame — Cancel itself
-// only updates local state and does not touch the Transport). It returns false if
-// id is already in any other terminal state (first-terminal-wins; a late Cancel
-// after e.g. StateCompleted is a no-op).
+// the caller must still separately emit a data-plane CANCEL Frame).
+// Cancel itself only updates local state and does not touch the Transport.
+// It returns false if id is already in any other terminal state
+// (first-terminal-wins; a late Cancel after e.g. StateCompleted is a no-op).
 func (t *Table) Cancel(id uint64) bool {
 	return t.terminate(id, StateCanceled, Result{Err: ErrCanceledLocally}, StateSubmitted, StatePublished)
 }
@@ -294,26 +294,24 @@ func (t *Table) Reject(id uint64, err error) bool {
 }
 
 // FailAll terminates every in-flight call and wakes all waiters — the
-// mechanism teardown uses to fail every outstanding call, since a
-// zero-budget abandoned call has no deadline timer to reap it, so FailAll is
+// mechanism teardown uses to fail every outstanding call.
+// A zero-budget abandoned call has no deadline timer to reap it, so FailAll is
 // its only exit.
-//
 // It splits by dispatch state, delivering a different error per class so the
 // caller layer's retryability classifier stays correct:
-//
-//   - A call still StateSubmitted had its request frame provably never
-//     published (the writer never emitted it), so its handler cannot have run.
-//     It terminates REJECTED with notDispatchedErr — the retryable,
-//     crash-before-dispatch class.
-//   - A call already StatePublished may have reached the handler, so its
-//     outcome is genuinely unknown. It terminates OUTCOME_UNKNOWN with
-//     dispatchedErr — the never-retryable class.
-//
+// A call still StateSubmitted had its request frame provably never published
+// (the writer never emitted it), so its handler cannot have run.
+// It terminates REJECTED with notDispatchedErr — the retryable,
+// crash-before-dispatch class.
+// A call already StatePublished may have reached the handler, so its outcome is
+// genuinely unknown.
+// It terminates OUTCOME_UNKNOWN with dispatchedErr — the never-retryable class.
 // The two-CAS-attempt ordering handles the publication race: try
 // Submitted→Rejected first; if it loses, the call was Published, so
-// Published→OutcomeUnknown. A call that already reached a terminal state is
-// skipped by both (first-terminal-wins), so FailAll is safe to call once per
-// teardown even as responses race in.
+// Published→OutcomeUnknown.
+// A call that already reached a terminal state is skipped by both
+// (first-terminal-wins), so FailAll is safe to call once per teardown even as
+// responses race in.
 func (t *Table) FailAll(dispatchedErr, notDispatchedErr error) {
 	t.mu.Lock()
 	ids := make([]uint64, 0, len(t.calls))
@@ -331,14 +329,15 @@ func (t *Table) FailAll(dispatchedErr, notDispatchedErr error) {
 }
 
 // terminate atomically CASes the call from the first matching source state in
-// from to the terminal state to, then — for the single CAS winner only —
-// delivers r on the call's resultCh and removes the call from the table.
-//
+// from to the terminal state to.
+// For the single CAS winner only, it delivers r on the call's resultCh and
+// removes the call from the table.
 // The CAS is the sole arbitration point: at most one goroutine can win it for a
 // given call, so resultCh receives exactly one send and the table sees exactly
-// one delete. A losing transition (state already moved by a concurrent winner)
-// returns false without touching resultCh or the map — the late-frame-discard
-// path. Trying the source states in order handles the publication race: a Cancel
+// one delete.
+// A losing transition (state already moved by a concurrent winner) returns false
+// without touching resultCh or the map — the late-frame-discard path.
+// Trying the source states in order handles the publication race: a Cancel
 // finds StateSubmitted (pre-publication) or, if Publish won first, StatePublished
 // (post-publication).
 func (t *Table) terminate(id uint64, to CallState, r Result, from ...CallState) bool {

@@ -9,18 +9,17 @@ import (
 )
 
 // StreamTable is the call-ID-keyed registry of open streams for one connection
-// generation — the streaming analogue of the unary request table. It owns the
-// connection-wide ACK machinery: one intrusive FIFO arming queue and one
-// ack-dispatch goroutine (stream-protocol.md §5.5), so the reader/Dispatch path
-// only ever sets a flag and appends, never blocks on an outbound Send.
-//
+// generation — the streaming analogue of the unary request table.
+// It owns the connection-wide ACK machinery: one intrusive FIFO arming queue
+// and one ack-dispatch goroutine, so the reader/Dispatch path only ever sets a
+// flag and appends, never blocks on an outbound Send.
 // The transport is injected by constructor parameter rather than per call: the
 // ack-dispatch goroutine and every teardown frame need it, it is fixed for the
 // table's whole life (one table per connection generation), and a constructor
 // parameter closes the window in which the table exists but cannot yet emit a
-// lifecycle frame. Every lifecycle Send (STREAM_ACK, teardown CANCEL) runs under
-// the table's connection context (§5.1); every data-lane Send runs under a
-// stream's own context (§4.5).
+// lifecycle frame.
+// Every lifecycle Send (STREAM_ACK, teardown CANCEL) runs under the table's
+// connection context; every data-lane Send runs under a stream's own context.
 type StreamTable struct {
 	maxOpen int
 	tr      transport.Transport
@@ -125,23 +124,25 @@ type StreamTable struct {
 }
 
 // emitJob is one queued data-lane STREAM_ERR for the connection emitter to
-// publish (stream-protocol.md §9.1): the call ID and the status body it carries.
-// reject marks the rejection class (a refused STREAM_OPEN that created no stream
-// state, whose rate a peer controls), which is admitted only against the queue's
-// reserve; teardown (step 1) and handler-error (step 4) jobs, each costing the
-// peer a stream, are admitted whenever the queue is not full.
+// publish: the call ID and the status body it carries.
+// reject marks the rejection class (a refused STREAM_OPEN that created no
+// stream state, whose rate a peer controls), which is admitted only against the
+// queue's reserve.
+// Teardown (step 1) and handler-error (step 4) jobs, each costing the peer a
+// stream, are admitted whenever the queue is not full.
 type emitJob struct {
 	callID uint64
 	status *transport.FrameStatus
 	reject bool
 	// keepObligation marks a teardown STREAM_ERR whose stream still owes its
-	// load-bearing terminal CANCEL to an outstanding STREAM_ACK holder: the
-	// STREAM_ERR is the pair's droppable frame (§9 tolerates its loss because the
-	// CANCEL carries the outcome), so its delivery must NOT close the response
-	// obligation — that close belongs solely to the CANCEL's handoff in
-	// releaseAckToken. Without this, the emitter racing the parked ack could close
-	// the obligation while the load-bearing teardown is still stuck, hiding
-	// exactly the stalled teardown the obligation accounting exists to expose.
+	// load-bearing terminal CANCEL to an outstanding STREAM_ACK holder.
+	// The STREAM_ERR is the pair's droppable frame (its loss is tolerated because
+	// the CANCEL carries the outcome), so its delivery must NOT close the
+	// response obligation — that close belongs solely to the CANCEL's handoff in
+	// releaseAckToken.
+	// Without this, the emitter racing the parked ack could close the obligation
+	// while the load-bearing teardown is still stuck, hiding exactly the stalled
+	// teardown the obligation accounting exists to expose.
 	keepObligation bool
 }
 

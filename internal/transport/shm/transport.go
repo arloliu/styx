@@ -61,9 +61,9 @@ type AttachParams struct {
 	Config Config
 }
 
-// regionHandle is the region surface Attach consumes: geometry, the mapped
-// bytes to carve, the fd, and teardown. *shm.Region satisfies it; a test
-// substitutes a double to assert Attach's validate-before-construct ordering.
+// regionHandle is the region interface Attach consumes: geometry, mapped bytes,
+// fd, and teardown. *shm.Region satisfies it; a test substitutes a double to
+// assert Attach's validate-before-construct ordering.
 type regionHandle interface {
 	Layout() shm.Layout
 	Bytes() []byte
@@ -73,12 +73,12 @@ type regionHandle interface {
 
 var _ regionHandle = (*shm.Region)(nil)
 
-// inboundReader is the consumer's view of its inbound ring: the seq_cst tail load
-// the waiter observes new work through (shm-abi.md §11), and the peek/advance the
-// drain loop consumes with, copy-before-advance (shm-abi.md §9). Narrowing
+// inboundReader is the consumer's view of its inbound ring: the seq_cst tail
+// the waiter observes new work through (shm-abi.md §11), and the peek/advance
+// the drain loop uses with copy-before-advance (shm-abi.md §9). Narrowing
 // *ring.Ring to these lets a test substitute a ring whose Peek lands teardown
-// between the drain loop's top gate and its post-copy dispatch gate — the §9 race
-// a concrete *ring.Ring cannot be forced into.
+// between the drain loop's top gate and its post-copy dispatch gate, a race a
+// concrete *ring.Ring cannot be forced into.
 type inboundReader interface {
 	Peek() (ring.Descriptor, ring.PeekStatus)
 	Advance()
@@ -95,17 +95,15 @@ type inboundReader interface {
 
 var _ inboundReader = (*ring.Ring)(nil)
 
-// Construction seams, overridable in tests to assert that a config which fails
-// admission constructs no writer or arena (the region is opened, validated, and
-// closed, with neither seam reached).
+// Construction seams: overridable in tests to assert that a config failing
+// admission constructs no writer or arena (the region is opened, validated,
+// and closed with neither seam reached).
 var (
 	// attachOpenRegion wraps shm.OpenRegion, preserving its Phase-1-vs-Phase-2
-	// failure contract: a Phase 1 failure returns (nil, err) -- nothing was
-	// mapped -- while a Phase 2 failure returns the still-mapped region
-	// ALONGSIDE the error, so Attach can poison it (shm-abi.md §1:296) before
-	// closing it. A nil *shm.Region must become a nil regionHandle, not a
-	// non-nil interface wrapping a nil pointer, hence the explicit guard
-	// rather than a bare `return r, err`.
+	// failure contract. A Phase 1 failure returns (nil, err); a Phase 2 failure
+	// returns the still-mapped region alongside the error, so Attach can poison
+	// it before closing (shm-abi.md §1:296). A nil *shm.Region must become nil
+	// regionHandle, not a non-nil interface with nil pointer.
 	attachOpenRegion = func(fd int, size uint64) (regionHandle, error) {
 		r, err := shm.OpenRegion(fd, size)
 		if r == nil {
@@ -117,20 +115,18 @@ var (
 	attachNewArena  = arena.New
 	attachNewWriter = newRegionWriter
 	// attachClock returns the current time for a freshly attached region's
-	// EscalationPolicy: bumpedAt (recovery.go's EscalationPolicy doc) is set
-	// to attachClock() at construction, and the same func is retained on the
-	// Transport (its clock field) so every later escalation.Observe call
-	// during classify uses it too. A package-level seam, like the three
-	// construction seams above, rather than an inline time.Now(): a test
-	// overrides it (before Attach) to drive the grace/rate-window logic
+	// EscalationPolicy. bumpedAt is set to attachClock() at construction, and
+	// the same func is retained on Transport so every later escalation.Observe
+	// call during classify uses it too. A package-level seam so a test can
+	// override it (before Attach) to drive the grace/rate-window logic
 	// deterministically.
 	attachClock = time.Now
 )
 
-// Transport implements transport.Transport over a shared-memory region: one
-// outbound writer (its ring/arena plus the single-writer goroutine) and one
-// inbound SpinWaiter-driven reader, wired to the region's per-direction rings,
-// arenas, and sync-page words (shm-abi.md §1/§3).
+// Transport implements transport.Transport over a shared-memory region: an
+// outbound writer (ring/arena plus single-writer goroutine) and an inbound
+// SpinWaiter-driven reader, wired to the region's per-direction rings, arenas,
+// and sync-page words (shm-abi.md §1/§3).
 type Transport struct {
 	region regionHandle
 
@@ -143,17 +139,15 @@ type Transport struct {
 	inboundEFD        *event.EventFD
 	inboundPark       *event.ParkState
 	shutdownPtr       *uint32
-	// poison wraps the same shared poison word teardownError checks (via
-	// Check) and actuates (via Set) for a detected conformance fault
-	// (shm-abi.md §16) -- the sole access path to that word; there is no
-	// separate raw poison pointer on Transport.
+	// poison wraps the shared poison word teardownError checks (Check) and
+	// actuates (Set) for a detected conformance fault (shm-abi.md §16). This
+	// is the sole access path to that word; there is no separate raw pointer.
 	poison *PoisonFlag
-	// escalation adjudicates the stale-generation discard stream classify
-	// feeds it via Observe (shm-abi.md §15's supervisor-owned policy,
-	// recovery.go's EscalationPolicy doc): a discard stream this side cannot
-	// explain as a single dying predecessor's late writes escalates to
-	// PoisonPeerCrash through the same poison field above. Constructed once
-	// per Attach, scoped to this generation's grace window.
+	// escalation adjudicates the stale-generation discard stream classify feeds
+	// via Observe (recovery.go's EscalationPolicy). A discard stream this side
+	// cannot explain as a single dying predecessor's late writes escalates to
+	// PoisonPeerCrash through poison. Constructed once per Attach, scoped to
+	// this generation's grace window.
 	escalation *EscalationPolicy
 	// clock returns the current time for escalation.Observe's grace/rate-
 	// window evaluation. It is attachClock's value captured at construction
@@ -193,17 +187,15 @@ type Transport struct {
 	outArena *arena.Arena
 
 	// closeMu is the closing gate: Send and Recv hold the read side for their
-	// whole call, since both read region-mapped memory directly on the calling
-	// goroutine (the poison/shutdown words, and Recv's ring/arena/park-state
-	// accesses); Close takes the write side around the munmap, after the
-	// writer goroutine has already been joined, so no data-plane access can
-	// still be touching the mapping when it is unmapped -- closeOnce alone
-	// only dedupes Close itself, it does not exclude a concurrent Send/Recv.
-	// closed is guarded by closeMu and checked before anything else under the
-	// read side: it is what keeps a Send/Recv call that starts AFTER Close has
-	// already unmapped from touching the mapping at all, rather than merely
-	// being excluded from the narrow in-flight-at-close window closeMu's
-	// mutual exclusion alone covers.
+	// whole call, since both read region-mapped memory on the calling goroutine
+	// (poison/shutdown words, and Recv's ring/arena/park-state accesses). Close
+	// takes the write side around the munmap, after the writer goroutine is
+	// joined, so no data-plane access can touch the mapping when it unmaps.
+	// closeOnce alone only dedupes Close, not concurrent Send/Recv. closed is
+	// guarded by closeMu and checked before anything else on the read side: it
+	// keeps a Send/Recv that starts after Close already unmapped from touching
+	// the mapping at all, not merely being excluded from the in-flight window
+	// closeMu alone covers.
 	closeMu   sync.RWMutex
 	closed    bool
 	closeOnce sync.Once
@@ -367,21 +359,17 @@ func (s *producerSignal) fault() error {
 }
 
 // Attach opens the region, validates the capacity invariant against its actual
-// geometry BEFORE allocating any writer or arena state, and — only if valid —
-// carves the per-direction rings, arenas, waiter, and writer for this role
-// (shm-abi.md §1/§18). On a validation failure it munmaps the region and
-// returns the typed error, having constructed nothing.
+// geometry before allocating any writer or arena state, and only if valid
+// carves the per-direction rings, arenas, waiter, and writer (shm-abi.md §1/§18).
+// On validation failure it unmaps the region and returns the typed error,
+// having constructed nothing.
 //
-// A Phase-2 structural geometry failure (shm.ErrBadGeometry) is a special
-// case of "validation failure": attachOpenRegion still returns the
-// still-mapped region alongside that error (shm.OpenRegion's contract, see
-// internal/shm/region.go's doc), and Attach poisons it with
-// PoisonBadGeometry -- the full §16 poison(cause) helper: CAS, shutdown
-// store, both eventfd writes -- BEFORE closing it (shm-abi.md §1:296: the
-// poison word is known-addressable because Phase 1 already proved the
-// mapping is at least minRegionSize long). A Phase-1 failure
-// (shm.ErrAttachRejected) returns a nil region and is never poisoned --
-// nothing was ever mapped.
+// A Phase-2 structural geometry failure (shm.ErrBadGeometry) is a special case:
+// attachOpenRegion returns the still-mapped region alongside the error, so
+// Attach can poison it with PoisonBadGeometry (the full §16 poison(cause)
+// helper: CAS, shutdown store, both eventfd writes) before closing
+// (shm-abi.md §1:296). A Phase-1 failure (shm.ErrAttachRejected) returns nil
+// and is never poisoned: nothing was mapped.
 func Attach(p AttachParams) (*Transport, error) {
 	region, err := attachOpenRegion(p.RegionFD, p.ExpectedSize)
 	if err != nil {
@@ -530,18 +518,16 @@ func (t *Transport) signalFault() error {
 	return t.signal.fault()
 }
 
-// Send hands the frame to the outbound writer on the lane its kind selects —
-// CANCEL to the lifecycle lane, every other kind to the data lane — after
-// bounding its payload by the negotiated max_payload (shm-abi.md §18). A
-// poisoned or shut-down region is refused at admission, before it reaches the
-// writer (shm-abi.md §16's producer-side detection point, top of Admit);
-// otherwise it returns the writer's result verbatim (ctx-cancel, backpressure,
+// Send hands the frame to the outbound writer on its lane: CANCEL to the
+// lifecycle lane, other kinds to the data lane. It bounds the payload by the
+// negotiated max_payload (shm-abi.md §18). A poisoned or shut-down region is
+// refused at admission, before the writer (shm-abi.md §16's producer-side
+// detection); otherwise it returns the writer's result (ctx-cancel, backpressure,
 // or transport.ErrClosed).
 //
 // It holds the closing gate's read side for its whole call, since the
-// admission check reads region-mapped memory (the poison/shutdown words)
-// directly on the calling goroutine: Close must not unmap while that read is
-// in flight (see Transport.closeMu's doc).
+// admission check reads region-mapped memory (poison/shutdown words) on the
+// calling goroutine. Close must not unmap while that read is in flight.
 func (t *Transport) Send(ctx context.Context, f transport.Frame) error {
 	t.closeMu.RLock()
 	defer t.closeMu.RUnlock()
@@ -677,19 +663,18 @@ func (t *Transport) ReadableNow() bool {
 	return !t.inboundRing.Empty()
 }
 
-// Recv waits for inbound work, drains descriptors from the inbound ring in
-// order, and returns the next deliverable frame (shm-abi.md §9/§11). It
-// discards stale-generation descriptors without reading their slab (§15) and
-// distinguishes a poisoned region (ErrPoisoned) from a graceful shutdown
-// (transport.ErrClosed, shm-abi.md §16). A conformance fault poisons the
-// region (the §16 actuation this package owns) and is returned as its own
-// typed error, not ErrPoisoned — the specific fault is more informative to
-// this caller; a later Send/Recv call observes ErrPoisoned instead.
+// Recv waits for inbound work, drains descriptors in order, and returns the
+// next deliverable frame (shm-abi.md §9/§11). It discards stale-generation
+// descriptors without reading their slab (§15) and distinguishes a poisoned
+// region (ErrPoisoned) from graceful shutdown (transport.ErrClosed, §16). A
+// conformance fault poisons the region and is returned as its own typed error,
+// not ErrPoisoned; the specific fault is more informative to this caller. A
+// later Send/Recv observes ErrPoisoned instead.
 //
 // It holds the closing gate's read side for its whole call: the waiter and
 // drain read region-mapped memory (ring, arena, park-state, poison/shutdown
-// words) throughout, including while blocked, so Close must not unmap while
-// any of that is in flight (see Transport.closeMu's doc).
+// words) throughout, including while blocked. Close must not unmap while any
+// of that is in flight.
 func (t *Transport) Recv(ctx context.Context) (transport.Frame, error) {
 	return t.recvCore(ctx, nil)
 }
@@ -1117,31 +1102,23 @@ func (t *Transport) SetWriterStuckObserverForTest(fn func()) {
 	})
 }
 
-// Close performs teardown step 4: it stops the outbound writer (draining
-// pending intents with transport.ErrClosed) and munmaps the region, exactly
-// once even under concurrent or repeated calls (shm-abi.md §16 / design
-// lifecycle). Steps 1-3 (admission stop, waiter wake, goroutine join) are the
-// caller's and are not re-performed here; the region fd the caller passed is
-// closed by the caller after Close returns. The eventfds are the caller's too,
-// so Close does not close them.
+// Close performs teardown step 4: stops the outbound writer (draining pending
+// intents with transport.ErrClosed) and unmaps the region, exactly once even
+// under concurrent or repeated calls (shm-abi.md §16). Steps 1-3 (admission
+// stop, waiter wake, goroutine join) are the caller's; the region fd and
+// eventfds are the caller's to close.
 //
-// Close is StopWriter composed with the region release: it repeats the writer
-// stop (idempotent) and, whether or not StopWriter already ran, munmaps the
-// region under the write side. A prior StopWriter leaves shutdown already set,
-// which is harmless (the store is idempotent) and does not change what Close does.
+// Close is StopWriter composed with the region release. A prior StopWriter
+// leaves shutdown already set, which is harmless (the store is idempotent).
 //
-// closeOnce alone dedupes concurrent/repeated Close calls, but does not by
-// itself exclude a Send/Recv call still touching the mapping when munmap
-// runs — a real fd-reuse hazard, since a virtual address freed by munmap can
-// be reused by a later, unrelated mapping. The munmap therefore runs under
-// closeMu's write side, which waits for every in-flight Send/Recv (holding
-// the read side for their whole call) to finish first, and sets closed = true
-// in the same critical section so any Send/Recv call that starts afterward
-// observes it and returns transport.ErrClosed immediately, before touching
-// the mapping at all. outbound.stop() runs before that: it joins the writer
-// goroutine and drains every queued intent with transport.ErrClosed, which
-// also unblocks any caller currently blocked inside Send's submit — so by the
-// time Close waits on closeMu, no Send call should still be in flight either.
+// closeOnce alone dedupes Close but does not exclude a Send/Recv still
+// touching the mapping when munmap runs (a real fd-reuse hazard). The munmap
+// runs under closeMu's write side, which waits for every in-flight Send/Recv
+// (holding the read side) to finish first, and sets closed = true so any
+// Send/Recv that starts afterward observes it and returns transport.ErrClosed
+// immediately, before touching the mapping. outbound.stop() runs before that:
+// it joins the writer and drains every queued intent with transport.ErrClosed,
+// unblocking any caller blocked in Send's submit.
 func (t *Transport) Close() error {
 	t.closeOnce.Do(func() {
 		t.outbound.stop()

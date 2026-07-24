@@ -26,9 +26,9 @@ func main() {
 	}
 }
 
-// realMain is the testable body: it loads the baseline, optionally enforces the
-// regime guard, parses the result files, evaluates the gate, prints the report,
-// and returns a non-nil error when the gate fails.
+// realMain is the testable body: it loads the baseline, optionally
+// verifies the CPU quota, parses the result files, evaluates the gate,
+// prints the report, and returns a non-nil error when the gate fails.
 func realMain(baselinePath string, requireQuota float64, resultPaths []string) error {
 	blData, err := os.ReadFile(baselinePath)
 	if err != nil {

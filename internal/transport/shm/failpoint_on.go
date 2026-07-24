@@ -2,11 +2,10 @@
 
 package shm
 
-// failpointEnabled is true only under the failpoint build tag, which the
-// cross-process crash-window matrix uses to install real Failpoints (via
-// SetFailpoints) and pause the writer at a chosen correctness-defining point —
-// after the payload write, after the tail publish, before the consumer wakeup,
-// after a slab release, or before the region unmap. This build exists solely for
-// that proof, never for production — the default build (failpoint_off.go)
-// compiles the seams out entirely.
+// failpointEnabled is true only under the failpoint build tag. The crash-window
+// test matrix uses this to install real Failpoints (via SetFailpoints) and pause
+// the writer at a chosen correctness-critical point: after payload write, after
+// tail publish, before consumer wakeup, after slab release, or before region
+// unmap. This build exists only for that test, never for production — the
+// default build (failpoint_off.go) compiles the seams out entirely.
 const failpointEnabled = true

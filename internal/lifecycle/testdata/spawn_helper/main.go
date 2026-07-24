@@ -1,9 +1,9 @@
-// Command spawn_helper is a test fixture for lifecycle.Spawn. It inspects
-// the environment Spawn handed it — the inherited control fd (fd 3), the
-// PR_SET_PDEATHSIG armed by SysProcAttr, and the sanitized env — and writes
-// what it found as key=value lines to the file named by $STYX_REPORT (so
-// the parent can read the result without depending on how Spawn wires the
-// child's stdio), then exits 0.
+// Command spawn_helper is a test fixture for lifecycle.Spawn.
+// It inspects the environment Spawn handed it (the inherited control fd,
+// PR_SET_PDEATHSIG armed by SysProcAttr, and the sanitized env) and writes
+// what it found as key=value lines to the file named by $STYX_REPORT
+// (so the parent can read the result without depending on how Spawn wires stdout),
+// then exits 0.
 package main
 
 import (
@@ -15,9 +15,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// controlFD is the first (and, for now, only) intentionally inherited
-// bootstrap fd: the child end of the control socketpair, per
-// lifecycle.Spawn.
+// controlFD is the first (and currently only) intentionally inherited bootstrap fd:
+// the child end of the control socketpair, per lifecycle.Spawn.
 const controlFD = 3
 
 func main() {
@@ -38,8 +37,8 @@ func main() {
 	}
 }
 
-// fdSockType returns fd's SO_TYPE (e.g. unix.SOCK_SEQPACKET), or -1 if fd is
-// not a socket / not open.
+// fdSockType returns fd's SO_TYPE (e.g. unix.SOCK_SEQPACKET), or -1 if
+// fd is not a socket or not open.
 func fdSockType(fd int) int {
 	t, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
 	if err != nil {
@@ -49,8 +48,8 @@ func fdSockType(fd int) int {
 	return t
 }
 
-// getPdeathsig returns the current PR_SET_PDEATHSIG signal number (0 if none
-// is armed), read back via PR_GET_PDEATHSIG.
+// getPdeathsig returns the current PR_SET_PDEATHSIG signal number (0 if none is armed),
+// read back via PR_GET_PDEATHSIG.
 func getPdeathsig() int {
 	var sig int
 	if err := unix.Prctl(unix.PR_GET_PDEATHSIG, uintptr(unsafe.Pointer(&sig)), 0, 0, 0); err != nil {

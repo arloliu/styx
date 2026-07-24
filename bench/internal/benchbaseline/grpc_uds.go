@@ -27,6 +27,7 @@ type GRPCUDSBaseline struct {
 	client   pingpb.PingClient
 }
 
+// NewGRPCUDS returns a new GRPCUDSBaseline.
 func NewGRPCUDS() *GRPCUDSBaseline { return &GRPCUDSBaseline{} }
 
 func (g *GRPCUDSBaseline) Name() string { return "grpc-uds" }
@@ -41,7 +42,8 @@ func (g *GRPCUDSBaseline) Start() error {
 	_ = os.Remove(path)
 	g.sockPath = path
 
-	//nolint:noctx // benchmark-harness Start has no ctx param; matches every other baseline in this package
+	// Start has no ctx param, matching every other baseline in this package.
+	//nolint:noctx
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return err
@@ -76,9 +78,8 @@ func (g *GRPCUDSBaseline) Stop() error {
 	if g.srv != nil {
 		g.srv.GracefulStop()
 	}
-	// GracefulStop closes the listener, which already unlinks the socket
-	// file it created; os.IsNotExist here just means we lost that race,
-	// not a teardown failure.
+	// GracefulStop closes the listener, which already unlinks the socket file.
+	// os.IsNotExist here means we lost the race to unlink, not a teardown failure.
 	if err := os.Remove(g.sockPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}

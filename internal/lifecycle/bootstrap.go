@@ -16,28 +16,21 @@ import (
 // AFTER it is armed.
 var initialPPID = os.Getppid()
 
-// InstallDeathSignal enforces the "a plugin never outlives its host"
-// invariant on the plugin side. It is meant to be the very first statement
-// of PluginServer.Serve, before any other setup.
+// InstallDeathSignal enforces that a plugin process does not outlive its host.
+// It should be called at the start of PluginServer.Serve, before any other setup.
 //
-// It arms PR_SET_PDEATHSIG(SIGKILL) as a backstop (the kernel SIGKILLs this
-// process if its parent later dies), then immediately re-checks
-// unix.Getppid(): if the parent no longer matches initialPPID — the original
-// host died and this process was reparented to a subreaper or to init/PID 1 —
-// the process is orphaned and must not keep running. In that case it calls
-// os.Exit(1) and never returns; otherwise it returns normally. Arming the
-// signal is best-effort: a Prctl failure does not by itself orphan the
-// process, so it is not treated as fatal — the getppid re-check is the
-// authoritative orphan test.
+// It arms PR_SET_PDEATHSIG(SIGKILL) to ensure the kernel kills this process if
+// its parent dies. It then immediately re-checks unix.Getppid(): if the parent
+// no longer matches the initial parent captured at package initialization, the
+// original host died and this process was reparented to a subreaper or init/PID 1,
+// meaning it is orphaned. The process exits with code 1 in that case.
+// Otherwise it returns normally. Arming the signal is best-effort: a Prctl failure
+// does not by itself make the process orphaned, so it is not treated as fatal —
+// the getppid re-check is the authoritative orphan test.
+// This function unconditionally calls os.Exit(1) on orphan detection, enforcing
+// the invariant that an orphaned plugin never continues running.
 //
-// The os.Exit below IS the safety contract this function exists to provide
-// — a caller that forgot to check a returned bool would reintroduce the
-// exact "orphaned plugin keeps running" failure this guards against.
-// Covered end to end by
-// TestInstallDeathSignal_ExitsChild_WhenOriginalParentDiesBeforeInstall via
-// testdata/deathsig_helper, a real spawned child process.
-//
-//nolint:revive // deep-exit: see doc above
+//nolint:revive // deep-exit: enforces the orphan-detection invariant
 func InstallDeathSignal() {
 	// Best-effort backstop; the getppid re-check below is authoritative.
 	_ = unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(unix.SIGKILL), 0, 0, 0)
@@ -49,14 +42,13 @@ func InstallDeathSignal() {
 	}
 }
 
-// orphaned reports whether the process was reparented away from its original
-// parent — the host died in the fork→PR_SET_PDEATHSIG-install window, which
-// the signal alone cannot cover. A plain getppid mismatch is the entire test:
-// deliberately NOT "currentPPID == 1", because a host that legitimately runs
-// as PID 1 (a container with no init shim — some deployments ship host and
-// plugins in one container) has a live parent whose pid IS 1, and initialPPID
-// captured it as 1; a "== 1" clause would then wrongly kill every plugin. Real
-// reparenting to init is already caught by the mismatch (1 != the host's pid).
+// orphaned reports whether the process was reparented away from its original parent.
+// This detects the fork to PR_SET_PDEATHSIG install window, which the signal alone
+// cannot cover. The test is a plain getppid mismatch: deliberately not "currentPPID == 1",
+// because a host running as PID 1 (e.g. in a container with no init shim) has a live
+// parent whose PID is 1, and this would have captured that as the original.
+// A "== 1" clause would then wrongly kill every plugin, whereas real reparenting to
+// init is already caught by the mismatch (1 != the original host's PID).
 func orphaned(currentPPID, originalPPID int) bool {
 	return currentPPID != originalPPID
 }

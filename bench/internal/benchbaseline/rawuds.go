@@ -8,28 +8,28 @@ import (
 	"sync"
 )
 
-// RawUDSBaseline is a length-prefixed echo server over a Unix domain
-// socket, no framing library, no RPC layer — the floor for any UDS-based
-// transport.
+// RawUDSBaseline is a length-prefixed echo server over a Unix domain socket with no
+// framing library or RPC layer — the floor for any UDS-based transport.
 type RawUDSBaseline struct {
 	sockPath string
 	ln       net.Listener
 	conn     net.Conn
 
-	// callMu serializes Call: the wire protocol carries no correlation ID
-	// (just a length prefix + payload, matched to its response purely by
-	// FIFO order on one stream), and each round trip is two separate
-	// Write() calls (length, then payload) rather than one. Two goroutines
-	// calling Call concurrently without this lock can interleave those
-	// writes mid-frame (e.g. A's length prefix, then B's length prefix,
-	// then A's payload) and permanently desync the stream — confirmed by a
-	// concurrent-Call stress test hanging every run at concurrency>=64
-	// before this fix. The benchmark suite is what first exercises this
-	// baseline concurrently; concurrency=1 callers pay an uncontended
-	// lock/unlock, negligible next to a syscall round trip.
+	// callMu serializes Call.
+	// The wire protocol carries no correlation ID; each round trip consists of two separate
+	// Write() calls (length prefix, then payload), and responses are matched to requests by
+	// FIFO order on one stream.
+	// Two goroutines calling Call concurrently without this lock can interleave writes
+	// mid-frame (e.g., A's length prefix, then B's length prefix, then A's payload) and
+	// permanently desync the stream; this was confirmed by a concurrent-Call stress test
+	// that hung at every run with concurrency >= 64 before this fix.
+	// The benchmark suite is the first consumer to exercise this baseline concurrently;
+	// at concurrency=1 callers pay an uncontended lock/unlock, which is negligible
+	// compared to a syscall round trip.
 	callMu sync.Mutex
 }
 
+// NewRawUDS returns a new RawUDSBaseline.
 func NewRawUDS() *RawUDSBaseline { return &RawUDSBaseline{} }
 
 func (r *RawUDSBaseline) Name() string { return "raw-uds" }
@@ -44,7 +44,8 @@ func (r *RawUDSBaseline) Start() error {
 	_ = os.Remove(path)
 	r.sockPath = path
 
-	//nolint:noctx // benchmark-harness Start has no ctx param; matches every other baseline in this package
+	// Start has no ctx param, matching every other baseline in this package.
+	//nolint:noctx
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return err
@@ -52,7 +53,8 @@ func (r *RawUDSBaseline) Start() error {
 	r.ln = ln
 	go r.serve()
 
-	//nolint:noctx // see above
+	// Start has no ctx param, matching every other baseline in this package.
+	//nolint:noctx
 	conn, err := net.Dial("unix", path)
 	if err != nil {
 		return err
@@ -67,7 +69,8 @@ func (r *RawUDSBaseline) Call(payload []byte) ([]byte, error) {
 	defer r.callMu.Unlock()
 
 	lenBuf := make([]byte, 4)
-	//nolint:gosec // payload is this benchmark's own generated request, well under 4GiB
+	// Payload is the benchmark's own generated request, well under 4GiB.
+	//nolint:gosec
 	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
 	if _, err := r.conn.Write(lenBuf); err != nil {
 		return nil, err
@@ -94,9 +97,8 @@ func (r *RawUDSBaseline) Stop() error {
 	if r.ln != nil {
 		_ = r.ln.Close()
 	}
-	// The Listener's Close (above) already unlinks the socket file it
-	// created; os.IsNotExist here just means we lost that race, not a
-	// teardown failure.
+	// Listener.Close already unlinks the socket file.
+	// os.IsNotExist here means we lost the race to unlink, not a teardown failure.
 	if err := os.Remove(r.sockPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}

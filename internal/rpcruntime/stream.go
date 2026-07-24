@@ -22,14 +22,15 @@ const (
 	ServerStream
 )
 
-// StreamShape is a stream method's gRPC-shaped direction set (stream-protocol.md
-// §6.3), fixed by the method's generated code on both sides. It is carried
-// explicitly in StreamConfig rather than inferred from the initial request's
-// length: a server-streaming request MAY be zero bytes (§2.3), so payload length
-// cannot distinguish the shapes. Each side sets it from what it knows locally —
-// the opener from the method it is calling, the accepter from the registered
-// handler's declared shape — never from the wire (§7.4); a disagreement is the
-// §7.3 shape-mismatch case, surfaced as a forbidden-direction frame.
+// StreamShape is a stream method's gRPC-shaped direction set, fixed by the
+// method's generated code on both sides.
+// It is carried explicitly in StreamConfig rather than inferred from the initial
+// request's length: a server-streaming request MAY be zero bytes, so payload
+// length cannot distinguish the shapes.
+// Each side sets it from what it knows locally — the opener from the method it
+// is calling, the accepter from the registered handler's declared shape — never
+// from the wire; a disagreement is a shape-mismatch case surfaced as a
+// forbidden-direction frame.
 type StreamShape uint8
 
 const (
@@ -78,46 +79,46 @@ type StreamOutcome struct {
 }
 
 // StreamConfig is the per-stream configuration established at STREAM_OPEN.
-// Credits is the negotiated per-direction credit N (stream-protocol.md §4.7);
-// zero defaults to the protocol's N_max of 16. Deadline is the stream's budget
-// (stream-protocol.md §2.3), re-anchored to the local clock at open.
-//
+// Credits is the negotiated per-direction credit N; zero defaults to the
+// protocol's N_max of 16.
+// Deadline is the stream's budget, re-anchored to the local clock at open.
 // Service and Method are the FNV-1a-64 routing hashes every STREAM_MSG carries
-// alongside its remaining budget (stream-protocol.md §2.3): STREAM_MSG is a
-// service-routed dispatch, unlike STREAM_ACK/STREAM_CLOSE/STREAM_ERR, which the
-// call ID alone routes. SendMsg stamps these onto each STREAM_MSG; computing
-// their values from the method's service/method names (the FNV-1a-64 hashing
-// OpenStream performs) is supplied by the streaming host layer.
+// alongside its remaining budget: STREAM_MSG is service-routed, unlike
+// STREAM_ACK/STREAM_CLOSE/STREAM_ERR, which the call ID alone routes.
+// SendMsg stamps these onto each STREAM_MSG; computing their values from the
+// method's service/method names is supplied by the streaming host layer.
 type StreamConfig struct {
 	Credits  uint32
 	Deadline time.Duration
 	Service  uint64
 	Method   uint64
-	// Shape is the method's gRPC-shaped direction set (stream-protocol.md §6.3),
-	// set explicitly by each side from what it knows locally — never inferred from
-	// OpenPayload's length. It is the sole discriminant of server-streaming
-	// establishment: for ServerStreaming the opener is half-closed-local and the
-	// accepter half-closed-remote at establishment, and OpenPayload (which MAY be
-	// empty) is delivered as the single request; for ClientStreaming/BidiStreaming
-	// there is no establishment half-close and OpenPayload is unused.
+	// Shape is the method's gRPC-shaped direction set, set explicitly by each
+	// side from what it knows locally — never inferred from OpenPayload's length.
+	// It is the sole discriminant of server-streaming establishment: for
+	// ServerStreaming the opener is half-closed-local and the accepter
+	// half-closed-remote at establishment, and OpenPayload (which MAY be empty) is
+	// delivered as the single request; for ClientStreaming/BidiStreaming there is
+	// no establishment half-close and OpenPayload is unused.
 	Shape StreamShape
 	// OpenPayload is the single request that rides STREAM_OPEN for a
-	// server-streaming method (stream-protocol.md §6.3): the opener puts it on the
-	// STREAM_OPEN frame, and the accepter delivers it to the handler. It is
-	// meaningful only when Shape is ServerStreaming, where it is delivered even
-	// when empty — a zero-byte request is legal (§2.3) and still establishes the
-	// shape. It consumes no stream credit (§4.4). Unused for the other shapes,
-	// whose first message is a STREAM_MSG.
+	// server-streaming method: the opener puts it on the STREAM_OPEN frame, and
+	// the accepter delivers it to the handler.
+	// It is meaningful only when Shape is ServerStreaming, where it is delivered
+	// even when empty — a zero-byte request is legal and still establishes the
+	// shape.
+	// It consumes no stream credit.
+	// Unused for the other shapes, whose first message is a STREAM_MSG.
 	OpenPayload []byte
 	// ParentCtx, when non-nil, is the caller's context the opener side roots the
-	// stream's own context in, so a caller cancellation is observed autonomously by
-	// the deadline watcher and drives the CANCELED terminal even with no subsequent
-	// operation (stream-protocol.md §7.1's CancelStream trigger). It never extends or
-	// shrinks the budget: the stream's context is WithDeadline(ParentCtx, deadline),
-	// keeping the exact instant the budget already resolved to, so an elapsed budget
-	// still records DEADLINE and only a genuine parent cancel records CANCELED. The
-	// accept side has no caller context and leaves it nil, so its context stays rooted
-	// in context.Background exactly as before.
+	// stream's own context in, so a caller cancellation is observed autonomously
+	// by the deadline watcher and drives the CANCELED terminal even with no
+	// subsequent operation.
+	// It never extends or shrinks the budget: the stream's context is
+	// WithDeadline(ParentCtx, deadline), keeping the exact instant the budget
+	// already resolved to, so an elapsed budget still records DEADLINE and only a
+	// genuine parent cancel records CANCELED.
+	// The accept side has no caller context and leaves it nil, so its context
+	// stays rooted in context.Background.
 	ParentCtx context.Context
 }
 
@@ -310,15 +311,15 @@ func (e *StreamStatusError) Error() string {
 }
 
 // Stream is the untyped, transport-facing half of a gRPC-shaped stream sharing
-// one call ID. Generated code wraps it with typed Send/Recv for one method's
-// message types; codec marshal/unmarshal happens in that wrapper, not here —
-// Stream itself moves only []byte.
-//
-// State is held in two separate atomic words per stream-protocol.md §6.1: a
-// phase word (the first-wins terminal CAS, mirroring table.go's call.state) and
-// a close-bits word (two retrying half-close bits). They are deliberately not
-// packed, so a concurrent half-close bit flip can never spuriously fail the
-// terminal CAS.
+// one call ID.
+// Generated code wraps it with typed Send/Recv for one method's message types;
+// codec marshal/unmarshal happens in that wrapper, not here — Stream itself
+// moves only []byte.
+// State is held in two separate atomic words: a phase word (the first-wins
+// terminal CAS, mirroring table.go's call.state) and a close-bits word (two
+// retrying half-close bits).
+// They are deliberately not packed, so a concurrent half-close bit flip can
+// never spuriously fail the terminal CAS.
 type Stream struct {
 	tbl    *StreamTable
 	callID uint64
@@ -362,20 +363,21 @@ type Stream struct {
 	// duplicate handoff can never strand a finisher and hang the table's Close.
 	owedTeardownEmitted atomic.Bool
 
-	// openSendPending gates the opener's teardown emission independently of the phase
-	// word, which is fixed at two live values by stream-protocol.md §6.1. The opener
-	// publishes SUBMITTED->PUBLISHED before it hands the STREAM_OPEN to the transport
-	// (so the §7.2 crash split classifies an accepted open as PUBLISHED, never the
-	// retryable SUBMITTED), but until OpenStream learns the send's fate the engine
-	// still cannot know whether the OPEN reached the wire. While this flag is set a
-	// locally-initiated terminal SUPPRESSES its own §9.1 emission and OpenStream drives
-	// the owed pair strictly after the OPEN (EmitOwedOpenTeardown); OpenStream clears it
-	// (ConfirmOpenSent) once the send has succeeded, after which terminals emit
-	// normally. Only the opener sets it, atomically with admission (OpenClient, before
-	// the deadline watcher can run), so no terminal ever observes an open-in-progress
-	// stream with it clear; a stream admitted for any other purpose leaves it clear, so
-	// its terminals emit at once. Read under stateMu (in casTerminal), so the clear and
-	// the read are serialized with the terminal CAS.
+	// openSendPending gates the opener's teardown emission independently of the
+	// phase word, which is fixed at two live values.
+	// The opener publishes SUBMITTED->PUBLISHED before it hands the STREAM_OPEN
+	// to the transport, but until OpenStream learns the send's fate the engine
+	// still cannot know whether the OPEN reached the wire.
+	// While this flag is set a locally-initiated terminal SUPPRESSES its own
+	// emission and OpenStream drives the owed pair strictly after the OPEN
+	// (EmitOwedOpenTeardown); OpenStream clears it (ConfirmOpenSent) once the send
+	// has succeeded, after which terminals emit normally.
+	// Only the opener sets it, atomically with admission (OpenClient, before the
+	// deadline watcher can run), so no terminal ever observes an open-in-progress
+	// stream with it clear; a stream admitted for any other purpose leaves it
+	// clear, so its terminals emit at once.
+	// Read under stateMu (in casTerminal), so the clear and the read are
+	// serialized with the terminal CAS.
 	openSendPending atomic.Bool
 
 	// Routing hashes every STREAM_MSG carries (§2.3), stamped by SendMsg. Their
@@ -680,12 +682,12 @@ func (s *Stream) isLive() bool {
 	return p == streamSubmitted || p == streamPublished
 }
 
-// SendMsg admits and sends one STREAM_MSG. Credit is reserved before the frame
-// is built (stream-protocol.md §4.5); when credit is exhausted the caller blocks
-// on ctx, the stream's termination, or credit return. The frame is sent under
-// the stream's OWN context (never the caller's or context.Background) so a
-// post-admission context error is terminal for the stream — §4.5's deliberate
-// divergence from the unary Invoke path.
+// SendMsg admits and sends one STREAM_MSG.
+// Credit is reserved before the frame is built; when credit is exhausted the
+// caller blocks on ctx, the stream's termination, or credit return.
+// The frame is sent under the stream's OWN context (never the caller's or
+// context.Background) so a post-admission context error is terminal for the
+// stream — a deliberate divergence from the unary Invoke path.
 func (s *Stream) SendMsg(ctx context.Context, payload []byte) error {
 	if s.sendClosed.Load() {
 		return ErrCanceledLocally // §6.4: no Send after CloseSend
@@ -822,9 +824,10 @@ func isRollbackEligible(err error) bool {
 }
 
 // RecvMsg returns the next delivered message, blocking until one arrives, the
-// stream terminates, or ctx is done. Delivery increments consumed and may arm a
-// STREAM_ACK (stream-protocol.md §4.6). A buffered message is returned ahead of
-// a terminal signal, so a normally completed stream drains before it reports EOF.
+// stream terminates, or ctx is done.
+// Delivery increments consumed and may arm a STREAM_ACK.
+// A buffered message is returned ahead of a terminal signal, so a normally
+// completed stream drains before it reports EOF.
 func (s *Stream) RecvMsg(ctx context.Context) ([]byte, error) {
 	if it, ok := s.drainOne(); ok {
 		return it.payload, nil
@@ -970,36 +973,33 @@ func (s *Stream) recvErr() error {
 	return io.EOF
 }
 
-// CloseSend half-closes this side's send direction (stream-protocol.md §6.4). It
-// emits a STREAM_CLOSE carrying the final sequence number and, only once the
+// CloseSend half-closes this side's send direction.
+// It emits a STREAM_CLOSE carrying the final sequence number and, only once the
 // transport accepts that frame, commits the local close bit (a retrying CAS on
 // the close-bits word), wakes any credit-parked sender (which then fails), and
 // completes the stream if both directions are now closed.
-//
 // The STREAM_CLOSE is sent under a context derived from the stream's own merged
-// with the caller's (§4.5), so a caller cancellation aborts a blocked close. A
-// definitively pre-acceptance transport failure commits nothing — the local
-// close bit stays clear, so the stream is re-closable and the caller may
-// retry — while a post-acceptance context error is terminal for the stream,
-// exactly as §4.5 makes it for a STREAM_MSG (the frame may already be published,
-// so the intent cannot be withdrawn). It returns ErrSendClosed if this side
-// already closed its send half.
-//
+// with the caller's, so a caller cancellation aborts a blocked close.
+// A definitively pre-acceptance transport failure commits nothing — the local
+// close bit stays clear, so the stream is re-closable and the caller may retry.
+// A post-acceptance context error is terminal for the stream (the frame may
+// already be published, so the intent cannot be withdrawn).
+// It returns ErrSendClosed if this side already closed its send half.
 // A server's STREAM_CLOSE for a client-streaming method also carries the single
-// response/trailer payload (§6.3): the streaming host passes it through payload,
-// which rides the STREAM_CLOSE frame. It consumes no credit — the receiving side
-// delivers a STREAM_CLOSE-borne payload as an un-credited item (§4.4). A nil
-// payload closes the direction with no trailer, the server-streaming and bidi
-// shape.
-//
-// Publication has a single in-progress owner. A caller claims sendCloseState
+// response/trailer payload: the streaming host passes it through payload, which
+// rides the STREAM_CLOSE frame.
+// It consumes no credit — the receiving side delivers a STREAM_CLOSE-borne
+// payload as an un-credited item.
+// A nil payload closes the direction with no trailer, the server-streaming and
+// bidi shape.
+// Publication has a single in-progress owner: a caller claims sendCloseState
 // (idle->publishing) before it may Send, so two concurrent CloseSend callers can
-// never both put a same-direction STREAM_CLOSE on the wire: the loser observes a
-// non-idle state and returns ErrSendClosed without sending. Calling CloseSend
-// concurrently with itself is a local programming error (§6.4/§6.5), so returning
-// ErrSendClosed to the loser is correct; a purely SEQUENTIAL retry after a
-// pre-acceptance failure still succeeds, because that failure rolls the state
-// back to idle.
+// never both put a same-direction STREAM_CLOSE on the wire.
+// The loser observes a non-idle state and returns ErrSendClosed without sending.
+// Calling CloseSend concurrently with itself is a local programming error, so
+// returning ErrSendClosed to the loser is correct.
+// A purely SEQUENTIAL retry after a pre-acceptance failure still succeeds,
+// because that failure rolls the state back to idle.
 func (s *Stream) CloseSend(ctx context.Context, payload []byte) error {
 	if !s.sendCloseState.CompareAndSwap(closeSendIdle, closeSendPublishing) {
 		return ErrSendClosed // already closed, or another caller owns publication (§6.4/§6.5)

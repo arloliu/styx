@@ -83,11 +83,17 @@ func (s PeekStatus) String() string {
 // edges in internal/transport/shm and internal/event — a Ring carries none of
 // that state.
 type Ring struct {
-	slots    []Descriptor // caller-supplied, backed by the region mapping; not owned by the ring
-	head     *uint64      // consumer sequence; seq_cst; consumer is sole writer, producer reads (reclaim gate)
-	tail     *uint64      // producer sequence; seq_cst; producer is sole writer, consumer reads (observation edge)
-	mask     uint64       // capacity - 1; the physical slot of sequence n is n & mask
-	capacity uint64       // slot count; power of two in [minCapacity, maxCapacity]
+	slots []Descriptor // caller-supplied, backed by the region mapping; not owned by the ring
+	// head is the consumer's sequence number, written only by the consumer,
+	// read by the producer to detect when the ring is full.
+	// All accesses use seq_cst atomics (shm-abi.md §3/§7).
+	head *uint64
+	// tail is the producer's sequence number, written only by the producer,
+	// read by the consumer to detect when the ring is empty.
+	// All accesses use seq_cst atomics (shm-abi.md §3/§7).
+	tail     *uint64
+	mask     uint64 // capacity - 1; the physical slot of sequence n is n & mask
+	capacity uint64 // slot count; power of two in [minCapacity, maxCapacity]
 }
 
 // New wraps pre-mapped descriptor slots and head/tail words into a Ring. slots,
@@ -140,8 +146,8 @@ var pushBeforeTailStore func()
 // descriptor write, and the seq_cst tail store; admission control, lanes, and
 // arena reservation live above it (§8).
 func (r *Ring) Push(d Descriptor) error {
-	head := atomic.LoadUint64(r.head) // seq_cst; consumer is sole writer
-	tail := atomic.LoadUint64(r.tail) // seq_cst; this producer is sole writer
+	head := atomic.LoadUint64(r.head) // seq_cst load; consumer is sole writer
+	tail := atomic.LoadUint64(r.tail) // seq_cst load; producer is sole writer
 
 	// depth = tail - head in uint64 is wrap-immune (shm-abi.md §10). The two
 	// failure outcomes are distinct signals, mirroring Peek's PeekEmpty vs
@@ -164,15 +170,14 @@ func (r *Ring) Push(d Descriptor) error {
 	r.slots[tail&r.mask] = d
 	// Test seam, compiled out in production: ringHookEnabled is the constant
 	// false in normal builds, so this whole branch is dead-code-eliminated and
-	// Push stays inlinable (.agents/rules/800-performance-security.md). Under
-	// -tags ringhook it lets the ordering tests pause a real Push between the
-	// descriptor write and the tail store.
+	// Push stays inlinable. Under -tags ringhook it lets the ordering tests pause
+	// a real Push between the descriptor write and the tail store.
 	if ringHookEnabled {
 		if pushBeforeTailStore != nil {
 			pushBeforeTailStore()
 		}
 	}
-	atomic.StoreUint64(r.tail, tail+1)
+	atomic.StoreUint64(r.tail, tail+1) // seq_cst store; publishes descriptor to consumer
 
 	return nil
 }
@@ -187,8 +192,8 @@ func (r *Ring) Push(d Descriptor) error {
 // it out before calling Advance, because the head advance is the producer's
 // reclaim signal (§6/§9).
 func (r *Ring) Peek() (Descriptor, PeekStatus) {
-	head := atomic.LoadUint64(r.head) // consumer-owned
-	tail := atomic.LoadUint64(r.tail) // seq_cst tail load — the observation edge
+	head := atomic.LoadUint64(r.head) // seq_cst load; consumer is sole writer
+	tail := atomic.LoadUint64(r.tail) // seq_cst load — the observation edge
 
 	switch depth := tail - head; { // §10 unsigned depth
 	case depth > r.capacity:
@@ -207,8 +212,8 @@ func (r *Ring) Peek() (Descriptor, PeekStatus) {
 // §6/§9). It MUST be called only after a PeekOK and, for an arena-backed
 // payload, only after that payload has been copied out.
 func (r *Ring) Advance() {
-	head := atomic.LoadUint64(r.head)
-	atomic.StoreUint64(r.head, head+1)
+	head := atomic.LoadUint64(r.head)  // seq_cst load
+	atomic.StoreUint64(r.head, head+1) // seq_cst store; releases the slot for reallocation
 }
 
 // Pop dequeues the next descriptor, combining Peek and Advance for the

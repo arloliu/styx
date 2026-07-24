@@ -30,15 +30,16 @@ const (
 	SyncPageSize = PageSize
 )
 
-// layoutHeader is the wire-exact layout-page header schema (shm-abi.md
-// §2): every field in declaration order, offset, and width. It exists
-// only to derive the offX constants below via unsafe.Offsetof, backing
-// the §17 compile-time assertions with a real structural check rather
-// than hand-duplicated numbers. Actual layout-page reads/writes go
-// through encoding/binary at those derived offsets (see below), never
-// through a cast of this type onto the mapping: the mapping is untrusted
-// cross-process input, and a manual bounds-checked decode is easier to
-// audit than an unsafe struct cast over it.
+// layoutHeader is the wire-exact layout-page header schema
+// (docs/specs/shm-abi.md §2): every field in declaration order, offset, and
+// width.
+// It exists only to derive the offX constants below via unsafe.Offsetof,
+// backing the §17 compile-time assertions with a real structural check rather
+// than hand-duplicated numbers.
+// Actual layout-page reads/writes use encoding/binary at those derived offsets
+// (see below), never a cast of this type onto the mapping.
+// The mapping is untrusted cross-process input; manual bounds-checked decode
+// is easier to audit than an unsafe struct cast.
 type layoutHeader struct {
 	Magic              [8]byte
 	LayoutVersion      uint32
@@ -65,12 +66,13 @@ type layoutHeader struct {
 	ReservedHdr        [116]byte
 }
 
-// Layout-page header field offsets (shm-abi.md §2), derived from
+// Layout-page header field offsets (docs/specs/shm-abi.md §2), derived from
 // layoutHeader's natural Go struct layout.
-// Offsets are cast to int at declaration (still a constant expression) so
-// every call site below can use them directly as slice bounds / function
-// arguments without a repeated conversion, while the §17 assertions still
-// check the struct-derived value against the ABI's frozen numbers.
+// Offsets are cast to int at declaration (still a constant expression) so call
+// sites can use them directly as slice bounds and function arguments without
+// repeated conversion.
+// The §17 assertions still check struct-derived values against the ABI's
+// frozen numbers.
 const (
 	offMagic              = int(unsafe.Offsetof(layoutHeader{}.Magic))
 	offLayoutVersion      = int(unsafe.Offsetof(layoutHeader{}.LayoutVersion))
@@ -100,11 +102,13 @@ const (
 	headerSize      = 256 // header occupies [0,256); the two class tables follow
 )
 
-// SizeClassEntry is the wire-exact 16-byte form of one size-class table
-// entry (shm-abi.md §2), used only to pin the entry schema at compile
-// time (§17) via unsafe.Sizeof/Offsetof/Alignof. Actual layout-page bytes
-// decode into the friendlier SizeClass (below) via encoding/binary, not by
-// casting this type onto the mapping — see layoutHeader's doc for why.
+// SizeClassEntry is the wire-exact 16-byte form of one size-class table entry
+// (docs/specs/shm-abi.md §2).
+// It is used only to pin the entry schema at compile time (§17) via
+// unsafe.Sizeof/Offsetof/Alignof.
+// Actual layout-page bytes decode into the friendlier SizeClass (below) via
+// encoding/binary, not by casting this type onto the mapping — see
+// layoutHeader's doc for why.
 type SizeClassEntry struct {
 	SlabSize        uint32
 	SlabCount       uint32
@@ -123,29 +127,32 @@ const (
 )
 
 // poisonWordOffset is the sync page's poison word absolute region offset
-// (shm-abi.md §3 offset 4480, §16). This package never reads or writes
-// the word — internal/event and the supervisor own poisoning (see
-// doc.go) — the constant exists only so Phase 1's fixed-header-minimum
-// comment can cite the exact byte it proves is mapped and writable before
-// Phase 2 runs.
+// (docs/specs/shm-abi.md §3 offset 4480, §16).
+// This package never reads or writes the word — internal/event and the
+// supervisor own poisoning (see doc.go).
+// The constant exists only so Phase 1's fixed-header-minimum comment can cite
+// the exact byte it proves is mapped and writable before Phase 2 runs.
 const poisonWordOffset = 4480
 
-// syncPageReservedTailOffset is the in-page byte offset where the sync
-// page's reserved tail begins (shm-abi.md §3: "bytes from offset 4608 to
+// syncPageReservedTailOffset is the in-page byte offset where the sync page's
+// reserved tail begins (docs/specs/shm-abi.md §3: "bytes from offset 4608 to
 // 8191 of the sync page are reserved"; 4608 = sync-page base 4096 + this
-// 512-byte in-page offset). This package proves only that the whole tail
-// range is zero at attach (Phase 2 step 7) — the sync page's word schema
-// (tail/head/park_state/poison/shutdown offsets, §3) belongs to
-// internal/ring and internal/event, not this package (see doc.go).
+// 512-byte in-page offset).
+// This package proves only that the whole tail range is zero at attach
+// (Phase 2 step 7).
+// The sync page's word schema (tail/head/park_state/poison/shutdown offsets,
+// §3) belongs to internal/ring and internal/event, not this package (see doc.go).
 const syncPageReservedTailOffset = 512
 
 // classTableRecommendedOffset is where CreateRegion places the H→P
-// size-class table; the P→H table immediately follows it. shm-abi.md §2
-// documents 256 as the RECOMMENDED (not mandatory) placement — a
-// hand-built region could choose any offset in [256, 4096) satisfying the
-// §1 Phase 2 address-range rules, but CreateRegion always uses the
-// recommended placement for simplicity. OpenRegion's attach path
-// validates whatever offset the wire actually carries, not this constant.
+// size-class table; the P→H table immediately follows it.
+// docs/specs/shm-abi.md §2 documents 256 as the RECOMMENDED (not mandatory)
+// placement.
+// A hand-built region could choose any offset in [256, 4096) satisfying the
+// §1 Phase 2 address-range rules, but CreateRegion always uses the recommended
+// placement for simplicity.
+// OpenRegion's attach path validates whatever offset the wire actually carries,
+// not this constant.
 const classTableRecommendedOffset = headerSize
 
 // layoutMagic is the frozen §2 magic tag, ASCII "STYXSHMR" in byte order
@@ -166,18 +173,21 @@ const (
 	// page plus the sync page, the region's two always-present fixed-size
 	// spans.
 	minRegionSize = 2 * PageSize
-	// minLargestSlabSize is the §1/§2 floor on a direction's largest
-	// class: it keeps max_payload positive after the ≤36 B worst-case
-	// per-frame overhead (§5/§18). Numerically equal to PageSize, but a
-	// distinct concept — kept as its own named constant so a future change
-	// to either bound doesn't silently couple to the other.
+	// minLargestSlabSize is the §1/§2 floor on a direction's largest class.
+	// It keeps max_payload positive after ≤36 B worst-case per-frame overhead
+	// (§5/§18).
+	// Numerically equal to PageSize, but a distinct concept — kept as its own
+	// named constant so a future change to either bound doesn't silently
+	// couple to the other.
 	minLargestSlabSize = 4096
 )
 
-// Direction identifies one of the two per-region communication
-// directions (shm-abi.md §1): H→P is host-produced, plugin-consumed
-// (requests); P→H is the reverse (responses). Both rings share one
-// ring_capacity; each direction has its own arena and size-class table.
+// Direction identifies one of the two per-region communication directions
+// (docs/specs/shm-abi.md §1).
+// H→P is host-produced, plugin-consumed (requests).
+// P→H is the reverse (responses).
+// Both rings share one ring_capacity; each direction has its own arena and
+// size-class table.
 type Direction int
 
 const (
@@ -186,25 +196,28 @@ const (
 )
 
 // SizeClass is one decoded entry of a direction's size-class table
-// (shm-abi.md §2). ClassBaseOffset is relative to that direction's
-// ArenaGeometry.Offset, not region-relative.
+// (docs/specs/shm-abi.md §2).
+// ClassBaseOffset is relative to that direction's ArenaGeometry.Offset,
+// not region-relative.
 type SizeClass struct {
 	SlabSize        uint32
 	SlabCount       uint32
 	ClassBaseOffset uint32
 }
 
-// RingGeometry is one direction's descriptor ring span (shm-abi.md §1).
+// RingGeometry is one direction's descriptor ring span
+// (docs/specs/shm-abi.md §1).
 // Capacity (slot count) and slot size (DescriptorSize) are shared by both
 // rings and live on Layout / the package constant, not duplicated here.
 type RingGeometry struct {
 	Offset uint64 // ring_{hp,ph}_offset: byte offset of the ring's base within the region
 }
 
-// ArenaGeometry is one direction's payload arena (shm-abi.md §1, §2, §6):
-// its span offset and total byte size (arena_bytes_{hp,ph}, which
-// includes page-alignment padding, §1), plus its size-class table and the
-// table's own offset within the layout page.
+// ArenaGeometry is one direction's payload arena
+// (docs/specs/shm-abi.md §1, §2, §6).
+// It includes span offset and total byte size (arena_bytes_{hp,ph}, including
+// page-alignment padding per §1), plus its size-class table and the table's
+// offset within the layout page.
 type ArenaGeometry struct {
 	Offset           uint64
 	Bytes            uint64
@@ -213,10 +226,11 @@ type ArenaGeometry struct {
 }
 
 // Layout is the decoded, immutable geometry read from the layout page
-// (shm-abi.md §2). Field offsets, widths, and types are frozen by the
-// ABI; this struct is the in-memory decoded form, not the wire form.
-// Region.Layout returns a cached copy — the layout page is validated
-// exactly once at attach (§1) and never re-read afterward.
+// (docs/specs/shm-abi.md §2).
+// Field offsets, widths, and types are frozen by the ABI; this struct is the
+// in-memory decoded form, not the wire form.
+// Region.Layout returns a cached copy — the layout page is validated exactly
+// once at attach (§1) and never re-read afterward.
 type Layout struct {
 	Magic            [8]byte
 	LayoutVersion    uint32
@@ -232,12 +246,12 @@ type Layout struct {
 	Arenas [2]ArenaGeometry
 }
 
-// derivedGeometry holds every §1-derived quantity computed from
-// host-chosen inputs: span offsets, per-direction arena byte totals
-// (already roundup-padded), and the region's total size. CreateRegion and
-// OpenRegion's Phase 2 attach path share this single computation (the §1
-// span-offset formula) so create-side derivation and attach-side
-// recomputation can never disagree.
+// derivedGeometry holds every §1-derived quantity computed from host-chosen
+// inputs: span offsets, per-direction arena byte totals (already roundup-padded),
+// and the region's total size.
+// CreateRegion and OpenRegion's Phase 2 attach path share this single
+// computation (the §1 span-offset formula), so create-side derivation and
+// attach-side recomputation can never disagree.
 type derivedGeometry struct {
 	syncPageOffset uint64
 	ringHPOffset   uint64
@@ -249,9 +263,9 @@ type derivedGeometry struct {
 }
 
 // addOverflowSafe adds addend to sum, returning an error wrapping
-// ErrBadGeometry if the addition would carry past math.MaxUint64
-// (shm-abi.md §1: "before each addition it MUST verify no carry past
-// math.MaxUint64").
+// ErrBadGeometry if the addition would overflow past math.MaxUint64
+// (docs/specs/shm-abi.md §1: "before each addition it MUST verify no carry
+// past math.MaxUint64").
 func addOverflowSafe(sum, addend uint64) (uint64, error) {
 	result := sum + addend
 	if result < sum {
@@ -272,8 +286,8 @@ func roundupPageSize(n uint64) (uint64, error) {
 	return addOverflowSafe(n, PageSize-rem)
 }
 
-// validateRingCapacity checks shm-abi.md §1: ring_capacity is a power of
-// two in [64, 1<<20].
+// validateRingCapacity checks docs/specs/shm-abi.md §1:
+// ring_capacity is a power of two in [64, 1<<20].
 func validateRingCapacity(c uint32) error {
 	if c < minRingCapacity || c > maxRingCapacity {
 		return fmt.Errorf("shm: ring_capacity %d outside [%d, %d]: %w",
@@ -286,7 +300,8 @@ func validateRingCapacity(c uint32) error {
 	return nil
 }
 
-// validateLifecycleReserve checks shm-abi.md §1/§18: 0 < R < ring_capacity.
+// validateLifecycleReserve checks docs/specs/shm-abi.md §1/§18:
+// 0 < R < ring_capacity.
 func validateLifecycleReserve(r, ringCapacity uint32) error {
 	if r == 0 || r >= ringCapacity {
 		return fmt.Errorf("shm: lifecycle_reserve %d does not satisfy 0 < R < ring_capacity (%d): %w",
@@ -296,10 +311,11 @@ func validateLifecycleReserve(r, ringCapacity uint32) error {
 	return nil
 }
 
-// validateSlabBounds checks the shm-abi.md §2 frozen per-direction rules
-// that don't involve class_base_offset: num_classes >= 1, every slab_size
-// a multiple of CacheLine and >= CacheLine, strictly ascending, the
-// largest class >= minLargestSlabSize, and every slab_count >= 1.
+// validateSlabBounds checks the docs/specs/shm-abi.md §2 frozen per-direction
+// rules that don't involve class_base_offset:
+// num_classes >= 1, every slab_size a multiple of CacheLine and >= CacheLine,
+// strictly ascending, the largest class >= minLargestSlabSize, and every
+// slab_count >= 1.
 func validateSlabBounds(classes []SizeClass) error {
 	if len(classes) == 0 {
 		return fmt.Errorf("shm: size-class table: num_classes must be >= 1: %w", ErrBadGeometry)
@@ -331,11 +347,11 @@ func validateSlabBounds(classes []SizeClass) error {
 
 // computeClassBaseOffsets returns each class's contiguous, unpadded
 // class_base_offset (base[0]==0, base[c+1]==base[c]+slab_size[c]*slab_count[c],
-// shm-abi.md §2) and the table's class_total, in overflow-safe uint64
-// arithmetic. buildArenaGeometry (create path) uses this to fill each
-// entry before writing; checkClassBaseOffsets (attach path) uses it to
-// verify the wire's decoded class_base_offset values against the same
-// formula.
+// docs/specs/shm-abi.md §2) and the table's class_total, in overflow-safe
+// uint64 arithmetic.
+// buildArenaGeometry (create path) uses this to fill each entry before writing.
+// checkClassBaseOffsets (attach path) uses it to verify the wire's decoded
+// class_base_offset values against the same formula.
 func computeClassBaseOffsets(classes []SizeClass) (bases []uint64, classTotal uint64, err error) {
 	bases = make([]uint64, len(classes))
 
@@ -351,12 +367,13 @@ func computeClassBaseOffsets(classes []SizeClass) (bases []uint64, classTotal ui
 	return bases, base, nil
 }
 
-// buildArenaGeometry validates classes' slab bounds, computes each
-// entry's class_base_offset and the direction's arena_bytes
-// (roundup-padded, ceiling-checked), and returns a defensive copy of
-// classes with ClassBaseOffset filled in. Any caller-supplied
-// ClassBaseOffset on the input is ignored and recomputed — shm-abi.md §1:
-// derived values are never trusted from the caller, only recomputed.
+// buildArenaGeometry validates classes' slab bounds, computes each entry's
+// class_base_offset and the direction's arena_bytes (roundup-padded,
+// ceiling-checked), and returns a defensive copy of classes with
+// ClassBaseOffset filled in.
+// Any caller-supplied ClassBaseOffset on the input is ignored and recomputed.
+// docs/specs/shm-abi.md §1: derived values are never trusted from the caller,
+// only recomputed.
 func buildArenaGeometry(classes []SizeClass) (finalClasses []SizeClass, arenaBytes uint64, err error) {
 	if err := validateSlabBounds(classes); err != nil {
 		return nil, 0, err
@@ -387,10 +404,10 @@ func buildArenaGeometry(classes []SizeClass) (finalClasses []SizeClass, arenaByt
 	return finalClasses, arenaBytes, nil
 }
 
-// deriveSpans computes derivedGeometry from ringCapacity and each
-// direction's already-validated arena byte total, per the shm-abi.md §1
-// span-offset formula, in overflow-safe uint64 arithmetic: every partial
-// sum is checked for wraparound before use.
+// deriveSpans computes derivedGeometry from ringCapacity and each direction's
+// already-validated arena byte total, per the docs/specs/shm-abi.md §1
+// span-offset formula, in overflow-safe uint64 arithmetic.
+// Every partial sum is checked for wraparound before use.
 func deriveSpans(ringCapacity uint32, arenaBytesHP, arenaBytesPH uint64) (derivedGeometry, error) {
 	var g derivedGeometry
 
@@ -427,10 +444,10 @@ func deriveSpans(ringCapacity uint32, arenaBytesHP, arenaBytesPH uint64) (derive
 }
 
 // writeLayoutPage encodes l into data[0:LayoutPageSize]: the header, both
-// directions' size-class tables at their recorded ClassTableOffset, and
-// zero for every reserved byte. l must already carry fully-derived,
-// validated values — CreateRegion builds it via buildArenaGeometry and
-// deriveSpans before calling this.
+// directions' size-class tables at their recorded ClassTableOffset, and zero
+// for every reserved byte.
+// l must already carry fully-derived, validated values — CreateRegion builds
+// it via buildArenaGeometry and deriveSpans before calling this.
 func writeLayoutPage(data []byte, l Layout) {
 	copy(data[offMagic:offMagic+8], l.Magic[:])
 	binary.LittleEndian.PutUint32(data[offLayoutVersion:], l.LayoutVersion)
@@ -497,14 +514,15 @@ func overlaps(aStart, aEnd, bStart, bEnd uint64) bool {
 	return aStart < bEnd && bStart < aEnd
 }
 
-// parseLayoutPhase2 implements shm-abi.md §1 Phase 2: the structural
-// geometry check run only after the region is mapped read/write. It reads
-// ONLY the fixed v1 schema offsets (never offsets derived from the page's
-// own fields) and runs in exactly the order §1 mandates, so that no
-// class-table entry is dereferenced before its address range is proven
-// in-bounds. On any violation it returns an error wrapping ErrBadGeometry;
-// shm-abi.md §16 requires the caller to poison the region on this failure
-// — this package does not (see doc.go's scope-boundary note).
+// parseLayoutPhase2 implements docs/specs/shm-abi.md §1 Phase 2:
+// the structural geometry check run only after the region is mapped
+// read/write.
+// It reads ONLY the fixed v1 schema offsets (never offsets derived from the
+// page's own fields) and runs in exactly the §1 order, so no class-table entry
+// is dereferenced before its address range is proven in-bounds.
+// On any violation, it returns an error wrapping ErrBadGeometry.
+// §16 requires the caller to poison the region on this failure — this package
+// does not (see doc.go's scope-boundary note).
 func parseLayoutPhase2(data []byte, declaredRegionSize uint64) (Layout, error) {
 	if err := checkHeaderScalars(data); err != nil {
 		return Layout{}, err
@@ -741,11 +759,11 @@ func checkArenaTotal(classTotal, storedArenaBytes uint64) (uint64, error) {
 	return want, nil
 }
 
-// checkSpansAndCoverage implements shm-abi.md §1 Phase 2 step 6: every
-// span offset and region_size, as recomputed by deriveSpans, must match
-// both the layout page's own stored values and the control-plane-declared
-// size — i.e. spans are contiguous, page-aligned, non-overlapping, and
-// cover the whole region with no gaps.
+// checkSpansAndCoverage implements docs/specs/shm-abi.md §1 Phase 2 step 6:
+// every span offset and region_size, as recomputed by deriveSpans, must match
+// both the layout page's stored values and the control-plane-declared size.
+// This ensures spans are contiguous, page-aligned, non-overlapping, and cover
+// the whole region with no gaps.
 func checkSpansAndCoverage(data []byte, spans derivedGeometry, declaredRegionSize uint64) error {
 	fields := []struct {
 		name string
@@ -776,13 +794,14 @@ func checkSpansAndCoverage(data []byte, spans derivedGeometry, declaredRegionSiz
 	return nil
 }
 
-// checkReservedZero implements shm-abi.md §1 Phase 2 step 7: byte-content
-// / reserved-zero checks, run only after step 6 proves every span's byte
-// range lies inside the validated, mapped region. This package has no
-// visibility into a negotiated feature tuple (that lives in
-// internal/control, not threaded through OpenRegion — see CreateRegion's
+// checkReservedZero implements docs/specs/shm-abi.md §1 Phase 2 step 7:
+// byte-content and reserved-zero checks.
+// These are run only after step 6 proves every span's byte range lies inside
+// the validated, mapped region.
+// This package has no visibility into a negotiated feature tuple (that lives
+// in internal/control, not threaded through OpenRegion — see CreateRegion's
 // doc comment), so every reserved bit/field is required to be zero
-// unconditionally, the fail-closed default for "no feature negotiated."
+// unconditionally, the fail-closed default for "no feature negotiated".
 func checkReservedZero(
 	data []byte, spans derivedGeometry,
 	classTableHPOff uint64, numHP uint32, classTablePHOff uint64, numPH uint32,
@@ -827,16 +846,17 @@ func checkClassEntriesReservedZero(data []byte, tableOff uint64, n uint32) error
 
 // checkSyncPageReservedTailZero checks the sync page's reserved tail —
 // absolute byte range [spans.syncPageOffset+syncPageReservedTailOffset,
-// spans.syncPageOffset+SyncPageSize), shm-abi.md §3's "offset 4608 to 8191"
-// — is all-zero. Fail-closed like every other reserved region this
-// function validates: no negotiated-feature tuple reaches OpenRegion (see
-// checkReservedZero's doc comment), so the whole tail is required to be
-// zero unconditionally. This is a pure byte-range check; the sync page's
-// word schema (§3) is a later package's concern, not this one's. Safe to
-// slice: checkSpansAndCoverage (step 6, run before this) already proved
-// [0, spans.regionSize) — which always contains [4096, 8192), since every
-// valid geometry's spans place the sync page immediately after the layout
-// page and before ring_hp — lies inside data.
+// spans.syncPageOffset+SyncPageSize), docs/specs/shm-abi.md §3's
+// "offset 4608 to 8191" — is all-zero.
+// Fail-closed like every other reserved region: no negotiated-feature tuple
+// reaches OpenRegion (see checkReservedZero's doc comment), so the whole tail
+// is required to be zero unconditionally.
+// This is a pure byte-range check; the sync page's word schema (§3) is a
+// later package's concern, not this one's.
+// Safe to slice: checkSpansAndCoverage (step 6, run before this) already
+// proved [0, spans.regionSize) lies inside data.
+// This range always contains [4096, 8192), since every valid geometry's spans
+// place the sync page immediately after the layout page and before ring_hp.
 func checkSyncPageReservedTailZero(data []byte, spans derivedGeometry) error {
 	start := spans.syncPageOffset + syncPageReservedTailOffset
 	end := spans.syncPageOffset + SyncPageSize
@@ -849,8 +869,9 @@ func checkSyncPageReservedTailZero(data []byte, spans derivedGeometry) error {
 
 // checkArenaPadZero checks a direction's page-alignment pad range
 // [class_total, arena_bytes) — reserved and never allocatable
-// (shm-abi.md §1) — is all-zero. Safe to slice: checkSpansAndCoverage
-// already proved this direction's whole arena span lies inside data.
+// (docs/specs/shm-abi.md §1) — is all-zero.
+// Safe to slice: checkSpansAndCoverage already proved this direction's whole
+// arena span lies inside data.
 func checkArenaPadZero(data []byte, arenaOffset, classTotal, arenaBytes uint64) error {
 	padStart := arenaOffset + classTotal
 	padEnd := arenaOffset + arenaBytes
@@ -862,22 +883,24 @@ func checkArenaPadZero(data []byte, arenaOffset, classTotal, arenaBytes uint64) 
 }
 
 // minRegionSize must cover the poison word's whole 4-byte width (absolute
-// offset poisonWordOffset, shm-abi.md §3): Phase 1's fixed-header-minimum
-// check relies on this to prove the word is inside every mapping it
-// accepts. A negative array length is a compile-time error, so this only
-// compiles if minRegionSize >= poisonWordOffset+4.
+// offset poisonWordOffset, docs/specs/shm-abi.md §3).
+// Phase 1's fixed-header-minimum check relies on this to prove the word is
+// inside every mapping it accepts.
+// A negative array length is a compile-time error, so this only compiles if
+// minRegionSize >= poisonWordOffset+4.
 var _ [minRegionSize - (poisonWordOffset + 4)]struct{}
 
-// Compile-time layout assertions (shm-abi.md §17, tier (a) structural).
-// These pin the fixed schema this package owns — the layout-page header
-// field offsets, the size-class entry schema, and the whole-page extents
-// — using the required constant out-of-range array-index idiom: each
-// index is a compile-time constant that is 0 (in range) exactly when the
-// invariant holds, and any nonzero value (including an unsigned uintptr
-// underflow when the actual value is smaller than expected) is a
-// compile-time "index out of range" error. internal/ring and
-// internal/arena own the equivalent assertions for Descriptor and the
-// sync-page word structs — those types are not defined here.
+// Compile-time layout assertions (docs/specs/shm-abi.md §17, tier (a)
+// structural).
+// These pin the fixed schema this package owns — the layout-page header field
+// offsets, the size-class entry schema, and the whole-page extents.
+// They use the required constant out-of-range array-index idiom: each index
+// is a compile-time constant that is 0 (in range) exactly when the invariant
+// holds, and any nonzero value (including unsigned uintptr underflow when the
+// actual value is smaller than expected) is a compile-time "index out of range"
+// error.
+// internal/ring and internal/arena own the equivalent assertions for Descriptor
+// and the sync-page word structs — those types are not defined here.
 
 // Fixed schema constants (§1).
 var _ = [1]byte{}[PageSize-4096]

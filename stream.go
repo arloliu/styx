@@ -35,42 +35,18 @@ const (
 	defaultStreamBudget = 30 * time.Second
 )
 
-// Stream is the public, narrow handle to a gRPC-shaped stream: OpenStream /
-// OpenStreamID / OpenServerStreamID return it, and a RegisterStreamHandler handler
-// receives it. It wraps the runtime's stream state machine — which stays in
-// internal/rpcruntime, so external generated code cannot reach it — and exposes ONLY
-// the operations generated code and hand-written seam users need: the byte-level
-// SendMsg/RecvMsg/CloseSend, the connection's negotiated codec (Marshal/Unmarshal),
-// the stream Context, and the terminal Err. The engine's lifecycle controls (deadline
-// watcher, publication, handler-termination, teardown emission) are deliberately NOT
-// promoted through this handle.
+// Stream is the public handle to a gRPC-shaped stream returned by OpenStream,
+// OpenStreamID, OpenServerStreamID, or received by a RegisterStreamHandler.
+// It wraps the internal stream state machine and exposes only what generated
+// code needs: SendMsg/RecvMsg/CloseSend, codec (Marshal/Unmarshal), Context,
+// and Err. Engine lifecycle controls are deliberately not promoted.
 //
-// The doc comments in this file use a few recurring stream-protocol terms: STREAM_OPEN,
-// STREAM_MSG, and STREAM_CLOSE are the wire frame kinds a stream sends as it opens,
-// carries a message, and half-closes; "credit" is a per-direction limit on how many
-// unacknowledged messages one side may have in flight before it must wait for the peer
-// to acknowledge more; and a stream is "half-closed" in a direction once that direction
-// has sent its STREAM_CLOSE (or, for server-streaming, at establishment) while the other
-// direction may still be live. See docs/specs/stream-protocol.md for the full protocol.
-//
-// The wrapper also closes stream-protocol.md §7.4's local-abort gap the raw byte
-// methods leave open: on the OPENER side a caller-context cancellation the runtime
-// surfaces without terminating (a pre-admission or credit-blocked cancel), and a local
-// codec failure the opener cannot send, both drive the stream terminal here so its
-// admission slot frees promptly instead of lingering to the deadline. The accepter's
-// termination flows through its handler's error return instead, so the wrapper drives
-// no local terminal there.
-//
-// A Stream handle follows gRPC ClientStream's goroutine rules. It is safe for one
-// sending goroutine and one receiving goroutine to use concurrently: a single
-// goroutine may call SendMsg and CloseSend while another calls RecvMsg. It is a
-// caller programming error to call SendMsg or CloseSend concurrently with each
-// other or with itself — the send direction has a single owner. The runtime gives
-// CloseSend publication that single owner, so a losing concurrent CloseSend
-// returns an error instead of putting a second STREAM_CLOSE on the wire; concurrent
-// SendMsg calls are NOT serialized and race the send sequence, which can desync and
-// poison the stream. Context, Err, Marshal, and Unmarshal are safe to call from any
-// goroutine.
+// Stream follows gRPC ClientStream's goroutine rules: it is safe for one
+// sending goroutine and one receiving goroutine to use concurrently (a single
+// goroutine may call SendMsg and CloseSend while another calls RecvMsg). It is
+// a caller programming error to call SendMsg or CloseSend concurrently with
+// each other or with itself (the send direction has a single owner). Context,
+// Err, Marshal, and Unmarshal are safe to call from any goroutine.
 type Stream struct {
 	stream *rpcruntime.Stream
 	codec  codec.Codec
@@ -92,22 +68,17 @@ func newServerStream(st *rpcruntime.Stream, cdc codec.Codec) *Stream {
 	return &Stream{stream: st, codec: cdc, opener: false}
 }
 
-// SendMsg sends payload as a STREAM_MSG under ctx (stream-protocol.md §4.5). It
-// returns nil on success and, on failure, an error already in the styx taxonomy — the
-// same sentinels Err() reports, no caller-side StreamError wrapping needed. Once the
-// stream has terminated it returns that terminal error. On the opener side a
-// caller-context cancellation the runtime surfaces without terminating drives the
-// stream terminal, freeing its slot.
+// SendMsg sends payload as a STREAM_MSG under ctx.
+// It returns nil on success and an error already in the styx taxonomy on failure
+// (the same sentinels Err() reports). Once the stream has terminated it returns
+// that terminal error.
 func (s *Stream) SendMsg(ctx context.Context, payload []byte) error {
 	return s.driveLocal(ctx, s.stream.SendMsg(ctx, payload))
 }
 
-// RecvMsg returns the next delivered STREAM_MSG payload, io.EOF at clean stream end
-// (returned unchanged, the signal generated stubs test for), or an error already in
-// the styx taxonomy — the same sentinels Err() reports, no caller-side StreamError
-// wrapping needed (stream-protocol.md §4.6). Once the stream has terminated it returns
-// that terminal error. On the opener side a caller-context cancellation drives the
-// stream terminal, freeing its slot.
+// RecvMsg returns the next delivered STREAM_MSG payload, io.EOF at clean stream
+// end, or an error already in the styx taxonomy (the same sentinels Err() reports).
+// Once the stream has terminated it returns that terminal error.
 func (s *Stream) RecvMsg(ctx context.Context) ([]byte, error) {
 	payload, err := s.stream.RecvMsg(ctx)
 
@@ -115,11 +86,9 @@ func (s *Stream) RecvMsg(ctx context.Context) ([]byte, error) {
 }
 
 // CloseSend half-closes this side's send direction, optionally carrying a final
-// payload (a client-streaming server's single response, stream-protocol.md §6.3/§6.4).
-// It returns nil on success and, on failure, an error already in the styx taxonomy —
-// the same sentinels Err() reports, no caller-side StreamError wrapping needed. Once
-// the stream has terminated it returns that terminal error. On the opener side a
-// caller-context cancellation drives the stream terminal.
+// payload. It returns nil on success and an error already in the styx taxonomy on
+// failure (the same sentinels Err() reports). Once the stream has terminated it
+// returns that terminal error.
 func (s *Stream) CloseSend(ctx context.Context, payload []byte) error {
 	return s.driveLocal(ctx, s.stream.CloseSend(ctx, payload))
 }

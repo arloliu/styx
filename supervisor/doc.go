@@ -1,3 +1,4 @@
-// Package supervisor defines the restart policy types that make up the
-// public config surface for plugin process supervision.
+// Package supervisor provides the restart policy configuration surface for
+// plugin process supervision. A host supplies a RestartPolicy to control how
+// crashed plugins are restarted.
 package supervisor

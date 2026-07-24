@@ -1,12 +1,14 @@
 package observe
 
-// Logger is Styx's structured internal-diagnostics seam: the framework logs its
-// own lifecycle and fault events through it rather than a hard-coded logging
-// stack, so a host can route Styx's diagnostics into its own logger. Messages
-// are static; variable data travels as trailing key/value pairs (kv), matching
-// the common structured-logging shape. Implementations MUST be safe for
-// concurrent use and MUST NOT block for long — like a MetricsSink, a Logger may
-// be called from more than one goroutine.
+// Logger is Styx's internal-diagnostics integration point.
+// The framework logs its own lifecycle and fault events through a Logger
+// rather than a hard-coded logging stack, so a host can route Styx's diagnostics
+// into its own logger.
+// Messages are static; variable data travels as trailing key/value pairs,
+// following the structured-logging pattern.
+// Implementations MUST be safe for concurrent use and MUST NOT block for long —
+// a Logger may be called from multiple goroutines and must return promptly.
+// A panic in a Logger method is isolated and does not propagate into Styx.
 type Logger interface {
 	// Debug logs a developer-detail message with optional key/value pairs.
 	Debug(msg string, kv ...any)
@@ -14,12 +16,13 @@ type Logger interface {
 	Info(msg string, kv ...any)
 	// Warn logs a recoverable-anomaly message with optional key/value pairs.
 	Warn(msg string, kv ...any)
-	// Error logs a failure, carrying the causing error, with optional key/value pairs.
+	// Error logs a failure with the causing error and optional key/value pairs.
 	Error(msg string, err error, kv ...any)
 }
 
-// NoopLogger returns a Logger whose methods do nothing — the default when no
-// logger is configured, so instrumentation code never nil-checks a logger.
+// NoopLogger returns a Logger whose methods do nothing.
+// This is the default when no logger is configured, so instrumentation code
+// never needs to nil-check a logger.
 func NoopLogger() Logger { return noopLogger{} }
 
 // noopLogger is the do-nothing Logger NoopLogger returns.

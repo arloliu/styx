@@ -45,29 +45,22 @@ const (
 type HostConfig struct {
 	Plugins []PluginSpec
 
-	// Metrics optionally receives this host's built-in instrumentation for
-	// every plugin it supervises (RPC latency, bytes moved, timeouts,
-	// cancellations, restarts, heartbeat misses, backpressure). One sink covers
-	// all plugins; each signal carries a "plugin" label.
-	//
-	// nil (the default) disables host-side metrics entirely — no dispatcher
-	// goroutine runs and no hot path allocates. Passing
-	// observe.NoopMetricsSink() enables the (harmless) machinery with a
-	// discarding sink.
+	// Metrics optionally sends built-in instrumentation to the sink
+	// (RPC latency, bytes moved, timeouts, cancellations, restarts, heartbeat
+	// misses, backpressure). One sink covers all plugins; each signal carries
+	// a "plugin" label. nil disables host-side metrics.
 	Metrics observe.MetricsSink
 
-	// Logger optionally receives Styx's structured internal diagnostics — plugin
-	// lifecycle transitions and faults. Delivery goes through the same bounded,
+	// Logger optionally sends structured internal diagnostics (plugin lifecycle
+	// transitions and faults). Delivery goes through the same bounded,
 	// panic-isolated worker as metrics, so a slow or panicking Logger neither
-	// stalls the event relay nor crashes the process.
-	//
-	// nil (the default) disables lifecycle logging entirely — no logger
-	// goroutine runs.
+	// stalls the relay nor crashes the process. nil disables logging.
 	Logger observe.Logger
 
-	// MetricsInterval sets the cadence of the periodic reporter for the
-	// transport-sourced signals (bytes moved, and the shared-memory gauges). Zero
-	// (the default) uses one second. Ignored when Metrics is nil.
+	// MetricsInterval sets the periodic reporter cadence for transport-sourced
+	// signals (bytes moved and shared-memory gauges).
+	// Zero uses the default (one second).
+	// Ignored when Metrics is nil.
 	MetricsInterval time.Duration
 }
 
@@ -80,99 +73,67 @@ type PluginSpec struct {
 	Restart RestartPolicy
 
 	// BinarySHA256 optionally pins the plugin binary's identity.
-	//
-	// When non-nil, Start verifies it host-side, before any supervisor is
-	// created for this plugin, and fails the plugin with *IncompatibleError on
-	// a mismatch. nil (the default) disables pinning.
+	// When non-nil, Start verifies it before creating any supervisor and fails
+	// the plugin with *IncompatibleError on a mismatch.
 	BinarySHA256 []byte
 
-	// Services optionally declares, per service this Host intends to call on
-	// this plugin, the version range the plugin must satisfy. Typically
-	// populated from a generated `<Service>Requirement()` value rather than
-	// constructed by hand.
-	//
-	// Start sends this on the Hello handshake offer; the plugin's own
-	// negotiation enforces it against its advertised versions, and a violation
-	// surfaces as *IncompatibleError naming the offending service. nil (the
-	// default) declares no requirements — every service version is accepted.
+	// Services optionally declares the version range each service must satisfy.
+	// Typically populated from a generated `<Service>Requirement()` value.
+	// Start sends this on the Hello offer; the plugin's negotiation enforces it
+	// against its advertised versions, and a violation surfaces as
+	// *IncompatibleError naming the offending service.
 	Services []ServiceRequirement
 
-	// RequireStreaming declares that this Host's client calls streaming methods
-	// on this plugin, so the streaming feature is marked required in the
-	// handshake offer (stream-protocol.md §11.2): a plugin that cannot stream
-	// fails the handshake at startup with *IncompatibleError, rather than the
-	// incompatibility surfacing only at the first OpenStream call.
-	//
+	// RequireStreaming declares that this Host calls streaming methods on this
+	// plugin, so streaming is marked required in the handshake offer.
+	// A plugin that cannot stream fails the handshake with *IncompatibleError
+	// rather than surfacing the incompatibility only at the first OpenStream call.
 	// Generated streaming client code sets it; the default (false) offers
-	// streaming as optional, so a non-streaming plugin still negotiates unary
-	// calls.
+	// streaming as optional.
 	RequireStreaming bool
 
 	// Transport selects this plugin's data-plane transport.
-	//
-	// TransportSHM pins the shared-memory transport: a plugin that cannot speak it
-	// fails the handshake rather than silently downgrading. TransportUDS pins Unix
-	// domain sockets. TransportAuto (also the zero-value default) offers both,
-	// preferring shared memory and falling back to Unix domain sockets only when
-	// the plugin does not offer shared memory.
-	//
-	// See docs/configuration.md for a worked example of choosing between them.
+	// TransportSHM pins the shared-memory transport (plugin that cannot speak it
+	// fails handshake). TransportUDS pins Unix domain sockets.
+	// TransportAuto (zero-value default) offers both, preferring shared memory.
 	Transport Transport
 
-	// Geometry is the host-authored shape of the shared-memory region — its
-	// capacity and payload size classes — used when the shared-memory transport
+	// Geometry is the host-authored shape of the shared-memory region
+	// (capacity and payload size classes) used when the shared-memory transport
 	// is negotiated. Ignored for the uds transport.
-	//
-	// The zero value selects the default profile (GeometryDefault); a profile
-	// helper (GeometryDefault, GeometryLean) or an explicit ShmGeometry
-	// overrides it. See docs/configuration.md for a plain-language explanation
-	// of what a geometry's fields mean and how to size one.
+	// The zero value selects the default profile (GeometryDefault).
 	Geometry ShmGeometry
 
-	// MaxDataInflight is the host-selected peak number of concurrent data calls,
-	// carried to the plugin so both sides admit identically (shm-abi.md §18).
+	// MaxDataInflight is the peak number of concurrent data calls.
+	// Carried to the plugin so both sides admit identically.
 	// Ignored for the uds transport.
-	//
-	// Zero (the default) falls back to the geometry's own data budget:
-	// RingCapacity minus LifecycleReserve.
+	// Zero falls back to RingCapacity minus LifecycleReserve.
 	MaxDataInflight int
 
-	// StrictCapacity opts into the frozen ABI's optional STRICT certification
-	// (shm-abi.md §18): the transport additionally requires MaxDataInflight not
-	// to exceed any reachable size class's usable slab count, so no admitted
-	// data call can ever run out of slabs for its size. Ignored for the uds
-	// transport.
-	//
-	// A geometry that fails this check is refused at spawn with a typed error
-	// naming the offending class, rather than the shortfall surfacing later as
-	// backpressure under load. Off by default; a geometry that doesn't opt in
-	// is still valid and simply experiences typed backpressure under load
-	// instead. See docs/configuration.md.
+	// StrictCapacity opts into ABI optional STRICT certification:
+	// the transport additionally requires MaxDataInflight not to exceed any
+	// reachable size class's usable slab count. A geometry that fails this check
+	// is refused at spawn with a typed error. Ignored for the uds transport.
+	// Off by default; a non-strict geometry experiences typed backpressure
+	// under load instead.
 	StrictCapacity bool
 }
 
 // ServiceRequirement is the host's declared acceptable version range for one
-// service it intends to call on a plugin, fed to PluginSpec.Services.
-//
+// service it intends to call on a plugin.
 // A generated `<Service>Requirement()` returns the exact-version form
-// (MinVersion == MaxVersion == the generated service's own version) most
-// callers should pass; a wider range is a hand-authored option this type
-// permits but that no generator output currently produces.
+// (MinVersion == MaxVersion); a wider range is a hand-authored option.
 type ServiceRequirement struct {
 	Service                string
 	MinVersion, MaxVersion uint32
 }
 
-// Host manages the plugins declared in a HostConfig end to end: spawning,
-// handshake, supervision, and teardown. Generated client stubs reach a
-// plugin through the *ClientConn Plugin returns. Unexported fields hold
-// the configuration and the live plugin routing table Start populates.
+// Host manages plugins declared in a HostConfig: spawning, handshake,
+// supervision, and teardown. Generated client stubs reach a plugin through
+// the *ClientConn Plugin returns.
 //
-// All exported Host methods — Plugin, Start, Stop, Reload, and Events — are safe
-// for concurrent use by multiple goroutines. The Host serializes its routing
-// state under a mutex and tracks each plugin's stopping state, so concurrent
-// Start, Stop, and Reload calls (on the same plugin or on different ones) never
-// corrupt that state.
+// All exported Host methods (Plugin, Start, Stop, Reload, Events) are safe for
+// concurrent use by multiple goroutines.
 type Host struct {
 	mu       sync.Mutex
 	cfg      HostConfig
@@ -294,18 +255,12 @@ func NewHost(cfg HostConfig) *Host {
 }
 
 // Start spawns every configured plugin, completes its handshake, and begins
-// supervisor heartbeat monitoring for each — one supervisor per PluginSpec,
-// running in its own goroutine for the plugin's whole life.
-//
-// Start blocks per plugin only until that plugin's FIRST attempt either
-// reaches Ready or gives up (its restart budget exhausted on the first
-// attempt already, e.g. the zero-value RestartPolicy{}); once Ready, ongoing
-// heartbeat monitoring and any later restarts continue in the background and
-// are reported only via Events.
-//
-// A single plugin's failure does not abort the others; it is reported via
-// Events, and Start's returned error is the combined (errors.Join) set of any
-// that failed.
+// supervisor heartbeat monitoring for each.
+// Start blocks per plugin only until that plugin's first attempt reaches Ready
+// or gives up; ongoing monitoring and restarts continue in the background and
+// are reported via Events.
+// A single plugin's failure does not abort the others; Start's returned error
+// is the combined (errors.Join) set of any that failed.
 func (h *Host) Start(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -510,25 +465,18 @@ func (h *Host) drainOnStop(name string, events <-chan supervisor.Event, quiesced
 	}
 }
 
-// Stop drains and shuts down every plugin via its Supervisor's own Stop
-// (which runs the normative teardown machine) and blocks until every child
-// that joins within ctx has been reaped. For the whole call, every plugin
-// being torn down is held in a stopping state that rejects a concurrent Start
-// or Reload of the same name, so no second supervisor is ever created for a
-// name mid-teardown.
+// Stop drains and shuts down every plugin and blocks until children that join
+// within ctx have been reaped. Every plugin being torn down is held in a
+// stopping state that rejects concurrent Start or Reload of the same name.
 //
-// A plugin whose Supervisor.Run — the sole publisher onto its event bus — does
-// not join before ctx expires cannot be torn down safely yet: closing its relay
-// and unsubscribing now could let the drain declare the subscription quiescent
-// and drop a terminal lifecycle event the still-running Run publishes later. So
-// Stop returns that plugin's deadline error but retains the runtime intact — its
-// relay stays subscribed, its client mapping stays absent (Plugin reports it
-// unavailable), and its name is held in a stopping state that rejects a new
-// Start or Reload. The retained runtime's teardown then completes automatically
-// once its Run finally exits, via a detached watcher on the join signal, or on a
-// retried Stop, whichever happens first. The observability workers are released
-// only after the last such runtime is gone, so a Run still logging or reporting
-// keeps its workers until it joins.
+// A plugin whose Supervisor.Run does not join before ctx expires cannot be torn
+// down safely: closing its relay now could drop a terminal event the still-running
+// Run publishes later. Stop returns that plugin's deadline error but retains the
+// runtime — its relay stays subscribed and its client mapping stays absent
+// (Plugin reports it unavailable). The retained runtime's teardown completes
+// automatically once its Run finally exits, via a detached watcher or a retried
+// Stop, whichever happens first. Observability workers are released only after
+// the last such runtime is gone.
 func (h *Host) Stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -683,15 +631,11 @@ func removeRuntime(runtimes []*pluginRuntime, target *pluginRuntime) []*pluginRu
 	return runtimes
 }
 
-// Plugin returns the named plugin's client connection, or a ClientConn
-// that fails every call with ErrPluginUnavailable if the plugin isn't
-// running — generated constructors accept this return value directly,
-// mirroring grpc.ClientConnInterface.
-//
-// A plugin whose prior instance is still stopping (a Stop deadline expired
-// before its supervisor joined) also reports unavailable, deliberately: its
-// client mapping was removed when Stop began, and no new instance may take the
-// name until that teardown completes, so there is nothing live to route to.
+// Plugin returns the named plugin's client connection, or a ClientConn that
+// fails every call with ErrPluginUnavailable if the plugin isn't running.
+// A plugin whose prior instance is still stopping also reports unavailable:
+// its client mapping was removed when Stop began, and no new instance may
+// take the name until that teardown completes.
 func (h *Host) Plugin(name string) *ClientConn {
 	h.mu.Lock()
 	cc, ok := h.plugins[name]
@@ -705,14 +649,11 @@ func (h *Host) Plugin(name string) *ClientConn {
 }
 
 // Events returns a channel of supervisor lifecycle events for every plugin
-// this Host manages — the EventStarting/EventReady/EventUnhealthy/
-// EventCrashed/EventRestarting/EventGaveUp stream described on EventKind.
-//
-// Delivery never blocks, even under a sustained burst from many plugins with
-// no reader at all: an informational event (Starting, Ready, Unhealthy,
-// Restarting) drops the oldest queued one once the reader falls behind, while
-// Crashed and GaveUp instead coalesce to the latest one, so a critical event
-// is never silently dropped the way an informational one may be.
+// this Host manages (EventStarting/EventReady/EventUnhealthy/EventCrashed/
+// EventRestarting/EventGaveUp).
+// Delivery never blocks, even under a sustained burst with no reader: an
+// informational event drops the oldest once the reader falls behind, while
+// Crashed and GaveUp instead coalesce to the latest one.
 func (h *Host) Events() <-chan Event {
 	return h.events
 }

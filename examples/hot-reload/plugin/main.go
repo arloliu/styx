@@ -1,11 +1,9 @@
-// Command hot-reload-plugin is examples/hot-reload's plugin binary: a stateful
-// Echo server that survives a hot-reload with its state intact. Each Say response
-// is prefixed with the number of calls this plugin has served ("<count>:<msg>"),
-// and the call count is sealed into the reload snapshot by SaveState and read back
-// by RestoreState — so after the host hot-reloads the plugin, the freshly spawned
-// successor resumes counting from where the predecessor left off instead of
-// resetting to zero. It reuses examples/echo's generated Echo service, so no new
-// protobuf is needed to demonstrate real state handoff.
+// Command hot-reload-plugin is a stateful Echo server that carries its state
+// through hot-reload. Each Say response is prefixed with a call count, which
+// is saved by SaveState and restored by RestoreState so the successor resumes
+// counting where the predecessor left off rather than resetting. It reuses the
+// generated Echo service from examples/echo, so no new protocol definition is
+// needed.
 package main
 
 import (

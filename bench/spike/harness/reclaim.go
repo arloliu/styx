@@ -9,9 +9,10 @@ type trackedSlab struct {
 
 // OutboundTracker records, in FIFO order, which arena handle each
 // outstanding outbound descriptor referenced, so its producer can reclaim
-// the slab once the peer's ring head has advanced past that position: the
-// producer may reclaim a slab only after the consumer's head has passed
+// the slab once the peer's ring head has advanced past that position.
+// The producer may reclaim a slab only after the consumer's head has passed
 // the descriptor referencing it.
+//
 // Single-writer only: exactly one goroutine (the direction's producer)
 // calls Track and Reclaim.
 type OutboundTracker struct {

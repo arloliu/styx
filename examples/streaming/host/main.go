@@ -1,11 +1,8 @@
-// Command streaming-host is examples/streaming's host binary: it spawns
-// examples/echo's plugin (which registers the generated EchoStream service) and
-// exercises all three streaming shapes from the host side — server-streaming
-// (Feed: one request, many responses), client-streaming (Collect: many requests,
-// one response), and bidirectional (Chat: send and receive run concurrently) —
-// printing each shape's result. RequireStreaming on the PluginSpec makes
-// streaming a hard handshake requirement, so a plugin that could not stream would
-// fail Start rather than only failing at the first OpenStream.
+// Command streaming-host spawns the echo plugin and exercises all three
+// streaming shapes from the host side: server-streaming (Feed), client-streaming
+// (Collect), and bidirectional (Chat). RequireStreaming on the PluginSpec makes
+// streaming a hard requirement for handshake success; a plugin lacking streaming
+// support fails Start rather than only failing at the first OpenStream.
 //
 // Usage: streaming-host <path-to-echo-plugin-binary>
 //

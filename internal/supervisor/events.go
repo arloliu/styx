@@ -13,10 +13,10 @@ import (
 const InformationalBufferCapacity = 16
 
 // EventKind enumerates the supervisor lifecycle event stream.
-// Order and values intentionally mirror the public styx.EventKind so
-// styx/host.go's translate-at-boundary conversion is a trivial mapping,
-// though the two types remain distinct (internal/supervisor must not
-// import styx).
+// Order and values intentionally mirror the public styx.EventKind
+// so the translate-at-boundary conversion is a trivial mapping.
+// The two types remain distinct to keep internal/supervisor independent
+// of the public styx package.
 type EventKind int
 
 const (
@@ -28,19 +28,17 @@ const (
 	EventGaveUp
 )
 
-// isCritical reports whether kind is lifecycle-critical (Crashed/GaveUp
-// coalesce-to-latest and are never silently dropped) rather than
-// informational (Starting/Ready/Unhealthy/Restarting: bounded,
-// drop-oldest).
+// isCritical reports whether kind is lifecycle-critical.
+// Critical events (Crashed/GaveUp) coalesce-to-latest and are never silently dropped.
+// Informational events (Starting/Ready/Unhealthy/Restarting) use bounded buffers
+// with drop-oldest semantics.
 func (k EventKind) isCritical() bool {
 	return k == EventCrashed || k == EventGaveUp
 }
 
-// Event is one supervisor lifecycle notification for the plugin instance a
-// Supervisor owns. It is internal/supervisor's own type — following the
-// same translate-at-boundary rule used elsewhere in this codebase — so
-// styx/host.go converts it into a styx.Event when relaying onto
-// Host.Events().
+// Event is one supervisor lifecycle notification for a plugin instance.
+// It is internal/supervisor's own type, following the translate-at-boundary rule.
+// styx/host.go converts it to styx.Event when relaying it to Host.Events().
 type Event struct {
 	Kind EventKind
 	Time time.Time
@@ -49,41 +47,32 @@ type Event struct {
 
 // Bus is the generic engine behind EventBus: a non-blocking, bounded,
 // per-subscriber fan-out with two delivery classes.
-// Informational entries (as classified by the isCritical predicate
-// returning false) use a bounded ring buffer with drop-oldest-and-count-
-// dropped semantics; critical entries instead occupy a single "latest
-// critical" slot per subscriber that a newer critical entry overwrites
-// rather than ever being silently dropped.
+// Informational entries use a bounded ring buffer with drop-oldest-and-count semantics.
+// Critical entries occupy a single "latest critical" slot per subscriber
+// that a newer critical entry overwrites rather than ever being silently dropped.
 //
-// It is exported generically — not just for internal/supervisor's own
-// Event — because styx.Host needs the IDENTICAL semantics for its own
-// fan-in of every plugin's events onto the one channel Host.Events()
-// exposes: lifecycle-critical events must never silently vanish there
-// either, not only within one plugin's own EventBus. styx may import
-// internal/supervisor (the reverse would cycle), so this is a legitimate,
-// minimal reuse rather than a duplicated implementation.
+// It is exported generically — not just for Event — because styx.Host
+// needs identical semantics for its own fan-in of every plugin's events
+// onto Host.Events(): lifecycle-critical events must never vanish silently.
+// This is a legitimate minimal reuse rather than duplication.
 type Bus[T any] struct {
 	mu         sync.Mutex
 	subs       map[*busSubscriber[T]]struct{}
 	isCritical func(T) bool
 }
 
-// busSubscriber holds one Subscribe call's delivery state. All queue
-// manipulation happens under mu from Publish's goroutine(s); the forwarder
-// goroutine (below) is the sole reader of that queue and the sole writer to
-// ch, so ch itself needs no locking.
+// busSubscriber holds one Subscribe call's delivery state.
+// All queue manipulation happens under mu from Publish's goroutine(s).
+// The forwarder goroutine is the sole reader of the queue and sole writer to ch,
+// so ch itself needs no locking.
 //
-// Because the forwarder actively pulls from the queue as soon as anything
-// is enqueued, at most one event can be "checked out" for delivery (blocked
-// mid-send on ch) at a time, ahead of whatever Publish's drop-oldest policy
-// would otherwise have evicted. A pathological interleaving can therefore
-// let one extra informational event survive beyond InformationalBufferCapacity
-// — the event the forwarder had already dequeued before a later Publish
-// call would have dropped it. This does not violate the documented
-// contract (Publish still never blocks, and the newest event is never the
-// one evicted); it only means "at most InformationalBufferCapacity+1
-// informational events survive a sustained backlog," not exactly
-// InformationalBufferCapacity.
+// The forwarder actively pulls from the queue as soon as anything is enqueued,
+// so at most one event is checked out for delivery (blocked mid-send on ch) at a time.
+// A pathological interleaving can therefore let one extra informational event
+// survive beyond InformationalBufferCapacity — the event the forwarder had
+// already dequeued before a later Publish call would have dropped it.
+// This does not violate the contract; it means at most
+// InformationalBufferCapacity+1 events survive a sustained backlog.
 type busSubscriber[T any] struct {
 	mu sync.Mutex
 
@@ -107,18 +96,17 @@ type busSubscriber[T any] struct {
 	done chan struct{}
 }
 
-// NewBus creates an empty Bus. isCritical classifies each published value;
-// a nil isCritical treats every value as informational.
+// NewBus creates an empty Bus.
+// isCritical classifies each published value; nil treats every value as informational.
 func NewBus[T any](isCritical func(T) bool) *Bus[T] {
 	return &Bus[T]{subs: make(map[*busSubscriber[T]]struct{}), isCritical: isCritical}
 }
 
-// Subscribe registers a new receiver channel and returns it, an unsubscribe
-// func, and a quiesced probe. Calling the returned unsubscribe func more than
-// once is safe (subsequent calls are no-ops). quiesced reports whether nothing
-// is queued or in flight for this subscriber (no critical pending, ring empty,
-// no send outstanding); a caller that is about to unsubscribe uses it to drain
-// first, so no queued event is discarded by the teardown.
+// Subscribe registers a new receiver channel and returns it, an unsubscribe func,
+// and a quiesced probe.
+// Calling the returned unsubscribe func more than once is safe (subsequent calls are no-ops).
+// quiesced reports whether nothing is queued or in flight for this subscriber;
+// a caller about to unsubscribe can use it to drain first so no queued event is discarded.
 func (b *Bus[T]) Subscribe() (<-chan T, func(), func() bool) {
 	s := &busSubscriber[T]{
 		ch:   make(chan T),
@@ -152,10 +140,10 @@ func (b *Bus[T]) Subscribe() (<-chan T, func(), func() bool) {
 	return s.ch, unsub, quiesced
 }
 
-// Publish delivers ev to every current subscriber per the drop-oldest /
-// coalesce-to-latest rule above. Publish itself never blocks regardless of
-// subscriber read behavior: it only ever mutates a subscriber's own
-// mutex-protected queue and performs a non-blocking wake signal.
+// Publish delivers ev to every current subscriber per the drop-oldest
+// and coalesce-to-latest rules.
+// Publish never blocks regardless of subscriber read behavior: it only mutates
+// a subscriber's mutex-protected queue and performs a non-blocking wake signal.
 func (b *Bus[T]) Publish(ev T) {
 	critical := b.isCritical != nil && b.isCritical(ev)
 
@@ -172,9 +160,8 @@ func (b *Bus[T]) Publish(ev T) {
 }
 
 // DroppedInformationalCounts reports every current subscriber's
-// informational-event drop counter (exported for test verification across
-// package boundaries — see internal/supervisor/export_test.go and
-// styx/export_test.go).
+// informational-event drop counter.
+// Exported for test verification across package boundaries.
 func (b *Bus[T]) DroppedInformationalCounts() []uint64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -189,8 +176,8 @@ func (b *Bus[T]) DroppedInformationalCounts() []uint64 {
 	return out
 }
 
-// enqueue applies ev's class-appropriate drop policy and wakes the
-// forwarder. Never blocks.
+// enqueue applies ev's class-appropriate drop policy and wakes the forwarder.
+// Never blocks.
 func (s *busSubscriber[T]) enqueue(ev T, critical bool) {
 	s.mu.Lock()
 	if critical {
@@ -215,9 +202,9 @@ func (s *busSubscriber[T]) enqueue(ev T, critical bool) {
 	}
 }
 
-// next pops the highest-priority pending event (critical before
-// informational, informational FIFO), or reports ok=false if nothing is
-// queued.
+// next pops the highest-priority pending event.
+// Critical events have priority over informational events; informational events
+// are FIFO. Reports ok=false if nothing is queued.
 func (s *busSubscriber[T]) next() (T, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -243,17 +230,17 @@ func (s *busSubscriber[T]) next() (T, bool) {
 	return ev, true
 }
 
-// clearSending marks the checked-out event's delivery finished, so quiesced can
-// again report the subscriber idle once its ring is also empty.
+// clearSending marks the checked-out event's delivery as finished.
+// quiesced can then report the subscriber idle once its ring is also empty.
 func (s *busSubscriber[T]) clearSending() {
 	s.mu.Lock()
 	s.sending = false
 	s.mu.Unlock()
 }
 
-// forward is the sole writer to s.ch: it drains s's queue one event at a
-// time, blocking on the send only (never on Publish), until Subscribe's
-// unsubscribe func closes s.done.
+// forward is the sole writer to s.ch.
+// It drains s's queue one event at a time, blocking on the send (never on Publish),
+// until the unsubscribe func closes s.done.
 func (s *busSubscriber[T]) forward() {
 	for {
 		ev, ok := s.next()
@@ -276,30 +263,29 @@ func (s *busSubscriber[T]) forward() {
 	}
 }
 
-// EventBus fans one supervisor's events out to every subscriber
-// non-blockingly: a thin, Event-specific wrapper around the
-// generic Bus above. See Bus's doc for the full drop-oldest /
-// coalesce-to-latest semantics.
+// EventBus fans one supervisor's events out to every subscriber non-blockingly.
+// It is a thin Event-specific wrapper around the generic Bus.
+// See Bus's doc for the full drop-oldest and coalesce-to-latest semantics.
 type EventBus struct {
 	bus *Bus[Event]
 }
 
-// NewEventBus creates an empty EventBus.
+// NewEventBus creates an empty EventBus for publishing and subscribing to events.
 func NewEventBus() *EventBus {
 	return &EventBus{bus: NewBus(func(e Event) bool { return e.Kind.isCritical() })}
 }
 
-// Subscribe registers a new receiver channel and returns it, an unsubscribe
-// func, and a quiesced probe (see Bus.Subscribe). Buffering is handled
-// internally via the bounded informational ring buffer and critical-event slot
-// described above, not by the channel itself.
+// Subscribe registers a new receiver channel and returns it, an unsubscribe func,
+// and a quiesced probe.
+// Buffering is handled internally via bounded ring buffer and critical-event slot,
+// not by the channel itself. See Bus.Subscribe for details.
 func (b *EventBus) Subscribe() (<-chan Event, func(), func() bool) {
 	return b.bus.Subscribe()
 }
 
-// Publish delivers ev to every current subscriber per the drop-oldest /
-// coalesce-to-latest rule above. Publish itself never blocks regardless of
-// subscriber read behavior.
+// Publish delivers ev to every current subscriber per the drop-oldest
+// and coalesce-to-latest rules.
+// Publish never blocks regardless of subscriber read behavior.
 func (b *EventBus) Publish(ev Event) {
 	b.bus.Publish(ev)
 }

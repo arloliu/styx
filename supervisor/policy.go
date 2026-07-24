@@ -5,28 +5,28 @@ import (
 	"time"
 )
 
-// BackoffFunc computes the delay before restart attempt number attempt
-// (0-indexed: attempt 0 is the delay before the FIRST restart, after the
-// initial crash).
+// BackoffFunc computes the delay before a restart attempt.
+// Attempt is 0-indexed: attempt 0 is the delay before the first restart,
+// after the initial crash.
 type BackoffFunc func(attempt int) time.Duration
 
-// RestartPolicy bounds how many times a crashed plugin is restarted and
-// how long to wait between attempts.
+// RestartPolicy controls how many times a plugin is restarted after a crash
+// and how long to wait between restart attempts.
+// A RestartPolicy is safe for concurrent use.
 type RestartPolicy struct {
 	Max     int
 	Backoff BackoffFunc
 }
 
-// ExpBackoff returns a BackoffFunc computing base*2^attempt, capped at
-// maxDelay, with up to 20% jitter added to avoid synchronized restart storms
-// across multiple plugin instances restarting at the same wall-clock
-// moment.
+// ExpBackoff returns a BackoffFunc computing exponential backoff: base*2^attempt,
+// capped at maxDelay, with up to 20% jitter added.
+// The jitter reduces the likelihood that multiple plugin instances restart
+// simultaneously at the same wall-clock time.
 func ExpBackoff(base, maxDelay time.Duration) BackoffFunc {
 	return func(attempt int) time.Duration {
 		d := maxDelay
-		// Guard the shift itself rather than the multiplication result: past
-		// attempt 62, 1<<attempt alone already dwarfs any realistic base/maxDelay,
-		// so there is nothing left to compute — d stays maxDelay.
+		// Limit the shift to attempt < 63 because 1<<attempt alone exceeds any
+		// realistic base or maxDelay past attempt 62, so scaling is pointless.
 		if attempt < 63 {
 			scaled := base * time.Duration(int64(1)<<uint(attempt))
 			if scaled > 0 && scaled <= maxDelay {

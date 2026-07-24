@@ -1,10 +1,7 @@
-// Command udsonlyplugin is a cross-process test fixture: a Styx plugin whose
-// transport allowlist advertises ONLY the uds transport (PluginServerConfig
-// Transports: []styx.Transport{styx.TransportUDS}), registering no services. It
-// completes the handshake and data-plane attach over uds and serves until torn
-// down. It exercises the transport-selection fallback rule: a TransportAuto host
-// negotiates uds against it and serves, while a TransportSHM-pinned host fails
-// the handshake (no common transport) rather than silently downgrading.
+// Command udsonlyplugin advertises only UDS transport and completes handshake
+// over it. It exercises transport negotiation: TransportAuto hosts select UDS
+// and serve successfully, while TransportSHM-pinned hosts fail the handshake
+// because there is no common transport.
 package main
 
 import (

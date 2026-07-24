@@ -15,7 +15,8 @@ import (
 )
 
 // castagnoliTable is the CRC32C (Castagnoli, polynomial 0x1EDC6F41) table the
-// checksum feature stamps and the receiver verifies against (shm-abi.md §5).
+// checksum feature stamps into frames and the receiver verifies against
+// (shm-abi.md §5).
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 
 // descriptorRing is the writer's view of its outbound ring: publish plus the
@@ -94,10 +95,10 @@ type slabRef struct {
 	present bool
 }
 
-// writer is the single producer goroutine plus the two bounded intent queues for
-// one direction of the shared-memory data plane. Exactly one goroutine (run)
-// touches the ring and arena; concurrent callers only submit intents (design
-// §12). See the package doc for the lane, priority, and completion invariants.
+// writer is the single producer goroutine plus the two bounded intent queues
+// for one direction of the shared-memory data plane. Exactly one goroutine
+// (run) touches the ring and arena; concurrent callers only submit intents
+// (design §12). See the package doc for lane, priority, and completion invariants.
 type writer struct {
 	ring  descriptorRing
 	arena payloadArena
@@ -129,11 +130,10 @@ type writer struct {
 	mode admissionMode
 
 	// gen is the low 32 bits of the region generation, stamped into every
-	// descriptor this writer publishes so the peer's staleness check accepts them
-	// (shm-abi.md §4/§15). It is 0 only in isolated unit tests that build a writer
-	// with no region; a real region's generation is always >= 1 (shm-abi.md §2),
-	// so the arena-consistency check in stampPayload is active in every production
-	// path.
+	// descriptor this writer publishes so the peer's staleness check accepts
+	// them (shm-abi.md §4/§15). It is 0 only in isolated unit tests; a real
+	// region's generation is always >= 1 (shm-abi.md §2), so the arena-consistency
+	// check in stampPayload is active in every production path.
 	gen uint32
 
 	// checksum records whether the CRC32C feature is negotiated; when set, a
@@ -156,23 +156,20 @@ type writer struct {
 	signal func()
 
 	// poison is the region's poison/shutdown query-and-actuation seam
-	// (shm-abi.md §16), used three ways: prePublishFault re-checks it
-	// immediately before every tail store (§8's producer pre-publish gate),
-	// rolling the admission back rather than publishing if either word is
-	// set; a Ring.Push that reports ring.ErrCorrupt actuates
-	// PoisonRingCorrupt through it (§8/§9's producer-side ring depth >
-	// capacity case); and reclaim's own bound check actuates the same cause
-	// when the untrusted peer head fails either validation before reclaim
-	// walks or frees anything. nil in isolated unit tests that build a writer
-	// with no attached region -- all three uses become no-ops; production
-	// wires the real PoisonFlag via newRegionWriter.
+	// (shm-abi.md §16), used three ways: prePublishFault re-checks it before
+	// every tail store (§8's pre-publish gate), rolling back admission if set;
+	// a Ring.Push reporting ring.ErrCorrupt actuates PoisonRingCorrupt through
+	// it (§8/§9's ring depth > capacity case); and reclaim's bound check
+	// actuates the same when the untrusted peer head fails validation. nil in
+	// isolated unit tests; production wires the real PoisonFlag via
+	// newRegionWriter.
 	poison *PoisonFlag
 
 	// handleTable, handleMask, and lastReclaimed drive head-gated slab reclaim
-	// (shm-abi.md §6): handleTable[seq & handleMask] records the slab published at
-	// ring sequence seq, and reclaim frees every slab in [lastReclaimed, head)
-	// before each allocation. handleTable is nil in isolated tests (reclaim
-	// disabled); production sizes it to ring capacity.
+	// (shm-abi.md §6). handleTable[seq & handleMask] records the slab published
+	// at ring sequence seq; reclaim frees every slab in [lastReclaimed, head)
+	// before each allocation. nil in isolated tests (reclaim disabled); sized to
+	// ring capacity in production.
 	handleTable   []slabRef
 	handleMask    uint64
 	lastReclaimed uint64
@@ -184,15 +181,11 @@ type writer struct {
 	pendingSlab slabRef
 
 	// onBlock is a test-only observation hook: when set, run calls it with the
-	// blockSite of a wake select immediately before parking on that select, so a
-	// test can prove run reached a specific intermediate state before delivering a
-	// burst rather than racing to reach it. It is unset in every production build
-	// (neither newWriterFromParts nor newRegionWriter sets it), so the guarded call
-	// is a no-op that leaves run's control flow unchanged. It is stored through an
-	// atomic pointer so a test can install it after start (the transport starts the
-	// writer in Attach) without racing run's reads at the park points; setOnBlock
-	// before start (the in-package writer tests) works identically. It must not
-	// block run indefinitely.
+	// blockSite immediately before parking on a wake select, so a test can prove
+	// run reached a specific state before delivering a burst without racing. It
+	// is unset in production, so the guarded call is a no-op. It is stored via
+	// atomic pointer so a test can install it after start without racing run's
+	// reads at park points. It must not block run indefinitely.
 	onBlock atomic.Pointer[func(blockSite)]
 
 	// closeMu guards the closed flag and, held for read across an enqueue, forms
@@ -231,10 +224,8 @@ type writer struct {
 
 // newWriter builds a writer over an already-attached ring and arena. dataDepth
 // and lifecycleDepth are the bounded queue capacities; they are a trusted-caller
-// contract (the capacity invariant that derives them, shm-abi.md §18, is not this
-// writer's concern) and MUST be positive — a non-positive depth is a construction
-// bug and panics. The returned writer is not yet running; call start to launch
-// its goroutine.
+// contract and must be positive, or construction panics. The returned writer is
+// not yet running; call start to launch its goroutine.
 func newWriter(r *ring.Ring, a *arena.Arena, dataDepth, lifecycleDepth int, mode admissionMode) *writer {
 	return newWriterFromParts(r, a, dataDepth, lifecycleDepth, mode)
 }
@@ -1060,18 +1051,16 @@ func (w *writer) capacity() uint64 {
 	return uint64(len(w.handleTable))
 }
 
-// reclaim frees every slab the consumer has released — those published at ring
-// sequences below the current head (Tail - Len, both seq_cst; shm-abi.md
-// §6/§10) — advancing lastReclaimed to that head. It is a no-op until the
-// handle table is wired (isolated tests).
+// reclaim frees every slab the consumer has released: those published at ring
+// sequences below the current head (Tail - Len, seq_cst; shm-abi.md §6/§10),
+// advancing lastReclaimed to that head. It is a no-op until the handle table
+// is wired (isolated tests).
 //
-// The head word is written by the untrusted peer (the consumer), so it MUST be
-// validated before it drives any free or counter mutation here — the same
-// validate-before-mutate rule Ring.Push and the ABI's Admit pseudocode apply to
-// depth (shm-abi.md §8/§9/§10, docs/specs/shm-abi.md §8's Admit: depth is
-// checked, then the reconcile walk is separately bounded, both before any
-// counter is touched). Two bounds, checked in order, each wrap-safe unsigned
-// arithmetic exactly like Ring's own depth check:
+// The head word is written by the untrusted peer (the consumer), so it must be
+// validated before it drives any free or counter mutation — the same
+// validate-before-mutate rule the ABI's Admit pseudocode applies to depth
+// (shm-abi.md §8/§9/§10). Two bounds, checked in order, each wrap-safe
+// unsigned arithmetic:
 //
 //  1. depth = tail - head MUST be <= capacity, the same condition Ring.Push
 //     itself enforces. A corrupt or backwards head makes depth wrap to a huge

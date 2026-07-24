@@ -2,11 +2,14 @@ package styx
 
 import "github.com/arloliu/styx/supervisor"
 
-// RestartPolicy, BackoffFunc, and ExpBackoff are the supervisor package's
-// types, aliased here so both `styx.RestartPolicy`/`styx.ExpBackoff` and
-// `supervisor.RestartPolicy` name the identical type — no duplication, no
-// conversion needed at the boundary.
+// RestartPolicy is the supervisor's restart-policy type, aliased here so
+// RestartPolicy and supervisor.RestartPolicy name the identical type.
 type RestartPolicy = supervisor.RestartPolicy
+
+// BackoffFunc is the supervisor's backoff-function type, aliased here so
+// BackoffFunc and supervisor.BackoffFunc name the identical type.
 type BackoffFunc = supervisor.BackoffFunc
 
+// ExpBackoff is the supervisor's exponential-backoff implementation, aliased
+// here so ExpBackoff and supervisor.ExpBackoff refer to the identical value.
 var ExpBackoff = supervisor.ExpBackoff

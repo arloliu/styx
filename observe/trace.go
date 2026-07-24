@@ -2,14 +2,14 @@ package observe
 
 import "context"
 
-// The out-of-line trace-context block, exactly as the frozen shared-memory ABI
-// defines it (shm-abi.md §5): a fixed 32-byte block laid out as version(1) +
-// trace-id(16) + span-id(8) + trace-flags(1) = 26 meaningful bytes, zero-padded
-// to 32. This is the block the descriptor's TRACE_PRESENT flag prefixes to the
-// payload slab, so a host can bridge Styx's trace context to and from
-// OpenTelemetry's W3C trace-context without a wire change. Styx defines only the
-// encoding here; actually carrying these bytes on the data plane is a separate,
-// out-of-line concern gated on negotiating the trace feature, and is not done yet.
+// Encoding of the out-of-line trace-context block, as defined in the frozen
+// shared-memory ABI (shm-abi.md §5): a fixed 32-byte block with version(1) +
+// trace-id(16) + span-id(8) + trace-flags(1), zero-padded to 32 bytes.
+// When TRACE_PRESENT is set, this block prefixes the payload slab, allowing a
+// host to bridge Styx's trace context to and from W3C trace-context without
+// changing the wire format.
+// Styx defines only the encoding here; carrying these bytes on the data plane is
+// a separate feature gated on trace negotiation and is not yet implemented.
 const (
 	traceFieldLen = 32 // shm-abi.md §5: version(1)+trace-id(16)+span-id(8)+flags(1), zero-padded to 32
 
@@ -23,52 +23,54 @@ const (
 	offFlags   = 25 // 1 byte; bytes 26..31 are zero padding
 )
 
-// SpanContext is the minimal trace identity Styx encodes and decodes: the two
-// identifiers and the sampled flag of W3C trace-context. It carries no vendor
-// span object — a host maps it to and from its own tracer's span context.
+// SpanContext carries the minimal trace identity: the trace ID, span ID, and
+// sampled flag from W3C trace-context.
+// It carries no vendor-specific span object; a host maps it to and from its own
+// tracer's span context.
+// A SpanContext is a plain value type safe for concurrent use.
 type SpanContext struct {
 	TraceID [16]byte
 	SpanID  [8]byte
 	Sampled bool
 }
 
-// TraceInjector encodes a SpanContext to, and decodes it from, the binary
-// trace-context field. Inject reads the current SpanContext from a context and
-// returns its wire bytes (nil when there is none); Extract parses wire bytes
-// back into a SpanContext attached to the returned context. Extract MUST be
-// total: malformed input returns the input context unchanged and never panics.
+// TraceInjector encodes SpanContext to and decodes from the binary trace-context field.
+// Inject reads the current SpanContext from a context and returns its wire bytes
+// (nil if no span is present); Extract parses wire bytes and returns a context
+// with the decoded SpanContext attached.
+// Extract MUST handle malformed input gracefully: it returns the input context
+// unchanged and never panics.
 //
-// Styx does not yet invoke a TraceInjector: no host or plugin configuration
-// accepts one, and no Styx instrumentation calls Inject or Extract. The type
-// defines the trace-context propagation contract for when Styx wires it, and an
-// application may use it — with SpanContext, ContextWithSpan, and
-// SpanFromContext — directly in its own handler code today to encode and decode
-// the binary trace-context field.
+// Styx does not yet invoke a TraceInjector — no host or plugin configuration
+// accepts one, and no Styx instrumentation calls Inject or Extract.
+// The type defines the trace-context propagation contract for future integration.
+// Applications may use it — with SpanContext, ContextWithSpan, and SpanFromContext —
+// to encode and decode the binary trace-context field in their own handler code.
 type TraceInjector interface {
 	// Inject returns the binary trace field for the SpanContext in ctx, or nil
-	// when ctx carries no span.
+	// if ctx carries no span.
 	Inject(ctx context.Context) []byte
 	// Extract parses traceField and returns ctx with the decoded SpanContext
 	// attached, or ctx unchanged if traceField is absent or malformed.
 	Extract(ctx context.Context, traceField []byte) context.Context
 }
 
-// NoopTraceInjector returns a TraceInjector that encodes nothing and attaches
-// nothing — the default when no injector is configured.
+// NoopTraceInjector returns a TraceInjector that encodes nothing and attaches nothing.
+// This is the default when no injector is configured.
 func NoopTraceInjector() TraceInjector { return noopTraceInjector{} }
 
 // NewW3CTraceInjector returns a TraceInjector that encodes and decodes the
 // binary W3C trace-context field with no vendor dependency.
 func NewW3CTraceInjector() TraceInjector { return w3cTraceInjector{} }
 
-// ContextWithSpan returns a copy of ctx carrying sc, so a caller can seed the
-// span a TraceInjector.Inject will encode.
+// ContextWithSpan returns a copy of ctx with the SpanContext attached.
+// This allows a caller to seed the span that a TraceInjector.Inject will encode.
 func ContextWithSpan(ctx context.Context, sc SpanContext) context.Context {
 	return context.WithValue(ctx, spanContextKey{}, sc)
 }
 
-// SpanFromContext returns the SpanContext ContextWithSpan (or a decoding
-// Extract) attached to ctx, and whether one was present.
+// SpanFromContext returns the SpanContext attached to ctx (by ContextWithSpan or
+// a decoding Extract), and whether one was present.
 func SpanFromContext(ctx context.Context) (SpanContext, bool) {
 	sc, ok := ctx.Value(spanContextKey{}).(SpanContext)
 
@@ -118,12 +120,13 @@ func (w3cTraceInjector) Extract(ctx context.Context, traceField []byte) context.
 }
 
 // decodeTraceField parses the frozen 32-byte trace-context block (shm-abi.md §5),
-// returning ok=false (never panicking) for any length, version, non-zero-padding,
-// or all-zero-identity error so a corrupt or foreign field leaves the caller's
-// context untouched. An all-zero trace id or span id is not a valid identity and
-// is rejected: a well-formed but empty block must not masquerade as a real span.
-// Bytes 26..31 are required zero padding; any non-zero byte there is a malformed
-// (or foreign) field and is rejected exactly like a bad length or version.
+// returning ok=false for any invalid length, version, non-zero padding, or
+// all-zero trace or span ID.
+// It never panics, so a corrupt or foreign field leaves the caller's context untouched.
+// An all-zero trace ID or span ID is not a valid identity: a well-formed but
+// empty block must not masquerade as a real span.
+// Bytes 26..31 must be zero; any non-zero byte there marks the field malformed
+// or foreign, rejected the same as a bad length or version.
 func decodeTraceField(field []byte) (SpanContext, bool) {
 	if len(field) != traceFieldLen {
 		return SpanContext{}, false

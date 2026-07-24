@@ -6,7 +6,10 @@ import (
 	"os"
 )
 
+// EchoArgs holds a payload for the Echo RPC call.
 type EchoArgs struct{ Payload []byte }
+
+// EchoReply holds the response payload from the Echo RPC call.
 type EchoReply struct{ Payload []byte }
 
 type echoService struct{}
@@ -16,14 +19,14 @@ func (echoService) Echo(args *EchoArgs, reply *EchoReply) error {
 	return nil
 }
 
-// NetRPCBaseline uses the stdlib net/rpc (gob codec) over a Unix domain
-// socket.
+// NetRPCBaseline uses the stdlib net/rpc package (gob codec) over a Unix domain socket.
 type NetRPCBaseline struct {
 	sockPath string
 	ln       net.Listener
 	client   *rpc.Client
 }
 
+// NewNetRPC returns a new NetRPCBaseline.
 func NewNetRPC() *NetRPCBaseline { return &NetRPCBaseline{} }
 
 func (n *NetRPCBaseline) Name() string { return "net-rpc-uds" }
@@ -42,7 +45,8 @@ func (n *NetRPCBaseline) Start() error {
 	if err := srv.RegisterName("Echo", echoService{}); err != nil {
 		return err
 	}
-	//nolint:noctx // benchmark-harness Start has no ctx param; matches every other baseline in this package
+	// Start has no ctx param, matching every other baseline in this package.
+	//nolint:noctx
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return err
@@ -83,9 +87,8 @@ func (n *NetRPCBaseline) Stop() error {
 	if n.ln != nil {
 		_ = n.ln.Close()
 	}
-	// The Listener's Close (above) already unlinks the socket file it
-	// created; os.IsNotExist here just means we lost that race, not a
-	// teardown failure.
+	// Listener.Close already unlinks the socket file.
+	// os.IsNotExist here means we lost the race to unlink, not a teardown failure.
 	if err := os.Remove(n.sockPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}

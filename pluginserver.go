@@ -37,19 +37,16 @@ const controlChildFD = 3
 // arrives. A poll expiry is not a fault; dispatchControl keeps serving.
 const controlServePoll = 50 * time.Millisecond
 
-// PluginServer is the plugin-side counterpart to Host: it owns the
-// control connection, the data-plane Transport, and the
-// internal/rpcruntime.Dispatcher services are registered against. Serve
-// drives the plugin side of the handshake, attaches the data-plane
+// PluginServer is the plugin-side counterpart to Host: it owns the control
+// connection, data-plane Transport, and internal/rpcruntime.Dispatcher that
+// services register against. Serve drives the handshake, attaches the
 // transport, runs the serving loop, and exits when the host disconnects or
 // sends Shutdown.
 //
-// Register the plugin's services, stream handlers, and reload hooks BEFORE
-// calling Serve; the handler-panic policy and the transport allowlist are fixed
-// at construction through PluginServerConfig. Each Register* method is
-// individually safe for concurrent use, but the serving session snapshots the
-// registered services, stream handlers, and reload hooks once when it starts, so
-// a registration made after Serve has begun does not affect the running session.
+// Register services, stream handlers, and reload hooks BEFORE calling Serve.
+// Each Register* method is individually safe for concurrent use, but Serve
+// snapshots the registered services, handlers, and hooks once at startup, so
+// a post-Serve registration does not affect the running session.
 // Serve is called once.
 type PluginServer struct {
 	mu       sync.Mutex
@@ -114,14 +111,10 @@ func NewPluginServer(cfg PluginServerConfig) *PluginServer {
 }
 
 // RegisterService installs desc against impl (the user's service
-// implementation, e.g. `&ImageProcessor{}`), to be called from the
-// dispatch loop once Serve starts.
-//
-// Registering two services whose ServiceID collides (an FNV-64 collision —
-// checked again here, defense in depth against the code generator's own
-// generation-time check missing a cross-package collision) panics
-// immediately: this is a startup-time configuration error, not a runtime
-// condition to recover from.
+// implementation, e.g., &ImageProcessor{}), to be called from the dispatch
+// loop once Serve starts. Registering two services with colliding ServiceIDs
+// panics immediately (a startup-time configuration error, not a runtime
+// condition to recover from).
 func (s *PluginServer) RegisterService(desc *ServiceDesc, impl any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,14 +129,11 @@ func (s *PluginServer) RegisterService(desc *ServiceDesc, impl any) {
 	s.services[desc.ServiceID] = registeredService{desc: desc, impl: impl}
 }
 
-// Serve reads the inherited control fd (fd 3, per lifecycle.Spawn's
-// contract), completes the handshake, receives the data-plane transport fd,
-// and runs the serving loop until the host disconnects or Shutdown is
-// received. It blocks until the plugin process should exit; callers do
-// os.Exit(1) if it returns a non-nil error.
-//
-// InstallDeathSignal is its literal first statement — a plugin must never
-// outlive its host — before any other setup, so an already-orphaned
+// Serve reads the inherited control fd, completes the handshake, receives
+// the data-plane transport fd, and runs the serving loop until the host
+// disconnects or Shutdown is received. It blocks until the plugin process
+// should exit; callers do os.Exit(1) if it returns a non-nil error.
+// InstallDeathSignal is its literal first statement so an already-orphaned
 // process exits immediately.
 func (s *PluginServer) Serve() error {
 	lifecycle.InstallDeathSignal()

@@ -1,4 +1,3 @@
-// Package codec defines the Codec interface used to marshal messages and
-// Status payloads on the wire, with a protobuf implementation as the
-// default.
+// Package codec defines the Codec interface for marshaling RPC payloads and Status on the wire.
+// It provides a protobuf implementation as the default and allows alternate codecs via negotiation.
 package codec

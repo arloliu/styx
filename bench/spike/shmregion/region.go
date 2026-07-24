@@ -90,7 +90,8 @@ func Attach(fd int) (*Region, error) {
 // FD returns the region's memfd, for passing over SCM_RIGHTS.
 func (r *Region) FD() int { return r.fd }
 
-// Close unmaps the region and closes the local fd. Safe to call once.
+// Close unmaps the region and closes the local fd.
+// Safe to call once.
 func (r *Region) Close() error {
 	if err := unix.Munmap(r.data); err != nil {
 		return fmt.Errorf("munmap: %w", err)
@@ -99,20 +100,42 @@ func (r *Region) Close() error {
 	return unix.Close(r.fd)
 }
 
-func (r *Region) TailHP() *uint64      { return r.wordU64(syncTailHPOffset) }
-func (r *Region) HeadHP() *uint64      { return r.wordU64(syncHeadHPOffset) }
-func (r *Region) TailPH() *uint64      { return r.wordU64(syncTailPHOffset) }
-func (r *Region) HeadPH() *uint64      { return r.wordU64(syncHeadPHOffset) }
-func (r *Region) ParkStateHP() *uint32 { return r.wordU32(syncParkStateHPOffset) }
-func (r *Region) ParkStatePH() *uint32 { return r.wordU32(syncParkStatePHOffset) }
-func (r *Region) Poison() *uint32      { return r.wordU32(syncPoisonOffset) }
-func (r *Region) Generation() *uint32  { return r.wordU32(syncGenerationOffset) }
+// TailHP returns a pointer to the host->plugin ring tail word for seq_cst atomics.
+func (r *Region) TailHP() *uint64 { return r.wordU64(syncTailHPOffset) }
 
+// HeadHP returns a pointer to the host->plugin ring head word for seq_cst atomics.
+func (r *Region) HeadHP() *uint64 { return r.wordU64(syncHeadHPOffset) }
+
+// TailPH returns a pointer to the plugin->host ring tail word for seq_cst atomics.
+func (r *Region) TailPH() *uint64 { return r.wordU64(syncTailPHOffset) }
+
+// HeadPH returns a pointer to the plugin->host ring head word for seq_cst atomics.
+func (r *Region) HeadPH() *uint64 { return r.wordU64(syncHeadPHOffset) }
+
+// ParkStateHP returns a pointer to the host->plugin direction's park-state word.
+func (r *Region) ParkStateHP() *uint32 { return r.wordU32(syncParkStateHPOffset) }
+
+// ParkStatePH returns a pointer to the plugin->host direction's park-state word.
+func (r *Region) ParkStatePH() *uint32 { return r.wordU32(syncParkStatePHOffset) }
+
+// Poison returns a pointer to the poison word in the sync page.
+func (r *Region) Poison() *uint32 { return r.wordU32(syncPoisonOffset) }
+
+// Generation returns a pointer to the generation word in the sync page.
+func (r *Region) Generation() *uint32 { return r.wordU32(syncGenerationOffset) }
+
+// RingHPBytes returns a byte slice over the host->plugin ring descriptor array.
 func (r *Region) RingHPBytes() []byte { return r.data[RingHPOffset : RingHPOffset+RingBytesHP] }
+
+// RingPHBytes returns a byte slice over the plugin->host ring descriptor array.
 func (r *Region) RingPHBytes() []byte { return r.data[RingPHOffset : RingPHOffset+RingBytesPH] }
+
+// ArenaHPBytes returns a byte slice over the host->plugin arena.
 func (r *Region) ArenaHPBytes() []byte {
 	return r.data[ArenaHPOffset : ArenaHPOffset+ArenaBytesPerDirection]
 }
+
+// ArenaPHBytes returns a byte slice over the plugin->host arena.
 func (r *Region) ArenaPHBytes() []byte {
 	return r.data[ArenaPHOffset : ArenaPHOffset+ArenaBytesPerDirection]
 }

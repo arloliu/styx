@@ -7,107 +7,98 @@ import (
 	"github.com/arloliu/styx/internal/transport"
 )
 
-// ErrBackpressure is returned by submit for a data intent when the writer's
-// bounded data-submission queue is full and the writer runs in reject mode
-// (design §19: a caller either blocks until space frees or receives
-// ErrBackpressure immediately). It is transient framework backpressure, never a
-// lost or failed frame: the caller may retry or wait. The lifecycle lane never
-// yields it, and the block-mode default never yields it either. The transport
-// surface translates it to the framework-level backpressure error at its
-// boundary.
+// ErrBackpressure is returned when the writer's bounded data-submission queue
+// is full and the writer runs in reject mode (design §19). The caller may retry
+// or wait; the frame is not lost. The lifecycle lane never yields this error,
+// and the default block-mode never yields it either. The transport surface
+// translates it to the framework-level backpressure error at its boundary.
 var ErrBackpressure = errors.New("shm: submission queue full")
 
-// errUnsupportedKind fails an intent whose frame kind is not one this writer
-// emits under layout_version = 1 (an unassigned byte outside the kinds mapKind
-// accepts). Reaching it is an in-process caller bug, not a peer fault, so the writer
-// surfaces it on the intent's completion channel rather than poisoning the
-// region — poisoning is the consumer's response to a bad received frame
-// (shm-abi.md §5/§16), never the producer's response to its own malformed
-// request.
+// errUnsupportedKind is returned for a frame kind this writer does not emit
+// under layout_version = 1. This is an in-process caller bug, not a peer fault,
+// so it is surfaced on the completion channel rather than poisoning the region.
+// Poisoning is the consumer's response to a bad received frame (shm-abi.md §5/§16),
+// never the producer's response to its own malformed request.
 var errUnsupportedKind = errors.New("shm: unsupported frame kind")
 
-// errLaneKindMismatch fails an intent queued on the wrong lane for its kind: the
-// lifecycle lane carries only the descriptor-only kinds (CANCEL, STREAM_ACK),
-// and the data lane only the payload-bearing kinds (design §12; shm-abi.md §5
-// descriptor-only kinds; stream-protocol.md §2.1). A mismatch is an in-process
-// caller bug, surfaced on the intent's completion channel, never poisoned.
+// errLaneKindMismatch is returned when an intent's frame kind does not match
+// its queue lane. The lifecycle lane carries only descriptor-only kinds
+// (CANCEL, STREAM_ACK), and the data lane only payload-bearing kinds
+// (design §12; shm-abi.md §5; stream-protocol.md §2.1). This is an in-process
+// caller bug, surfaced on the completion channel, never poisoned.
 var errLaneKindMismatch = errors.New("shm: frame kind not valid for its lane")
 
-// errUnknownLane fails an intent carrying a lane value outside the two the writer
-// knows (laneData, laneLifecycle). Trusted in-package callers use the lane
-// constants, so an out-of-domain lane is a caller bug, surfaced on the intent's
-// completion channel and never published on a lane the consumer does not expect;
-// poisoning is the consumer's job, never the producer's.
+// errUnknownLane is returned for an intent with a lane value outside the two
+// the writer knows (laneData, laneLifecycle). Trusted in-package callers use
+// the lane constants, so this is a caller bug, surfaced on the completion
+// channel. The frame is never published on an unexpected lane; poisoning is
+// the consumer's job, not the producer's.
 var errUnknownLane = errors.New("shm: unknown lane")
 
-// lane selects which of the writer's two bounded queues an intent joins. The
-// split lets the writer give the lifecycle lane strict priority over the data
-// lane (design §12): a CANCEL must make progress regardless of data traffic or
+// lane selects which of the writer's two bounded queues an intent joins.
+// The split lets the lifecycle lane take strict priority over the data lane
+// (design §12): a CANCEL must make progress regardless of data traffic or
 // arena/ring backpressure.
 type lane uint8
 
 const (
-	// laneData carries the payload-bearing kinds: the unary kinds and the four
-	// payload-bearing streaming kinds (STREAM_OPEN/MSG/CLOSE/ERR). Data admission
-	// is bounded (design §19); a full data queue is backpressure.
+	// laneData carries payload-bearing kinds: unary kinds and the four
+	// payload-bearing stream kinds (STREAM_OPEN/MSG/CLOSE/ERR). Data admission is
+	// bounded (design §19); a full queue is backpressure.
 	laneData lane = iota
-	// laneLifecycle carries the descriptor-only kinds: CANCEL and STREAM_ACK
+	// laneLifecycle carries descriptor-only kinds: CANCEL and STREAM_ACK
 	// (stream-protocol.md §2.1). It has a reserved ring budget (shm-abi.md §18)
-	// and is never starved by data (design §12); it never returns ErrBackpressure.
+	// and is never starved by data (design §12). It never returns ErrBackpressure.
 	laneLifecycle
 )
 
-// admissionMode selects what submit does when the bounded data-submission queue
-// is full (design §19). It governs only the data lane; the lifecycle lane always
-// blocks on space-or-context and never rejects.
+// admissionMode selects submit's behavior when the bounded data-submission
+// queue is full (design §19). It applies only to the data lane; the lifecycle
+// lane always blocks on space-or-context and never rejects.
 type admissionMode uint8
 
 const (
-	// admitBlock is the default: block the caller until data-queue space frees or
-	// the caller's context is done.
+	// admitBlock is the default: block the caller until data-queue space frees
+	// or the caller's context is done.
 	admitBlock admissionMode = iota
 	// admitReject returns ErrBackpressure immediately when the data queue is full.
 	admitReject
 )
 
-// intent is one fully-formed, immutable send request handed to the writer. A
-// producer builds it and queues it on a lane; only the single writer goroutine
-// touches the ring and arena to emit it (design §12: exactly one writer owns each
-// direction's ring and arena). done reports the emit outcome back to submit.
+// intent is one fully-formed, immutable send request handed to the writer.
+// A producer builds it and queues it on a lane; only the single writer
+// goroutine touches the ring and arena to emit it (design §12). done reports
+// the emit outcome back to submit.
 type intent struct {
 	frame transport.Frame
 	lane  lane
-	// wire is the frame's pre-encoded wire payload -- its Payload, or a
-	// status-bearing frame's EncodeStatus(Status) -- snapshotted at submit so the
-	// bytes the writer stamps are exactly the bytes admission validated and
-	// cannot change if the caller mutates the frame after Send returns. nil
-	// for a directly-constructed intent (test seams), which build falls back
-	// to computing from frame.
+	// wire is the frame's wire payload snapshotted at submit: either Payload or
+	// the encoded Status for status-bearing frames. This snapshot ensures the
+	// bytes stamped are exactly those admission validated, and remain unchanged
+	// if the caller mutates the frame after Send. nil for test-constructed
+	// intents, which build falls back to computing from frame.
 	wire []byte
-	// done is buffered with capacity 1 so the writer's single completion send
-	// never blocks, even when the caller has already abandoned the intent on a
-	// context cancel. This is the crux of the completion protocol: a caller that
-	// returned early can never wedge the writer.
+	// done is buffered with capacity 1 so the writer's completion send never
+	// blocks, even if the caller already abandoned the intent on context cancel.
+	// This ensures a caller that returned early can never wedge the writer.
 	done chan error
-	// onReport, when non-nil, is invoked exactly once when this intent resolves —
-	// published (true), or discarded / disposed at teardown (false) — from the
-	// same single report call that delivers on done (transport.ReportingSender).
-	// It must be non-blocking (it may run on the writer goroutine). nil for an
-	// ordinary submit that has no completion callback.
+	// onReport, when non-nil, is invoked exactly once when the intent resolves
+	// (published true, or discarded/disposed at teardown false), from the same
+	// report call that sends on done (transport.ReportingSender). It must be
+	// non-blocking and may run on the writer goroutine. nil for ordinary submits
+	// with no completion callback.
 	onReport func(published bool)
 }
 
 // mapKind maps a transport frame kind to its ring descriptor kind and reports
-// whether the kind is descriptor-only (carries no payload slab). It maps through
-// an explicit switch rather than a numeric cast: the two enumerations coincide by
-// the ABI (shm-abi.md §5), but an explicit map fails closed on any out-of-range
-// byte this writer does not emit under layout_version = 1 instead of silently
-// forwarding a stale value.
+// whether it is descriptor-only. It uses an explicit switch rather than a
+// numeric cast: while the enumerations coincide by the ABI (shm-abi.md §5),
+// an explicit map fails closed on out-of-range bytes this writer does not emit
+// under layout_version = 1, rather than silently forwarding a stale value.
 //
-// STREAM_ACK is descriptor-only (a lifecycle credit return, like CANCEL); the
-// other four streaming kinds are payload-bearing data frames
-// (stream-protocol.md §2.1/§2.3). Only an unassigned byte yields
-// errUnsupportedKind.
+// STREAM_ACK is descriptor-only (a lifecycle credit return, like CANCEL);
+// the other four stream kinds are payload-bearing (stream-protocol.md §2.1/§2.3).
+// Only an unassigned byte yields errUnsupportedKind.
 func mapKind(k transport.FrameKind) (rk ring.FrameKind, descriptorOnly bool, err error) {
 	switch k {
 	case transport.FrameUnaryReq:

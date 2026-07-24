@@ -1,9 +1,10 @@
 // Command protoc-gen-go-styx is a protoc/buf plugin that generates Styx
-// unary service clients and servers from ordinary gRPC-compatible `service`
-// definitions. Install it on PATH as `protoc-gen-go-styx` and
-// invoke it via `protoc --go-styx_out=...` or a buf.gen.yaml `local:`
-// plugin entry, alongside protoc-gen-go (which generates the message types
-// this generator's output imports but never defines itself).
+// unary service clients and servers from ordinary gRPC-compatible service
+// definitions.
+// Install it on PATH as protoc-gen-go-styx and invoke it via
+// `protoc --go-styx_out=...` or a buf.gen.yaml `local:` plugin entry, alongside
+// protoc-gen-go (which generates the message types this generator's output
+// imports but never defines itself).
 package main
 
 import (

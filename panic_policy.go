@@ -11,34 +11,24 @@ import (
 // The handler-panic policy is PluginServerConfig.ContinueAfterPanic, fixed at
 // construction and read once when the serving session builds its panicController.
 //
-// Default (false) is the enterprise profile. A handler panic — unary or
-// streaming — is recovered at the dispatch boundary, the panicking call is sent a
-// reply carrying the panic outcome, and the server then initiates controlled
-// termination: it dispatches no further calls, tears down through the ordinary
-// serving-phase lifecycle, and exits so the supervisor restarts it per policy.
+// Default (false) is the enterprise profile: a handler panic is recovered at
+// the dispatch boundary, the panicking call is sent a reply carrying the panic
+// outcome, and the server initiates controlled termination (no further calls,
+// ordinary teardown, exit so the supervisor restarts per policy).
+// The reply delivery and guarantee differ by call kind:
+//   - Unary: reply sent inline synchronously, serve loop begins termination only
+//     after the reply reaches the transport. A unary caller is guaranteed to see
+//     a *PluginPanicError, not a vanished call.
+//   - Streaming: panic status emitted best-effort through handler-error
+//     termination. It is enqueued on the bounded emitter; teardown may win and
+//     drop it. A streaming caller usually sees *PluginPanicError but is not
+//     guaranteed.
 //
-// How that reply reaches the peer differs by call kind, so the delivery guarantee
-// does too:
-//
-//   - Unary: the reply is sent inline and synchronously, and the serve loop begins
-//     termination only after it has reached the transport. A unary caller is
-//     guaranteed to see a *PluginPanicError rather than a vanished call, and the
-//     response obligation closes cleanly — unlike an unrecovered crash mid-call.
-//   - Streaming: the panic status is emitted best-effort through the handler-error
-//     termination path (stream-protocol.md §9.1). It is enqueued on the bounded
-//     stream emitter, and connection teardown may win before the emitter sends it;
-//     the frozen protocol permits dropping a handler-error STREAM_ERR, in which
-//     case the peer is left bounded by its own stream deadline (§10.2). A streaming
-//     caller usually sees a *PluginPanicError but is not guaranteed to.
-//
-// With true the server recovers the panic, replies with the panic outcome, and
-// keeps serving; a later call succeeds. It is an explicit opt-in, safe only if
-// every registered handler guarantees its own isolation, because after a panic
-// the process state is whatever the panicking handler left behind. A panic in the
-// Styx runtime itself (outside handler frames) is never recovered by this policy
-// under either setting — the recovery boundary is drawn tightly around the handler
-// invocation, so a framework-internal panic still crashes the process
-// unconditionally.
+// With true the server recovers the panic, replies, and keeps serving. It is an
+// explicit opt-in, safe only if every handler guarantees its own isolation,
+// since process state after a panic is whatever the handler left behind.
+// A panic in the Styx runtime itself (outside handler frames) is never recovered
+// under either setting.
 
 // panicController carries one serving session's handler-panic policy and the
 // termination signal its two dispatch paths raise. The unary and streaming paths
