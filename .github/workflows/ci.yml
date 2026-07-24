@@ -42,4 +42,11 @@ jobs:
           protoc --version
 
       - name: Run make ci (lint, vet, test)
+        # -p=1 serializes test packages. The hosted runner has few CPUs and
+        # the race-enabled suites carry ~1s liveness deadlines; packages
+        # running in parallel starve each other and flake timing-sensitive
+        # tests (observed: three different tests across three runs). Local
+        # runs keep default parallelism.
+        env:
+          GOFLAGS: -p=1
         run: make ci
