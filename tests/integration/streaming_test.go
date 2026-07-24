@@ -235,20 +235,22 @@ func TestStreaming_CallerCancelMidStream_ReturnsErrCanceled(t *testing.T) {
 	}
 }
 
-// Test a caller deadline expiring mid-stream observing ErrDeadlineExceeded cross-
-// process: the plugin's Feed handler is blocked on its stream context past the
-// caller's deadline, so the re-anchored client-side deadline is what terminates
-// the next Recv.
-func TestStreaming_CallerDeadlineMidStream_ReturnsErrDeadlineExceeded(t *testing.T) {
+// Test a caller deadline expiring mid-stream terminating the next Recv cross-
+// process. Two legitimate terminals race once the deadline passes: the
+// client-side deadline watcher fires ErrDeadlineExceeded, or the plugin's
+// blocked Feed handler observes its own expired stream context first and
+// returns that error, which travels back as an application *styx.Status.
+// Either proves the deadline ended the stream; which side wins is scheduling.
+func TestStreaming_CallerDeadlineMidStream_ReturnsDeadlineTerminal(t *testing.T) {
 	// A short deadline the blocked handler will not meet; generous enough that the
 	// first response (asserted in the helper) still arrives comfortably inside it.
 	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	defer cancel()
 	stream := newBlockingFeedStream(t, ctx)
 
-	// When / Then: the next receive terminates with ErrDeadlineExceeded once the
-	// deadline passes — bounded by this watchdog so a broken deadline path fails
-	// the test instead of hanging it.
+	// When / Then: the next receive terminates with one of the two deadline
+	// terminals once the deadline passes — bounded by this watchdog so a broken
+	// deadline path fails the test instead of hanging it.
 	recvCh := make(chan error, 1)
 	go func() {
 		_, err := stream.Recv()
@@ -256,7 +258,13 @@ func TestStreaming_CallerDeadlineMidStream_ReturnsErrDeadlineExceeded(t *testing
 	}()
 	select {
 	case err := <-recvCh:
-		require.ErrorIs(t, err, styx.ErrDeadlineExceeded)
+		if !errors.Is(err, styx.ErrDeadlineExceeded) {
+			var status *styx.Status
+			require.ErrorAs(t, err, &status,
+				"the terminal must be ErrDeadlineExceeded or the handler's own deadline status, got: %v", err)
+			require.Contains(t, status.Message, context.DeadlineExceeded.Error(),
+				"a status terminal must carry the handler's observed deadline expiry")
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Recv did not return after the mid-stream deadline expired")
 	}
