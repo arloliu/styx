@@ -2,7 +2,10 @@ module github.com/arloliu/styx/tools/buf
 
 go 1.26.0
 
-tool github.com/bufbuild/buf/cmd/buf
+tool (
+	github.com/bufbuild/buf/cmd/buf
+	github.com/planetscale/vtprotobuf/cmd/protoc-gen-go-vtproto
+)
 
 require (
 	buf.build/gen/go/bufbuild/bufplugin/protocolbuffers/go v1.36.11-20260626152828-968bf0468096.1 // indirect
@@ -56,6 +59,7 @@ require (
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/petermattis/goid v0.0.0-20260716134002-a9b348f0a2b9 // indirect
+	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/quic-go v0.60.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect

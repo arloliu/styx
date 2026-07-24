@@ -6,3 +6,8 @@ plugins:
   - local: bin/protoc-gen-go-styx
     out: .
     opt: module=github.com/arloliu/styx
+  - local: ["go", "tool", "-modfile=.buf.go.mod", "protoc-gen-go-vtproto"]
+    out: .
+    opt:
+      - module=github.com/arloliu/styx
+      - features=marshal+unmarshal+size

@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/hashicorp/go-plugin v1.8.0
+	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sys v0.47.0
 	google.golang.org/grpc v1.82.1
