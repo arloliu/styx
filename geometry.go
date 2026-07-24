@@ -15,25 +15,22 @@ type ShmSizeClass struct {
 	SlabCount uint32
 }
 
-// ShmGeometry is the public, root-package description of a shared-memory region's
-// geometry: the ring capacity, the lifecycle reserve, and the per-direction
-// size-class tables. It is the external form of the internal region layout
-// (external users cannot import internal/shm), converted when a shared-memory
-// transport is spawned. The host authors geometry, so it lives on PluginSpec; the
-// plugin reads it from the region header at attach.
-//
-// A zero ShmGeometry selects the default profile (GeometryDefault). Use a profile
-// helper (GeometryDefault, GeometryLean) or build one explicitly.
+// ShmGeometry describes a shared-memory region's geometry: ring capacity,
+// lifecycle reserve, and per-direction size-class tables.
+// The host authors it (via PluginSpec); the plugin reads it from the region
+// header at attach. A zero ShmGeometry selects the default profile.
 type ShmGeometry struct {
-	// RingCapacity is C, the descriptor-slot bound shared by both rings: a power
-	// of two in [64, 1<<20] (shm-abi.md §18).
+	// RingCapacity is the descriptor-slot bound shared by both rings:
+	// a power of two in [64, 1<<20].
 	RingCapacity uint32
-	// LifecycleReserve is R, the ring slots kept unavailable to data frames so the
-	// lifecycle lane always has room: 0 < R < C, recommended C/16 (shm-abi.md §18).
+
+	// LifecycleReserve is the ring slots kept unavailable to data frames
+	// so the lifecycle lane always has room: 0 < R < C.
 	LifecycleReserve uint32
-	// HostToPlugin and PluginToHost are the per-direction size-class tables, each
-	// with ascending, cache-line-multiple slab sizes. An empty direction copies the
-	// other; both empty selects the default profile's classes.
+
+	// HostToPlugin and PluginToHost are the per-direction size-class tables.
+	// Each has ascending, cache-line-multiple slab sizes.
+	// An empty direction copies the other; both empty selects the default profile.
 	HostToPlugin []ShmSizeClass
 	PluginToHost []ShmSizeClass
 }
@@ -52,13 +49,11 @@ const (
 	oneMiB = 1 << 20
 )
 
-// GeometryDefault returns the frozen ABI's recommended default profile
-// (shm-abi.md §1): ring capacity 4096, lifecycle reserve 256, and per-direction
-// size classes {64 B ×4096, 4 KiB ×1024, 1 MiB ×26} — at most 64 MiB total.
-//
-// It suits a general workload; a memory-constrained deployment should prefer
-// GeometryLean or an explicit geometry sized to its peak concurrency. See
-// docs/configuration.md for what these numbers mean in practice.
+// GeometryDefault returns the ABI's recommended default profile:
+// ring capacity 4096, lifecycle reserve 256, per-direction size classes
+// {64 B ×4096, 4 KiB ×1024, 1 MiB ×26} (at most 64 MiB total).
+// Suits a general workload; memory-constrained deployments should prefer
+// GeometryLean or a custom geometry sized to peak concurrency.
 func GeometryDefault() ShmGeometry {
 	classes := []ShmSizeClass{
 		{SlabSize: 64, SlabCount: 4096},
@@ -74,14 +69,11 @@ func GeometryDefault() ShmGeometry {
 	}
 }
 
-// GeometryLean returns the lean device-gateway profile recorded in
-// bench/shm/REPORT.md: ring capacity 512, lifecycle reserve 32, and per-direction
-// size classes {512 B ×64, 4096 B ×64} — a region of roughly 0.6 MiB sized to a
-// 32-concurrent-call peak.
-//
-// Scale the class counts and RingCapacity minus LifecycleReserve to the peak
-// concurrent in-flight calls, plus headroom, for a workload with a different
-// peak. See docs/configuration.md.
+// GeometryLean returns a device-gateway profile:
+// ring capacity 512, lifecycle reserve 32, per-direction size classes
+// {512 B ×64, 4096 B ×64} (roughly 0.6 MiB, sized to a 32-concurrent-call peak).
+// Scale the class counts and RingCapacity minus LifecycleReserve to your
+// workload's peak concurrent in-flight calls plus headroom.
 func GeometryLean() ShmGeometry {
 	classes := []ShmSizeClass{
 		{SlabSize: 512, SlabCount: 64},

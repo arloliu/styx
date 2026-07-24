@@ -1,8 +1,7 @@
-// Command readyplugin is a minimal Styx plugin used as a cross-process test
-// fixture for Host.Start/Stop. It registers no services: it exists only to
-// complete the handshake and data-plane attach (reaching Ready on the host
-// side), then serve until the host sends Shutdown or disconnects, exercising
-// the full spawn → handshake → serve → teardown → reap lifecycle.
+// Command readyplugin is a minimal plugin for testing Host.Start and Stop.
+// It registers no services, only completes the handshake and data-plane attach
+// (reaching Ready), then serves until shutdown or disconnect, exercising the
+// full plugin lifecycle: spawn, handshake, serve, teardown, and reap.
 package main
 
 import (

@@ -18,12 +18,14 @@ type GRPCTCPBaseline struct {
 	client pingpb.PingClient
 }
 
+// NewGRPCTCP returns a new GRPCTCPBaseline.
 func NewGRPCTCP() *GRPCTCPBaseline { return &GRPCTCPBaseline{} }
 
 func (g *GRPCTCPBaseline) Name() string { return "grpc-tcp-loopback" }
 
 func (g *GRPCTCPBaseline) Start() error {
-	//nolint:noctx // benchmark-harness Start has no ctx param; matches every other baseline in this package
+	// Start has no ctx param, matching every other baseline in this package.
+	//nolint:noctx
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err

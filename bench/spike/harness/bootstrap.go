@@ -13,10 +13,10 @@ import (
 	"github.com/arloliu/styx/bench/spike/shmregion"
 )
 
-// readyByte is the single byte the plugin writes back over the control
-// socket once it has mapped the region and is ready to serve. There is no
-// versioning or feature negotiation in the spike (later work will add
-// that) — one byte is the entire "ready" protocol.
+// readyByte is the single byte the plugin writes back over the control socket
+// once it has mapped the region and is ready to serve.
+// There is no versioning or feature negotiation in the spike: one byte is the
+// entire "ready" protocol.
 const readyByte = 0x52 // 'R'
 
 // Bootstrap holds everything the host side owns after a successful spawn:

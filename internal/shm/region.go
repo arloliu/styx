@@ -8,17 +8,24 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// regionsCreated and regionsClosed count, process-wide, the shared-memory region
-// mappings this process has created and successfully unmapped. Region
-// create/close is a per-generation cold path (never per RPC), so the two atomic
-// increments add no hot-path cost. RegionsCreated/RegionsClosed expose them so a
-// leak test can assert every mapping a run created was closed, without parsing
-// /proc maps. Closed counts only mappings whose Munmap actually succeeded, so a
-// failed unmap surfaces as a created/closed imbalance — a still-live mapping —
+// regionsCreated and regionsClosed count, process-wide, the shared-memory
+// region mappings this process has created and successfully unmapped.
+// Region create/close is a per-generation cold path (never per RPC), so the
+// atomic increments add no hot-path cost.
+// RegionsCreated/RegionsClosed expose them so a leak test can assert every
+// mapping a run created was closed, without parsing /proc/maps.
+// Closed counts only mappings whose Munmap actually succeeded, so a failed
+// unmap surfaces as a created/closed imbalance — a still-live mapping —
 // rather than being masked by an equal count.
+//
+// regionsCreated is written only by newMappedRegion.
+// regionsClosed is written only by Region.Close, gated by close.CompareAndSwap so
+// each Region writes it at most once.
+// Both are plain atomic counters: a concurrent RegionsCreated/RegionsClosed read
+// can observe either value without blocking or racing.
 var (
-	regionsCreated atomic.Int64
-	regionsClosed  atomic.Int64
+	regionsCreated atomic.Int64 // incremented once per created mapping
+	regionsClosed  atomic.Int64 // incremented once per successfully unmapped region
 )
 
 // RegionsCreated returns the cumulative count of region mappings this process created.
@@ -63,30 +70,42 @@ var ErrBadGeometry = errors.New("shm: bad geometry")
 const wantSeals = unix.F_SEAL_GROW | unix.F_SEAL_SHRINK | unix.F_SEAL_SEAL
 
 // Region wraps a sealed memfd mapping shared between host and plugin.
-// Layout is validated exactly once at attach (shm-abi.md §1) and cached;
-// it is never re-read from the mapping afterward (§2).
+// Layout is validated exactly once at attach (docs/specs/shm-abi.md §1) and
+// cached; it is never re-read from the mapping afterward (§2).
+//
+// Region is not safe for concurrent use: Close must be called exactly once
+// and no other methods may be called concurrently with Close.
+// The region is not race-free between processes — it is the producer's and
+// consumer's shared state, but each field has a defined owner and single-writer
+// guarantee by design (see individual field comments).
 type Region struct {
-	fd     int
-	data   []byte // nil after Close
+	fd   int
+	data []byte // nil after Close
+
+	// layout is read from the mapping exactly once at attach and cached.
+	// It never changes afterward.
 	layout Layout
-	closed atomic.Bool // set once by the Close that wins the release
+
+	// closed is set once by the Close that wins the release race (via CAS).
+	// All other Close calls return nil immediately.
+	closed atomic.Bool
 }
 
-// CreateRegion validates input's host-chosen geometry (shm-abi.md §1:
-// ring_capacity, lifecycle_reserve, and each direction's size-class
-// table), computes every derived field (span offsets, arena_bytes_*,
-// region_size) from it via the same formula OpenRegion's Phase 2 attach
-// path uses, creates a sealed memfd of the resulting size, writes the
-// layout page, and seals it F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL before
-// returning. Called once, host-side, before fd passing.
+// CreateRegion validates input's host-chosen geometry (docs/specs/shm-abi.md
+// §1: ring_capacity, lifecycle_reserve, and each direction's size-class table),
+// computes every derived field (span offsets, arena_bytes_*, region_size) via
+// the same formula OpenRegion's Phase 2 uses, creates a sealed memfd, writes
+// the layout page, and seals it F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL before
+// returning.
+// Called once, host-side, before fd passing.
 //
-// input.Generation must be >= 1 (host-assigned, §2) and input.HeaderFlags
-// must be 0 — this package has no visibility into a negotiated feature
-// tuple (that lives in internal/control), so it cannot safely set a
-// feature-scoped header bit; a later task that threads negotiated
-// features through attach can extend this. Every derived field on input
-// (offsets, arena_bytes_*, region_size, each class's ClassBaseOffset) is
-// ignored and recomputed, never trusted from the caller.
+// input.Generation must be >= 1 (host-assigned, §2).
+// input.HeaderFlags must be 0 — this package has no visibility into a
+// negotiated feature tuple (that lives in internal/control), so it cannot
+// safely set feature-scoped header bits; a later task threading negotiated
+// features through attach can extend this.
+// Every derived field on input (offsets, arena_bytes_*, region_size, each
+// class's ClassBaseOffset) is recomputed and never trusted from the caller.
 func CreateRegion(input Layout) (*Region, error) {
 	if input.Generation == 0 {
 		return nil, fmt.Errorf("shm: CreateRegion: generation must be >= 1: %w", ErrBadGeometry)
@@ -151,11 +170,11 @@ func CreateRegion(input Layout) (*Region, error) {
 	return createSealedRegion(layout)
 }
 
-// createSealedRegion performs the actual memfd_create/ftruncate/mmap/write/
-// seal syscall sequence for a fully-derived, already-validated layout.
-// Split out of CreateRegion so the pure geometry validation above stays
-// free of syscalls, keeping the input-rejection paths simple functions of
-// their arguments rather than tangled with fd/mapping lifetime.
+// createSealedRegion performs the memfd_create/ftruncate/mmap/write/seal
+// syscall sequence for a fully-derived, already-validated layout.
+// It is split out of CreateRegion so the pure geometry validation stays
+// free of syscalls, keeping input-rejection paths simple functions of their
+// arguments rather than tangled with fd/mapping lifetime.
 func createSealedRegion(layout Layout) (*Region, error) {
 	fd, err := unix.MemfdCreate("styx-shm-region", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
 	if err != nil {
@@ -192,36 +211,35 @@ func createSealedRegion(layout Layout) (*Region, error) {
 }
 
 // OpenRegion attaches to an existing sealed memfd received via SCM_RIGHTS.
-// expectedSize is the control-plane-declared region_size (design §6's
-// AttachRegion message carries at least this much before any mapping
-// happens). OpenRegion duplicates fd (via F_DUPFD_CLOEXEC) and the
-// returned Region owns only that duplicate — the caller retains ownership
-// of the fd it passed in and is responsible for closing it; this mirrors
-// bench/spike/shmregion.Attach's ownership contract for the same reason:
-// a caller attaching within the same process (tests, or a composite
-// transport) would otherwise share the original fd number and double-close
-// it.
+// expectedSize is the control-plane-declared region_size; design §6's
+// AttachRegion message carries this before any mapping.
+// OpenRegion duplicates fd (via F_DUPFD_CLOEXEC).
+// The returned Region owns only the duplicate — the caller retains the
+// original fd and is responsible for closing it.
+// This mirrors bench/spike/shmregion.Attach's ownership contract: a caller
+// attaching within the same process (tests, composite transport) would
+// otherwise share the original fd and double-close it.
 //
-// OpenRegion implements shm-abi.md §1's two-phase attach exactly:
+// OpenRegion implements docs/specs/shm-abi.md §1's two-phase attach exactly:
 //
-//	Phase 1 (before any shared memory is touched): fstat, the fixed-header
-//	minimum, the exact-size check, and the seal-set check. Any Phase 1
-//	failure returns (nil, err) wrapping ErrAttachRejected and never maps
-//	anything — the control plane MUST treat this as a handshake/attach
-//	rejection, not a poison cause.
+// Phase 1 (before any shared memory is touched): fstat, fixed-header minimum,
+// exact-size check, and seal-set check.
+// Any Phase 1 failure returns (nil, err) wrapping ErrAttachRejected and never
+// maps anything.
+// The control plane MUST treat this as handshake/attach rejection, not poison
+// cause.
 //
-//	Phase 2 (after mapping): the full structural geometry check
-//	(parseLayoutPhase2), reading only the fixed v1 schema offsets in the
-//	exact order §1 mandates. Any Phase 2 failure returns the region
-//	ALONGSIDE an error wrapping ErrBadGeometry, rather than unmapping it —
-//	shm-abi.md §1:296/§16 requires POISON_BAD_GEOMETRY on a Phase 2
-//	failure, and the poison word is known-addressable because Phase 1
-//	already proved the mapping is at least minRegionSize long, so a caller
-//	needing to poison it (a later orchestration layer, see doc.go) must be
-//	able to reach the still-mapped bytes before discarding it. The caller
-//	owns the returned Region in this case and MUST Close it; Region.Layout
-//	is unspecified (the parse that would fill it failed) and MUST NOT be
-//	relied on.
+// Phase 2 (after mapping): full structural geometry check (parseLayoutPhase2),
+// reading only fixed v1 schema offsets in the exact §1 order.
+// Any Phase 2 failure returns the region ALONGSIDE an error wrapping
+// ErrBadGeometry, rather than unmapping it.
+// §1:296/§16 requires POISON_BAD_GEOMETRY on Phase 2 failure, and the poison
+// word is known-addressable because Phase 1 already proved the mapping is at
+// least minRegionSize long.
+// A caller needing to poison it (a later orchestration layer, see doc.go)
+// must be able to reach the still-mapped bytes before discarding it.
+// The caller owns the returned Region in this case and MUST Close it.
+// Region.Layout is unspecified (its parse failed) and MUST NOT be relied on.
 func OpenRegion(fd int, expectedSize uint64) (*Region, error) {
 	ownFD, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
@@ -241,17 +259,18 @@ func OpenRegion(fd int, expectedSize uint64) (*Region, error) {
 
 // openRegionOwned runs OpenRegion's two-phase attach against a descriptor
 // this call already owns (a duplicate OpenRegion made, so the caller's
-// original fd is untouched). A Phase 1 failure (or an mmap syscall failure)
-// returns (nil, err) and the caller closes ownFD; a Phase 2 failure instead
-// returns (region, err) BOTH non-nil — the mapping succeeded, so ownership of
-// the still-mapped region passes to the caller, which MUST Close it (see
-// OpenRegion's doc); on success, (region, nil), ownership likewise passing to
-// the caller.
+// original fd is untouched).
+// A Phase 1 failure (or mmap failure) returns (nil, err); the caller closes
+// ownFD.
+// A Phase 2 failure returns (region, err) both non-nil — the mapping
+// succeeded, so ownership of the still-mapped region passes to the caller,
+// which MUST Close it (see OpenRegion's doc).
+// On success, it returns (region, nil); ownership likewise passes to the
+// caller.
 func openRegionOwned(ownFD int, expectedSize uint64) (*Region, error) {
-	// Phase 1 — size/seal gate BEFORE mapping (shm-abi.md §1 Phase 1).
-	// regionSize is bounded to maxRegionSize (1<<40) below before it is
-	// ever used as a mmap/Ftruncate length, so no later int conversion can
-	// overflow.
+	// Phase 1 — size/seal gate before mapping (docs/specs/shm-abi.md §1 Phase 1).
+	// expectedSize is bounded to maxRegionSize (1<<40) before use as a
+	// mmap/Ftruncate length, so int conversion never overflows.
 	if expectedSize > maxRegionSize {
 		return nil, fmt.Errorf("shm: OpenRegion: declared size %d exceeds the %d (1 TiB) ceiling: %w",
 			expectedSize, uint64(maxRegionSize), ErrAttachRejected)
@@ -266,10 +285,10 @@ func openRegionOwned(ownFD int, expectedSize uint64) (*Region, error) {
 	}
 	actualSize := uint64(stat.Size)
 
-	// The fixed-header minimum guarantees the poison word (absolute
-	// offset poisonWordOffset, within the sync page) lands inside a
-	// region that, once mapped, is at least two pages long — even though
-	// this package never itself writes that word (see doc.go).
+	// The fixed-header minimum (minRegionSize = 2 pages) guarantees the
+	// poison word (absolute offset poisonWordOffset, within the sync page)
+	// lands inside a mapped region at least two pages long.
+	// This package never writes that word itself (see doc.go).
 	if expectedSize < minRegionSize || actualSize < minRegionSize {
 		return nil, fmt.Errorf("shm: OpenRegion: declared %d / actual %d below the fixed-header minimum %d: %w",
 			expectedSize, actualSize, uint64(minRegionSize), ErrAttachRejected)
@@ -293,13 +312,13 @@ func openRegionOwned(ownFD int, expectedSize uint64) (*Region, error) {
 		return nil, fmt.Errorf("shm: OpenRegion: mmap: %w", err)
 	}
 
-	// Phase 2 — structural geometry check AFTER mapping (shm-abi.md §1 Phase 2).
+	// Phase 2 — structural geometry check after mapping
+	// (docs/specs/shm-abi.md §1 Phase 2).
 	layout, err := parseLayoutPhase2(data, expectedSize)
 	if err != nil {
-		// Do NOT unmap here: the mapping is returned to the caller instead, so
-		// a caller that needs to poison the region (shm-abi.md §1:296/§16)
-		// still can, before it Closes this Region (see this function's and
-		// OpenRegion's doc).
+		// Do NOT unmap here: the mapping is returned to the caller instead,
+		// so a caller needing to poison the region (§1:296/§16) still can,
+		// before Close (see this function's and OpenRegion's doc).
 		return newMappedRegion(ownFD, data, Layout{}), err
 	}
 
@@ -311,12 +330,11 @@ func (r *Region) FD() int {
 	return r.fd
 }
 
-// VerifySealed confirms the region's memfd carries EXACTLY the required
-// seal set — no more and no fewer bits (shm-abi.md §1 Phase 1 step 4). A
-// seal set missing a required bit means the size could still change under
-// us; an unexpected extra bit is equally suspicious (a peer or a future
-// kernel added a seal this package doesn't reason about), so both
-// directions are rejected.
+// VerifySealed confirms the region's memfd carries exactly the required seal
+// set — no more and no fewer bits (docs/specs/shm-abi.md §1 Phase 1 step 4).
+// A missing required bit means the size could still change.
+// An unexpected extra bit is equally suspicious (a peer or future kernel added
+// a seal this package doesn't reason about), so both directions are rejected.
 func (r *Region) VerifySealed() error {
 	got, err := unix.FcntlInt(uintptr(r.fd), unix.F_GET_SEALS, 0)
 	if err != nil {
@@ -329,14 +347,15 @@ func (r *Region) VerifySealed() error {
 	return nil
 }
 
-// RemapLayoutReadOnly re-maps the layout page's byte range (region offset
-// [0, LayoutPageSize)) read-only, where the platform allows it
-// (shm-abi.md §2: "the layout page SHOULD be remapped read-only after
-// validation"). It is best-effort and never required for correctness: the
-// decoded Layout is already cached in r.layout and this package never
-// re-reads the mapping (see doc.go) — a peer that later scribbles on the
-// layout page cannot redirect this side's accesses regardless of whether
-// this call succeeds.
+// RemapLayoutReadOnly re-maps the layout page's byte range [0, LayoutPageSize)
+// read-only, where the platform allows it.
+// docs/specs/shm-abi.md §2: "the layout page SHOULD be remapped read-only
+// after validation".
+// It is best-effort and never required for correctness: the decoded Layout is
+// already cached in r.layout and this package never re-reads the mapping
+// (see doc.go).
+// A peer that later scribbles on the layout page cannot redirect this side's
+// accesses regardless of whether this call succeeds.
 func (r *Region) RemapLayoutReadOnly() error {
 	if err := unix.Mprotect(r.data[:LayoutPageSize], unix.PROT_READ); err != nil {
 		return fmt.Errorf("shm: RemapLayoutReadOnly: mprotect: %w", err)
@@ -345,12 +364,13 @@ func (r *Region) RemapLayoutReadOnly() error {
 	return nil
 }
 
-// Layout returns the cached, validated geometry. It never re-parses the
-// mapping (shm-abi.md §2). The returned value is a defensive copy: r.layout
-// has two slice fields (Arenas[*].Classes), and returning r.layout
-// directly would let a caller's mutation of the returned Classes slice
-// silently corrupt the cache — since Go's implicit struct copy on return
-// copies the slice header, not its backing array — for every subsequent
+// Layout returns the cached, validated geometry.
+// It never re-parses the mapping (docs/specs/shm-abi.md §2).
+// The returned value is a defensive copy: r.layout has two slice fields
+// (Arenas[*].Classes), and returning r.layout directly would let a caller's
+// mutation of the returned Classes slice silently corrupt the cache.
+// Go's implicit struct copy on return copies slice headers, not backing arrays,
+// so a mutated returned Classes would corrupt r.layout for every subsequent
 // Layout() call in the process.
 func (r *Region) Layout() Layout {
 	l := r.layout
@@ -360,21 +380,23 @@ func (r *Region) Layout() Layout {
 	return l
 }
 
-// Bytes returns the region's whole mapped byte slice, so a consumer that
-// owns the layout (internal/transport/shm) can carve the ring, arena, and
-// sync-page spans over it (shm-abi.md §1). It returns nil after Close. The
-// caller MUST NOT retain the slice past Close: the backing memory is
+// Bytes returns the region's whole mapped byte slice.
+// A consumer that owns the layout (internal/transport/shm) uses it to carve
+// the ring, arena, and sync-page spans (docs/specs/shm-abi.md §1).
+// It returns nil after Close.
+// The caller MUST NOT retain the slice past Close: the backing memory is
 // unmapped there, and any access afterward reads freed address space.
 func (r *Region) Bytes() []byte { return r.data }
 
-// Close munmaps the region and closes the local fd. Idempotent and
-// concurrency-safe: an atomic compare-and-swap elects exactly one caller to
-// release, so concurrent or repeated Close calls each run the unmap-and-close
-// (and the region create/close accounting) at most once; the losers return nil.
+// Close unmaps the region and closes the local fd.
+// Idempotent and concurrency-safe via atomic CAS: exactly one caller wins the
+// release, so concurrent or repeated Close calls each run unmap-and-close and
+// region create/close accounting at most once; losers return nil.
 // Even if Munmap fails, the winner still closes the fd (never leaking it) and
-// surfaces the failure; a region is counted closed only once its mapping is
-// actually gone, so a failed unmap shows up as a created/closed imbalance rather
-// than a masked equal count.
+// surfaces the failure.
+// A region is counted closed only once its mapping is actually gone, so a
+// failed unmap shows up as a created/closed imbalance rather than a masked
+// equal count.
 func (r *Region) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
@@ -386,14 +408,16 @@ func (r *Region) Close() error {
 	munmapErr := unix.Munmap(data)
 	closeErr := unix.Close(r.fd)
 	if munmapErr == nil {
-		regionsClosed.Add(1) // paired with newMappedRegion, counted only on a real unmap
+		// Paired with newMappedRegion: counted only on a successful unmap.
+		regionsClosed.Add(1)
 	}
 
 	return errors.Join(wrapErrNonNil("shm: Close: munmap", munmapErr), wrapErrNonNil("shm: Close: close", closeErr))
 }
 
-// wrapErrNonNil returns nil for a nil err (so errors.Join drops it), or err
-// wrapped with a "prefix: " message otherwise.
+// wrapErrNonNil wraps err with prefix, or returns nil if err is nil.
+// It is used with errors.Join so nil errors are dropped (errors.Join returns
+// nil for an all-nil input).
 func wrapErrNonNil(prefix string, err error) error {
 	if err == nil {
 		return nil

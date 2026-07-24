@@ -39,23 +39,20 @@ var (
 	protoPackage   = protogen.GoImportPath("google.golang.org/protobuf/proto")
 )
 
-// Run is the generator's entry point, invoked by protogen.Options.Run from
-// main(). For every service in every file to generate, it emits one
-// `<file>.styx.go` alongside the plain-message `<file>.pb.go` produced
-// separately by protoc-gen-go in the same buf.gen.yaml run.
+// Run is the generator entry point, invoked by protogen.Options.Run from main().
+// For every service in every file to generate, it emits one `<file>.styx.go`
+// alongside the message types from `<file>.pb.go` (generated separately by
+// protoc-gen-go in the same buf.gen.yaml run).
 //
-// Every service ID minted across the whole invocation is checked for an
-// FNV-64 collision (see checkCollisions) invocation-wide, matching
-// PluginServer.RegisterService's single global services map. Method IDs
-// are instead checked per service, in a fresh map for each service: the
-// runtime dispatch table is two-level (ServiceID -> a methods map built
-// fresh per registered service by pluginserver.go's newServiceHandler), so
-// two different services reusing an ordinary method name like "Get" hash
-// to the identical MethodID by construction (methodID hashes only the
-// bare name) without that ever being a real dispatch collision — checking
-// method IDs invocation-wide would reject that as a false collision. Every
-// method is also checked for a collision first — a collision aborts
-// generation for the entire request, not just the offending file.
+// Service IDs are checked invocation-wide for FNV-64 collisions against the
+// single global services map in PluginServer.RegisterService.
+// Method IDs are checked per service in a fresh map for each service, because
+// the runtime dispatch is two-level: ServiceID -> (methods map per service).
+// Two different services reusing a bare method name like "Get" hash to the
+// identical MethodID by construction (methodID hashes only the bare name), but
+// this is not a dispatch collision since method dispatch is scoped per service.
+// Checking method IDs invocation-wide would reject this as a false collision.
+// Any collision aborts generation for the entire request, not just the offending file.
 func Run(gen *protogen.Plugin) error {
 	serviceIDs := make(map[uint64]protoreflect.FullName)
 
@@ -90,41 +87,39 @@ func Run(gen *protogen.Plugin) error {
 	return nil
 }
 
-// serviceID computes a service's dispatch ID: 64-bit FNV-1a of its full
-// dotted name (e.g. "echo.Echo"). It MUST use the identical algorithm as
-// clientconn.go's unexported fnv64a, which Invoke calls on the "service"
-// string argument a generated client stub passes it — so a generated
-// client and the generated server it targets land on the same ID without
-// any wire-level ID exchange.
+// serviceID computes a service's dispatch ID: 64-bit FNV-1a of its full dotted name
+// (for example, "echo.Echo").
+// It MUST use the identical algorithm as clientconn.go's unexported fnv64a, which
+// Invoke calls on the "service" string argument a generated client stub passes it.
+// This ensures a generated client and the generated server it targets land on the
+// same ID without any wire-level ID exchange.
 func serviceID(fullName protoreflect.FullName) uint64 {
 	return fnv64a(string(fullName))
 }
 
-// methodID computes a method's dispatch ID: 64-bit FNV-1a of the BARE
-// method name only (e.g. "Say", never "echo.Echo.Say"). This mirrors
-// clientconn.go's Invoke, which hashes only the "method" argument a
-// generated client stub passes it — see NewEchoClient's Say method, which
-// calls c.conn.Invoke(ctx, "echo.Echo", "Say", ...). service is accepted
-// so callers can build a fully qualified protoreflect.FullName for
-// checkCollisions' reporting; it does not contribute to the hash itself,
-// since method dispatch tables are scoped per service (pluginserver.go's
-// newServiceHandler builds one methods map per registered service), so
-// only same-service method names need to stay distinct once hashed.
+// methodID computes a method's dispatch ID: 64-bit FNV-1a of the bare method name
+// only (for example, "Say", not "echo.Echo.Say").
+// This mirrors clientconn.go's Invoke, which hashes only the "method" argument
+// a generated client stub passes it (for example, c.conn.Invoke(ctx, "echo.Echo", "Say", ...)).
+// The service parameter is accepted so callers can build a fully qualified
+// protoreflect.FullName for checkCollisions' reporting; it does not contribute
+// to the hash itself because method dispatch tables are scoped per service.
+// Only same-service method names need to stay distinct once hashed.
 //
 //nolint:unparam // service is intentionally unused in the hash itself; see the doc above.
 func methodID(service protoreflect.FullName, method string) uint64 {
 	return fnv64a(method)
 }
 
-// checkCollisions records id -> name in ids, returning an error naming
-// both full names when id was already claimed by a distinct name. Run
-// calls it once per service ID against an invocation-wide map, and once
-// per method ID against a map scoped fresh to that method's own service —
-// see Run's doc for why those need different scopes. Either way this only
-// catches a collision within one generation invocation; a collision between
-// independently generated packages is instead caught at handshake time,
-// when a plugin's advertised ServiceID doesn't match any service the
-// host's generated client code expects for that name.
+// checkCollisions records id -> name in ids, returning an error when id was
+// already claimed by a distinct name.
+// Run calls it once per service ID against an invocation-wide map, and once
+// per method ID against a fresh map scoped to that method's own service.
+// See Run's doc for why those scopes differ.
+// This detects collisions within one generation invocation; collisions between
+// independently generated packages are instead caught at handshake time, when a
+// plugin's advertised ServiceID doesn't match any service the host's generated
+// client code expects for that name.
 func checkCollisions(ids map[uint64]protoreflect.FullName, id uint64, name protoreflect.FullName) error {
 	if existing, ok := ids[id]; ok && existing != name {
 		return fmt.Errorf("protoc-gen-go-styx: FNV-64 ID collision: %q and %q both hash to 0x%016x", existing, name, id)
@@ -135,10 +130,10 @@ func checkCollisions(ids map[uint64]protoreflect.FullName, id uint64, name proto
 	return nil
 }
 
-// fnv64a hashes s with 64-bit FNV-1a (hash/fnv.New64a). It MUST stay
-// byte-for-byte identical to clientconn.go's unexported fnv64a: this
-// package cannot import that function (protoc-gen-go-styx is a separate
-// `main` binary from the styx runtime the generated code targets), so the
+// fnv64a hashes s with 64-bit FNV-1a (hash/fnv.New64a).
+// It MUST stay byte-for-byte identical to clientconn.go's unexported fnv64a.
+// This package cannot import that function (protoc-gen-go-styx is a separate
+// main binary from the styx runtime the generated code targets), so the
 // algorithm is duplicated deliberately rather than shared.
 func fnv64a(s string) uint64 {
 	h := fnv.New64a()
@@ -147,9 +142,8 @@ func fnv64a(s string) uint64 {
 	return h.Sum64()
 }
 
-// generateFile emits f's `<file>.styx.go`: the file header, the
-// generated-code metadata constants, and one client/server pair per
-// service in f.
+// generateFile emits f's `<file>.styx.go`: the file header, the generated-code
+// metadata constants, and one client/server pair per service in f.
 func generateFile(gen *protogen.Plugin, f *protogen.File) *protogen.GeneratedFile {
 	filename := f.GeneratedFilenamePrefix + ".styx.go"
 	g := gen.NewGeneratedFile(filename, f.GoImportPath)
@@ -177,9 +171,9 @@ func generateFile(gen *protogen.Plugin, f *protogen.File) *protogen.GeneratedFil
 	return g
 }
 
-// genService emits one service's ID/version constants, its
-// `<Service>Client` interface and implementation, `New<Service>Client`,
-// its `<Service>Server` interface, and `Register<Service>Server`.
+// genService emits one service's ID/version constants, its `<Service>Client`
+// interface and implementation, `New<Service>Client`, its `<Service>Server`
+// interface, and `Register<Service>Server`.
 func genService(g *protogen.GeneratedFile, svc *protogen.Service) {
 	genServiceConsts(g, svc)
 	genRequirementFunc(g, svc)
@@ -191,15 +185,15 @@ func genService(g *protogen.GeneratedFile, svc *protogen.Service) {
 }
 
 // isStreaming reports whether m is a streaming method (client-, server-, or
-// bidi-streaming) rather than a unary one. The three shapes are distinguished by
-// IsStreamingClient/IsStreamingServer where a shape's send/recv wrappers differ.
+// bidi-streaming) rather than unary.
+// The three shapes are distinguished by IsStreamingClient/IsStreamingServer.
 func isStreaming(m *protogen.Method) bool {
 	return m.Desc.IsStreamingClient() || m.Desc.IsStreamingServer()
 }
 
-// serviceHasStreaming reports whether any of svc's methods stream, which decides
-// the generated `<Service>RequiresStreaming` metadata a host reads to set
-// PluginSpec.RequireStreaming.
+// serviceHasStreaming reports whether any of svc's methods stream.
+// This determines the generated `<Service>RequiresStreaming` metadata that a host
+// reads to set PluginSpec.RequireStreaming.
 func serviceHasStreaming(svc *protogen.Service) bool {
 	for _, m := range svc.Methods {
 		if isStreaming(m) {
@@ -210,9 +204,8 @@ func serviceHasStreaming(svc *protogen.Service) bool {
 	return false
 }
 
-// genServiceConsts emits the unexported service/method ID constants and
-// the exported per-service version constant, consumed by handshake
-// negotiation.
+// genServiceConsts emits the unexported service/method ID constants and the
+// exported per-service version constant consumed by handshake negotiation.
 func genServiceConsts(g *protogen.GeneratedFile, svc *protogen.Service) {
 	nameLower := unexport(svc.GoName)
 	fullName := svc.Desc.FullName()
@@ -242,13 +235,13 @@ func genServiceConsts(g *protogen.GeneratedFile, svc *protogen.Service) {
 	g.P()
 }
 
-// genRequirementFunc emits `<Service>Requirement`, returning a
+// genRequirementFunc emits `<Service>Requirement`, which returns a
 // styx.ServiceRequirement for this exact generated version: MinVersion ==
-// MaxVersion == <Service>ServiceVersion, so a host's PluginSpec.Services
-// typically reads `[]styx.ServiceRequirement{echopb.EchoRequirement()}`
-// rather than hand-authoring the range. A wider range is a hand-authored
-// option styx.ServiceRequirement's own type permits; no generator output
-// produces one yet.
+// MaxVersion == <Service>ServiceVersion.
+// A host's PluginSpec.Services typically reads []styx.ServiceRequirement{...Requirement()}
+// rather than hand-authoring the range.
+// A wider range is an option styx.ServiceRequirement's type permits, but the
+// generator does not produce one yet.
 func genRequirementFunc(g *protogen.GeneratedFile, svc *protogen.Service) {
 	fullName := string(svc.Desc.FullName())
 
@@ -262,8 +255,8 @@ func genRequirementFunc(g *protogen.GeneratedFile, svc *protogen.Service) {
 	g.P()
 }
 
-// genClientInterface emits the `<Service>Client` interface: one
-// `(ctx, req) (resp, error)` method per RPC, gRPC's unary shape.
+// genClientInterface emits the `<Service>Client` interface with one
+// `(ctx, req) (resp, error)` method per RPC, matching gRPC's unary shape.
 func genClientInterface(g *protogen.GeneratedFile, svc *protogen.Service) {
 	g.P("type ", svc.GoName, "Client interface {")
 	for _, m := range svc.Methods {
@@ -273,9 +266,8 @@ func genClientInterface(g *protogen.GeneratedFile, svc *protogen.Service) {
 	g.P()
 }
 
-// genClientImpl emits the unexported client struct, its
-// `New<Service>Client` constructor, and one Invoke-calling method body per
-// RPC.
+// genClientImpl emits the unexported client struct, its `New<Service>Client`
+// constructor, and one Invoke-calling method body per RPC.
 func genClientImpl(g *protogen.GeneratedFile, svc *protogen.Service) {
 	nameLower := unexport(svc.GoName)
 	structName := nameLower + "Client"
@@ -304,11 +296,11 @@ func genClientImpl(g *protogen.GeneratedFile, svc *protogen.Service) {
 	}
 }
 
-// genStreamClientMethod emits one streaming method's client constructor: it opens
-// the stream by precomputed service/method ID (no per-call hash) with the shape's
-// open option, and returns the typed send/recv wrapper for the shape. A
-// server-streaming open marshals the single request onto STREAM_OPEN; a bidi open
-// declares the bidi shape; a client-streaming open uses the default shape.
+// genStreamClientMethod emits one streaming method's client constructor.
+// It opens the stream by precomputed service/method ID (no per-call hash) with
+// the shape's open option, and returns the typed send/recv wrapper.
+// A server-streaming open marshals the single request onto STREAM_OPEN;
+// a bidi open declares the bidi shape; a client-streaming open uses the default shape.
 func genStreamClientMethod(g *protogen.GeneratedFile, svc *protogen.Service, m *protogen.Method) {
 	structName := unexport(svc.GoName) + "Client"
 	wrapper := streamImplName(svc, m, "Client")
@@ -345,9 +337,8 @@ func genStreamClientMethod(g *protogen.GeneratedFile, svc *protogen.Service, m *
 	g.P()
 }
 
-// genServerInterface emits the `<Service>Server` interface: identical
-// method shapes to the client interface, implemented by the user's plugin
-// code.
+// genServerInterface emits the `<Service>Server` interface with identical
+// method shapes to the client interface, to be implemented by the user's plugin code.
 func genServerInterface(g *protogen.GeneratedFile, svc *protogen.Service) {
 	g.P("type ", svc.GoName, "Server interface {")
 	for _, m := range svc.Methods {
@@ -358,7 +349,7 @@ func genServerInterface(g *protogen.GeneratedFile, svc *protogen.Service) {
 }
 
 // genRegisterFunc emits `Register<Service>Server`, which builds a
-// styx.ServiceDesc from the service's ID/version/method table and installs
+// styx.ServiceDesc from the service's ID/version/method table and registers
 // it against impl via srv.RegisterService.
 func genRegisterFunc(g *protogen.GeneratedFile, svc *protogen.Service) {
 	nameLower := unexport(svc.GoName)
@@ -404,14 +395,13 @@ func genRegisterFunc(g *protogen.GeneratedFile, svc *protogen.Service) {
 }
 
 // genStreamHandlerRegistration emits one streaming method's
-// RegisterStreamHandlerID call: it keys the handler by precomputed
-// service/method ID (no per-registration hash) with the method's declared shape,
-// and adapts the untyped *styx.Stream to the shape's typed server wrapper. A
-// server-streaming registration first reads the single request that rode
-// STREAM_OPEN, then runs the handler; a normal (nil-error) return closes the
-// server's send direction so the stream completes rather than lingering to its
-// deadline. A client-streaming server closes through its own SendAndClose (which
-// carries the single response), so it is not auto-closed here.
+// RegisterStreamHandlerID call.
+// It keys the handler by precomputed service/method ID (no per-registration hash)
+// with the method's declared shape, and adapts the untyped *styx.Stream to the
+// shape's typed server wrapper.
+// For server-streaming: reads the single request from STREAM_OPEN, runs the handler,
+// then closes the server's send direction on normal return (nil error).
+// For client-streaming: the handler closes through SendAndClose, so no auto-close here.
 func genStreamHandlerRegistration(g *protogen.GeneratedFile, svc *protogen.Service, m *protogen.Method) {
 	nameLower := unexport(svc.GoName)
 	serverWrapper := streamImplName(svc, m, "Server")
@@ -450,9 +440,8 @@ func genStreamHandlerRegistration(g *protogen.GeneratedFile, svc *protogen.Servi
 	g.P("})")
 }
 
-// methodSignature renders one unary RPC's shape, shared byte-for-byte between the
-// client and server interfaces since a unary method uses the identical gRPC-style
-// "(ctx, req) (resp, error)" shape on both sides:
+// methodSignature renders one unary RPC's shape, shared by both client and server
+// interfaces since unary methods use the identical gRPC-style shape on both sides:
 // "<Name>(ctx context.Context, req *Input) (*Output, error)".
 func methodSignature(g *protogen.GeneratedFile, m *protogen.Method) string {
 	return fmt.Sprintf("%s(ctx %s, req *%s) (*%s, error)",
@@ -463,9 +452,9 @@ func methodSignature(g *protogen.GeneratedFile, m *protogen.Method) string {
 	)
 }
 
-// clientMethodSignature renders one RPC's client-interface shape. A unary method
-// keeps the shared "(ctx, req) (resp, error)" shape; a streaming method mirrors
-// gRPC's generated client shape, returning the method's typed client stream:
+// clientMethodSignature renders one RPC's client-interface shape.
+// A unary method keeps the shared "(ctx, req) (resp, error)" shape;
+// a streaming method mirrors gRPC's generated client shape:
 //   - client-streaming: "<Name>(ctx) (<Service>_<Name>Client, error)"
 //   - server-streaming: "<Name>(ctx, req *Input) (<Service>_<Name>Client, error)"
 //   - bidi:             "<Name>(ctx) (<Service>_<Name>Client, error)"
@@ -483,9 +472,9 @@ func clientMethodSignature(g *protogen.GeneratedFile, svc *protogen.Service, m *
 	return fmt.Sprintf("%s(ctx %s) (%s, error)", m.GoName, ctxType, streamType)
 }
 
-// serverMethodSignature renders one RPC's server-interface shape (the plugin
-// implements it). A unary method keeps the shared shape; a streaming method
-// mirrors gRPC's generated server shape:
+// serverMethodSignature renders one RPC's server-interface shape.
+// A unary method keeps the shared shape; a streaming method mirrors gRPC's
+// generated server shape:
 //   - client-streaming: "<Name>(stream <Service>_<Name>Server) error"
 //   - server-streaming: "<Name>(req *Input, stream <Service>_<Name>Server) error"
 //   - bidi:             "<Name>(stream <Service>_<Name>Server) error"
@@ -501,21 +490,21 @@ func serverMethodSignature(g *protogen.GeneratedFile, svc *protogen.Service, m *
 	return fmt.Sprintf("%s(stream %s) error", m.GoName, streamType)
 }
 
-// streamTypeName is the exported name of a streaming method's typed stream
-// interface, mirroring gRPC's "<Service>_<Method>Client"/"Server" convention.
+// streamTypeName is the exported name of a streaming method's typed stream interface,
+// mirroring gRPC's "<Service>_<Method>Client"/"Server" convention.
 func streamTypeName(svc *protogen.Service, m *protogen.Method, side string) string {
 	return svc.GoName + "_" + m.GoName + side
 }
 
-// streamImplName is the unexported struct that implements a streamTypeName
-// interface, e.g. "echoStreamCollectClient".
+// streamImplName is the unexported struct implementing a streamTypeName interface
+// (for example, "echoCollectClient").
 func streamImplName(svc *protogen.Service, m *protogen.Method, side string) string {
 	return unexport(svc.GoName) + m.GoName + side
 }
 
 // streamShapeIdent is the styx.StreamShape constant for m's shape, passed to
-// RegisterStreamHandlerID so the accepter establishes the stream from the
-// declared shape rather than inferring it from the wire.
+// RegisterStreamHandlerID so the accepter establishes the stream from the declared
+// shape rather than inferring it from the wire.
 func streamShapeIdent(m *protogen.Method) protogen.GoIdent {
 	switch {
 	case m.Desc.IsStreamingServer() && !m.Desc.IsStreamingClient():
@@ -528,12 +517,12 @@ func streamShapeIdent(m *protogen.Method) protogen.GoIdent {
 }
 
 // genStreamTypes emits, for each streaming method in svc, the typed client and
-// server stream interfaces and their unexported implementations wrapping
-// *styx.Stream. Encoding is delegated to the stream handle's Marshal/Unmarshal — the
-// connection's negotiated codec, the same codec the unary stubs and every other
-// message on the connection use — never a hardcoded one; the underlying Stream moves
-// only []byte. Send/Recv/Close errors surface through styx.StreamError so an
-// application sees the same sentinels a unary call returns.
+// server stream interfaces and their unexported implementations wrapping *styx.Stream.
+// Encoding is delegated to the stream handle's Marshal/Unmarshal, which uses the
+// connection's negotiated codec (the same codec the unary stubs use).
+// The underlying Stream moves only []byte.
+// Send/Recv/Close errors surface through styx.StreamError so an application sees
+// the same error sentinels a unary call returns.
 func genStreamTypes(g *protogen.GeneratedFile, svc *protogen.Service) {
 	for _, m := range svc.Methods {
 		if !isStreaming(m) {
@@ -546,7 +535,7 @@ func genStreamTypes(g *protogen.GeneratedFile, svc *protogen.Service) {
 
 // genStreamClientType emits one streaming method's typed client stream interface
 // and its implementation: Send for a client-writable direction, Recv for a
-// server-writable one, and the shape's close/finish method.
+// server-writable one, and the shape's close method.
 func genStreamClientType(g *protogen.GeneratedFile, svc *protogen.Service, m *protogen.Method) {
 	iface := streamTypeName(svc, m, "Client")
 	impl := streamImplName(svc, m, "Client")
@@ -593,7 +582,7 @@ func genStreamClientType(g *protogen.GeneratedFile, svc *protogen.Service, m *pr
 
 // genStreamServerType emits one streaming method's typed server stream interface
 // and its implementation: Send for a server-writable direction, Recv for a
-// client-writable one, and SendAndClose for client-streaming's single response.
+// client-writable one, and SendAndClose for client-streaming responses.
 func genStreamServerType(g *protogen.GeneratedFile, svc *protogen.Service, m *protogen.Method) {
 	iface := streamTypeName(svc, m, "Server")
 	impl := streamImplName(svc, m, "Server")
@@ -631,35 +620,36 @@ func genStreamServerType(g *protogen.GeneratedFile, svc *protogen.Service, m *pr
 	genStreamContextMethod(g, impl)
 }
 
-// genStreamContextMethod emits the Context accessor shared by every generated stream
-// impl: it returns the underlying stream's context (its deadline, canceled on
-// terminal), the gRPC-shaped Context() the generated interfaces require.
+// genStreamContextMethod emits the Context accessor shared by every generated
+// stream impl, returning the underlying stream's context (its deadline,
+// canceled on stream terminal).
 func genStreamContextMethod(g *protogen.GeneratedFile, impl string) {
 	g.P("func (x *", impl, ") Context() ", contextPackage.Ident("Context"), " { return x.stream.Context() }")
 	g.P()
 }
 
-// sendSig/recvSig render the client-side typed Send/Recv method signatures; the
-// server-side variants swap Input and Output (the client sends Input, the server
-// sends Output).
+// sendSig renders the client-side Send method signature.
 func sendSig(g *protogen.GeneratedFile, m *protogen.Method) string {
 	return fmt.Sprintf("Send(*%s) error", g.QualifiedGoIdent(m.Input.GoIdent))
 }
 
+// recvSig renders the client-side Recv method signature.
 func recvSig(g *protogen.GeneratedFile, m *protogen.Method) string {
 	return fmt.Sprintf("Recv() (*%s, error)", g.QualifiedGoIdent(m.Output.GoIdent))
 }
 
+// serverSendSig renders the server-side Send method signature.
 func serverSendSig(g *protogen.GeneratedFile, m *protogen.Method) string {
 	return fmt.Sprintf("Send(*%s) error", g.QualifiedGoIdent(m.Output.GoIdent))
 }
 
+// serverRecvSig renders the server-side Recv method signature.
 func serverRecvSig(g *protogen.GeneratedFile, m *protogen.Method) string {
 	return fmt.Sprintf("Recv() (*%s, error)", g.QualifiedGoIdent(m.Input.GoIdent))
 }
 
-// genStreamSendMethod emits the client-side Send: marshal the request and send it
-// as a STREAM_MSG under the stream's own context.
+// genStreamSendMethod emits the client-side Send method: marshals the request and
+// sends it as a STREAM_MSG under the stream's own context.
 func genStreamSendMethod(g *protogen.GeneratedFile, impl string, m *protogen.Method) {
 	g.P("func (x *", impl, ") Send(m *", g.QualifiedGoIdent(m.Input.GoIdent), ") error {")
 	g.P("payload, err := x.stream.Marshal(m)")
@@ -671,8 +661,8 @@ func genStreamSendMethod(g *protogen.GeneratedFile, impl string, m *protogen.Met
 	g.P()
 }
 
-// genStreamRecvMethod emits the client-side Recv: receive the next STREAM_MSG (or
-// io.EOF at stream end, surfaced unchanged by StreamError) and unmarshal it.
+// genStreamRecvMethod emits the client-side Recv method: receives the next STREAM_MSG
+// (or io.EOF at stream end, surfaced unchanged by StreamError) and unmarshals it.
 func genStreamRecvMethod(g *protogen.GeneratedFile, impl string, m *protogen.Method) {
 	g.P("func (x *", impl, ") Recv() (*", g.QualifiedGoIdent(m.Output.GoIdent), ", error) {")
 	g.P("payload, err := x.stream.RecvMsg(x.ctx)")
@@ -688,8 +678,8 @@ func genStreamRecvMethod(g *protogen.GeneratedFile, impl string, m *protogen.Met
 	g.P()
 }
 
-// genStreamCloseSendMethod emits the bidi client-side CloseSend: half-close the
-// send direction with no trailer.
+// genStreamCloseSendMethod emits the bidi client-side CloseSend method:
+// half-closes the send direction with no trailer.
 func genStreamCloseSendMethod(g *protogen.GeneratedFile, impl string) {
 	g.P("func (x *", impl, ") CloseSend() error {")
 	g.P("return ", styxPackage.Ident("StreamError"), "(x.stream.CloseSend(x.ctx, nil))")
@@ -697,9 +687,9 @@ func genStreamCloseSendMethod(g *protogen.GeneratedFile, impl string) {
 	g.P()
 }
 
-// genStreamCloseAndRecvMethod emits the client-streaming client-side
-// CloseAndRecv: half-close the send direction, then receive the single response
-// the server's STREAM_CLOSE carried and unmarshal it.
+// genStreamCloseAndRecvMethod emits the client-streaming client-side CloseAndRecv method:
+// half-closes the send direction, then receives and unmarshals the single response
+// the server's STREAM_CLOSE carried.
 func genStreamCloseAndRecvMethod(g *protogen.GeneratedFile, impl string, m *protogen.Method) {
 	g.P("func (x *", impl, ") CloseAndRecv() (*", g.QualifiedGoIdent(m.Output.GoIdent), ", error) {")
 	g.P("if err := x.stream.CloseSend(x.ctx, nil); err != nil {")
@@ -718,8 +708,8 @@ func genStreamCloseAndRecvMethod(g *protogen.GeneratedFile, impl string, m *prot
 	g.P()
 }
 
-// genStreamServerSendMethod emits the server-side Send: marshal the response and
-// send it as a STREAM_MSG.
+// genStreamServerSendMethod emits the server-side Send method: marshals the
+// response and sends it as a STREAM_MSG.
 func genStreamServerSendMethod(g *protogen.GeneratedFile, impl string, m *protogen.Method) {
 	g.P("func (x *", impl, ") Send(m *", g.QualifiedGoIdent(m.Output.GoIdent), ") error {")
 	g.P("payload, err := x.stream.Marshal(m)")
@@ -732,11 +722,12 @@ func genStreamServerSendMethod(g *protogen.GeneratedFile, impl string, m *protog
 	g.P()
 }
 
-// genStreamServerRecvMethod emits the server-side Recv: receive the next client
-// STREAM_MSG (or io.EOF once the client half-closed) and unmarshal it. It uses a
-// background context, not the stream's own: the stream's context is canceled by
-// its terminal transition, which would race the done signal and mask the real
-// outcome; the stream's deadline still bounds the receive through the done path.
+// genStreamServerRecvMethod emits the server-side Recv method: receives the next
+// client STREAM_MSG (or io.EOF once the client half-closed) and unmarshals it.
+// It uses a background context, not the stream's own, because the stream's context
+// is canceled by its terminal transition.
+// Using the stream's context would race the done signal and mask the real outcome;
+// the stream's deadline still bounds the receive through the done path.
 func genStreamServerRecvMethod(g *protogen.GeneratedFile, impl string, m *protogen.Method) {
 	g.P("func (x *", impl, ") Recv() (*", g.QualifiedGoIdent(m.Input.GoIdent), ", error) {")
 	g.P("payload, err := x.stream.RecvMsg(", contextPackage.Ident("Background"), "())")
@@ -752,9 +743,9 @@ func genStreamServerRecvMethod(g *protogen.GeneratedFile, impl string, m *protog
 	g.P()
 }
 
-// genStreamSendAndCloseMethod emits the client-streaming server-side
-// SendAndClose: marshal the single response and half-close the server's send
-// direction carrying it on the STREAM_CLOSE payload.
+// genStreamSendAndCloseMethod emits the client-streaming server-side SendAndClose method:
+// marshals the single response and half-closes the server's send direction
+// carrying it on the STREAM_CLOSE payload.
 func genStreamSendAndCloseMethod(g *protogen.GeneratedFile, impl string, m *protogen.Method) {
 	g.P("func (x *", impl, ") SendAndClose(m *", g.QualifiedGoIdent(m.Output.GoIdent), ") error {")
 	g.P("payload, err := x.stream.Marshal(m)")
@@ -768,8 +759,8 @@ func genStreamSendAndCloseMethod(g *protogen.GeneratedFile, impl string, m *prot
 }
 
 // unexport lower-cases the first byte of s, matching protoc-gen-go-grpc's
-// convention for turning an exported Go identifier into its unexported
-// counterpart (e.g. "Echo" -> "echo").
+// convention for turning an exported Go identifier into its unexported counterpart
+// (for example, "Echo" -> "echo").
 func unexport(s string) string {
 	return strings.ToLower(s[:1]) + s[1:]
 }

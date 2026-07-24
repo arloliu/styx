@@ -98,25 +98,12 @@ func (c *Conn) SendFDs(ctx context.Context, msg *controlpb.ControlMessage, fds [
 	return c.sendFDsUnchecked(ctx, msg, fds)
 }
 
-// RecvFDs receives one message plus any SCM_RIGHTS ancillary fds, up to
-// maxFDs. It parses the message's declared fd-count field (via KindOf +
-// a per-kind accessor) and compares it against the number of fds actually
-// received: a mismatch, or MSG_CTRUNC (ancillary buffer too small — sized
-// maxFDs*4 bytes of SCM_RIGHTS header + fd array up front, so this should
-// only fire on a malicious/buggy peer attaching more than maxFDs real
-// fds), is ErrProtocolViolation. On that path RecvFDs closes every fd it
-// did receive before returning the error, so no fd survives a rejected
-// message. On success, every returned fd is already CLOEXEC (every fd
-// this package hands out is CLOEXEC except the two intentionally
-// inherited bootstrap fds) and owned by the caller from that point.
-// CLOEXEC is set by
-// passing MSG_CMSG_CLOEXEC to recvmsg, which makes the kernel set it
-// atomically as part of fd creation — not via a separate fcntl call
-// afterward. That matters because this process forks plugin children via
-// os/exec elsewhere: a fcntl-after-the-fact window would let a fork
-// racing this call inherit a not-yet-CLOEXEC'd fd into an unrelated
-// child. MSG_CMSG_CLOEXEC closes that window entirely, with no ForkLock
-// needed.
+// RecvFDs receives one message plus any SCM_RIGHTS ancillary fds, up to maxFDs.
+// It parses the message's declared fd-count field and compares it against the number of
+// fds actually received: a mismatch or MSG_CTRUNC is ErrProtocolViolation.
+// On error, RecvFDs closes every fd it received before returning, so no fd survives a rejected message.
+// On success, every returned fd is already CLOEXEC (set atomically by MSG_CMSG_CLOEXEC
+// to avoid a fork race) and owned by the caller.
 func (c *Conn) RecvFDs(ctx context.Context, maxFDs int) (*controlpb.ControlMessage, []int, error) {
 	c.recvProbe.enter()
 	defer c.recvProbe.leave()

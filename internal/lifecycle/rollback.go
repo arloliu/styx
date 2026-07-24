@@ -9,22 +9,17 @@ import (
 	"github.com/arloliu/styx/internal/control/controlpb"
 )
 
-// rollback reverses the freeze from fromPhase and returns the error the
-// caller should surface. It tears down successor if one was spawned and
-// never promoted, sends Resume to the old instance, waits for its ResumeAck,
-// and only then reopens admission. That order is the whole point: a call
-// admitted before the old instance has confirmed its mutators are running
-// again would enter a half-frozen plugin.
-//
-// An abort from PhaseCutoff needs none of this — nothing was frozen and no
-// successor exists — so it just reopens admission.
-//
-// If the old instance cannot be unfrozen because it stopped answering,
-// rollback returns an error wrapping ErrReloadCrashEquivalent and leaves
-// admission closed. Reopening it would admit calls to an instance that is
-// frozen forever; leaving it closed hands the situation to the caller's
-// normal crash-and-restart path, which is the only thing that can still
-// produce a serving plugin.
+// rollback reverses the freeze from fromPhase and returns the error to surface.
+// It tears down successor if one was spawned and never promoted, sends Resume
+// to the old instance, waits for its ResumeAck, and only then reopens admission.
+// This order is critical: a call admitted before the old instance confirms its
+// mutators are running again would enter a half-frozen plugin.
+// An abort from PhaseCutoff needs none of this; nothing was frozen and no
+// successor exists, so it just reopens admission. If the old instance cannot be
+// unfrozen because it stopped answering, rollback returns an error wrapping
+// ErrReloadCrashEquivalent and leaves admission closed. Reopening would admit
+// calls to an instance frozen forever; leaving closed hands it to the normal
+// crash-and-restart path, the only thing that can produce a serving plugin.
 func (tx *Transaction) rollback(ctx context.Context, fromPhase Phase, successor ReloadTarget, cause error) error {
 	if fromPhase == PhaseCutoff {
 		tx.admission.Open()
@@ -32,18 +27,18 @@ func (tx *Transaction) rollback(ctx context.Context, fromPhase Phase, successor 
 		return cause
 	}
 
-	// Every wire step below runs on a context detached from the caller's, so
-	// a reload aborted BY cancellation can still unfreeze the old instance.
-	// Using the caller's canceled context here would turn every cancellation
-	// into a permanently frozen plugin.
+	// Every wire step below runs on a context detached from the caller's,
+	// so a reload aborted by cancellation can still unfreeze the old instance.
+	// Using the caller's canceled context would turn every cancellation into
+	// a permanently frozen plugin.
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tx.deadlines.DrainAck)
 	defer cancel()
 
 	if successor != nil {
-		// The successor never routed anything, so tearing it down cannot
-		// affect a caller. Its error is deliberately not propagated: the
-		// reason the reload failed is more useful than the reason its cleanup
-		// did, and the reap happens either way.
+		// The successor never routed anything, so tearing it down cannot affect
+		// a caller. Its error is deliberately not propagated; the reason the
+		// reload failed is more useful than the reason its cleanup did, and the
+		// reap happens either way.
 		_ = successor.Teardown(rctx, control.ReplyDeadlines[control.KindShutdown])
 	}
 
@@ -56,8 +51,8 @@ func (tx *Transaction) rollback(ctx context.Context, fromPhase Phase, successor 
 	return cause
 }
 
-// resumeOld sends Resume to the old instance and waits for its ResumeAck,
-// which is the instance confirming its background mutators are running again
+// resumeOld sends Resume to the old instance and waits for its ResumeAck.
+// This is the instance confirming its background mutators are running again
 // and it is safe to admit calls to.
 func (tx *Transaction) resumeOld(ctx context.Context) error {
 	msg := &controlpb.ControlMessage{

@@ -1,9 +1,9 @@
 package benchbaseline
 
-// DirectBaseline is the speed-of-light reference: an ordinary function
-// call, no IPC of any kind.
+// DirectBaseline is the speed-of-light reference: an ordinary function call, no IPC of any kind.
 type DirectBaseline struct{}
 
+// NewDirect returns a new DirectBaseline.
 func NewDirect() *DirectBaseline { return &DirectBaseline{} }
 
 func (d *DirectBaseline) Name() string { return "direct" }

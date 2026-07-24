@@ -20,10 +20,10 @@ const (
 	numClasses = 3
 )
 
-// Handle identifies one allocated slab. Handles are only valid within the
-// Arena that produced them. The spike omits the (generation, allocation
-// sequence) pair a production arena would carry — single-region,
-// single-writer, no restarts within a benchmark run.
+// Handle identifies one allocated slab.
+// Handles are only valid within the Arena that produced them.
+// The spike omits the (generation, allocation sequence) pair a production arena would carry:
+// single-region, single-writer, no restarts within a benchmark run.
 type Handle struct {
 	Class Class
 	Index uint32

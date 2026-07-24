@@ -31,8 +31,8 @@ const (
 	KindRestoreAck
 )
 
-// LifecycleState is the coarse control-plane state each side tracks to
-// decide which message kinds are legal to receive right now.
+// LifecycleState tracks the coarse control-plane state each side is in to decide
+// which message kinds are legal to receive.
 type LifecycleState int
 
 const (
@@ -41,23 +41,19 @@ const (
 	StateServing
 	StateDraining
 	StateShuttingDown
-	// StateRestoring is the freshly spawned successor's state during a
-	// hot-reload's restore-and-validate phase: it has finished handshake and
-	// attach but is not yet promoted, so the only traffic it may exchange is
-	// the snapshot delivery itself. Restore/RestoreAck are legal here and
-	// nowhere else — a Restore arriving in StateServing would mean the host
-	// tried to reset an already-promoted instance's state underneath live
-	// calls.
+	// StateRestoring is the freshly spawned successor's state during a hot-reload's
+	// restore-and-validate phase.
+	// It has finished handshake and attach but is not yet promoted.
+	// Only Restore/RestoreAck traffic is legal; a Restore in StateServing would indicate
+	// the host tried to reset an already-promoted instance's state underneath live calls.
 	StateRestoring
 )
 
-// ReplyDeadlines is the per-message-type reply deadline. Drain and
-// Shutdown carry their own deadline_unix_nano field for the phase itself;
-// this map is the deadline for the *reply* to arrive at all. Ack kinds and
-// Resume/Poisoned are deliberately absent — they ARE replies, or (Poisoned)
-// arrive unsolicited, so none has a reply deadline of its own.
+// ReplyDeadlines maps each message kind to the deadline for its reply to arrive.
+// Drain and Shutdown carry their own deadline_unix_nano field for the phase itself; this is the deadline for the reply.
+// Ack kinds and Resume/Poisoned are absent — they are replies or arrive unsolicited, so they have no reply deadline.
 //
-//exhaustive:ignore -- see comment above: only kinds that expect a reply appear here.
+//exhaustive:ignore -- only kinds that expect a reply appear here.
 var ReplyDeadlines = map[MessageKind]time.Duration{
 	KindHello:        2 * time.Second,
 	KindAttachRegion: 2 * time.Second,
@@ -74,13 +70,7 @@ var ReplyDeadlines = map[MessageKind]time.Duration{
 var ErrProtocolViolation = errors.New("control: protocol violation")
 
 // legalByState is the per-lifecycle-state table of legal message kinds.
-// Both Hello/HelloAck are legal only in StateHandshaking;
-// AttachRegion/Ack only in StateAttaching; Heartbeat/HeartbeatAck, Drain,
-// SaveState/Ack, Shutdown, and Poisoned are legal in StateServing;
-// DrainAck, Resume/ResumeAck, SaveState/Ack, Shutdown, and Poisoned are
-// legal in StateDraining; only ShutdownAck and Poisoned are legal in
-// StateShuttingDown; only Restore and RestoreAck are legal in
-// StateRestoring.
+// It defines which message kinds are valid in each lifecycle state.
 var legalByState = map[LifecycleState]map[MessageKind]bool{
 	StateHandshaking: {
 		KindHello:    true,

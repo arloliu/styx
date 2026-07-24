@@ -10,8 +10,8 @@
 //
 // # Delivery discipline
 //
-// Observability never slows or destabilizes the data plane. The rules Styx's
-// instrumentation call sites obey:
+// Observability never slows or destabilizes the data plane.
+// Styx's instrumentation call sites follow these rules:
 //
 //   - Zero cost when unconfigured. When no sink is set, a hot path allocates
 //     nothing, closes over nothing, and submits nothing: it checks a cheap

@@ -20,24 +20,18 @@ var (
 	_ StateRestorer           = lifecycle.StateRestorer(nil)
 )
 
-// Mutator is a background component of a plugin that must hold its own state
-// still while a hot reload is in flight. A plugin registers one with
-// RegisterMutator; anything that mutates state on its own schedule — a
-// background flusher, a lease renewer, a reconnect loop, a cache evictor —
-// is a Mutator, so that a reload sees a quiescent snapshot instead of a
-// moving target.
+// Mutator is a background component that must hold its state still during hot
+// reload. Register one with RegisterMutator. Anything that mutates state on its
+// own schedule — a background flusher, a lease renewer, a reconnect loop, a
+// cache evictor — is a Mutator.
 //
-// During a reload the host asks the plugin to drain. The plugin freezes
-// every registered Mutator, in registration order, and only then reports the
-// drain complete. If the reload is later abandoned and the plugin keeps
-// serving, each Mutator is resumed, in that same order. On a reload that
-// succeeds, the frozen instance is retired without ever being resumed, so
-// Resume runs only on the rollback path.
-//
-// Register mutators in dependency order: one that must stop before another
-// can safely settle (a cache that draws on a connection pool, say) is
-// registered before that other. Freeze walks the list front to back and
-// Resume walks it front to back as well.
+// During reload the host asks the plugin to drain. The plugin freezes every
+// registered Mutator in registration order, then reports drain complete. If
+// reload is abandoned and the plugin keeps serving, each Mutator is resumed
+// in that same order. On successful reload, the frozen instance is retired
+// without being resumed (Resume runs only on rollback).
+// Mutators should be registered in dependency order (a cache drawing on a
+// connection pool registers before that pool).
 type Mutator interface {
 	// Freeze stops the component from mutating its own state and returns only
 	// once it has settled. The plugin waits for Freeze to return on every
@@ -63,10 +57,10 @@ type Mutator interface {
 }
 
 // StateSaver produces the snapshot payload a plugin hands to its successor
-// across a hot reload. A plugin with state to carry forward registers one
-// with RegisterStateSaver; a stateless plugin registers none, and the reload
-// then carries an empty snapshot. Styx handles versioning, checksumming, and
-// sealing around the returned bytes — the payload itself is opaque to Styx.
+// across hot reload. A plugin with state to carry forward registers one with
+// RegisterStateSaver; a stateless plugin registers none and the reload then
+// carries an empty snapshot. Styx handles versioning, checksumming, and sealing
+// around the returned bytes (the payload is opaque to Styx).
 type StateSaver interface {
 	// SaveState returns the bytes to seal into the snapshot handed to the
 	// successor instance. It runs after the drain is acknowledged, once the
@@ -83,13 +77,11 @@ type StateSaver interface {
 // StateRestorer applies a predecessor's snapshot to a freshly spawned
 // successor instance before that successor begins serving. A plugin that
 // registers a StateSaver registers a matching StateRestorer with
-// RegisterStateRestorer so its state survives a reload; a stateless plugin
-// registers neither.
-//
-// A successor with no registered StateRestorer accepts only an empty
-// snapshot. If a predecessor sends real state and the successor has nothing
-// registered to apply it, the successor refuses the snapshot rather than
-// silently discard it, and the host abandons the reload.
+// RegisterStateRestorer so its state survives reload; a stateless plugin
+// registers neither. A successor with no registered StateRestorer accepts only
+// an empty snapshot. If a predecessor sends real state and the successor has
+// nothing registered to apply it, the successor refuses the snapshot and the
+// host abandons the reload.
 type StateRestorer interface {
 	// RestoreState applies data — the verified snapshot payload the
 	// predecessor produced, built under formatVersion — to this freshly
@@ -106,12 +98,10 @@ type StateRestorer interface {
 	RestoreState(ctx context.Context, formatVersion uint32, data []byte) error
 }
 
-// RegisterMutator registers a background component that must be frozen
-// before drain-ack and resumed on rollback, during hot-reload. Mutators are
-// frozen, and later resumed, in the order they were registered — a plugin
-// with mutators that depend on each other's state (e.g. a cache that must
-// stop before the connection pool it draws from) registers them in the
-// order that dependency requires.
+// RegisterMutator registers a background component that must be frozen before
+// drain-ack and resumed on rollback during hot-reload. Mutators are frozen and
+// resumed in registration order, so a plugin with dependent mutators
+// (e.g., a cache drawing on a connection pool) registers them in dependency order.
 func (s *PluginServer) RegisterMutator(m Mutator) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

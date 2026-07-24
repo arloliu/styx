@@ -35,80 +35,89 @@ const DefaultSpinBudget = 30 * time.Microsecond
 const quotaSpinShrinkDivisor = 32
 
 // RingPeeker is the minimal seam SpinWaiter needs into a ring: a seq_cst
-// load of the producer's tail sequence number (shm-abi.md §11's C2/C4 --
-// the load-bearing consumer access the §13 litmus proof reasons about).
+// load of the producer's tail sequence number (C2/C4,
+// docs/specs/shm-abi.md §11 — the load-bearing consumer access the §13 litmus
+// proof reasons about).
 // *ring.Ring satisfies this via its Tail method, so event and ring need not
 // import each other's concrete types.
 //
-// This is deliberately NOT an Empty() bool seam: the protocol compares the
-// tail against lastSeen (the value already drained up to, §11), which
-// Empty alone cannot express -- a ring can be non-empty yet hold no *new*
-// work relative to what this waiter has already consumed.
+// This is deliberately NOT an Empty() bool seam: the protocol compares tail
+// against lastSeen (the value already drained, §11), which Empty alone cannot
+// express — a ring can be non-empty yet hold no new work relative to what
+// this waiter has already consumed.
 type RingPeeker interface {
-	// Tail returns the producer's current tail sequence number via a
-	// seq_cst load (shm-abi.md §11's C2/C4).
+	// Tail returns the producer's current tail sequence number via a seq_cst
+	// load (C2/C4, docs/specs/shm-abi.md §11).
 	Tail() uint64
 }
 
-// SpinWaiter implements the hybrid spin-then-park consumer loop (shm-abi.md
-// §11): spin up to a wall-time budget, re-checking the ring tail via
-// runtime.Gosched-yielding iterations, then arm via ParkState and block on
-// the eventfd.
+// SpinWaiter implements the hybrid spin-then-park consumer loop
+// (docs/specs/shm-abi.md §11): spin up to a wall-time budget, re-checking
+// the ring tail with yielding iterations, then arm and block on the eventfd.
 //
-// Spin policy (binding, non-ABI -- docs/plans/2026-07-16-m0-gate-report.md;
-// see effectiveSpinBudget for the exact rule and its reasoning): the budget
-// is forced to 0 when GOMAXPROCS<=1 or the process runs under a cgroup CPU
-// quota below one full CPU, sharply shrunk under any OTHER finite cgroup
-// quota (regardless of its magnitude) and under an unconfirmable quota
-// (fail closed), and left at the configured value only when the quota is
-// confirmed unlimited, so a spinning consumer can never starve the producer,
-// dispatcher, heartbeat, or GC of the only runnable P, nor drain a
-// constrained CFS bandwidth quota into a throttle stall.
+// Spin policy is quota-aware (docs/plans/2026-07-16-m0-gate-report.md;
+// see effectiveSpinBudget for details).
+// The budget is zero under GOMAXPROCS<=1 or sub-one-CPU quota,
+// full under confirmed-unlimited quota, sharply shrunk under any other finite
+// or unconfirmable quota (fail-closed), so a spinning consumer never starves
+// the producer, dispatcher, heartbeat, or GC of the only runnable P, nor
+// drains a constrained CFS quota into throttle stall.
 type SpinWaiter struct {
 	budget time.Duration // effective, already quota/GOMAXPROCS-adjusted
 
-	// beforeBlock is a process-local, test-only observation hook. When set, Wait
-	// invokes it once per park attempt immediately before efd.Read -- strictly
-	// after the arm (C1) and the arm-path ctx/shutdown/tail re-checks (§11), at
-	// the point the consumer is committed to the blocking read: past that point
-	// the only exit is a real eventfd write or a ctx cancel, never the arm-path
-	// shutdown early-out. It lets a test prove a reader has crossed its final
-	// pre-block shutdown re-check before firing a teardown wake, so removing that
-	// direction's eventfd write strands the reader deterministically. It is NOT
-	// one of the compile-gated §13 litmus checkpoints above (which fire at the
-	// C1..C4 boundaries under the eventhook build tag) and adds no new park-word
-	// state -- the park protocol is unchanged. Unset in every production build: a
-	// single atomic load on the cold path a syscall already dominates. Stored
-	// through an atomic pointer so a test may install it concurrently with the
+	// beforeBlock is a process-local, test-only observation hook.
+	// When set, Wait invokes it once per park attempt immediately before
+	// efd.Read — strictly after the arm (C1) and the arm-path ctx/shutdown/tail
+	// re-checks (docs/specs/shm-abi.md §11), at the point the consumer is
+	// committed to the blocking read.
+	// Past that point, only a real eventfd write or ctx cancel can unblock it,
+	// never arm-path early-out.
+	// It lets a test prove the reader crossed its final pre-block shutdown
+	// re-check before firing a teardown wake, deterministically stranding the
+	// reader when that direction's eventfd write is removed.
+	// It is NOT one of the compile-gated §13 litmus checkpoints (which fire at
+	// C1..C4 under the eventhook build tag) and adds no new park-word state —
+	// the park protocol is unchanged.
+	// Unset in production: a single atomic load on the cold path a syscall
+	// already dominates.
+	// Stored via atomic pointer so tests can install it concurrently with the
 	// Wait goroutine, mirroring the writer's onBlock seam.
 	beforeBlock atomic.Pointer[func()]
 }
 
-// Forced-interleaving test seams for the shm-abi.md §13 litmus proof,
-// mirroring internal/ring's pushBeforeTailStore pattern: each fires at one
-// of the four load-bearing seq_cst checkpoints inside Wait, letting
-// waiter_hook_test.go (built with -tags eventhook) pause a real Wait call
-// and control exactly when a test-driven producer's accesses land relative
-// to it. Guarded by eventHookEnabled (hook_off.go/hook_on.go), a
-// compile-time constant false in every normal build, so these checks are
-// dead-code-eliminated and cost nothing in production.
+// hookAfterArm fires after C1 (TryPark), before C2 (tail re-load).
+// hookAfterArmCheck fires after C2 resolves, before branching on it.
+// hookAfterWake fires after C3 (MarkAwake, post-wake), before C4.
+// hookAfterWakeCheck fires after C4 resolves, before branching on it.
+//
+// These are forced-interleaving test seams for the §13 litmus proof
+// (docs/specs/shm-abi.md §13), mirroring internal/ring's pushBeforeTailStore
+// pattern.
+// Each fires at one of the four load-bearing seq_cst checkpoints inside Wait,
+// letting waiter_hook_test.go (built with -tags eventhook) pause a real Wait
+// call and control exactly when a test-driven producer's accesses land
+// relative to it.
+// Guarded by eventHookEnabled (hook_off.go/hook_on.go), a compile-time
+// constant false in normal builds, so these checks are dead-code-eliminated
+// with no production cost.
 var (
-	hookAfterArm       func() // fires after C1 (TryPark), before C2 (tail re-load)
-	hookAfterArmCheck  func() // fires after C2 resolves, before branching on it
-	hookAfterWake      func() // fires after C3 (MarkAwake, post-wake), before C4
-	hookAfterWakeCheck func() // fires after C4 resolves, before branching on it
+	hookAfterArm       func()
+	hookAfterArmCheck  func()
+	hookAfterWake      func()
+	hookAfterWakeCheck func()
 )
 
-// cgroupCPUQuota is a package-level seam over the real cgroup probe so tests
-// can inject a synthetic quota classification (including the fail-closed
-// Unknown case) without touching real cgroup files; production callers always
-// go through NewSpinWaiter, which never overrides it. It returns the
-// effective quota ratio and its tri-state classification (see quotaClass).
+// cgroupCPUQuota is a package-level seam over the real cgroup probe.
+// Tests can inject a synthetic quota classification (including fail-closed
+// Unknown) without touching real cgroup files.
+// Production callers go through NewSpinWaiter, which never overrides it.
+// It returns the effective quota ratio and its tri-state classification
+// (Limited, Unlimited, or Unknown; see quotaClass).
+//
+// The spin policy decides on (ratio, class) only; the exact flag matters
+// solely to the exported CgroupCPUQuota's certification, so it is dropped here.
 var cgroupCPUQuota = func() (float64, quotaClass) {
-	// The spin policy decides on (ratio, class) only; the exact flag matters
-	// solely to CgroupCPUQuota's exported certification, so it is dropped here.
 	ratio, class, _ := resolveCPUQuota(readFileNoFail)
-
 	return ratio, class
 }
 
@@ -196,24 +205,24 @@ func effectiveSpinBudget(configured time.Duration, gomaxprocs int, ratio float64
 	}
 }
 
-// Wait blocks until r's tail differs from lastSeen, the shared shutdown
-// word is observed set, or ctx is done -- following shm-abi.md §11's exact
-// sequence: spin (if the budget is nonzero) -> arm (TryPark) -> re-check
-// r.Tail() -> MarkAwake-and-return on a hit, or block on efd.Read.
+// Wait blocks until the ring tail differs from lastSeen, the shared shutdown
+// word is observed set, or ctx is done.
+// It follows docs/specs/shm-abi.md §11's exact sequence: spin (if budget is
+// nonzero) → arm (TryPark) → re-check r.Tail() → MarkAwake-and-return on a
+// hit, or block on efd.Read.
 //
-// ctx is an additional, non-ABI convenience layered on top of the ABI
-// shutdown-word protocol (not a replacement for it): it lets a caller bound
-// a Wait call externally (tests, or a higher layer with its own deadline).
-// Wait returns the observed tail alongside any error because shm-abi.md §11's
-// protocol is a tail comparison against lastSeen (RingPeeker.Tail(), not
-// RingPeeker.Empty()), and the caller needs the new tail value to know how
-// far it may now drain.
+// ctx is an additional, non-ABI convenience layered on the ABI shutdown-word
+// protocol (not a replacement).
+// It lets a caller bound a Wait call externally (tests, higher layer with
+// deadline).
+// Wait returns the observed tail alongside any error because the §11 protocol
+// compares tail against lastSeen (RingPeeker.Tail(), not RingPeeker.Empty()),
+// and the caller needs the new tail value to know how far it may drain.
 //
-// shutdown is the region's single shared shutdown word (shm-abi.md §3,
-// §14) -- not part of ParkState, which models only the per-direction
-// park/wake word -- passed in because SpinWaiter itself holds no reference
-// to it (only NewSpinWaiter's construction is per-direction; shutdown is
-// shared by both directions).
+// shutdown is the region's single shared shutdown word (§3, §14) — not part
+// of ParkState, which models only the per-direction park/wake word.
+// It is passed in because SpinWaiter holds no reference to it: construction
+// is per-direction, but shutdown is shared by both directions.
 func (w *SpinWaiter) Wait(
 	ctx context.Context, r RingPeeker, lastSeen uint64, state *ParkState, efd *EventFD, shutdown *uint32,
 ) (uint64, error) {

@@ -5,15 +5,14 @@ import (
 	"unsafe"
 )
 
-// Ring is a single-producer/single-consumer descriptor ring. Exactly one
-// goroutine calls TryEnqueue; exactly one (possibly different) goroutine
-// consumes via TryPeek + AdvanceHead — each ring has exactly one writer.
-// head and tail are monotonically increasing counters (never wrapped
-// modulo
-// capacity); the physical slot is `counter & mask`. This makes the
-// full/empty test unsigned-wraparound-safe: `tail - head` is always the
-// true in-flight count even after both counters wrap past 2^64 (unsigned
-// subtraction is modulo-correct).
+// Ring is a single-producer/single-consumer descriptor ring.
+// Exactly one goroutine calls TryEnqueue; exactly one (possibly different)
+// goroutine consumes via TryPeek + AdvanceHead.
+// Head and tail are monotonically increasing counters (never wrapped modulo
+// capacity); the physical slot is `counter & mask`.
+// This makes the full/empty test unsigned-wraparound-safe: `tail - head` is
+// always the true in-flight count even after both counters wrap past 2^64
+// (unsigned subtraction is modulo-correct).
 type Ring struct {
 	desc     []Descriptor
 	tail     *uint64 // producer-owned; seq_cst store on publish, seq_cst load by consumer

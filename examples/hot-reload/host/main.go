@@ -1,13 +1,12 @@
-// Command hot-reload-host is examples/hot-reload's host binary: it spawns the
-// stateful counter plugin named by its first argument, makes a few calls to build
-// up state, hot-reloads the plugin in place, and then makes more calls to show the
-// call count survived the reload. A hot-reload swaps in a freshly spawned instance
-// without dropping the plugin's state or restarting supervision.
+// Command hot-reload-host spawns a stateful counter plugin, makes initial
+// calls to build state, hot-reloads it in place, and makes more calls to
+// verify the state survived. Hot-reload replaces the plugin instance while
+// preserving its state and host supervision.
 //
 // Usage: hot-reload-host <path-to-hot-reload-plugin-binary>
 //
-// Expected output (the counts continuing past the reload prove state was carried
-// across, not reset):
+// Expected output shows the call count continuing past the reload, proving
+// state was carried across rather than reset:
 //
 //	before reload: 1:a 2:b 3:c
 //	after reload: 4:d 5:e

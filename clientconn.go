@@ -19,15 +19,14 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
-// ClientConn is a connection to a single running plugin, accepted by
-// generated service client constructors (a grpc.ClientConnInterface
+// ClientConn is a host-side connection to a single running plugin instance.
+// Generated service client constructors return it (a grpc.ClientConnInterface
 // analog).
 //
-// A ClientConn is safe for concurrent use by multiple goroutines: Invoke,
-// InvokeID, and the OpenStream/OpenStreamID/OpenServerStreamID stream-open
-// methods may all be called concurrently, mirroring grpc.ClientConn. Each
-// *Stream a stream-open returns carries its own narrower goroutine rule — see
-// Stream.
+// ClientConn is safe for concurrent use: Invoke, InvokeID, and the stream-open
+// methods (OpenStream, OpenStreamID, OpenServerStreamID) may all be called
+// concurrently. Each Stream returned by a stream-open carries its own narrower
+// goroutine rule (see Stream).
 type ClientConn struct {
 	name  string
 	state atomic.Pointer[connState] // nil until a plugin instance is live; Invoke reports ErrPluginUnavailable

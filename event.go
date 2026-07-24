@@ -36,8 +36,8 @@ const (
 	EventGaveUp
 )
 
-// Event is one supervisor lifecycle notification. Err is populated for
-// EventUnhealthy, EventCrashed, and EventGaveUp.
+// Event is one supervisor lifecycle notification.
+// Err is populated for EventUnhealthy, EventCrashed, and EventGaveUp.
 type Event struct {
 	Plugin string
 	Kind   EventKind

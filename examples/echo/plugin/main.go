@@ -1,8 +1,7 @@
-// Command echo-plugin is examples/echo's plugin binary: it registers the
-// generated EchoServer against a trivial implementation that echoes its
-// request back unchanged, and the generated EchoStreamServer against a
-// deterministic implementation of all three streaming shapes, then serves
-// until the host disconnects or shuts it down.
+// Command echo-plugin registers handlers for the EchoServer (echoing each
+// request back unchanged) and EchoStreamServer (with deterministic responses
+// for all three streaming shapes), then serves until the host closes the
+// connection.
 package main
 
 import (

@@ -30,24 +30,24 @@ func (p *pingGRPCPlugin) GRPCClient(_ context.Context, _ *goplugin.GRPCBroker, c
 	return pingpb.NewPingClient(c), nil
 }
 
-// GoPluginBaseline drives hashicorp/go-plugin in its gRPC mode against a
-// separate helper binary implementing the same Ping service.
+// GoPluginBaseline drives hashicorp/go-plugin in gRPC mode against a
+// separate helper binary that runs the Ping service.
 type GoPluginBaseline struct {
 	pluginBinPath string
 	client        *goplugin.Client
 	pingClient    pingpb.PingClient
 }
 
-// NewGoPlugin takes the path to a helper binary (built by the benchmark
-// suite) that calls goplugin.Serve with pingGRPCPlugin registered.
+// NewGoPlugin returns a GoPluginBaseline configured to spawn the helper binary at pluginBinPath.
+// The helper binary is built by the benchmark suite and calls goplugin.Serve with pingGRPCPlugin registered.
 func NewGoPlugin(pluginBinPath string) *GoPluginBaseline {
 	return &GoPluginBaseline{pluginBinPath: pluginBinPath}
 }
 
-// HandshakeConfig exposes handshakeConfig to the companion server binary.
+// HandshakeConfig returns the handshake configuration used by the goplugin-ping-server helper.
 func HandshakeConfig() goplugin.HandshakeConfig { return handshakeConfig }
 
-// PingGRPCPlugin exposes a fresh pingGRPCPlugin to the companion server binary.
+// PingGRPCPlugin returns a fresh goplugin.Plugin implementing the Ping gRPC service.
 func PingGRPCPlugin() goplugin.Plugin { return &pingGRPCPlugin{} }
 
 func (g *GoPluginBaseline) Name() string { return "hashicorp-go-plugin-grpc" }
@@ -56,10 +56,9 @@ func (g *GoPluginBaseline) Start() error {
 	g.client = goplugin.NewClient(&goplugin.ClientConfig{
 		HandshakeConfig: handshakeConfig,
 		Plugins:         goplugin.PluginSet{"ping": &pingGRPCPlugin{}},
-		// g.pluginBinPath is the benchmark suite's own built helper binary
-		// path (see NewGoPlugin), not externally supplied input; Start has no
-		// ctx param, matching every other baseline in this package.
-		//nolint:gosec,noctx // see comment above
+		// pluginBinPath is the benchmark suite's own helper binary (see NewGoPlugin), not
+		// externally supplied input; Start has no ctx param, matching every other baseline in this package.
+		//nolint:gosec,noctx // safe: binary is built and controlled by the benchmark suite
 		Cmd:              exec.Command(g.pluginBinPath),
 		AllowedProtocols: []goplugin.Protocol{goplugin.ProtocolGRPC},
 	})

@@ -207,23 +207,20 @@ const cgroupRoot = "/sys/fs/cgroup"
 // CgroupCPUQuota resolves this process's own cgroup v2 CPU quota and
 // returns the effective CPU count (quota/period), or ok=false if no quota
 // applies (unlimited "max", or nothing readable/parsable anywhere in the
-// resolution below). Exported so callers outside this package can verify
-// a claimed scheduler regime actually matches this process's real cgroup
-// constraint — e.g. the benchmark suite uses this to b.Fatal() loudly
-// when a "cgroup2cpu" regime label isn't backed by a real ~2-CPU quota,
-// using the exact same probe effectiveSpinBudget already relies on for
-// its own regime-sensitive decision, so the two can never disagree.
+// resolution below).
+// Exported so callers outside this package can verify that a claimed
+// scheduler regime actually matches this process's real cgroup constraint.
 //
-// Resolution: parse /proc/self/cgroup for this process's own cgroup v2
-// path, then look for cpu.max starting at that path and walking UP the
-// hierarchy toward (and including) cgroupRoot — a quota may legitimately
-// be set on any ancestor cgroup and applies down the tree, so the nearest
-// one found is the effective quota. If /proc/self/cgroup can't be read or
-// has no v2 unified-hierarchy line (cgroup v1, or parsing otherwise
-// fails), the walk starts at cgroupRoot itself instead — this both covers
-// a cgroupns=private container (where the process's own path genuinely IS
-// the root) and preserves this function's pre-fix behavior as the last
-// resort for anything else.
+// Resolution strategy: parse /proc/self/cgroup for this process's own
+// cgroup v2 path, then look for cpu.max starting at that path and walking
+// UP the hierarchy toward (and including) cgroupRoot.
+// A quota may legitimately be set on any ancestor cgroup and applies down
+// the tree, so the nearest one found is the effective quota.
+// If /proc/self/cgroup can't be read or has no v2 unified-hierarchy line
+// (cgroup v1, or parsing otherwise fails), the walk starts at cgroupRoot
+// itself — this covers cgroupns=private containers (where the process's own
+// path genuinely IS the root) and also handles edge cases on hybrid v1+v2
+// hosts.
 func CgroupCPUQuota() (float64, bool) {
 	path, _ := ownCgroupPath() // ok=false -> path=="" -> quotaFromPathUpward starts at (and stays at) cgroupRoot
 	return quotaFromPathUpward(path)

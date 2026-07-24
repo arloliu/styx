@@ -1,10 +1,8 @@
-// Command echo-crashy-plugin is examples/echo/plugin's deliberately
-// misbehaving twin, used only by the tests under tests/integration to drive
-// Styx's crash-timing, restart-policy, hot-reload, wedge-classifier, and
-// panic-policy behavior — scenarios the real examples/echo/plugin, by design,
-// never triggers. It registers the real generated EchoServer and
-// EchoStreamServer (so a well-behaved call round-trips normally), but argv[1]
-// selects one misbehavior:
+// Command echo-crashy-plugin deliberately misbehaves to test crash-timing,
+// restart policies, hot-reload, wedge detection, and panic handling — all
+// scenarios the normal example avoids by design. It registers the same
+// EchoServer and EchoStreamServer so well-behaved calls round-trip normally,
+// but argv[1] selects which misbehavior to trigger:
 //
 //   - "slow": Say synchronizes on the STYX_ECHO_CRASHY_FIFO checkpoint (see
 //     syncFIFO) if set, then sleeps for STYX_ECHO_CRASHY_DELAY (default 1s)

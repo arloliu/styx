@@ -6,12 +6,13 @@ import (
 )
 
 // Lease is one executing handler's active-handler lease: the call ID, when its
-// handler started, and when the dispatch layer last renewed it. The plugin
-// mirrors these into the heartbeat's active-handler leases so the host
-// classifier can tell a genuinely-running handler (a fresh renewal) from a
-// dispatch that owes a response but has no handler running for it — the latter,
-// with the produce counter frozen, is dispatch-wedged; a renewing lease exempts
-// its call, because an executing call is governed by its own deadline.
+// handler started, and when the dispatch layer last renewed it.
+// The plugin mirrors these into the heartbeat's active-handler leases so the
+// host classifier can tell a genuinely-running handler (a fresh renewal) from a
+// dispatch that owes a response but has no handler running for it.
+// The latter, with the produce counter frozen, is dispatch-wedged; a renewing
+// lease exempts its call because an executing call is governed by its own
+// deadline.
 type Lease struct {
 	CallID        uint64
 	StartedAt     time.Time
@@ -21,48 +22,51 @@ type Lease struct {
 // LeaseTable tracks two related facts about one serving session, under a single
 // lock so the heartbeat sees them coherently:
 //
-//   - active-handler leases: a handler acquires a lease when it starts and
-//     releases it when it returns (including on panic), so a lease is present
-//     exactly while its handler goroutine is live. The table never renews on its
-//     own: RenewAll, driven periodically by the dispatch layer, advances every
-//     live lease's renewal stamp — a lease that is still present is by definition
-//     a genuinely-running handler, so renewing the live set renews exactly the
-//     running handlers. A deadlocked handler therefore keeps renewing (it is
-//     governed by its own call deadline, not by wedge detection).
+// Active-handler leases: a handler acquires a lease when it starts and releases
+// it when it returns (including on panic), so a lease is present exactly while
+// its handler goroutine is live.
+// The table never renews on its own: RenewAll, driven periodically by the
+// dispatch layer, advances every live lease's renewal stamp.
+// A lease that is still present is by definition a genuinely-running handler, so
+// renewing the live set renews exactly the running handlers.
+// A deadlocked handler therefore keeps renewing (it is governed by its own call
+// deadline, not by wedge detection).
 //
-//   - response obligations: a call opens an obligation when its request is
-//     consumed and closes it only once its response/terminal frame has been
-//     handed to the transport — a span that outlives the lease, because the
-//     handler can return (releasing the lease) while its response send is still
-//     owed. The heartbeat's inflight_count is the number of open obligations that
-//     have NO live lease (SnapshotWithObligations computes this set difference
-//     under the lock): a per-call quantity the host cannot reconstruct from the
-//     aggregate obligation and lease counts, because a fresh lease with an already
-//     closed obligation would otherwise mask a different call's unleased owed
-//     response. A call whose handler is running (its lease is live) is excluded and
-//     governed by its own deadline; a response owed with no handler running for it
-//     is the dispatch stall the count exposes.
+// Response obligations: a call opens an obligation when its request is consumed
+// and closes it only once its response/terminal frame has been handed to the
+// transport.
+// This span outlives the lease, because the handler can return (releasing the
+// lease) while its response send is still owed.
+// The heartbeat's inflight_count is the number of open obligations that have NO
+// live lease (SnapshotWithObligations computes this set difference under the
+// lock): a per-call quantity the host cannot reconstruct from the aggregate
+// obligation and lease counts, because a fresh lease with an already-closed
+// obligation would otherwise mask a different call's owed response with no
+// handler running for it.
+// A call whose handler is running (its lease is live) is excluded and governed
+// by its own deadline; a response owed with no handler running for it is the
+// dispatch stall the count exposes.
 //
 // A call's obligation opens (OpenObligation) at consumption, before its lease is
-// acquired, so a call caught between consumption and handler start has an obligation
-// and no lease — correctly counted as unleased for that transient (the host's
-// persistence window absorbs it). An unknown-service reply, which never acquires a
-// lease, likewise carries an obligation until its error reply is published. Release
-// drops the lease when the handler returns, CloseObligation drops the obligation
-// when the response reaches the transport; the two are independent.
-//
-// All methods are safe for concurrent use: handler goroutines acquire and release
-// while the heartbeat assembly renews and snapshots.
+// acquired, so a call caught between consumption and handler start has an
+// obligation and no lease — correctly counted as owing a response with no
+// handler. An unknown-service reply, which never acquires a lease, likewise
+// carries an obligation until its error reply is published.
+// Release drops the lease when the handler returns, CloseObligation drops the
+// obligation when the response reaches the transport; the two are independent.
+// All methods are safe for concurrent use: handler goroutines acquire and
+// release while the heartbeat assembly renews and snapshots.
 type LeaseTable struct {
 	mu          sync.Mutex
 	active      map[uint64]Lease
 	obligations map[uint64]struct{}
-	// obligationClosedHook, when set, is invoked (without the lock held) after each
-	// obligation close, so a reload drain coordinator can re-evaluate quiescence
-	// when a response that was owed is finally handed to the transport — including a
-	// stream obligation that closes on a handler/finisher goroutine, not the reader
-	// loop. Set once at serving-session start (SetObligationClosedHook), nil
-	// otherwise. It must be non-blocking.
+	// obligationClosedHook, when set, is invoked (without the lock held) after
+	// each obligation close, so a reload drain coordinator can re-evaluate
+	// quiescence when a response that was owed is finally handed to the transport.
+	// This includes a stream obligation that closes on a handler/finisher
+	// goroutine, not the reader loop.
+	// Set once at serving-session start (SetObligationClosedHook), nil otherwise.
+	// It must be non-blocking.
 	obligationClosedHook func()
 }
 

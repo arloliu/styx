@@ -69,43 +69,27 @@ func SetReadinessWaitHookForTest(fn func()) (restore func()) {
 	return func() { readinessWaitHook = prev }
 }
 
-// UDSTransport implements Transport over an already-connected SOCK_STREAM
-// socket. Concurrency contract: writeMu serializes concurrent Send calls
-// so their header+body writes can never interleave. This IS load-bearing:
-// the styx client (clientconn.go) calls Send from every caller's own Invoke
-// goroutine, and abandon() sends a CANCEL frame from yet another, so several
-// Sends genuinely race per Transport — without writeMu two frames' bytes
-// could interleave and desync the stream. (The plugin-side serving loop is
-// single-writer, but the client side is not, and one Transport type serves
-// both.) Recv has no equivalent lock — it is only ever called from a single
-// reader goroutine per Transport, and this package does not invent a
-// multi-reader contract Transport's interface doc never promises.
+// UDSTransport implements Transport over an already-connected SOCK_STREAM socket.
+// Safe for concurrent Send calls via writeMu serialization. Recv must be called
+// from a single reader goroutine; the interface does not promise multi-reader safety.
 type UDSTransport struct {
 	fd int
-	// streaming is fixed at construction from the acknowledged compatibility
-	// tuple and never re-derived per call: it selects the header shape (37 or 45
-	// bytes) for the whole connection, so two frames on one connection can never
-	// disagree about how many bytes to read (stream-protocol.md §2.4). A 45-byte
-	// header on a non-streaming peer would silently desynchronize its framing on
-	// the first frame.
+	// streaming is fixed at construction and selects the header shape (37 or 45 bytes)
+	// for the whole connection, ensuring both peers agree on frame length.
 	streaming bool
 	writeMu   sync.Mutex
 	closed    atomic.Bool
 	closeOnce sync.Once
 
-	// sentCount and recvCount are the cumulative frame-progress counters exposed
-	// via FrameCounter: each advances once per fully-completed Send/Recv, never on
-	// a rejected-before-write Send or a mid-frame abort. They are the plugin's
-	// heartbeat produce/consume counters and the host's own H2P produce reference
-	// (see FrameCounter's doc). A single atomic add on the already-syscall-bound
-	// Send/Recv path is negligible.
+	// sentCount and recvCount are cumulative frame counters exposed via FrameCounter.
+	// Each increments exactly once per fully-completed Send/Recv, never on rejection
+	// or mid-frame abort. They are the heartbeat produce/consume counters.
 	sentCount atomic.Uint64
 	recvCount atomic.Uint64
 
-	// sentBytes and recvBytes are the cumulative wire-byte counters exposed via
-	// ByteCounter (header plus body), advanced at the same chokepoint as the frame
-	// counters and under the same "fully completed only" rule. They are the
-	// authoritative byte-throughput source for the observability reporter.
+	// sentBytes and recvBytes are cumulative wire-byte counters exposed via ByteCounter.
+	// They are incremented at the same chokepoint as the frame counters and count
+	// header plus body for every fully-completed Send/Recv.
 	sentBytes atomic.Uint64
 	recvBytes atomic.Uint64
 }
@@ -121,22 +105,14 @@ func (t *UDSTransport) headerLen() int {
 	return headerSize
 }
 
-// NewUDSTransport wraps fd, an already-connected SOCK_STREAM socket (the
-// data-plane socketpair attached during handshake, distinct from the
-// control-plane SOCK_SEQPACKET socket used for setup), in a Transport that
-// frames each Frame with a fixed header (4-byte big-endian uint32 total
-// payload length + 8-byte CallID + 1-byte Kind + 8-byte Service + 8-byte
-// Method + 8-byte Budget-as-int64-nanoseconds) followed by Payload.
-//
-// streaming is the acknowledged state of the streaming feature from the
-// negotiated compatibility tuple, and it fixes the header shape for the whole
-// connection: 37 bytes when absent, 45 bytes (with the 8-byte little-endian
-// stream control word appended) when present (stream-protocol.md §2.4). Both
-// sides derive it from the same tuple, so they never disagree about how many
-// bytes to read. fd must already be CLOEXEC; NewUDSTransport does not set it
-// (that's the caller's responsibility at the point fd was created/received).
-// Returns an error if fd is not a SOCK_STREAM socket, catching a
-// wrong-socket-type caller mistake before any Frame is ever attempted on it.
+// NewUDSTransport wraps an already-connected SOCK_STREAM socket in a Transport.
+// The socket must be the data-plane socketpair attached during handshake, not the
+// control-plane SOCK_SEQPACKET socket used for setup.
+// streaming fixes the header shape for the whole connection: 37 bytes when false,
+// 45 bytes with the control word appended when true. Both peers derive it from
+// the same negotiated compatibility tuple, ensuring they agree on frame length.
+// fd must already be CLOEXEC; NewUDSTransport does not set it. Returns an error
+// if fd is not a SOCK_STREAM socket.
 func NewUDSTransport(fd int, streaming bool) (*UDSTransport, error) {
 	sockType, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
 	if err != nil {
@@ -150,34 +126,21 @@ func NewUDSTransport(fd int, streaming bool) (*UDSTransport, error) {
 	return &UDSTransport{fd: fd, streaming: streaming}, nil
 }
 
-// Send blocks until f is fully written or ctx is done. It carries every
-// implemented Kind, including the five streaming kinds, and rejects only an
-// unimplemented/out-of-range Kind or an oversized Payload before writing any
-// byte of the frame.
-//
-// Mid-frame abort sacrifices the connection, by design (poison, don't
-// repair). If ctx is done (or a write fails) before any byte of f
-// has reached the socket, Send returns cleanly and the Transport stays
-// usable. But once even one byte of f's header or payload has been
-// written, SOCK_STREAM gives no way to resynchronize a peer that's
-// expecting the rest — so Send poisons the Transport (as Close would)
-// before returning, and every subsequent Send/Recv on it returns
-// ErrClosed. This call's own error is still the original ctx/IO error
-// (errors.Is-checkable against context.Canceled/context.DeadlineExceeded),
-// not ErrClosed — only later calls see that. Callers needing per-call
-// cancellation without losing the connection get it at the RPC layer
-// (a CANCEL frame), not here.
+// Send blocks until f is fully written or ctx is done.
+// It carries every implemented Kind, including streaming kinds, and rejects
+// unimplemented Kind or oversized Payload before writing any byte.
+// Mid-frame abort poisons the connection: if any byte of f reaches the socket
+// before failure, the Transport is closed and subsequent Send/Recv return ErrClosed.
+// This call's error is the original ctx/IO error (errors.Is-checkable against
+// context.Canceled/context.DeadlineExceeded). Per-call cancellation without
+// connection loss is available at the RPC layer via CANCEL frames.
 func (t *UDSTransport) Send(ctx context.Context, f Frame) error {
 	if err := checkImplementedKind(f.Kind); err != nil {
 		return err
 	}
 
-	// body is the wire bytes following the header: the raw Payload for the
-	// data-bearing kinds, or the encoded Status for a status-bearing kind
-	// (FrameUnaryErr/FrameStreamErr). Either
-	// way it is bounded by the same MaxFrameSize check, so a status whose
-	// message/details would overflow the frame is rejected before any
-	// write, exactly like an oversized payload.
+	// body is the wire bytes following the header: raw Payload for data-bearing kinds,
+	// encoded Status for FrameUnaryErr/FrameStreamErr. Both are bounded by MaxFrameSize.
 	body := frameBody(f)
 	if len(body) > MaxFrameSize {
 		return fmt.Errorf("transport: send: body %d bytes exceeds MaxFrameSize %d: %w",
@@ -209,52 +172,33 @@ func (t *UDSTransport) BytesSent() uint64 { return t.sentBytes.Load() }
 // BytesReceived reports the cumulative wire bytes fully received (transport.ByteCounter).
 func (t *UDSTransport) BytesReceived() uint64 { return t.recvBytes.Load() }
 
-// AcceptanceUnknown reports whether a failed Send left the frame's acceptance
-// unknown (transport.AcceptanceClassifier). For SOCK_STREAM, acceptance is "a byte
-// reached the socket", and the only outcome a live peer could still act on is a
-// mid-frame abort: Send marks it by poisoning (wrapping ErrPoisoned), because the peer
-// may have the frame's prefix and the framing is now desynced. Every other Send
-// failure is a definitively NEGATIVE result — the frame can never become observable to
-// a LIVE peer. Most wrote nothing: ErrUnimplementedFrameKind or ErrPayloadTooLarge
-// rejected before any write, or a clean pre-byte context abort (started=false,
-// returned un-wrapped). The one case that CAN follow bytes on the wire is a plain
-// ErrClosed when a concurrent external Close wins before abortFrame runs; that is
-// still safe to treat as negative because the socket is already shut down, so no live
-// connection remains on which the peer could act on a partial frame — the observability
-// property, not "no byte crossed", is what makes the disposition correct.
+// AcceptanceUnknown reports whether a failed Send left the frame's acceptance unknown.
+// For SOCK_STREAM, acceptance means "a byte reached the socket". Mid-frame abort is
+// the only outcome a live peer could still act on (peer may have the frame's prefix);
+// Send marks it by poisoning (wrapping ErrPoisoned). Every other Send failure is
+// definitively negative: most never wrote anything (unimplemented Kind, oversized
+// Payload, or pre-byte context abort), and even plain ErrClosed after bytes wrote is
+// safe because the socket is already shut down.
 func (t *UDSTransport) AcceptanceUnknown(err error) bool {
 	return errors.Is(err, ErrPoisoned)
 }
 
-// Recv blocks until a full Frame is available, ctx is done, or the
-// Transport is closed. It never returns a torn/partial Frame: the
-// header's declared payload length is bounds-checked against
-// MaxFrameSize before any payload allocation, and both the header and
-// payload reads loop until complete (SOCK_STREAM gives no
-// message-boundary guarantee, so one read(2) is never assumed to return
-// a whole frame).
-//
-// Mid-frame abort sacrifices the connection, by design (poison, don't
-// repair) — see Send's doc for the full rationale, which applies
-// symmetrically here: once any byte of the current frame has been
-// consumed from the socket, an abort (ctx done, a read failing, or a
-// declared length/Kind this Recv chooses not to safely drain) leaves an
-// unknown number of that frame's bytes still sitting in the kernel's
-// receive buffer, which the next Recv would otherwise misparse as a
-// fresh header. Recv poisons the Transport in that case instead, and
-// returns its own error un-substituted (errors.Is-checkable against
-// context.Canceled/context.DeadlineExceeded); only later calls see
-// ErrClosed.
+// Recv blocks until a full Frame is available, ctx is done, or the Transport is closed.
+// It never returns a torn/partial Frame: declared payload length is bounds-checked
+// against MaxFrameSize before allocation, and both header and payload reads loop
+// until complete.
+// Mid-frame abort poisons the connection: if any byte of the current frame has been
+// consumed from the socket before failure, the Transport is closed and subsequent
+// Send/Recv return ErrClosed. This call's error is the original ctx/IO error
+// (errors.Is-checkable against context.Canceled/context.DeadlineExceeded).
 func (t *UDSTransport) Recv(ctx context.Context) (Frame, error) {
 	return t.recvCore(ctx, nil)
 }
 
-// RecvReserving is Recv with the ReservingReceiver contract: it first does a
-// non-destructive readiness wait (a blocking MSG_PEEK that consumes nothing), then
-// invokes reserve exactly once — after readiness commits and BEFORE the header
-// read, the uds custody boundary — then reads the frame. A ctx-cancel or close
-// that interrupts the readiness wait consumes nothing and never reserves. See
-// transport.ReservingReceiver for the invariant this discharges.
+// RecvReserving is Recv with the ReservingReceiver contract: it does a
+// non-destructive readiness wait (MSG_PEEK), then invokes reserve exactly once
+// after readiness commits and before the header read, then reads the frame.
+// Context-cancel or close before readiness consumes nothing and never reserves.
 func (t *UDSTransport) RecvReserving(ctx context.Context, reserve func()) (Frame, error) {
 	return t.recvCore(ctx, reserve)
 }
@@ -271,13 +215,8 @@ func (t *UDSTransport) recvCore(ctx context.Context, reserve func()) (Frame, err
 		return Frame{}, ErrClosed
 	}
 
-	// The reserving path (reserve != nil) does a non-destructive readiness wait so
-	// reserve precedes the first destructive read (transport.ReservingReceiver):
-	// block until a byte is peekable — or a peer-close EOF is pending — consuming
-	// nothing, then reserve, then read. An interruption (ctx or close) consumed
-	// nothing and produces no reservation. Plain Recv (reserve == nil) skips the
-	// readiness peek and reads directly, keeping its original single-syscall,
-	// allocation-free-baseline path.
+	// Reserving path: non-destructive readiness wait before reserve, ensuring
+	// reservation is published before the first destructive read.
 	if reserve != nil {
 		if err := t.waitReadable(ctx); err != nil {
 			return Frame{}, err
@@ -294,15 +233,9 @@ func (t *UDSTransport) recvCore(ctx context.Context, reserve func()) (Frame, err
 
 	f, payloadLen := decodeHeader(header, t.streaming)
 
-	// Bounds-check the declared length against MaxFrameSize BEFORE
-	// allocating (or reading) a single payload byte: a corrupt or
-	// malicious length must never drive an oversized allocation, and
-	// must never leave Recv blocked waiting for bytes a well-behaved
-	// peer (bounded by Send's own MaxFrameSize check) would never send.
-	// The header is already fully consumed at this point, so there is
-	// no safe way to skip past an untrusted, possibly-unbounded declared
-	// length either — poison rather than attempt a drain that might
-	// never complete.
+	// Bounds-check declared length before allocating or reading: a corrupt
+	// or malicious length must never drive oversized allocation or a blocking
+	// wait for unbounded bytes. Poison rather than drain an untrusted length.
 	if payloadLen > MaxFrameSize {
 		err := fmt.Errorf("transport: recv: declared payload %d bytes exceeds MaxFrameSize %d: %w",
 			payloadLen, MaxFrameSize, ErrPayloadTooLarge)
@@ -311,10 +244,8 @@ func (t *UDSTransport) recvCore(ctx context.Context, reserve func()) (Frame, err
 	}
 
 	if err := checkImplementedKind(f.Kind); err != nil {
-		// Drain the declared payload (now known <= MaxFrameSize) so a
-		// rejected frame doesn't leave the stream torn for whatever
-		// Recv is called next. Only a drain failure poisons — a
-		// completed drain leaves the connection perfectly resynced.
+		// Drain the payload so a rejected frame doesn't tear the stream.
+		// Only a drain failure poisons; a completed drain resyncs the connection.
 		if payloadLen > 0 {
 			if _, discardErr := io.CopyN(io.Discard, r, int64(payloadLen)); discardErr != nil {
 				return Frame{}, t.abortFrame(discardErr, r.started)
@@ -332,10 +263,8 @@ func (t *UDSTransport) recvCore(ctx context.Context, reserve func()) (Frame, err
 		}
 	}
 
-	// A FrameUnaryErr or FrameStreamErr carries an encoded Status in the body
-	// region, not a raw payload. The body is fully consumed by now, so a
-	// malformed status leaves the stream synchronized — reject only this frame,
-	// don't poison the connection (contrast the mid-frame aborts above).
+	// Status-bearing kinds carry encoded Status in the body, not raw payload.
+	// Body is fully consumed, so a malformed status is frame-local and doesn't poison.
 	if CarriesStatusBody(f.Kind) {
 		status, err := DecodeStatus(body)
 		if err != nil {
@@ -357,26 +286,13 @@ func (t *UDSTransport) recvCore(ctx context.Context, reserve func()) (Frame, err
 	return f, nil
 }
 
-// abortFrame implements the "poison, don't repair" policy for a
-// Send/Recv call that failed partway through moving one Frame: err is
-// the original ctx/IO error from the failed write/read, started reports
-// whether any byte of that Frame had already reached (Send) or been
-// consumed from (Recv) the socket before the failure.
-//
-//   - If the Transport is already closed — by an earlier abortFrame call
-//     on this connection, or an external Close — the caller sees
-//     ErrClosed instead of err, matching every other call on an already-
-//     closed Transport.
-//   - Else if started, a partially-transmitted frame has permanently
-//     desynced this connection's SOCK_STREAM framing: there is no way to
-//     resynchronize, so the Transport is poisoned (Close is called on
-//     the caller's behalf) and err is returned wrapped in ErrPoisoned so
-//     this call's caller still sees the real reason (errors.Is against the
-//     underlying cause) AND can observe that the desync poisoned the
-//     connection (errors.Is against ErrPoisoned) — the signal both
-//     connection owners escalate on.
-//   - Else (nothing of this Frame moved yet), it's a clean abort: err is
-//     returned as-is and the Transport remains usable.
+// abortFrame implements poison-don't-repair policy when Send/Recv fails mid-frame.
+// started reports whether any byte of the frame reached (Send) or was consumed from
+// (Recv) the socket before failure.
+// If started, a partial frame permanently desynchronizes framing: the transport is
+// closed and err is wrapped in ErrPoisoned so callers can observe both the underlying
+// cause and the desync. If not started, err is returned as-is and the transport
+// remains usable. If the transport is already closed, ErrClosed is returned instead.
 func (t *UDSTransport) abortFrame(err error, started bool) error {
 	if t.closed.Load() {
 		return ErrClosed
@@ -391,29 +307,11 @@ func (t *UDSTransport) abortFrame(err error, started bool) error {
 	return err
 }
 
-// ReadableNow reports whether this connection's inbound queue is NOT confirmed
-// empty — the reader's drain-boundary probe (stream-protocol.md §4.6), which
-// signals the boundary only on a false return. It does one non-blocking MSG_PEEK
-// recv (which consumes nothing).
-//
-// It returns false ONLY on a positive EAGAIN/EWOULDBLOCK: the queue is confirmed
-// empty, the drain boundary. Every other outcome returns true (not
-// confirmed-empty), deliberately conservative so an owed below-threshold ACK is
-// never armed off an unconfirmed-empty queue:
-//   - a peekable byte (n > 0): more is available;
-//   - a peeked EOF (n == 0, no error): the peer has closed — the next Recv
-//     surfaces io.EOF and the reader tears down, not a drained live queue;
-//   - EINTR: a signal (Go's async preemption) interrupted the peek, not a queue
-//     state — retried in the loop;
-//   - a closed transport or any other recv error: the next Recv surfaces it.
-//
-// It is safe to call concurrently with a single reader's Recv, and from a different
-// goroutine than that reader (the plugin's heartbeat assembly probes it while the
-// serve loop runs Recv): the MSG_PEEK recv consumes nothing, so it removes no byte
-// the reader will read, and Recv reads exact frame bytes (io.ReadFull over the raw
-// fd, never an over-read into the next frame), so the peek and the reader never
-// contend for the same bytes. A concurrent Send holds writeMu and only writes, so it
-// never races this read-side peek either.
+// ReadableNow reports whether this connection's inbound queue is NOT confirmed empty.
+// It performs a non-blocking MSG_PEEK (which consumes nothing) and returns false
+// only on EAGAIN/EWOULDBLOCK (queue confirmed empty). Every other outcome returns
+// true (conservative). It is safe to call concurrently with a single reader's Recv
+// and from a different goroutine (e.g., heartbeat).
 func (t *UDSTransport) ReadableNow() bool {
 	if t.closed.Load() {
 		return true // the next Recv surfaces ErrClosed; never confirm drained off a closed probe
@@ -436,20 +334,12 @@ func (t *UDSTransport) ReadableNow() bool {
 	}
 }
 
-// waitReadable blocks until this connection's inbound queue has a byte available
-// (or a peer-close EOF is pending), consuming nothing, or ctx is done or the
-// transport is closed. It is the non-destructive readiness wait RecvReserving
-// performs before its reserve call, so a reservation is published before any byte
-// of the frame is read (the uds custody boundary). It uses a blocking MSG_PEEK
-// recv bounded by the same poll timeout the destructive reads use, so a bare ctx
-// cancel is observed within one poll. It returns nil on a readiness commit — a
-// peekable byte (the next Recv reads a frame) or an n==0 EOF (the next Recv
-// surfaces io.EOF and tears down); the destructive read that follows sees the same
-// byte, since the peek removed none.
-//
-// It is called only from the single reader goroutine, before that reader's own
-// destructive read, so it never races that read; a concurrent ReadableNow probe
-// from another goroutine is also a non-consuming MSG_PEEK and does not contend.
+// waitReadable blocks until the inbound queue has a byte available (or peer-close
+// EOF is pending), consuming nothing, or ctx is done or the transport is closed.
+// It is the non-destructive readiness wait for RecvReserving's reserve call, so
+// reservation is published before the first destructive read.
+// It uses blocking MSG_PEEK bounded by poll timeout so context cancellation is
+// observed within one poll.
 func (t *UDSTransport) waitReadable(ctx context.Context) error {
 	var b [1]byte
 	for {
@@ -488,12 +378,10 @@ func (t *UDSTransport) waitReadable(ctx context.Context) error {
 	}
 }
 
-// Close shuts down the socket for both directions before closing its fd,
-// so a Send/Recv blocked in a concurrent read(2)/write(2) wakes with an
-// error instead of racing the fd number's reuse by a bare unix.Close
-// (never let a live fd number be reassigned out from under an in-flight
-// syscall). Idempotent: a second Close returns nil without re-closing the
-// fd.
+// Close shuts down the socket for both directions before closing its fd.
+// This wakes any Send/Recv blocked in a concurrent syscall instead of racing
+// the fd number's reuse (never reassign an fd out from under an in-flight syscall).
+// Idempotent: a second Close returns nil without re-closing the fd.
 func (t *UDSTransport) Close() error {
 	var err error
 
@@ -506,12 +394,9 @@ func (t *UDSTransport) Close() error {
 	return err
 }
 
-// writeFrame encodes f and writes its header then its payload, holding
-// writeMu for the whole call so two concurrent Sends can't interleave
-// their bytes on the wire. started tracks whether any byte of f has
-// reached the socket yet, across both the header and payload writes, so
-// abortFrame can tell a clean pre-frame abort from a connection-poisoning
-// mid-frame one (see Send's doc and abortFrame).
+// writeFrame encodes f and writes header then payload, holding writeMu for the
+// whole call to prevent concurrent Sends from interleaving bytes on the wire.
+// started tracks whether any byte of f reached the socket across both writes.
 func (t *UDSTransport) writeFrame(ctx context.Context, f Frame, body []byte) error {
 	//nolint:gosec // len(body) already bounds-checked <= MaxFrameSize by Send.
 	header := encodeHeader(f, uint32(len(body)), t.streaming)
@@ -535,13 +420,10 @@ func (t *UDSTransport) writeFrame(ctx context.Context, f Frame, body []byte) err
 	return nil
 }
 
-// writeFull writes buf in full, looping over short writes (a shrunk
-// SO_SNDBUF or a full peer receive buffer can make a single write(2)
-// return fewer bytes than requested) until done, ctx is done, or the
-// Transport is closed. *started is set true the first time any write(2)
-// call in this loop (or an earlier one sharing the same pointer, e.g.
-// writeFrame's header call before its payload call) returns n > 0 — it
-// is never reset to false, since progress on a frame is never undone.
+// writeFull writes buf in full, looping over short writes (when SO_SNDBUF is
+// shrunk or peer's receive buffer is full).
+// *started is set true the first time any write(2) returns n > 0 and never reset,
+// since progress on a frame is never undone.
 func (t *UDSTransport) writeFull(ctx context.Context, buf []byte, started *bool) error {
 	for len(buf) > 0 {
 		if err := ctx.Err(); err != nil {
@@ -583,27 +465,19 @@ func (t *UDSTransport) writeFull(ctx context.Context, buf []byte, started *bool)
 	return nil
 }
 
-// fdReader adapts UDSTransport's fd into an io.Reader bound to one ctx,
-// so Recv can drive it through io.ReadFull/io.CopyN and get their
-// standard torn-read semantics (io.EOF only when zero bytes were read
-// for this call, io.ErrUnexpectedEOF once some-but-not-all of a fixed-size
-// read completed before EOF) for free instead of reimplementing them.
-// ctx is scoped to a single Recv call and never stored beyond it. started
-// is set true the first time Read consumes any byte of the current
-// frame — across every io.ReadFull/io.CopyN call sharing this fdReader
-// within one Recv (header, then a rejected frame's drain or its
-// payload) — and never reset, since Recv shares one fdReader for the
-// whole call precisely so abortFrame can see this. See Recv's doc.
+// fdReader adapts the fd into an io.Reader for one Recv call.
+// This lets Recv drive io.ReadFull/io.CopyN to get their standard torn-read
+// semantics (io.EOF only on zero read, io.ErrUnexpectedEOF on partial read).
+// started tracks whether any byte of the current frame was consumed across all
+// io.ReadFull/io.CopyN calls in this Recv, for abortFrame's use.
 type fdReader struct {
 	t       *UDSTransport
 	ctx     context.Context
 	started bool
 }
 
-// Read performs one read(2), looping internally only to retry EINTR or a
-// poll-interval timeout (see pollInterval); a genuine zero-byte read (EOF
-// or a peer/local close) is reported to the caller immediately per
-// io.Reader's contract, not retried.
+// Read performs one read(2), looping internally only to retry EINTR or
+// poll-interval timeout. Zero-byte reads (EOF/close) are reported immediately.
 func (r *fdReader) Read(p []byte) (int, error) {
 	for {
 		if err := r.ctx.Err(); err != nil {
@@ -664,16 +538,10 @@ func frameBody(f Frame) []byte {
 	return f.Payload
 }
 
-// EncodeStatus serializes a FrameStatus into a self-describing,
-// length-delimited body: code, then a length-prefixed message, then a
-// count-prefixed sequence of length-prefixed details. A nil status encodes
-// as the all-zero head (code 0, empty message, no details) so the shape is
-// always decodable. The whole body rides inside the frame's payload region,
-// so MaxFrameSize (checked by Send) already bounds message+details.
-//
-// This is the canonical FrameStatus wire codec, shared by both the uds and
-// shm transports so a FrameUnaryErr's Status arrives byte-identical
-// regardless of which transport carried it.
+// EncodeStatus serializes a FrameStatus into a length-delimited body:
+// code, length-prefixed message, count-prefixed details.
+// A nil status encodes as all-zero head (always decodable).
+// This is the canonical codec shared by uds and shm so Status arrives byte-identical.
 func EncodeStatus(s *FrameStatus) []byte {
 	if s == nil {
 		s = &FrameStatus{}
@@ -702,20 +570,12 @@ func EncodeStatus(s *FrameStatus) []byte {
 	return buf
 }
 
-// DecodeStatus parses a FrameUnaryErr body produced by EncodeStatus,
-// validating every length prefix against the bytes actually remaining so a
-// corrupt or hostile body (an oversized message/detail length, a truncated
-// tail) yields ErrMalformedStatusFrame rather than an out-of-range slice
-// panic. body is already bounded by MaxFrameSize (Recv checked payloadLen);
-// crucially, the detail-slice preallocation is clamped to what the remaining
-// body could physically hold (each detail needs >= 4 prefix bytes), NOT the
-// raw wire detailCount — so a 12-byte frame declaring detailCount=0xFFFFFFFF
-// can never request a ~100 GB slice header. Every allocation here is thus
-// bounded transitively.
-//
-// This is the canonical FrameStatus wire codec, shared by both the uds and
-// shm transports so a FrameUnaryErr's Status arrives byte-identical
-// regardless of which transport carried it.
+// DecodeStatus parses a FrameUnaryErr body produced by EncodeStatus.
+// It validates every length prefix against remaining bytes so a corrupt or hostile
+// body yields ErrMalformedStatusFrame, not panic. The detail-slice preallocation
+// is clamped to what the body could physically hold, not the raw wire detailCount,
+// so an attacker-controlled count cannot drive oversized allocation.
+// This is the canonical codec shared by uds and shm so Status arrives byte-identical.
 func DecodeStatus(body []byte) (*FrameStatus, error) {
 	if len(body) < statusHeadSize {
 		return nil, fmt.Errorf("transport: recv: status body %d bytes < %d: %w",
@@ -738,10 +598,8 @@ func DecodeStatus(body []byte) (*FrameStatus, error) {
 
 	var details [][]byte
 	if detailCount > 0 {
-		// Clamp the preallocation to the most details the remaining bytes
-		// could possibly encode (each needs a >= 4-byte length prefix), so an
-		// attacker-controlled detailCount can't drive an oversized allocation
-		// before the per-detail bounds checks below ever run.
+		// Clamp preallocation to the most details the remaining bytes could encode
+		// (each needs >= 4-byte length prefix), preventing oversized allocation.
 		capHint := (len(body) - off) / 4
 		//nolint:gosec // capHint derives from len(body), body is already bounded by MaxFrameSize
 		if uint64(detailCount) < uint64(capHint) {
@@ -770,15 +628,10 @@ func DecodeStatus(body []byte) (*FrameStatus, error) {
 	return &FrameStatus{Code: code, Message: message, Details: details}, nil
 }
 
-// encodeHeader serializes f's fields (except Payload) plus an explicit
-// payloadLen into a fresh header buffer. payloadLen is taken separately from
-// len(f.Payload) so test code can construct a header declaring a length its
-// actual payload doesn't match (see export_test.go), independent of the
-// caller's own bounds-checking. When streaming is set the buffer is 45 bytes:
-// the same 37 big-endian bytes followed by the 8-byte little-endian stream
-// control word (stream-protocol.md §2.4). When streaming is absent the word is
-// neither written nor reserved, so the bytes are byte-identical to a
-// non-streaming peer's.
+// encodeHeader serializes f's fields (except Payload) plus explicit payloadLen.
+// When streaming is true, the buffer includes the 8-byte little-endian stream
+// control word appended to the base 37-byte big-endian header.
+// When streaming is false, the bytes are byte-identical to a non-streaming peer's.
 func encodeHeader(f Frame, payloadLen uint32, streaming bool) []byte {
 	size := headerSize
 	if streaming {
@@ -799,11 +652,9 @@ func encodeHeader(f Frame, payloadLen uint32, streaming bool) []byte {
 	return buf
 }
 
-// decodeHeader parses a header buffer produced by encodeHeader. Callers (Recv
-// only) must pass exactly the connection's header length — 37 bytes, or 45 when
-// streaming — as guaranteed by io.ReadFull(r, make([]byte, t.headerLen())): an
-// internal invariant, not re-validated here. When streaming is set the trailing
-// 8 little-endian bytes decode into Frame.Control; when absent Control stays 0.
+// decodeHeader parses a header buffer produced by encodeHeader.
+// Callers (Recv only) must pass exactly the connection's header length (37 or 45 bytes).
+// When streaming is true, the trailing 8 little-endian bytes decode into Frame.Control.
 func decodeHeader(buf []byte, streaming bool) (Frame, uint32) {
 	payloadLen := binary.BigEndian.Uint32(buf[0:4])
 	//nolint:gosec // round-trips encodeHeader's uint64(int64(...)) cast, lossless
@@ -822,10 +673,8 @@ func decodeHeader(buf []byte, streaming bool) (Frame, uint32) {
 	return f, payloadLen
 }
 
-// setSocketTimeout sets fd's SO_SNDTIMEO/SO_RCVTIMEO (opt) to at most
-// pollInterval, clamped tighter when ctx's deadline is closer than that —
-// see pollInterval's doc for why UDSTransport polls instead of blocking
-// for a whole ctx.Deadline() the way internal/control.Conn does.
+// setSocketTimeout sets SO_SNDTIMEO/SO_RCVTIMEO to at most pollInterval,
+// clamped tighter by ctx's deadline so context cancellation is observed within one poll.
 func setSocketTimeout(ctx context.Context, fd, opt int) error {
 	d := pollInterval
 
@@ -844,10 +693,9 @@ func setSocketTimeout(ctx context.Context, fd, opt int) error {
 	return unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, opt, &tv)
 }
 
-// isTimeoutErrno reports whether err is the errno read(2)/write(2) return
-// when SO_RCVTIMEO/SO_SNDTIMEO (set by setSocketTimeout) expires: EAGAIN
-// on Linux, aliased to EWOULDBLOCK. Checked explicitly against both names
-// since callers on other platforms may see either.
+// isTimeoutErrno reports whether err is the errno from SO_RCVTIMEO/SO_SNDTIMEO
+// expiry: EAGAIN on Linux, aliased to EWOULDBLOCK. Checked against both names
+// for portability.
 func isTimeoutErrno(err error) bool {
 	return errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK)
 }

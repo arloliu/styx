@@ -2,18 +2,15 @@
 
 package styx
 
-// SetPluginAttachSHMFailAt installs a per-step hook fired after each named
-// construction step of the plugin-side shared-memory attach (pluginAttachSHM):
-// recv-fds, hp-wrap, ph-wrap, attach, and ack-send (each before the ack reaches the
-// host), plus post-ack (after the ack is sent, so the host can already be Ready). A
-// non-nil return aborts the attach at that step.
+// SetPluginAttachSHMFailAt installs a test hook that fires after each named
+// construction step of plugin-side shared-memory attach: recv-fds, hp-wrap,
+// ph-wrap, attach, ack-send (each before the ack reaches the host), and post-ack
+// (after the ack is sent). A non-nil return aborts the attach at that step.
 //
-// It exists only under -tags failpoint so a crash-window plugin fixture can install
-// a hook that os.Exit()s at a chosen step — modeling a plugin process dying
-// mid-attach across a real process boundary, so the host's spawn/attach-failure
-// classification and its fd/region cleanup can be asserted. The default build
-// compiles this setter out; the seam it drives stays nil there, a cold-path no-op on
-// the attach path.
+// This is available only under -tags failpoint so a test can model a plugin
+// process dying mid-attach, verifying the host's spawn/attach-failure
+// classification and its fd/region cleanup. The default build compiles this
+// setter out; the seam stays nil, a cold-path no-op on the attach path.
 func SetPluginAttachSHMFailAt(f func(step string) error) {
 	pluginAttachSHMFailAt = f
 }

@@ -12,32 +12,29 @@ import (
 )
 
 // ReloadSuccessorEnv is the environment variable a host sets on a plugin it
-// spawns as a hot-reload successor (merged onto Spec.Env). When it is present
-// in the process environment, the freshly spawned plugin runs ServeRestore to
-// receive and apply the predecessor's snapshot, and ack readiness, before it
-// begins serving. A first-start plugin never has it set and so must not wait
-// for a Restore that will never arrive. The value is not interpreted — any
-// non-empty value means "spawned as a successor".
+// spawns as a hot-reload successor (merged onto Spec.Env). When present,
+// the freshly spawned plugin runs ServeRestore to receive and apply the
+// predecessor's snapshot and ack readiness, before beginning to serve.
+// A first-start plugin never has it set and must not wait for a Restore
+// that will never arrive. Any non-empty value means "spawned as a successor".
 const ReloadSuccessorEnv = "STYX_RELOAD_SUCCESSOR"
 
-// ErrNoRestorerForState marks a snapshot a nil StateRestorer cannot accept:
-// the successor was handed predecessor state but has no way to apply it, so
-// accepting the snapshot would silently discard it.
+// ErrNoRestorerForState marks a snapshot a nil StateRestorer cannot accept.
+// The successor was handed predecessor state but has no way to apply it,
+// so accepting would silently discard it.
 var ErrNoRestorerForState = errors.New("lifecycle: reload: snapshot carries state but no StateRestorer is registered")
 
-// ServeRestore runs on a newly spawned instance, in control.StateRestoring:
-// it receives Restore, independently re-verifies the delivered snapshot via
-// shm.VerifySealedSnapshot — "never trust the other side of the wall"
-// applies even to a snapshot the host has already verified, since this is a
-// separate process, possibly a different binary version — calls
-// restorer.RestoreState if non-nil, and sends RestoreAck{Ready: true} on
-// success or RestoreAck{Ready: false, Reason: err.Error()} on any restore
-// failure. A nil restorer accepts only an empty snapshot: a non-empty one
-// with nothing registered to apply it is a failure, not a silent no-op,
-// since that would discard the predecessor's state. A refused snapshot is
-// reported to the host over the wire, not returned as a Go error; the only
-// errors ServeRestore itself returns are protocol-level (an illegal
-// message, or a failure sending the ack).
+// ServeRestore runs on a newly spawned instance in StateRestoring:
+// it receives Restore, independently re-verifies the delivered snapshot
+// (never trust the other side of the wall, even if already verified by the host,
+// since this is a separate process possibly running different binary version),
+// calls restorer.RestoreState if registered, and sends RestoreAck{Ready: true}
+// on success or RestoreAck{Ready: false, Reason: err.Error()} on any failure.
+// A nil restorer accepts only an empty snapshot; a non-empty snapshot with
+// nothing registered to apply it is a failure (not silent no-op, which would
+// discard the predecessor's state). A refused snapshot is reported to the host
+// over the wire, not as a Go error; the only errors ServeRestore itself returns
+// are protocol-level (illegal message or ack send failure).
 func ServeRestore(ctx context.Context, conn *control.Conn, restorer StateRestorer) error {
 	msg, fds, err := conn.RecvFDs(ctx, 1)
 	if err != nil {
@@ -69,16 +66,13 @@ func ServeRestore(ctx context.Context, conn *control.Conn, restorer StateRestore
 }
 
 // verifyAndRestore independently verifies fd, calls restorer.RestoreState
-// (when non-nil) against the verified payload, and builds the resulting
-// RestoreAck. It always closes fd, and unmaps the verified mapping if one
-// was produced, before returning.
-//
-// A nil restorer only ever blesses an empty payload: len(data) == 0 is what
-// a stateless plugin's predecessor sends (see runSnapshotPhase), so a
-// successor with nothing registered can legitimately ack it ready. A
-// non-empty payload arriving here means the predecessor had real state and
-// this successor has no way to apply it — accepting that as ready would
-// silently drop it, so it is reported as a refused snapshot instead.
+// (when registered) against the verified payload, and builds the resulting
+// RestoreAck. It always closes fd and unmaps the verified mapping (if produced).
+// A nil restorer only blesses an empty payload: len(data) == 0 is what a
+// stateless plugin's predecessor sends, so a successor with nothing registered
+// can legitimately ack it ready. A non-empty payload means the predecessor had
+// real state and this successor has no way to apply it; accepting would silently
+// drop it, so it is reported as a refused snapshot.
 func verifyAndRestore(
 	ctx context.Context, fd int, declaredLen uint64, formatVersion uint32, restorer StateRestorer,
 ) *controlpb.RestoreAck {

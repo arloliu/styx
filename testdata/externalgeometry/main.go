@@ -1,8 +1,6 @@
-// Command externalgeometry configures every public shared-memory geometry form
-// from outside the styx module. It is compiled, never run: successful compilation
-// is the assertion that the public geometry API is self-contained (an external
-// user cannot import internal/shm, so ShmGeometry and the profile helpers must
-// expose no internal types).
+// Command externalgeometry compiles a program that uses only public APIs to
+// configure shared-memory geometry. Successful compilation proves the geometry
+// API is self-contained and does not leak internal types to external users.
 package main
 
 import "github.com/arloliu/styx"

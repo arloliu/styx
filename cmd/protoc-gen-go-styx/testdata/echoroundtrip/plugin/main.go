@@ -1,14 +1,12 @@
-// Command echoroundtrip-plugin is the plugin-side half of
-// generate_test.go's compile-and-round-trip test fixture (see the
-// echoroundtrip-host command in the sibling directory): it registers the
-// generated EchoServer against a trivial implementation and serves,
-// proving RegisterEchoServer's generated dispatch table actually reaches a
-// real handler through a real spawned process, not just that its source
-// text looks right.
+// Command echoroundtrip-plugin registers the generated EchoServer and serves,
+// completing the echo call from the host side and returning a response.
+// Together with echoroundtrip-host, this proves the generated code works
+// end-to-end: the host-side NewEchoClient can make real calls that reach
+// a real handler in a real spawned process and get responses back.
 //
-// It imports ".../testdata/echoroundtrip/echopb", a package that does not
-// exist in this source tree until generate_test.go generates it moments
-// before building this command — see that test for why.
+// The echopb package imported here does not exist in the source tree until
+// the test generates it moments before building this binary, proving the
+// generated dispatch table truly works and is not just structurally correct.
 package main
 
 import (
