@@ -33,6 +33,16 @@ func SetAttachSHMFailAtForTest(f func(step string) error) func() {
 	return func() { attachSHMFailAt = prev }
 }
 
+// SetHeartbeatReceivedForTest installs a hook the serving loop fires on each real
+// heartbeat received from the plugin, returning a restore func. A cross-process test
+// uses it to synchronize on a proven-healthy instance before injecting a fault.
+func SetHeartbeatReceivedForTest(f func()) func() {
+	prev := heartbeatReceivedForTest
+	heartbeatReceivedForTest = f
+
+	return func() { heartbeatReceivedForTest = prev }
+}
+
 // AttachSHMForTest drives the host-side shared-memory attach against conn and
 // tuple, closing any resources it returns (so a success path never leaks in a
 // test) and returning only the error. With a failpoint installed it exercises a

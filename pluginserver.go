@@ -859,6 +859,17 @@ func (s *PluginServer) pluginAttachSHM(
 		return nil, nil, serr
 	}
 
+	// post-ack: the AttachRegionAck is fully on the wire — one SOCK_SEQPACKET
+	// datagram — so the host can receive it, return the attached transport, and
+	// publish Ready before this fires. A crash here models a plugin that dies AFTER
+	// it is Ready, a window distinct from the pre-ack ones (which the host only ever
+	// observes as a missing ack). Only a crash exercises it; a returned error would
+	// abort a plugin the host already believes is attached, so no in-process
+	// error-injection arms this step.
+	if err = pluginAttachFailStep("post-ack"); err != nil {
+		return nil, nil, err
+	}
+
 	return pluginTr, &pluginShmResources{hpEFD: hpEFD, phEFD: phEFD}, nil
 }
 

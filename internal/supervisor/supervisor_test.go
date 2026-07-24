@@ -1015,21 +1015,39 @@ func TestSupervisor_FreshShmRegionPerGeneration_NoLeakAcrossRestarts(t *testing.
 		"shm resources leaked across generations: before=%d after=%d", fdsBefore, testutil.CountOpenFDs(t))
 }
 
+// readyInfo is what a test captures at each Ready: the plugin PID and the instance
+// generation, so it can assert a restart spawned a new process at a fresh generation.
+type readyInfo struct {
+	pid int
+	gen uint64
+}
+
+// boundedStop tears sup down under a LOCAL deadline, so a Stop regression fails the
+// test promptly instead of consuming the whole package timeout.
+func boundedStop(t *testing.T, sup *supervisor.Supervisor) {
+	t.Helper()
+	sctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, sup.Stop(sctx))
+}
+
 // Test a supervisor-driven TRANSPARENT RESTART on the shared-memory transport under a
 // real crash: a plugin attaches over shm and reaches Ready, is then SIGKILLed (an
 // unclean death, not a cooperative exit), and the supervisor detects the death and
-// restarts it — a FRESH generation attaches over a fresh region and reaches Ready again
-// (recovery), a different process than the killed one. After teardown, both the open-fd
-// count and the region-mapping count return to their pre-start baseline: the crashed
-// generation's host-side region and eventfds were released on its reap, and no region
-// mapping survives, so a crash-restart cycle over shm misdelivers no descriptor and
-// leaks no region.
+// restarts it — a fresh generation attaches over a fresh region and reaches Ready again
+// (recovery), a different process at a HIGHER generation than the killed one. After
+// teardown, both the open-fd count and the region-mapping count return to their
+// pre-start baseline: the crashed generation's host-side region and eventfds were
+// released on its reap and no region mapping survives. (That no descriptor is
+// MISDELIVERED across the crash — a unique request answered correctly on each side of
+// the boundary — is asserted with real RPC at the integration layer, which this
+// supervisor-level test cannot reach without importing the RPC stack.)
 func TestSupervisor_ShmTransparentRestart_AfterSIGKILL_RecoversNoLeak(t *testing.T) {
 	bus := supervisor.NewEventBus()
 	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
-	pids := make(chan int, 8)
+	ready := make(chan readyInfo, 8)
 	cfg := supervisor.Config{
 		Spec: lifecycle.Spec{Path: fixtureReadyPlugin},
 		Restart: supervisor.RestartPolicy{
@@ -1040,22 +1058,22 @@ func TestSupervisor_ShmTransparentRestart_AfterSIGKILL_RecoversNoLeak(t *testing
 		ShmLayout:         leanShmLayout(),
 		MaxDataInflight:   32,
 		OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
-			pids <- inst.Process.PID
+			ready <- readyInfo{pid: inst.Process.PID, gen: inst.Generation}
 
 			return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
 		},
 	}
 	sup := supervisor.New(cfg, bus)
 
-	readPID := func() int {
+	readReady := func() readyInfo {
 		t.Helper()
 		select {
-		case p := <-pids:
-			return p
+		case r := <-ready:
+			return r
 		case <-time.After(5 * time.Second):
-			t.Fatal("no plugin PID captured at Ready")
+			t.Fatal("no plugin captured at Ready")
 
-			return 0
+			return readyInfo{}
 		}
 	}
 
@@ -1069,21 +1087,23 @@ func TestSupervisor_ShmTransparentRestart_AfterSIGKILL_RecoversNoLeak(t *testing
 
 	// The first generation attaches over shm and reaches Ready.
 	requireEventOfKind(t, ch, supervisor.EventReady)
-	gen0 := readPID()
+	gen0 := readReady()
 
 	// A real crash: SIGKILL the Ready plugin. The supervisor observes the death and
 	// transparently restarts it.
-	require.NoError(t, syscall.Kill(gen0, syscall.SIGKILL))
+	require.NoError(t, syscall.Kill(gen0.pid, syscall.SIGKILL))
 
 	// Recovery: a fresh generation attaches over a fresh region and reaches Ready — a
-	// different process than the one just killed.
+	// different process, at a higher generation, than the one just killed (the fresh
+	// memfd/generation the ABI requires, so no stale region can be reused).
 	requireEventOfKind(t, ch, supervisor.EventReady)
-	gen1 := readPID()
-	require.NotEqual(t, gen0, gen1, "a transparent restart must spawn a new plugin process")
+	gen1 := readReady()
+	require.NotEqual(t, gen0.pid, gen1.pid, "a transparent restart must spawn a new plugin process")
+	require.Greater(t, gen1.gen, gen0.gen, "the restart must advance to a fresh generation, not reuse the region")
 
 	// Teardown, then assert no fd or region-mapping leak across the crash-restart cycle:
 	// the killed generation's host-owned region and eventfds were released on its reap.
-	require.NoError(t, sup.Stop(t.Context()))
+	boundedStop(t, sup)
 	select {
 	case <-runDone:
 	case <-time.After(5 * time.Second):
@@ -1100,17 +1120,26 @@ func TestSupervisor_ShmTransparentRestart_AfterSIGKILL_RecoversNoLeak(t *testing
 
 // Test that a SIGSTOP-wedged plugin on the shared-memory transport is declared
 // unhealthy by the supervisor's heartbeat liveness path within its bound. The plugin
-// attaches over shm, reaches Ready, and sends heartbeats faster than the host's
-// per-interval receive wait, so it is healthy; SIGSTOP then freezes it, its heartbeats
-// stop, and after MissedHeartbeats consecutive silent intervals the host publishes
-// Unhealthy. The bound is MissedHeartbeats x HeartbeatInterval, well inside the wait.
-// This is the Task 2 shm-heartbeat wiring under a real freeze signal; the host call's
-// own ctx-boundedness during a wedge is asserted at the transport level by the chaos
-// package's SIGSTOP scenario.
+// attaches over shm and sends heartbeats faster than the host's per-interval receive
+// wait; the test synchronizes on at least one heartbeat RECEIVED — so the instance is
+// proven healthy, not merely silent from startup — and only then SIGSTOPs it. Its
+// heartbeats stop, and after MissedHeartbeats consecutive silent intervals the host
+// publishes Unhealthy WITH the missed-heartbeat cause (bound: MissedHeartbeats x
+// HeartbeatInterval). The host call's own ctx-boundedness during a wedge is asserted at
+// the transport level by the chaos package's SIGSTOP scenario.
 func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
 	bus := supervisor.NewEventBus()
 	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
+
+	gotBeat := make(chan struct{}, 1)
+	restore := supervisor.SetHeartbeatReceivedForTest(func() {
+		select {
+		case gotBeat <- struct{}{}:
+		default:
+		}
+	})
+	defer restore()
 
 	const beat = 100 * time.Millisecond
 	pids := make(chan int, 8)
@@ -1148,17 +1177,33 @@ func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
 		t.Fatal("no plugin PID captured at Ready")
 	}
 
-	// Freeze the plugin: its heartbeats stop, and the host's liveness path must declare
-	// it unhealthy within MissedHeartbeats silent intervals.
-	require.NoError(t, syscall.Kill(pid, syscall.SIGSTOP))
-	ev := awaitUnhealthy(t, ch)
-	require.Equal(t, supervisor.EventUnhealthy, ev.Kind,
-		"a frozen shm plugin's missed heartbeats must be declared unhealthy")
+	// Prove the instance is HEALTHY before freezing it: wait for the host to receive at
+	// least one real heartbeat, so what follows is a healthy-to-unhealthy transition, not
+	// startup silence.
+	select {
+	case <-gotBeat:
+	case <-time.After(5 * time.Second):
+		t.Fatal("host received no heartbeat from a healthy shm plugin")
+	}
 
-	// Continue the frozen child so the supervisor's teardown reaps it promptly, then
-	// stop and join.
+	// Freeze the plugin: its heartbeats stop, and the host's liveness path must declare
+	// it unhealthy within MissedHeartbeats silent intervals. Register the continue as a
+	// cleanup immediately, so a failure below still lets the process be reaped rather
+	// than leaking a stopped child.
+	require.NoError(t, syscall.Kill(pid, syscall.SIGSTOP))
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGCONT) })
+
+	ev := awaitUnhealthy(t, ch)
+	require.Equal(t, supervisor.EventUnhealthy, ev.Kind)
+	require.ErrorContains(t, ev.Err, "missed",
+		"the wedge must be declared unhealthy for MISSED heartbeats, not another cause: %v", ev.Err)
+	require.ErrorContains(t, ev.Err, "consecutive heartbeats",
+		"the cause must be the missed-heartbeat threshold: %v", ev.Err)
+
+	// Continue the frozen child now so the supervisor's teardown reaps it promptly (the
+	// cleanup above is the failure-path backstop; SIGCONT is idempotent).
 	_ = syscall.Kill(pid, syscall.SIGCONT)
-	_ = sup.Stop(t.Context())
+	boundedStop(t, sup)
 	select {
 	case <-runDone:
 	case <-time.After(5 * time.Second):
@@ -1166,9 +1211,11 @@ func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
 	}
 }
 
-// requireCleanShmSpawn proves a fresh supervisor spawns a plugin that attaches over
-// shm and reaches Ready, then tears it down without leaking — used after an attach
-// crash to show it left no poisoned host residue.
+// requireCleanShmSpawn drives a fresh supervisor that spawns a plugin, attaches over
+// shm, and reaches Ready, then tears it down. Run after a failed attach, it proves the
+// failure left the process-global state (fds, region mappings) clean enough for a brand
+// new supervisor to attach — process-level recovery, not a claim about internal state
+// of the supervisor object whose attach failed (that object is discarded).
 func requireCleanShmSpawn(t *testing.T) {
 	t.Helper()
 
@@ -1194,7 +1241,7 @@ func requireCleanShmSpawn(t *testing.T) {
 	go func() { defer close(runDone); sup.Run(ctx) }()
 
 	requireEventOfKind(t, ch, supervisor.EventReady)
-	require.NoError(t, sup.Stop(t.Context()))
+	boundedStop(t, sup)
 	select {
 	case <-runDone:
 	case <-time.After(5 * time.Second):
@@ -1212,9 +1259,10 @@ func requireCleanShmSpawn(t *testing.T) {
 // window is reached deterministically at the step itself, with no timing to race.
 //
 // These are the crash-window forms of the data plane's per-step attach ownership
-// table. The host-side pre-send steps (region create, the two eventfd creates) involve
-// no live child; their partial-cleanup is covered by that error-injection unit table
-// and is not re-exercised as a process-death window here.
+// table. The host-side pre-send steps (region create, the two eventfd creates) run
+// before any fd is transferred, so no transferred fd is child-owned yet; their
+// partial-cleanup is covered by that error-injection unit table and is not re-exercised
+// as a process-death window here.
 func TestSupervisor_ShmAttachCrashWindows_ClassifiedAndNoLeak(t *testing.T) {
 	steps := []string{"recv-fds", "hp-wrap", "ph-wrap", "attach", "ack-send"}
 	for _, step := range steps {
@@ -1263,10 +1311,17 @@ func TestSupervisor_ShmAttachCrashWindows_ClassifiedAndNoLeak(t *testing.T) {
 			}
 			require.Equal(t, supervisor.EventGaveUp, seen[len(seen)-1].Kind)
 			require.Error(t, failErr, "the mid-attach death must be classified as a typed failure")
-			require.Contains(t, failErr.Error(), "exit status 3",
-				"the failure must carry the plugin's crash-at-attach exit status")
-			require.Contains(t, failErr.Error(), "AttachRegionAck",
-				"the failure must be the shm attach ack step, not a generic or downgraded path")
+
+			// Typed, not string-matched: the failure is a *supervisor.CrashInfo carrying
+			// the plugin's own exit status (the fixture's crash-at-attach os.Exit(3)), and
+			// its cause is the host's shm attach ack step — not a generic or uds-downgraded
+			// path.
+			var ci *supervisor.CrashInfo
+			require.ErrorAs(t, failErr, &ci, "the failure must be a typed *supervisor.CrashInfo")
+			require.True(t, ci.ExitStatusKnown, "the crashed plugin must be reaped with a known exit status")
+			require.Equal(t, 3, ci.ExitStatus, "the exit status must be the fixture's crash-at-attach os.Exit(3)")
+			require.ErrorContains(t, ci.Cause, "AttachRegionAck",
+				"the crash cause must be the shm attach ack step, not a generic or downgraded path")
 
 			select {
 			case <-runDone:
@@ -1293,6 +1348,84 @@ func TestSupervisor_ShmAttachCrashWindows_ClassifiedAndNoLeak(t *testing.T) {
 				2*time.Second, 20*time.Millisecond, "a clean spawn after crash at %q leaked a region mapping", step)
 		})
 	}
+}
+
+// Test the POST-ack attach crash window, distinct from the pre-ack matrix above: the
+// plugin dies AFTER it has sent AttachRegionAck. A SOCK_SEQPACKET datagram delivers the
+// whole ack at once, so the host receives it, returns the attached transport, and
+// publishes Ready — and only then observes the child's death. So unlike every pre-ack
+// window (which never reaches Ready), this instance DOES reach Ready and is then
+// classified as a crashed Ready instance, still tearing down to the fd and region
+// baseline with no leak.
+func TestSupervisor_ShmPostAckCrash_ReadyThenClassifiedDead(t *testing.T) {
+	fdsBefore := testutil.CountOpenFDs(t)
+	mapsBefore := countRegionMappings(t)
+
+	bus := supervisor.NewEventBus()
+	collector := newEventCollector(bus)
+	defer collector.unsub()
+	reachedReady := make(chan struct{}, 1)
+	cfg := supervisor.Config{
+		Spec: lifecycle.Spec{
+			Path: fixtureCrashAttachPlugin,
+			Env:  []string{"STYX_CRASH_AT_ATTACH_STEP=post-ack"},
+		},
+		Restart:           supervisor.RestartPolicy{Max: 0}, // give up after the first crash
+		HeartbeatInterval: 100 * time.Millisecond,
+		Transport:         "shm",
+		ShmLayout:         leanShmLayout(),
+		MaxDataInflight:   32,
+		OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
+			select {
+			case reachedReady <- struct{}{}:
+			default:
+			}
+
+			return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// The instance reaches Ready (the ack arrived) and is only then seen dead: the run
+	// ends in GaveUp carrying a typed crash, and Ready appeared on the way.
+	seen := collector.awaitKind(t)
+	var failErr error
+	sawReady := false
+	for _, ev := range seen {
+		if ev.Kind == supervisor.EventReady {
+			sawReady = true
+		}
+		if ev.Err != nil {
+			failErr = ev.Err
+		}
+	}
+	require.True(t, sawReady,
+		"a post-ack crash must reach Ready first (the ack was delivered), unlike a pre-ack window")
+	select {
+	case <-reachedReady:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnReady never fired for the post-ack instance")
+	}
+	require.Equal(t, supervisor.EventGaveUp, seen[len(seen)-1].Kind)
+	var ci *supervisor.CrashInfo
+	require.ErrorAs(t, failErr, &ci, "a Ready-then-dead instance must be classified as a typed crash")
+
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after GaveUp")
+	}
+
+	require.Eventually(t, func() bool { return testutil.CountOpenFDs(t) <= fdsBefore },
+		2*time.Second, 20*time.Millisecond,
+		"host leaked fds after a post-ack crash: before=%d after=%d", fdsBefore, testutil.CountOpenFDs(t))
+	require.Eventually(t, func() bool { return countRegionMappings(t) <= mapsBefore },
+		2*time.Second, 20*time.Millisecond, "host leaked a region mapping after a post-ack crash")
 }
 
 // countRegionMappings counts the shared-memory region mappings currently held by

@@ -917,6 +917,10 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 			continue // nothing else is currently expected from the plugin during serving.
 		}
 
+		if heartbeatReceivedForTest != nil {
+			heartbeatReceivedForTest() // test-only: a real heartbeat arrived from the plugin.
+		}
+
 		sample := heartbeatSampleFromMessage(msg.GetHeartbeat())
 
 		// A reload is serviced here, after this heartbeat is received but
@@ -1168,6 +1172,13 @@ func (s *Supervisor) attachUDS(
 // overhead: six nil-checked hook calls on the attach path per spawn, and nothing
 // else. Set only via the test seam in export_test.go.
 var attachSHMFailAt func(step string) error
+
+// heartbeatReceivedForTest, when non-nil, is invoked each time the serving loop
+// receives a real heartbeat from the plugin — a test seam letting a cross-process
+// test synchronize on a proven-healthy instance (at least one heartbeat received)
+// before it injects a fault, so it observes a healthy-to-unhealthy transition rather
+// than startup silence. Nil in production.
+var heartbeatReceivedForTest func()
 
 // attachFailStep consults the failpoint for a named step. It is a no-op returning
 // nil in production.
