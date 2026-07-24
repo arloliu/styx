@@ -239,3 +239,15 @@ func (s *PluginServer) PluginAttachSHMForTest(ctx context.Context, conn *control
 
 	return err
 }
+
+// SetDuplicateUnaryResponseHookForTest installs a hook fired when a unary response (or
+// error) is discarded because its call was already terminal — a late or DUPLICATE
+// delivery — and returns a restore func. It lets a test assert that no trailing
+// duplicate response is delivered for a completed call, which the caller-visible result
+// alone cannot reveal. Test-only; nil in production.
+func SetDuplicateUnaryResponseHookForTest(f func(callID uint64)) func() {
+	prev := duplicateUnaryResponseHook
+	duplicateUnaryResponseHook = f
+
+	return func() { duplicateUnaryResponseHook = prev }
+}

@@ -7,10 +7,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/arloliu/styx"
+	"github.com/arloliu/styx/examples/echo/echopb"
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
@@ -22,6 +27,7 @@ var (
 	fixtureReadyPlugin     string
 	fixtureVersionedPlugin string
 	fixtureUDSOnlyPlugin   string
+	fixtureCrashyPlugin    string
 )
 
 // TestMain builds the cross-process plugin fixtures once (Host.Start spawns
@@ -57,6 +63,15 @@ func TestMain(m *testing.M) {
 	uBuild := exec.Command("go", "build", "-o", fixtureUDSOnlyPlugin, "./testdata/udsonlyplugin")
 	if out, err := uBuild.CombinedOutput(); err != nil {
 		panic("building udsonlyplugin fixture: " + err.Error() + "\n" + string(out))
+	}
+
+	// The examples/echo crashy plugin in its PID-tagging echo mode: a real Echo
+	// service whose response is "<pid>:<message>", used to prove a crash-restart
+	// misdelivers nothing across the generation boundary.
+	fixtureCrashyPlugin = filepath.Join(dir, "crashyplugin")
+	cBuild := exec.Command("go", "build", "-o", fixtureCrashyPlugin, "./examples/echo/plugin/crashy")
+	if out, err := cBuild.CombinedOutput(); err != nil {
+		panic("building crashy echo plugin fixture: " + err.Error() + "\n" + string(out))
 	}
 
 	m.Run()
@@ -473,4 +488,101 @@ func TestHost_ShmAttachFailsAfterNegotiation_IsSpawnFailure_NoDowngrade(t *testi
 			}, 5*time.Second, 20*time.Millisecond, "the attach failure must be reported on the event stream")
 		})
 	}
+}
+
+// hostParsePIDTag parses a "<pid>:<message>" echo response into its pid and body; ok is
+// false for any response not of that shape (a spliced two-generation response would not
+// parse), so a caller can reject a splice.
+func hostParsePIDTag(response string) (pid int, body string, ok bool) {
+	p, b, found := strings.Cut(response, ":")
+	if !found {
+		return 0, "", false
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil {
+		return 0, "", false
+	}
+
+	return n, b, true
+}
+
+// Test that a real crash of a shared-memory plugin is transparently recovered with no
+// cross-generation misdelivery and no trailing DUPLICATE delivery. A unique request is
+// answered correctly by the first process; that process is SIGKILLed; and after the host
+// restarts it, another unique request is answered correctly by a live process. The exact
+// PID-tagged tokens reject a stale or spliced response that wins the live call, and a
+// discard hook proves no second (duplicate or late) response is ever delivered for a
+// completed call — a misdelivery the caller-visible result alone could never reveal.
+func TestHost_ShmCrashRestart_NoMisdeliveryNoDuplicate(t *testing.T) {
+	// Given: a host pinned to shm, a PID-tagged crashy echo plugin with a restart
+	// budget, and a hook counting any unary response the runtime discards as a
+	// late/duplicate delivery.
+	var discarded atomic.Int64
+	restore := styx.SetDuplicateUnaryResponseHookForTest(func(uint64) { discarded.Add(1) })
+	defer restore()
+
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{
+			Name:      "echo",
+			Path:      fixtureCrashyPlugin,
+			Args:      []string{"echo"},
+			Transport: "shm", // pin shm: a failed attach is a hard error, never a uds downgrade
+			Env:       []string{"STYX_ECHO_PID_TAG=1"},
+			Restart:   styx.RestartPolicy{Max: 3, Backoff: func(int) time.Duration { return 10 * time.Millisecond }},
+		}},
+	})
+	require.NoError(t, h.Start(t.Context()))
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	client := echopb.NewEchoClient(h.Plugin("echo"))
+
+	// say sends one call under its OWN short deadline, so a wedged call returns to the
+	// retry loop rather than hanging, and rejects any misdelivered/malformed response.
+	say := func(msg string) (int, error) {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		resp, err := client.Say(ctx, &echopb.SayRequest{Message: msg})
+		if err != nil {
+			return 0, err
+		}
+		pid, body, ok := hostParsePIDTag(resp.GetMessage())
+		require.True(t, ok, "response %q is not the <pid>:<message> shape a single instance emits", resp.GetMessage())
+		require.Equal(t, msg, body, "response body must echo the exact request, never a misdelivered one")
+
+		return pid, nil
+	}
+
+	// When: a unique request before the crash, a SIGKILL, then unique requests until the
+	// transparent restart answers one.
+	gen0PID, err := say("before-crash-7f3a")
+	require.NoError(t, err)
+	require.NoError(t, syscall.Kill(gen0PID, syscall.SIGKILL))
+
+	var gen1PID int
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		pid, callErr := say("after-restart-b19c")
+		if callErr != nil {
+			time.Sleep(50 * time.Millisecond)
+
+			continue
+		}
+		gen1PID = pid
+
+		break
+	}
+
+	// Then: the restart answered a unique request correctly from a live process (the old
+	// one is dead, so a success is necessarily a fresh generation), and NO duplicate or
+	// late response was ever delivered for a completed call.
+	require.NotZero(t, gen1PID, "the host did not transparently restart the crashed shm plugin in time")
+	if gen1PID == gen0PID {
+		// PID reuse is possible: the crashed process is reaped before the restart, so the
+		// OS may hand its number to the successor. The successful post-crash call already
+		// proves a fresh generation (the old process is gone); a differing PID is expected
+		// but not required, so equality is not a failure.
+		t.Logf("plugin PID %d was reused across the restart; the successful post-crash call still proves recovery",
+			gen0PID)
+	}
+	require.Zero(t, discarded.Load(),
+		"a duplicate or late unary response was delivered across the crash-restart (misdelivery)")
 }

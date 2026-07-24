@@ -1098,8 +1098,15 @@ func TestSupervisor_ShmTransparentRestart_AfterSIGKILL_RecoversNoLeak(t *testing
 	// memfd/generation the ABI requires, so no stale region can be reused).
 	requireEventOfKind(t, ch, supervisor.EventReady)
 	gen1 := readReady()
-	require.NotEqual(t, gen0.pid, gen1.pid, "a transparent restart must spawn a new plugin process")
-	require.Greater(t, gen1.gen, gen0.gen, "the restart must advance to a fresh generation, not reuse the region")
+	require.Greater(t, gen1.gen, gen0.gen,
+		"the restart must advance to a fresh generation, not reuse the region")
+	if gen0.pid == gen1.pid {
+		// PID reuse is possible — the crashed process is reaped before the restart, so the
+		// OS may hand its number to the successor. The advanced generation above already
+		// proves a fresh instance, so equal PIDs are not a failure.
+		t.Logf("plugin PID %d was reused across the restart; the advanced generation proves a fresh instance",
+			gen0.pid)
+	}
 
 	// Teardown, then assert no fd or region-mapping leak across the crash-restart cycle:
 	// the killed generation's host-owned region and eventfds were released on its reap.
@@ -1132,8 +1139,13 @@ func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
 	ch, unsub, _ := bus.Subscribe()
 	defer unsub()
 
+	// Record the time of each received heartbeat; after the freeze no more arrive, so the
+	// last stored value is the last healthy beat — the reference point for the
+	// miss-detection window measured below.
+	var lastBeat atomic.Int64
 	gotBeat := make(chan struct{}, 1)
 	restore := supervisor.SetHeartbeatReceivedForTest(func() {
+		lastBeat.Store(time.Now().UnixNano())
 		select {
 		case gotBeat <- struct{}{}:
 		default:
@@ -1186,12 +1198,16 @@ func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
 		t.Fatal("host received no heartbeat from a healthy shm plugin")
 	}
 
-	// Freeze the plugin: its heartbeats stop, and the host's liveness path must declare
-	// it unhealthy within MissedHeartbeats silent intervals. Register the continue as a
-	// cleanup immediately, so a failure below still lets the process be reaped rather
-	// than leaking a stopped child.
+	// Freeze the plugin: its heartbeats stop, and the host's liveness path must declare it
+	// unhealthy. Register the continue as a cleanup backstop immediately, disarmed once the
+	// child is explicitly continued and reaped (so it never signals a reused PID).
+	var reaped atomic.Bool
 	require.NoError(t, syscall.Kill(pid, syscall.SIGSTOP))
-	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGCONT) })
+	t.Cleanup(func() {
+		if !reaped.Load() {
+			_ = syscall.Kill(pid, syscall.SIGCONT)
+		}
+	})
 
 	ev := awaitUnhealthy(t, ch)
 	require.Equal(t, supervisor.EventUnhealthy, ev.Kind)
@@ -1200,10 +1216,25 @@ func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
 	require.ErrorContains(t, ev.Err, "consecutive heartbeats",
 		"the cause must be the missed-heartbeat threshold: %v", ev.Err)
 
-	// Continue the frozen child now so the supervisor's teardown reaps it promptly (the
-	// cleanup above is the failure-path backstop; SIGCONT is idempotent).
+	// Prove the CONFIGURED bound, not merely that some Unhealthy arrived. Each miss is a
+	// full HeartbeatInterval receive wait that no heartbeat cuts short (the peer is
+	// frozen), so the window from the last received beat to Unhealthy is at least
+	// MissedHeartbeats x HeartbeatInterval = 300ms. The lower bound (250ms) catches an
+	// over-eager declaration after fewer than three misses (two misses fire near 200ms);
+	// the upper bound (700ms) catches a regression to substantially more misses (seven
+	// would take 700ms) while leaving generous -race scheduling headroom over the 300ms
+	// nominal.
+	missWindow := ev.Time.Sub(time.Unix(0, lastBeat.Load()))
+	require.GreaterOrEqual(t, missWindow, 250*time.Millisecond,
+		"declared unhealthy too early for a 3-miss threshold: %v", missWindow)
+	require.LessOrEqual(t, missWindow, 700*time.Millisecond,
+		"declared unhealthy far later than a 3-miss threshold — a regression to more misses: %v", missWindow)
+
+	// Continue the frozen child so the supervisor's teardown reaps it promptly, then
+	// disarm the backstop (the child is reaped by boundedStop; SIGCONT is idempotent).
 	_ = syscall.Kill(pid, syscall.SIGCONT)
 	boundedStop(t, sup)
+	reaped.Store(true)
 	select {
 	case <-runDone:
 	case <-time.After(5 * time.Second):
@@ -1358,6 +1389,7 @@ func TestSupervisor_ShmAttachCrashWindows_ClassifiedAndNoLeak(t *testing.T) {
 // classified as a crashed Ready instance, still tearing down to the fd and region
 // baseline with no leak.
 func TestSupervisor_ShmPostAckCrash_ReadyThenClassifiedDead(t *testing.T) {
+	// Given: a supervisor spawning a plugin that crashes at the post-ack attach step.
 	fdsBefore := testutil.CountOpenFDs(t)
 	mapsBefore := countRegionMappings(t)
 
@@ -1386,13 +1418,15 @@ func TestSupervisor_ShmPostAckCrash_ReadyThenClassifiedDead(t *testing.T) {
 	}
 	sup := supervisor.New(cfg, bus)
 
+	// When: the run drives the instance to Ready (the ack was delivered) and the plugin
+	// then dies.
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	runDone := make(chan struct{})
 	go func() { defer close(runDone); sup.Run(ctx) }()
 
-	// The instance reaches Ready (the ack arrived) and is only then seen dead: the run
-	// ends in GaveUp carrying a typed crash, and Ready appeared on the way.
+	// Then: the instance reaches Ready and is only then seen dead — the run ends in
+	// GaveUp carrying a typed crash, with Ready on the way.
 	seen := collector.awaitKind(t)
 	var failErr error
 	sawReady := false

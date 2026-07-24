@@ -317,12 +317,16 @@ func runReadLoop(state *connState) {
 		// table; the trailing comment documents the discard of anything else.
 		switch {
 		case f.Kind == transport.FrameUnaryResp:
-			state.table.Complete(f.CallID, f.Payload)
+			if !state.table.Complete(f.CallID, f.Payload) {
+				notifyDiscardedUnaryResponse(f.CallID) // late or duplicate: the call was already terminal
+			}
 		case f.Kind == transport.FrameUnaryErr:
 			// An error response: fail the call with the carried
 			// status. Fail is a no-op for an already-terminal/unknown CallID,
 			// the same late-frame-discard rule Complete follows.
-			state.table.Fail(f.CallID, statusFromFrame(f.Status))
+			if !state.table.Fail(f.CallID, statusFromFrame(f.Status)) {
+				notifyDiscardedUnaryResponse(f.CallID)
+			}
 		case state.streams == nil && isFeatureAbsentStreamFrame(f):
 			// Feature-absent, fail-closed (stream-protocol.md §11.2): this
 			// generation negotiated no streaming half, so any STREAM_* frame (or a
@@ -397,6 +401,20 @@ func translateReadLoopExit(err error) error {
 func isFrameLocalRecvErr(err error) bool {
 	return errors.Is(err, transport.ErrMalformedStatusFrame) ||
 		errors.Is(err, transport.ErrUnimplementedFrameKind)
+}
+
+// duplicateUnaryResponseHook, when non-nil, is invoked with a CallID whose unary
+// response (or error) arrived after the call was already terminal — a late or DUPLICATE
+// delivery the Table discards silently. It is a TEST SEAM: nil in production (one
+// predictable nil check on the cold late-frame path, never on the healthy call path),
+// so a test can assert no trailing duplicate response is delivered for a completed call
+// (a misdelivered second copy the caller-visible result could never reveal).
+var duplicateUnaryResponseHook func(callID uint64)
+
+func notifyDiscardedUnaryResponse(callID uint64) {
+	if duplicateUnaryResponseHook != nil {
+		duplicateUnaryResponseHook(callID)
+	}
 }
 
 // statusFromFrame converts the transport-owned FrameStatus carried by a
