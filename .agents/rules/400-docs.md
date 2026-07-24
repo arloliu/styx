@@ -25,6 +25,45 @@ func (h *Host) Plugin(name string) *ClientConn { }
 
 Don't restate obvious types/parameters the signature already shows.
 
+## Package Comments
+Every package needs a doc comment starting with `// Package <name> ...` that
+explains what the package is for, not what its name already says.
+
+```go
+// Package shm implements the default shared-memory transport for Styx.
+package shm
+```
+
+A package with more to say uses blank comment lines between paragraphs
+rather than one dense block — one paragraph for what it does, one for
+constraints or how it relates to other packages.
+
+## Public API Semantics
+For public API that crosses the host/plugin process boundary, document the
+contract, not just what a call returns. State explicitly, wherever it
+applies:
+- whether a value or buffer is host-owned or plugin-owned
+- whether the method is safe for concurrent use
+- whether it can block, and on what
+- whether cancellation is best-effort or guaranteed
+- what happens if the plugin crashes mid-call
+- whether returned data is copied or borrowed, and how long it stays valid
+  after the call returns
+- whether a protocol field or behavior is stable or experimental
+
+Leave implementation details (which ring, which syscall) out of the public
+comment unless they're part of the contract — put those in an internal
+comment near the code instead, per
+[200-coding-standards.md#comments](200-coding-standards.md#comments).
+
+```go
+// Buffer references payload memory owned by the transport.
+//
+// A Buffer is valid only until Release is called or the request handler
+// returns. Callers must copy the bytes if they need to retain them.
+type Buffer struct{}
+```
+
 ## Examples
 Prefer `ExampleXxx` test functions over long comment blocks for
 pkg.go.dev-runnable documentation.
@@ -36,6 +75,13 @@ install/usage accurate when it changes. The design spec
 implementation deviates from it deliberately, update the spec (or note the
 deviation in a new dated spec/plan under `docs/specs/`/`docs/plans/`) rather
 than letting code and doc silently diverge.
+
+Write markdown prose (`docs/`, `README`, specs, plans) with semantic
+linefeeds — break lines at sentence or clause boundaries, not by wrapping to
+a fixed column. Don't hard-wrap a paragraph to a target width; that forces a
+full-paragraph reflow, and a noisy diff, every time a sentence is added or
+edited later. One sentence per line reads fine and keeps future diffs to the
+sentence that actually changed.
 
 ## Test Functions
 Different, terser convention (one line, or a self-documenting name alone) —

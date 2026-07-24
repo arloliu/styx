@@ -48,3 +48,12 @@ user instruction overrides it.
 ## No Jargon
 State facts plainly in rules, code, commits, everywhere — see the root
 [`AGENTS.md`](../../AGENTS.md#no-jargon-anywhere) for the full rule.
+
+## Comment and Markdown Wrapping
+Wrap multi-sentence Go comments and markdown docs alike at sentence/phrase
+boundaries (semantic linefeeds), not by column count, and don't rewrap
+stable text just to move its line breaks — see
+[200-coding-standards.md#comments](200-coding-standards.md#comments) and
+[400-docs.md#docs--readme](400-docs.md#docs--readme). Easy to forget
+mid-edit; check it before touching an existing comment block or doc
+paragraph.
