@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"unsafe"
 
@@ -498,6 +499,54 @@ func TestRegion_Close_ClosesFDEvenIfMunmapFails(t *testing.T) {
 
 	// A second Close call must be a clean, idempotent no-op.
 	require.NoError(t, r.Close())
+}
+
+// Test that a Close whose Munmap fails does not count the region as closed, so a
+// failed unmap surfaces as a created/closed imbalance (a still-live mapping)
+// rather than being masked by an equal count. NewRegionForTest bypasses the
+// created counter, so only the closed counter's behavior is asserted here: it
+// must not advance when the unmap itself failed.
+func TestRegion_Close_FailedMunmap_IsNotCountedClosed(t *testing.T) {
+	// Given a region whose zero-length data makes Munmap fail with EINVAL.
+	fd, err := unix.MemfdCreate("shm-close-failed-munmap-count", unix.MFD_CLOEXEC)
+	require.NoError(t, err)
+	closedBefore := shm.RegionsClosed()
+	r := shm.NewRegionForTest(fd, make([]byte, 0))
+
+	// When / Then
+	require.Error(t, r.Close(), "a zero-length mapping makes Munmap fail")
+	require.Equal(t, closedBefore, shm.RegionsClosed(),
+		"a failed unmap must not increment the closed-region count")
+}
+
+// Test that concurrent Close calls release a region exactly once: it is counted
+// closed exactly once, never once per racing caller. Before Close elected a
+// single releaser with an atomic compare-and-swap, its unsynchronized nil guard
+// let multiple racers each pass, munmap, and increment the closed counter.
+func TestRegion_Close_ConcurrentIsExactlyOnce(t *testing.T) {
+	// Given a live region and the closed count before any release.
+	r, err := shm.CreateRegion(minimalLayoutInput())
+	require.NoError(t, err)
+	closedBefore := shm.RegionsClosed()
+
+	// When many goroutines race to Close the same region.
+	const racers = 8
+	var start, done sync.WaitGroup
+	start.Add(1)
+	done.Add(racers)
+	for range racers {
+		go func() {
+			defer done.Done()
+			start.Wait()
+			_ = r.Close()
+		}()
+	}
+	start.Done()
+	done.Wait()
+
+	// Then it is counted closed exactly once.
+	require.Equal(t, closedBefore+1, shm.RegionsClosed(),
+		"concurrent Close must count the region closed exactly once")
 }
 
 // Test that RemapLayoutReadOnly actually changes the layout page's memory

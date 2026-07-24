@@ -9,10 +9,13 @@ import (
 )
 
 // regionsCreated and regionsClosed count, process-wide, the shared-memory region
-// mappings this process has created and closed. Region create/close is a
-// per-generation cold path (never per RPC), so the two atomic increments add no
-// hot-path cost. RegionsCreated/RegionsClosed expose them so a leak test can assert
-// every mapping a run created was closed, without parsing /proc maps.
+// mappings this process has created and successfully unmapped. Region
+// create/close is a per-generation cold path (never per RPC), so the two atomic
+// increments add no hot-path cost. RegionsCreated/RegionsClosed expose them so a
+// leak test can assert every mapping a run created was closed, without parsing
+// /proc maps. Closed counts only mappings whose Munmap actually succeeded, so a
+// failed unmap surfaces as a created/closed imbalance — a still-live mapping —
+// rather than being masked by an equal count.
 var (
 	regionsCreated atomic.Int64
 	regionsClosed  atomic.Int64
@@ -21,7 +24,8 @@ var (
 // RegionsCreated returns the cumulative count of region mappings this process created.
 func RegionsCreated() int64 { return regionsCreated.Load() }
 
-// RegionsClosed returns the cumulative count of region mappings this process closed.
+// RegionsClosed returns the cumulative count of region mappings this process
+// successfully unmapped.
 func RegionsClosed() int64 { return regionsClosed.Load() }
 
 // newMappedRegion constructs a Region that holds a live mmap and counts it against the
@@ -65,6 +69,7 @@ type Region struct {
 	fd     int
 	data   []byte // nil after Close
 	layout Layout
+	closed atomic.Bool // set once by the Close that wins the release
 }
 
 // CreateRegion validates input's host-chosen geometry (shm-abi.md §1:
@@ -362,21 +367,27 @@ func (r *Region) Layout() Layout {
 // unmapped there, and any access afterward reads freed address space.
 func (r *Region) Bytes() []byte { return r.data }
 
-// Close munmaps the region and closes the local fd. Idempotent: a second
-// call is a no-op. Both resources are marked released up front, so even if
-// Munmap fails, Close still attempts to close the fd (never leaking it on
-// a subsequent Close call) and a later Close remains a clean no-op.
+// Close munmaps the region and closes the local fd. Idempotent and
+// concurrency-safe: an atomic compare-and-swap elects exactly one caller to
+// release, so concurrent or repeated Close calls each run the unmap-and-close
+// (and the region create/close accounting) at most once; the losers return nil.
+// Even if Munmap fails, the winner still closes the fd (never leaking it) and
+// surfaces the failure; a region is counted closed only once its mapping is
+// actually gone, so a failed unmap shows up as a created/closed imbalance rather
+// than a masked equal count.
 func (r *Region) Close() error {
-	if r.data == nil {
+	if !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 
 	data := r.data
 	r.data = nil
-	regionsClosed.Add(1) // paired with newMappedRegion; only a region that actually mapped reaches here
 
 	munmapErr := unix.Munmap(data)
 	closeErr := unix.Close(r.fd)
+	if munmapErr == nil {
+		regionsClosed.Add(1) // paired with newMappedRegion, counted only on a real unmap
+	}
 
 	return errors.Join(wrapErrNonNil("shm: Close: munmap", munmapErr), wrapErrNonNil("shm: Close: close", closeErr))
 }
