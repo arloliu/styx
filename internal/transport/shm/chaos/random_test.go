@@ -3,8 +3,10 @@ package chaos
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,7 +94,10 @@ func multiFaultRepertoire() []faultChoice {
 		})
 	}
 	choices = append(choices, faultChoice{
-		label:  "corrupt@AfterDescriptorWrite",
+		// RunCorruptDescriptor parks at AfterTailPublish (it mutates the just-published
+		// descriptor before the host reads it), so the label names that window, not the
+		// descriptor-write one.
+		label:  "corrupt@" + WindowAfterTailPublish,
 		drive:  func(ctx context.Context) (Outcome, error) { return RunCorruptDescriptor(ctx, peerBin) },
 		assert: assertCorruptPoisons,
 	})
@@ -129,6 +134,8 @@ func assertCorruptPoisons(t *testing.T, oc Outcome) {
 func TestChaos_RandomizedMultiFault_ComposesWindowsNoAccumulation(t *testing.T) {
 	runs, compositionLen := multiFaultBudget()
 	repertoire := multiFaultRepertoire()
+	require.LessOrEqual(t, compositionLen, len(repertoire),
+		"composition length must not exceed the repertoire, so faults can be distinct")
 
 	const baseSeed = int64(20260724)
 	for r := range runs {
@@ -136,31 +143,39 @@ func TestChaos_RandomizedMultiFault_ComposesWindowsNoAccumulation(t *testing.T) 
 		//nolint:gosec // reproducible randomized coverage, not a security context
 		rng := rand.New(rand.NewSource(seed))
 
+		// Sample WITHOUT replacement so a composition is genuinely heterogeneous — never
+		// the same window/fault twice. Perm is seeded, so the same seed reproduces the
+		// same composition.
+		perm := rng.Perm(len(repertoire))[:compositionLen]
 		composition := make([]faultChoice, compositionLen)
 		labels := make([]string, compositionLen)
-		for i := range composition {
-			composition[i] = repertoire[rng.Intn(len(repertoire))]
-			labels[i] = composition[i].label
+		for i, idx := range perm {
+			composition[i] = repertoire[idx]
+			labels[i] = repertoire[idx].label
 		}
+
+		// The replay key: seed + full composition, logged BEFORE executing so it is in
+		// the output ahead of any failure below, and repeated in every per-fault subtest
+		// name so a failing assertion carries it inline.
+		replayKey := fmt.Sprintf("seed=%d composition=[%s]", seed, strings.Join(labels, " "))
+		t.Logf("multi-fault run: %s", replayKey)
 
 		fdsBefore := testutil.CountOpenFDs(t)
 
 		for i, fc := range composition {
-			oc, err := fc.drive(context.Background())
-			require.NoErrorf(t, err, "seed %d composition %v step %d (%s): harness error",
-				seed, labels, i, fc.label)
-			fc.assert(t, oc)
+			name := fmt.Sprintf("%s/step=%d=%s", replayKey, i, fc.label)
+			t.Run(name, func(t *testing.T) {
+				oc, err := fc.drive(context.Background())
+				require.NoError(t, err, "harness error")
+				fc.assert(t, oc)
+			})
 		}
 
 		// No accumulation across the composed faults: each fault session released its
 		// host-side region, eventfds, and transport on teardown, so the host fd count
-		// returns exactly to baseline (the harness's own leak-detection primitive). A
-		// failure here is replayable from the logged seed and composition.
+		// returns exactly to baseline (the harness's own leak-detection primitive).
 		require.Eventuallyf(t, func() bool { return testutil.CountOpenFDs(t) <= fdsBefore },
 			2*time.Second, 20*time.Millisecond,
-			"seed %d composition %v accumulated fds: before=%d after=%d",
-			seed, labels, fdsBefore, testutil.CountOpenFDs(t))
-
-		t.Logf("seed %d composition %v: every fault met its contract, no fd accumulation", seed, labels)
+			"%s accumulated fds: before=%d after=%d", replayKey, fdsBefore, testutil.CountOpenFDs(t))
 	}
 }

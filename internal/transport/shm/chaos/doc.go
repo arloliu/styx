@@ -73,7 +73,9 @@
 //     region-mapping counts back at baseline and no poisoned residue for the next spawn
 //     (internal/supervisor's attach-crash-window matrix, driven by the -tags failpoint
 //     crash-attach fixture through STYX_CRASH_AT_ATTACH_STEP). The host-side pre-send
-//     steps (region create, the two eventfd creates) involve no live child; their
+//     steps (region create, the two eventfd creates) run before any fd is transferred,
+//     so no transferred fd is child-owned yet (the child is spawned, but has received
+//     nothing); their
 //     partial-cleanup stays covered by the data plane's error-injection unit table.
 //
 // Two further boundaries stand on their own:
