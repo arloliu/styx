@@ -15,8 +15,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/arloliu/styx"
@@ -24,9 +26,17 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// run does all the work and returns an error instead of calling os.Exit, so the
+// deferred host.Stop always runs before the process exits.
+func run() error {
 	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: hot-reload-host <plugin-path>")
-		os.Exit(2)
+		return errors.New("usage: hot-reload-host <plugin-path>")
 	}
 
 	host := styx.NewHost(styx.HostConfig{
@@ -41,31 +51,52 @@ func main() {
 	defer cancel()
 
 	if err := host.Start(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "start:", err)
-		os.Exit(1)
+		return fmt.Errorf("start: %w", err)
 	}
 	defer func() { _ = host.Stop(ctx) }()
 
 	client := echopb.NewEchoClient(host.Plugin("counter"))
-	say := func(msg string) string {
+	say := func(msg string) (string, error) {
 		resp, err := client.Say(ctx, &echopb.SayRequest{Message: msg})
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "say:", err)
-			os.Exit(1)
+			return "", fmt.Errorf("say %q: %w", msg, err)
 		}
 
-		return resp.GetMessage()
+		return resp.GetMessage(), nil
 	}
 
-	fmt.Println("before reload:", say("a"), say("b"), say("c"))
+	before, err := sayAll(say, "a", "b", "c")
+	if err != nil {
+		return err
+	}
+	fmt.Println("before reload:", before)
 
 	// Reload blocks until the successor is serving and the predecessor is reaped.
 	// The successor is a fresh process; RestoreState seeds it with the count the
 	// predecessor's SaveState sealed into the snapshot.
 	if err := host.Reload(ctx, "counter"); err != nil {
-		fmt.Fprintln(os.Stderr, "reload:", err)
-		os.Exit(1)
+		return fmt.Errorf("reload: %w", err)
 	}
 
-	fmt.Println("after reload:", say("d"), say("e"))
+	after, err := sayAll(say, "d", "e")
+	if err != nil {
+		return err
+	}
+	fmt.Println("after reload:", after)
+
+	return nil
+}
+
+// sayAll calls say for each message and returns the responses space-joined.
+func sayAll(say func(string) (string, error), msgs ...string) (string, error) {
+	out := make([]string, 0, len(msgs))
+	for _, msg := range msgs {
+		resp, err := say(msg)
+		if err != nil {
+			return "", err
+		}
+		out = append(out, resp)
+	}
+
+	return strings.Join(out, " "), nil
 }

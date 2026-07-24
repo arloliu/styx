@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -18,6 +19,12 @@ import (
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/examples/echo/echopb"
 )
+
+// counterSnapshotVersion is the framework's current snapshot envelope
+// version. The framework stamps it on every snapshot (SaveState supplies no
+// version of its own); RestoreState validates it so a plugin never misreads
+// an envelope from a different framework version.
+const counterSnapshotVersion uint32 = 1
 
 // counterServer answers Echo's Say, prefixing each response with the running
 // count of calls this instance has served. The count is the state that a
@@ -34,8 +41,8 @@ func (s *counterServer) Say(_ context.Context, req *echopb.SayRequest) (*echopb.
 // SaveState runs on the predecessor once it has drained and frozen (its snapshot
 // is sealed and verified by the host); RestoreState runs on the freshly spawned
 // successor before it begins serving, so the successor resumes from the saved
-// count. formatVersion lets a plugin evolve its snapshot layout; this one has a
-// single layout and ignores it.
+// count. RestoreState validates the format version and payload it is handed
+// rather than trusting them (see counterSnapshotVersion).
 type counterState struct{ srv *counterServer }
 
 func (c counterState) SaveState(context.Context) ([]byte, error) {
@@ -45,10 +52,15 @@ func (c counterState) SaveState(context.Context) ([]byte, error) {
 	return buf, nil
 }
 
-func (c counterState) RestoreState(_ context.Context, _ uint32, data []byte) error {
-	if len(data) == 8 {
-		c.srv.calls.Store(binary.LittleEndian.Uint64(data))
+func (c counterState) RestoreState(_ context.Context, formatVersion uint32, data []byte) error {
+	if formatVersion != counterSnapshotVersion {
+		return fmt.Errorf("hot-reload plugin: unknown snapshot format version %d (want %d)",
+			formatVersion, counterSnapshotVersion)
 	}
+	if len(data) != 8 {
+		return fmt.Errorf("hot-reload plugin: malformed snapshot: %d bytes, want 8", len(data))
+	}
+	c.srv.calls.Store(binary.LittleEndian.Uint64(data))
 
 	return nil
 }

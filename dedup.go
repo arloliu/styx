@@ -7,11 +7,11 @@ import "context"
 // DedupKeyFromContext, so host-side code can tag the calls of one logical
 // operation and recognize the same key back on any of them. Reusing the same
 // context — or setting the same key on a re-issued call — carries the key across
-// those calls, but Styx mints no retries or attempts of its own around it. It is
-// NOT transported to the plugin — the data-plane frame carries no per-call
-// metadata field — so a plugin handler cannot observe it today. Whether a future
-// data-plane wire carrier will deliver the key to plugin handlers end to end is a
-// design decision still pending; until it is settled the key stays host-local.
+// those calls, but Styx mints no retries or attempts of its own around it. The
+// key is host-local: it is NOT transported to the plugin — the data-plane frame
+// carries no per-call metadata field — so a plugin handler cannot observe it.
+// Delivering it to the plugin end to end would need a wire carrier the frame does
+// not have; it is a possible future extension, not a current capability.
 //
 // Styx does NOT deduplicate. It never inspects, compares, or acts on a DedupKey.
 // Deduplication — deciding that two attempts are the same operation and

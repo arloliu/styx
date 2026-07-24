@@ -2,10 +2,10 @@
 // examples/echo's plugin (which registers the generated EchoStream service) and
 // exercises all three streaming shapes from the host side — server-streaming
 // (Feed: one request, many responses), client-streaming (Collect: many requests,
-// one response), and bidirectional (Chat: interleaved) — printing each shape's
-// result. RequireStreaming on the PluginSpec makes streaming a hard handshake
-// requirement, so a plugin that could not stream would fail Start rather than
-// only failing at the first OpenStream.
+// one response), and bidirectional (Chat: send and receive run concurrently) —
+// printing each shape's result. RequireStreaming on the PluginSpec makes
+// streaming a hard handshake requirement, so a plugin that could not stream would
+// fail Start rather than only failing at the first OpenStream.
 //
 // Usage: streaming-host <path-to-echo-plugin-binary>
 //
@@ -30,9 +30,17 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// run does all the work and returns an error instead of calling os.Exit, so the
+// deferred host.Stop always runs before the process exits.
+func run() error {
 	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: streaming-host <plugin-path>")
-		os.Exit(2)
+		return errors.New("usage: streaming-host <plugin-path>")
 	}
 
 	host := styx.NewHost(styx.HostConfig{
@@ -48,23 +56,40 @@ func main() {
 	defer cancel()
 
 	if err := host.Start(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "start:", err)
-		os.Exit(1)
+		return fmt.Errorf("start: %w", err)
 	}
 	defer func() { _ = host.Stop(ctx) }()
 
 	client := echopb.NewEchoStreamClient(host.Plugin("echo"))
 
-	fmt.Println("server-streaming:", serverStreaming(ctx, client))
-	fmt.Println("client-streaming:", clientStreaming(ctx, client))
-	fmt.Println("bidi:", bidiStreaming(ctx, client))
+	server, err := serverStreaming(ctx, client)
+	if err != nil {
+		return err
+	}
+	fmt.Println("server-streaming:", server)
+
+	collected, err := clientStreaming(ctx, client)
+	if err != nil {
+		return err
+	}
+	fmt.Println("client-streaming:", collected)
+
+	bidi, err := bidiStreaming(ctx, client)
+	if err != nil {
+		return err
+	}
+	fmt.Println("bidi:", bidi)
+
+	return nil
 }
 
 // serverStreaming opens Feed with one request and reads responses until the server
 // closes the stream, returning them space-joined.
-func serverStreaming(ctx context.Context, client echopb.EchoStreamClient) string {
+func serverStreaming(ctx context.Context, client echopb.EchoStreamClient) (string, error) {
 	stream, err := client.Feed(ctx, &echopb.SayRequest{Message: "tick"})
-	fatalOn(err, "feed")
+	if err != nil {
+		return "", fmt.Errorf("feed: %w", err)
+	}
 
 	var got []string
 	for {
@@ -72,38 +97,58 @@ func serverStreaming(ctx context.Context, client echopb.EchoStreamClient) string
 		if errors.Is(err, io.EOF) {
 			break
 		}
-		fatalOn(err, "feed recv")
+		if err != nil {
+			return "", fmt.Errorf("feed recv: %w", err)
+		}
 		got = append(got, resp.GetMessage())
 	}
 
-	return strings.Join(got, " ")
+	return strings.Join(got, " "), nil
 }
 
 // clientStreaming opens Collect, sends several requests, half-closes, and reads
 // the single aggregated response.
-func clientStreaming(ctx context.Context, client echopb.EchoStreamClient) string {
+func clientStreaming(ctx context.Context, client echopb.EchoStreamClient) (string, error) {
 	stream, err := client.Collect(ctx)
-	fatalOn(err, "collect")
+	if err != nil {
+		return "", fmt.Errorf("collect: %w", err)
+	}
 
 	for _, msg := range []string{"a", "b", "c"} {
-		fatalOn(stream.Send(&echopb.SayRequest{Message: msg}), "collect send")
+		if err := stream.Send(&echopb.SayRequest{Message: msg}); err != nil {
+			return "", fmt.Errorf("collect send: %w", err)
+		}
 	}
 	resp, err := stream.CloseAndRecv()
-	fatalOn(err, "collect close")
+	if err != nil {
+		return "", fmt.Errorf("collect close: %w", err)
+	}
 
-	return resp.GetMessage()
+	return resp.GetMessage(), nil
 }
 
-// bidiStreaming opens Chat, sends several requests, half-closes its send
-// direction, then reads the interleaved responses until the server closes.
-func bidiStreaming(ctx context.Context, client echopb.EchoStreamClient) string {
+// bidiStreaming opens Chat and runs send and receive concurrently: a sender
+// goroutine streams requests while the main goroutine reads responses as they
+// arrive, so the two directions genuinely interleave rather than one completing
+// before the other begins. The echo plugin answers each request in order, so the
+// responses arrive in the order sent.
+func bidiStreaming(ctx context.Context, client echopb.EchoStreamClient) (string, error) {
 	stream, err := client.Chat(ctx)
-	fatalOn(err, "chat")
-
-	for _, msg := range []string{"x", "y"} {
-		fatalOn(stream.Send(&echopb.SayRequest{Message: msg}), "chat send")
+	if err != nil {
+		return "", fmt.Errorf("chat: %w", err)
 	}
-	fatalOn(stream.CloseSend(), "chat close-send")
+
+	sendErr := make(chan error, 1)
+	go func() {
+		for _, msg := range []string{"x", "y"} {
+			if err := stream.Send(&echopb.SayRequest{Message: msg}); err != nil {
+				sendErr <- err
+
+				return
+			}
+		}
+		sendErr <- stream.CloseSend()
+	}()
 
 	var got []string
 	for {
@@ -111,16 +156,14 @@ func bidiStreaming(ctx context.Context, client echopb.EchoStreamClient) string {
 		if errors.Is(err, io.EOF) {
 			break
 		}
-		fatalOn(err, "chat recv")
+		if err != nil {
+			return "", fmt.Errorf("chat recv: %w", err)
+		}
 		got = append(got, resp.GetMessage())
 	}
-
-	return strings.Join(got, " ")
-}
-
-func fatalOn(err error, what string) {
-	if err != nil {
-		fmt.Fprintln(os.Stderr, what+":", err)
-		os.Exit(1)
+	if err := <-sendErr; err != nil {
+		return "", fmt.Errorf("chat send: %w", err)
 	}
+
+	return strings.Join(got, " "), nil
 }

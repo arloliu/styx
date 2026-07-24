@@ -15,10 +15,11 @@ import (
 	"testing"
 )
 
-// echoPluginBin, echoHostBin, and crashyPluginBin are paths to the
-// examples/echo binaries, built once here (mirroring styx/host_test.go's
-// and internal/supervisor/supervisor_test.go's own build-once-per-package
-// fixture pattern) rather than per test.
+// These are paths to the example binaries built once here (mirroring
+// styx/host_test.go's and internal/supervisor/supervisor_test.go's own
+// build-once-per-package fixture pattern) rather than per test: examples/echo's
+// plugin, host, and crashy-plugin twin; examples/streaming's host; and
+// examples/hot-reload's plugin and host.
 var (
 	echoPluginBin      string
 	echoHostBin        string
@@ -28,9 +29,9 @@ var (
 	hotReloadHostBin   string
 )
 
-// TestMain builds examples/echo's plugin, host, and crashy-plugin binaries
-// once via `go build` into a temp directory removed on process exit, then
-// runs the package's tests against them as real spawned child processes.
+// TestMain builds the six example binaries once via `go build` into a temp
+// directory removed on process exit, then runs the package's tests against them
+// as real spawned child processes.
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "styx-echo-integration")
 	if err != nil {

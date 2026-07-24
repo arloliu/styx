@@ -131,10 +131,17 @@ The framework is complete on both data-plane transports:
   and Unix domain sockets. Each plugin selects its transport on `PluginSpec`:
   the default offers shared memory, preferred, and falls back to UDS only when a
   plugin does not offer shared memory — never a silent downgrade when shared
-  memory is pinned.
+  memory is pinned. At a 64-byte payload with one in-flight call, the measured
+  round-trip p50 is 2.11 µs on shared memory versus 8.15 µs on UDS
+  ([bench/shm/REPORT.md](bench/shm/REPORT.md)).
 - **RPC.** Unary and streaming (server-, client-, and bidirectional streaming),
   with version-negotiated handshake, deadline and cancellation propagation, and
-  a comprehensive, retryability-classified error taxonomy.
+  a comprehensive, retryability-classified error taxonomy. Under load, a
+  shared-memory send whose ring or arena is full applies typed backpressure —
+  deadline-bounded for streaming sends, while a starved unary send can outlive
+  its call deadline (see the migration guide's provisioning section);
+  provisioning the geometry for peak concurrency (or opting into
+  `StrictCapacity`) avoids it.
 - **Lifecycle.** Supervised plugins with a restart policy, crash detection, a
   progress-based heartbeat, and hot-reload that hands a plugin's sealed,
   verified state to a freshly spawned successor without dropping accepted calls
@@ -142,8 +149,8 @@ The framework is complete on both data-plane transports:
 
 The shared-memory data plane is validated by a differential test suite against
 the UDS oracle, a fault-injection (chaos) suite, and a long-running leak soak.
-Its performance is measured in [bench/shm/REPORT.md](bench/shm/REPORT.md); the
-earlier prototype that first validated the premise is in
+Its full performance profile is in [bench/shm/REPORT.md](bench/shm/REPORT.md);
+the earlier prototype that first validated the premise is in
 [docs/plans/2026-07-16-m0-gate-report.md](docs/plans/2026-07-16-m0-gate-report.md).
 
 For the full design, see [docs/specs/2026-07-16-styx-design.md](docs/specs/2026-07-16-styx-design.md).

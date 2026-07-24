@@ -12,16 +12,28 @@ says so.
 
 go-plugin runs its gRPC transport over a listener that can, in principle, be
 network-capable, which is why it ships TLS/mutual-TLS machinery to authenticate
-the link. Styx has a narrower, explicit trust model: host and plugins run as the
-**same user on the same machine**, communicating over a private Unix-domain
-socketpair for control and anonymous `memfd` shared-memory regions for data —
-none of which is ever exposed on a filesystem path or a network. There is no
-networked link to secure.
+the link. Styx has a narrower transport: host and plugins run as the **same user
+on the same machine**, communicating over a private Unix-domain socketpair for
+control and anonymous `memfd` shared-memory regions for data — none of which is
+ever exposed on a filesystem path or a network. There is no networked link to
+secure, so Styx has **no TLS, no AutoMTLS, and no `TLSProvider`**.
 
-Consequently Styx has **no TLS, no AutoMTLS, no `TLSProvider`, and no magic-cookie
-handshake secret**. Compatibility is established by version negotiation at
-handshake instead of a shared cookie, and a plugin binary's identity can
-optionally be pinned by SHA-256 (`PluginSpec.BinarySHA256`).
+The trust model is worth stating plainly: host and plugin are assumed **mutually
+non-malicious once launched**. Styx defends against bugs, not adversaries. It
+seals and fully validates every shared-memory-derived value so a buggy or
+crashing plugin cannot corrupt or crash the host — regions are anonymous memfds,
+fds pass only over the private socketpair, each launch carries a handshake nonce,
+the environment is sanitized on spawn, and a plugin binary's identity can be
+pinned by SHA-256 (`PluginSpec.BinarySHA256`). It does not sandbox a plugin or
+defend against a deliberately hostile one; cross-user isolation and
+seccomp/namespace sandboxing are out of scope. See the security model in
+docs/specs/2026-07-16-styx-design.md.
+
+go-plugin's magic cookie is not a security boundary — upstream documents it as a
+UX check that prints human-friendly output when a plugin binary is run outside
+its host — and go-plugin negotiates a protocol version separately from it. Styx
+has no magic cookie; compatibility is established by the version negotiation at
+handshake.
 
 Each plugin picks its data-plane transport. On the host, `PluginSpec.Transport`
 defaults to offering shared memory (preferred) with a Unix-domain-socket
@@ -84,8 +96,6 @@ client := plugin.NewClient(&plugin.ClientConfig{
     HandshakeConfig: handshake,
     Plugins:         pluginMap,
     Cmd:             exec.Command(path),
-    PingTimeout:     5 * time.Second,
-    ShutdownTimeout: 10 * time.Second,
 })
 rpc, _ := client.Client()
 raw, _ := rpc.Dispense("svc")
@@ -119,23 +129,32 @@ a subscription rather than a callback invoked under a lock.
 
 ## Lifecycle: liveness, shutdown, and kill
 
-- **`ClientConfig.PingTimeout` + `client.Ping()`** → Styx runs an automatic,
-  progress-based heartbeat internally. There is no manual `Ping()` to call: the
-  supervisor distinguishes a transport-wedged, dispatch-wedged, or overloaded
-  plugin from a healthy one and acts on it, which is stronger than a bare liveness
-  RPC. Restarts and heartbeat misses surface as `host.Events()`.
-- **`ClientConfig.ShutdownTimeout` + graceful stop** → `host.Stop(ctx)`. The
-  context deadline is the grace window: teardown always attempts a graceful
-  shutdown, then falls back to `SIGKILL`, then reaps — never leaving an orphan.
-- **`client.Kill()`** → there is no public per-process kill primitive. Process
-  termination is owned by the supervisor and by `Host.Stop`; you tear a whole
-  host down rather than killing one plugin from arbitrary call sites. This is
-  deliberate — a freely callable concurrent kill is a race surface Styx does not
-  expose.
+- **`ClientProtocol.Ping()`** → go-plugin's liveness check is a bare RPC on the
+  protocol client you get from `client.Client()`; v1.8.0 has no built-in ping
+  timeout knob on `ClientConfig`. Styx has no manual ping: the supervisor runs an
+  automatic, progress-based heartbeat that classifies a plugin as healthy,
+  transport-wedged, dispatch-wedged, or overloaded from advancing counters. A
+  plugin that stays wedged past the wedge window is restarted, and restarts and
+  heartbeat misses surface on `host.Events()`. Overload (advancing but arena
+  occupancy over a high-water mark) is deliberately **not** a restart trigger and
+  emits no event — it only clears wedge tracking so a load spike cannot cause a
+  restart storm.
+- **`client.Kill()` and shutdown** → v1.8.0's `Kill()` waits a **fixed two
+  seconds** for a graceful exit, then force-kills; there is no `ShutdownTimeout`
+  on `ClientConfig`. Styx has no public per-process kill primitive at all:
+  `host.Stop(ctx)` tears every plugin down through a graceful shutdown bounded by
+  the teardown's own configured shutdown deadline, then `SIGKILL`, then a
+  `waitpid` reap — always, never leaving an orphan. The `ctx` passed to `Stop`
+  bounds `Stop`'s wait for the teardown goroutines to join, not the graceful
+  window itself. Process termination is owned by the supervisor and `Host.Stop`;
+  you tear a whole host down rather than killing one plugin from arbitrary call
+  sites, which keeps a freely callable concurrent kill off the API.
 - **`plugin.CleanupClients()` / a global managed-client registry** → none. Each
   `Host` owns its own plugins' state; there is no package-level registry to leak.
 - **`ReattachConfig` (reattach to an already-running plugin)** → not supported.
-  A Styx host spawns and owns its plugin processes for their whole lifetime.
+  A Styx host spawns and owns its plugin processes for their whole lifetime. Each
+  is spawned into its own process group, so teardown's `SIGKILL` reaches any
+  child processes the plugin itself spawned, not just the plugin's own PID.
 
 ## Error taxonomy
 
@@ -151,16 +170,39 @@ a fresh attempt is safe:
   (retryable).
 - `ErrDeadlineExceeded` / `ErrCanceled` — the call's own deadline elapsed or its
   context was canceled.
-- `ErrBackpressure` — transient admission pushback under load (retryable).
+- `ErrBackpressure` — the shared-memory ring or arena had no room for the send
+  (retryable). See the provisioning note below for what "retryable" costs.
 - A `*Status` — an application-level error your handler returned, with a code and
   message, round-tripped as a typed value.
-- `*PluginPanicError` — a handler panicked; the panicking call sees this directly.
-  `*PluginCrashError` appears only on `host.Events()`, never as a per-call error.
+- `*PluginPanicError` — a handler panicked. A unary caller receives it directly;
+  for a streaming call the panic status is best-effort and connection teardown
+  may win before it is delivered, so a streaming caller usually but not always
+  sees it. `*PluginCrashError` appears only on `host.Events()`, never as a
+  per-call error.
 
 Because "open valve 42" issued twice is not something a framework can know is the
 same physical action, Styx never deduplicates or silently retries on your behalf.
 An application-chosen idempotency key (`DedupKey`, attached via `WithDedupKey`) is
 host-local scaffolding you read back yourself; see its docstring.
+
+### Backpressure and provisioning
+
+`ErrBackpressure` is retryable, but be aware of the provisioning floor on the
+shared-memory transport today. When a send finds the descriptor ring or the
+payload arena full, the writer sets the intent aside; the consumer-to-producer
+"space available" wake is not wired in this version, so the set-aside intent
+resumes only when further lifecycle traffic runs the writer, or at shutdown.
+For a streaming send that bound is the caller's own context — it fails with a
+deadline rather than hanging. A **unary** call's send is deliberately
+detached from the caller's context (so its outcome is always definitive),
+which means a starved unary send can outlive the call's deadline and resolve
+only on later lifecycle traffic or shutdown. Opt into
+`PluginSpec.StrictCapacity` to remove the risk at the source: STRICT
+certification (shm-abi.md §18) requires the inflight budget to fit
+every reachable size class's slab count, so no admitted data call can hit arena
+exhaustion; a geometry that fails STRICT is refused at spawn. Provision the
+geometry for the peak concurrency, or run STRICT, rather than relying on
+backpressure recovery.
 
 ## Streaming
 
@@ -201,10 +243,9 @@ Carried from the list above, in one place:
 - No magic-cookie handshake — version negotiation and optional binary pinning
   instead.
 - No public `Kill()` primitive and no global managed-client registry — a `Host`
-  owns and reaps its own plugins.
-- No process-group-wide kill for a plugin that itself spawns child processes: a
-  plugin that shells out to a helper must reap its own children. Styx tears down
-  the plugin process it spawned, not a process group.
+  owns and reaps its own plugins (teardown SIGKILLs the plugin's whole process
+  group, so a helper remaining in that group is killed too; Styx reaps only
+  the plugin process it spawned).
 - No deduplication or automatic retry — that is the application's decision.
 
 For the rationale and the full contract these choices realize, see
