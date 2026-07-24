@@ -1,4 +1,4 @@
-package baseline
+package benchbaseline
 
 import (
 	"encoding/binary"

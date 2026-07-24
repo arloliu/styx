@@ -41,8 +41,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/arloliu/styx/bench/spike/baseline"
-	"github.com/arloliu/styx/bench/spike/benchresults"
+	"github.com/arloliu/styx/bench/internal/benchbaseline"
 	"github.com/arloliu/styx/internal/event"
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/transport"
@@ -103,7 +102,7 @@ const (
 
 // resultsFilePath is one JSONL file per `go test` process, written under
 // bench/results/ (resolved relative to this package's test cwd, bench/shm).
-// Every cell appends exactly one benchresults.Result row to it.
+// Every cell appends exactly one benchbaseline.Result row to it.
 var resultsFilePath = filepath.Join("..", "results",
 	fmt.Sprintf("shm-results-%s-%d.jsonl", time.Now().UTC().Format("20060102-150405"), os.Getpid()))
 
@@ -657,7 +656,7 @@ func runLatencySuite(
 
 	slices.Sort(latencies)
 	n := len(latencies)
-	res := benchresults.Result{
+	res := benchbaseline.Result{
 		Impl:             impl,
 		PayloadBytes:     payload,
 		Concurrency:      concurrency,
@@ -678,9 +677,9 @@ func runLatencySuite(
 }
 
 // writeRow appends one result row to the results file.
-func writeRow(b *testing.B, res benchresults.Result) {
+func writeRow(b *testing.B, res benchbaseline.Result) {
 	b.Helper()
-	if err := benchresults.WriteJSONL(resultsFilePath, []benchresults.Result{res}); err != nil {
+	if err := benchbaseline.WriteJSONL(resultsFilePath, []benchbaseline.Result{res}); err != nil {
 		b.Fatalf("write result: %v", err)
 	}
 }
@@ -788,11 +787,11 @@ func BenchmarkBaselines(b *testing.B) {
 	regime := currentRegime()
 	verifyRegime(b, regime)
 
-	impls := []baseline.Baseline{
-		baseline.NewDirect(),
-		baseline.NewRawUDS(),
-		baseline.NewNetRPC(),
-		baseline.NewGRPCUDS(),
+	impls := []benchbaseline.Baseline{
+		benchbaseline.NewDirect(),
+		benchbaseline.NewRawUDS(),
+		benchbaseline.NewNetRPC(),
+		benchbaseline.NewGRPCUDS(),
 	}
 	for _, impl := range impls {
 		if err := impl.Start(); err != nil {
@@ -881,7 +880,7 @@ func BenchmarkIdleToActive(b *testing.B) {
 	}
 	slices.Sort(latencies)
 	n := len(latencies)
-	res := benchresults.Result{
+	res := benchbaseline.Result{
 		Impl:                "production-shm-sync",
 		PayloadBytes:        payload,
 		Concurrency:         1,

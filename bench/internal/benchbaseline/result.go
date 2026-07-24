@@ -1,6 +1,6 @@
 // Package benchresults defines the spike benchmark suite's machine-readable
 // output row and JSONL writer.
-package benchresults
+package benchbaseline
 
 import (
 	"bufio"

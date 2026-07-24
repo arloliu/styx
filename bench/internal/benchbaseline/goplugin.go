@@ -1,4 +1,4 @@
-package baseline
+package benchbaseline
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 	goplugin "github.com/hashicorp/go-plugin"
 	"google.golang.org/grpc"
 
-	"github.com/arloliu/styx/bench/spike/baseline/pingpb"
+	"github.com/arloliu/styx/bench/internal/benchbaseline/pingpb"
 )
 
 var handshakeConfig = goplugin.HandshakeConfig{

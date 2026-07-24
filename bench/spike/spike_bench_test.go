@@ -21,9 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arloliu/styx/bench/internal/benchbaseline"
 	"github.com/arloliu/styx/bench/spike/arena"
-	"github.com/arloliu/styx/bench/spike/baseline"
-	"github.com/arloliu/styx/bench/spike/benchresults"
 	"github.com/arloliu/styx/bench/spike/event"
 	"github.com/arloliu/styx/bench/spike/harness"
 	"github.com/arloliu/styx/bench/spike/ring"
@@ -369,7 +368,7 @@ func (c *shmClient) dispatchLoop() {
 var errShmAttemptDropped = errors.New("shm-spike: attempt window elapsed with no response")
 
 // Call submits payload and blocks for its response, implementing the same
-// submit-request -> response-fully-received shape as every baseline.Call
+// submit-request -> response-fully-received shape as every benchbaseline.Call
 // (the binding "timed region identical" rule) despite the mux underneath.
 //
 // cmd/spikeplugin's response path is deliberately best-effort: if its own
@@ -584,7 +583,7 @@ func runLatencySuite(
 		wakeupPerOp = float64(syscallsAfter-syscallsBefore) / float64(len(latencies))
 	}
 
-	res := benchresults.Result{
+	res := benchbaseline.Result{
 		Impl:                implName,
 		PayloadBytes:        payloadBytes,
 		Concurrency:         concurrency,
@@ -599,7 +598,7 @@ func runLatencySuite(
 		Samples:             len(latencies),
 		Timestamp:           time.Now().UTC(),
 	}
-	if err := benchresults.WriteJSONL(resultsPath(), []benchresults.Result{res}); err != nil {
+	if err := benchbaseline.WriteJSONL(resultsPath(), []benchbaseline.Result{res}); err != nil {
 		b.Fatal(err)
 	}
 }
@@ -753,19 +752,19 @@ func BenchmarkBaselines(b *testing.B) {
 	regime := currentRegime()
 	verifyRegime(b, regime)
 	pluginBin := buildGoPluginServerForBench(b)
-	impls := []baseline.Baseline{
-		baseline.NewDirect(),
-		baseline.NewRawUDS(),
-		baseline.NewNetRPC(),
-		baseline.NewGRPCUDS(),
-		baseline.NewGRPCTCP(),
-		baseline.NewGoPlugin(pluginBin),
+	impls := []benchbaseline.Baseline{
+		benchbaseline.NewDirect(),
+		benchbaseline.NewRawUDS(),
+		benchbaseline.NewNetRPC(),
+		benchbaseline.NewGRPCUDS(),
+		benchbaseline.NewGRPCTCP(),
+		benchbaseline.NewGoPlugin(pluginBin),
 	}
 	for _, impl := range impls {
 		if err := impl.Start(); err != nil {
 			b.Fatal(err)
 		}
-		defer func(i baseline.Baseline) { _ = i.Stop() }(impl) //nolint:revive // intentional: every baseline must stay running until this function returns
+		defer func(i benchbaseline.Baseline) { _ = i.Stop() }(impl) //nolint:revive // intentional: every baseline must stay running until this function returns
 	}
 
 	for _, payloadBytes := range payloadSizes {
@@ -785,7 +784,7 @@ func buildGoPluginServerForBench(b *testing.B) string {
 	dir := b.TempDir()
 	out := filepath.Join(dir, "goplugin-ping-server")
 	cmd := exec.Command("go", "build", "-o", out,
-		"github.com/arloliu/styx/bench/spike/baseline/cmd/goplugin-ping-server")
+		"github.com/arloliu/styx/bench/internal/benchbaseline/cmd/goplugin-ping-server")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -847,7 +846,7 @@ func BenchmarkSpikeIdleToActive(b *testing.B) {
 	if len(latencies) > 0 {
 		wakeupPerOp = float64(syscallsAfter-syscallsBefore) / float64(len(latencies))
 	}
-	res := benchresults.Result{
+	res := benchbaseline.Result{
 		Impl:                "shm-spike",
 		PayloadBytes:        64,
 		Concurrency:         1,
@@ -860,7 +859,7 @@ func BenchmarkSpikeIdleToActive(b *testing.B) {
 		Samples:             len(latencies),
 		Timestamp:           time.Now().UTC(),
 	}
-	if err := benchresults.WriteJSONL(resultsPath(), []benchresults.Result{res}); err != nil {
+	if err := benchbaseline.WriteJSONL(resultsPath(), []benchbaseline.Result{res}); err != nil {
 		b.Fatal(err)
 	}
 }

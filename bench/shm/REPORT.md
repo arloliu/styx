@@ -125,7 +125,7 @@ spike on the mechanism that mattered," not as a two-variable diff.
 × concurrency ∈ {1, 8, 64, 512} × regime ∈ {default, gomaxprocs1, cgroup2cpu, gc-churn,
 idle-wake}, plus a synchronous-path cell at concurrency 1 per payload, plus the
 production `uds.Transport` (through the identical driver) and the
-direct/raw-uds/net-rpc/gRPC-UDS baselines (reused verbatim from `bench/spike/baseline`).
+direct/raw-uds/net-rpc/gRPC-UDS baselines (reused verbatim from `bench/internal/benchbaseline`).
 Benchtimes follow the gate methodology:
 
 - **Small payloads (64 B, 4096 B):** `-benchtime 10000x -count 3` — 10 000 batches per

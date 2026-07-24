@@ -1,4 +1,4 @@
-package baseline
+package benchbaseline
 
 // Baseline is the common shape every benchmark comparison point implements:
 // an echo round-trip over payload bytes, plus explicit start/stop so the

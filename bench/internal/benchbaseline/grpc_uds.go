@@ -1,4 +1,4 @@
-package baseline
+package benchbaseline
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/arloliu/styx/bench/spike/baseline/pingpb"
+	"github.com/arloliu/styx/bench/internal/benchbaseline/pingpb"
 )
 
 type pingServer struct {

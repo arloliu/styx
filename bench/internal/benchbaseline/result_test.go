@@ -1,4 +1,4 @@
-package benchresults_test
+package benchbaseline_test
 
 import (
 	"bufio"
@@ -10,11 +10,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/arloliu/styx/bench/spike/benchresults"
+	"github.com/arloliu/styx/bench/internal/benchbaseline"
 )
 
-func sampleResult(impl string) benchresults.Result {
-	return benchresults.Result{
+func sampleResult(impl string) benchbaseline.Result {
+	return benchbaseline.Result{
 		Impl:                impl,
 		PayloadBytes:        64,
 		Concurrency:         8,
@@ -32,16 +32,16 @@ func sampleResult(impl string) benchresults.Result {
 }
 
 // readLines parses path as newline-delimited JSON Results, in file order.
-func readLines(t *testing.T, path string) []benchresults.Result {
+func readLines(t *testing.T, path string) []benchbaseline.Result {
 	t.Helper()
 	f, err := os.Open(path)
 	require.NoError(t, err)
 	defer func() { _ = f.Close() }()
 
-	var out []benchresults.Result
+	var out []benchbaseline.Result
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		var r benchresults.Result
+		var r benchbaseline.Result
 		require.NoError(t, json.Unmarshal(sc.Bytes(), &r))
 		out = append(out, r)
 	}
@@ -56,10 +56,10 @@ func TestWriteJSONL_CreatesDirAndFile_OneObjectPerLine(t *testing.T) {
 	// Given
 	dir := filepath.Join(t.TempDir(), "nested", "results")
 	path := filepath.Join(dir, "out.jsonl")
-	results := []benchresults.Result{sampleResult("shm-spike"), sampleResult("grpc-uds")}
+	results := []benchbaseline.Result{sampleResult("shm-spike"), sampleResult("grpc-uds")}
 
 	// When
-	require.NoError(t, benchresults.WriteJSONL(path, results))
+	require.NoError(t, benchbaseline.WriteJSONL(path, results))
 
 	// Then
 	got := readLines(t, path)
@@ -72,10 +72,10 @@ func TestWriteJSONL_CreatesDirAndFile_OneObjectPerLine(t *testing.T) {
 func TestWriteJSONL_AppendsAcrossCalls_DoesNotTruncate(t *testing.T) {
 	// Given
 	path := filepath.Join(t.TempDir(), "out.jsonl")
-	require.NoError(t, benchresults.WriteJSONL(path, []benchresults.Result{sampleResult("direct")}))
+	require.NoError(t, benchbaseline.WriteJSONL(path, []benchbaseline.Result{sampleResult("direct")}))
 
 	// When
-	require.NoError(t, benchresults.WriteJSONL(path, []benchresults.Result{sampleResult("raw-uds")}))
+	require.NoError(t, benchbaseline.WriteJSONL(path, []benchbaseline.Result{sampleResult("raw-uds")}))
 
 	// Then
 	got := readLines(t, path)
@@ -89,7 +89,7 @@ func TestWriteJSONL_AppendsAcrossCalls_DoesNotTruncate(t *testing.T) {
 func TestWriteJSONL_FieldNames_MatchBriefSchema(t *testing.T) {
 	// Given
 	path := filepath.Join(t.TempDir(), "out.jsonl")
-	require.NoError(t, benchresults.WriteJSONL(path, []benchresults.Result{sampleResult("shm-spike")}))
+	require.NoError(t, benchbaseline.WriteJSONL(path, []benchbaseline.Result{sampleResult("shm-spike")}))
 
 	// When
 	data, err := os.ReadFile(path)

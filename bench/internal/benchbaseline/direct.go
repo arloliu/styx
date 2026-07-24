@@ -1,4 +1,4 @@
-package baseline
+package benchbaseline
 
 // DirectBaseline is the speed-of-light reference: an ordinary function
 // call, no IPC of any kind.

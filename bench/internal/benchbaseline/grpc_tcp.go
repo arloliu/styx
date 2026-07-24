@@ -1,4 +1,4 @@
-package baseline
+package benchbaseline
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/arloliu/styx/bench/spike/baseline/pingpb"
+	"github.com/arloliu/styx/bench/internal/benchbaseline/pingpb"
 )
 
 // GRPCTCPBaseline runs the Ping gRPC service over TCP loopback (127.0.0.1).
