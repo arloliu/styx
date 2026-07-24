@@ -20,9 +20,12 @@ import (
 // and internal/supervisor/supervisor_test.go's own build-once-per-package
 // fixture pattern) rather than per test.
 var (
-	echoPluginBin   string
-	echoHostBin     string
-	crashyPluginBin string
+	echoPluginBin      string
+	echoHostBin        string
+	crashyPluginBin    string
+	streamingHostBin   string
+	hotReloadPluginBin string
+	hotReloadHostBin   string
 )
 
 // TestMain builds examples/echo's plugin, host, and crashy-plugin binaries
@@ -42,6 +45,15 @@ func TestMain(m *testing.M) {
 
 	crashyPluginBin = filepath.Join(dir, "echo-crashy-plugin")
 	buildOrPanic(crashyPluginBin, "../../examples/echo/plugin/crashy")
+
+	streamingHostBin = filepath.Join(dir, "streaming-host")
+	buildOrPanic(streamingHostBin, "../../examples/streaming/host")
+
+	hotReloadPluginBin = filepath.Join(dir, "hot-reload-plugin")
+	buildOrPanic(hotReloadPluginBin, "../../examples/hot-reload/plugin")
+
+	hotReloadHostBin = filepath.Join(dir, "hot-reload-host")
+	buildOrPanic(hotReloadHostBin, "../../examples/hot-reload/host")
 
 	m.Run()
 	_ = os.RemoveAll(dir)

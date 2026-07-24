@@ -9,7 +9,9 @@ import "context"
 // context — or setting the same key on a re-issued call — carries the key across
 // those calls, but Styx mints no retries or attempts of its own around it. It is
 // NOT transported to the plugin — the data-plane frame carries no per-call
-// metadata field — so a plugin handler cannot observe it today.
+// metadata field — so a plugin handler cannot observe it today. Whether a future
+// data-plane wire carrier will deliver the key to plugin handlers end to end is a
+// design decision still pending; until it is settled the key stays host-local.
 //
 // Styx does NOT deduplicate. It never inspects, compares, or acts on a DedupKey.
 // Deduplication — deciding that two attempts are the same operation and

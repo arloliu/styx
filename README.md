@@ -50,7 +50,7 @@ func (echoServer) Say(ctx context.Context, req *echopb.SayRequest) (*echopb.SayR
 }
 
 func main() {
-	srv := styx.NewPluginServer()
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	echopb.RegisterEchoServer(srv, echoServer{})
 	if err := srv.Serve(); err != nil {
 		os.Exit(1)
@@ -117,14 +117,33 @@ func main() {
 }
 ```
 
+More runnable examples are under [`examples/`](examples/): host-side streaming
+of all three shapes ([`examples/streaming/`](examples/streaming/)) and a
+state-preserving hot-reload ([`examples/hot-reload/`](examples/hot-reload/)).
+Coming from `hashicorp/go-plugin`? See
+[docs/migration-from-go-plugin.md](docs/migration-from-go-plugin.md).
+
 ## Status
 
-**Complete:** Full framework on UDS transport. Handshake with version negotiation, supervised lifecycle management with restart policy, crash detection, comprehensive error taxonomy.
+The framework is complete on both data-plane transports:
 
-**Earlier spike:** Validated the shared-memory performance premise. See [docs/plans/2026-07-16-m0-gate-report.md](docs/plans/2026-07-16-m0-gate-report.md).
+- **Transports.** Shared memory (memfd rings + payload arena + eventfd wakeups)
+  and Unix domain sockets. Each plugin selects its transport on `PluginSpec`:
+  the default offers shared memory, preferred, and falls back to UDS only when a
+  plugin does not offer shared memory — never a silent downgrade when shared
+  memory is pinned.
+- **RPC.** Unary and streaming (server-, client-, and bidirectional streaming),
+  with version-negotiated handshake, deadline and cancellation propagation, and
+  a comprehensive, retryability-classified error taxonomy.
+- **Lifecycle.** Supervised plugins with a restart policy, crash detection, a
+  progress-based heartbeat, and hot-reload that hands a plugin's sealed,
+  verified state to a freshly spawned successor without dropping accepted calls
+  or restarting supervision.
 
-**Next:** SHM transport implementation (memfd rings + arena + eventfd wakeups).
-
-**Planned:** Streaming RPC.
+The shared-memory data plane is validated by a differential test suite against
+the UDS oracle, a fault-injection (chaos) suite, and a long-running leak soak.
+Its performance is measured in [bench/shm/REPORT.md](bench/shm/REPORT.md); the
+earlier prototype that first validated the premise is in
+[docs/plans/2026-07-16-m0-gate-report.md](docs/plans/2026-07-16-m0-gate-report.md).
 
 For the full design, see [docs/specs/2026-07-16-styx-design.md](docs/specs/2026-07-16-styx-design.md).
