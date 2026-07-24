@@ -246,8 +246,12 @@ func (s *PluginServer) PluginAttachSHMForTest(ctx context.Context, conn *control
 // duplicate response is delivered for a completed call, which the caller-visible result
 // alone cannot reveal. Test-only; nil in production.
 func SetDuplicateUnaryResponseHookForTest(f func(callID uint64)) func() {
-	prev := duplicateUnaryResponseHook
-	duplicateUnaryResponseHook = f
+	prev := duplicateUnaryResponseHook.Load()
+	if f == nil {
+		duplicateUnaryResponseHook.Store(nil)
+	} else {
+		duplicateUnaryResponseHook.Store(&f)
+	}
 
-	return func() { duplicateUnaryResponseHook = prev }
+	return func() { duplicateUnaryResponseHook.Store(prev) }
 }

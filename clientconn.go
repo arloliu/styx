@@ -403,17 +403,18 @@ func isFrameLocalRecvErr(err error) bool {
 		errors.Is(err, transport.ErrUnimplementedFrameKind)
 }
 
-// duplicateUnaryResponseHook, when non-nil, is invoked with a CallID whose unary
-// response (or error) arrived after the call was already terminal — a late or DUPLICATE
-// delivery the Table discards silently. It is a TEST SEAM: nil in production (one
-// predictable nil check on the cold late-frame path, never on the healthy call path),
-// so a test can assert no trailing duplicate response is delivered for a completed call
-// (a misdelivered second copy the caller-visible result could never reveal).
-var duplicateUnaryResponseHook func(callID uint64)
+// duplicateUnaryResponseHook, when set, is invoked with a CallID whose unary response
+// (or error) arrived after the call was already terminal — a late or DUPLICATE delivery
+// the Table discards silently. It is a TEST SEAM: unset in production (one atomic load
+// on the cold late-frame path, never on the healthy call path), so a test can assert no
+// trailing duplicate response is delivered for a completed call (a misdelivered second
+// copy the caller-visible result could never reveal). It is an atomic.Pointer so the
+// reader goroutine's load never races a test's install/restore.
+var duplicateUnaryResponseHook atomic.Pointer[func(callID uint64)]
 
 func notifyDiscardedUnaryResponse(callID uint64) {
-	if duplicateUnaryResponseHook != nil {
-		duplicateUnaryResponseHook(callID)
+	if f := duplicateUnaryResponseHook.Load(); f != nil {
+		(*f)(callID)
 	}
 }
 

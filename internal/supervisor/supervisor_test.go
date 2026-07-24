@@ -1211,24 +1211,26 @@ func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
 
 	ev := awaitUnhealthy(t, ch)
 	require.Equal(t, supervisor.EventUnhealthy, ev.Kind)
-	require.ErrorContains(t, ev.Err, "missed",
-		"the wedge must be declared unhealthy for MISSED heartbeats, not another cause: %v", ev.Err)
-	require.ErrorContains(t, ev.Err, "consecutive heartbeats",
-		"the cause must be the missed-heartbeat threshold: %v", ev.Err)
 
-	// Prove the CONFIGURED bound, not merely that some Unhealthy arrived. Each miss is a
-	// full HeartbeatInterval receive wait that no heartbeat cuts short (the peer is
-	// frozen), so the window from the last received beat to Unhealthy is at least
-	// MissedHeartbeats x HeartbeatInterval = 300ms. The lower bound (250ms) catches an
-	// over-eager declaration after fewer than three misses (two misses fire near 200ms);
-	// the upper bound (700ms) catches a regression to substantially more misses (seven
-	// would take 700ms) while leaving generous -race scheduling headroom over the 300ms
-	// nominal.
+	// Prove the EXACT configured threshold. The production error records the miss count
+	// that tripped it, and it fires the instant that count reaches MissedHeartbeats, so
+	// the recorded count is exactly 3 — a regression to any other threshold changes this
+	// string. This is the authoritative regression check.
+	require.ErrorContains(t, ev.Err, "missed 3 consecutive heartbeats",
+		"unhealthy must be declared at exactly the configured 3-miss threshold, not another count or cause: %v",
+		ev.Err)
+
+	// Corroborate with timing: each miss is a full HeartbeatInterval receive wait no
+	// heartbeat cuts short (the peer is frozen), so the window from the last received
+	// beat to Unhealthy is at least MissedHeartbeats x HeartbeatInterval = 300ms. The
+	// 250ms floor catches an over-eager declaration before three misses could elapse; the
+	// 700ms ceiling is only a coarse hang guard, since the exact-count assertion above
+	// already carries the threshold-regression sensitivity.
 	missWindow := ev.Time.Sub(time.Unix(0, lastBeat.Load()))
 	require.GreaterOrEqual(t, missWindow, 250*time.Millisecond,
 		"declared unhealthy too early for a 3-miss threshold: %v", missWindow)
 	require.LessOrEqual(t, missWindow, 700*time.Millisecond,
-		"declared unhealthy far later than a 3-miss threshold — a regression to more misses: %v", missWindow)
+		"declared unhealthy far later than a 3-miss threshold: %v", missWindow)
 
 	// Continue the frozen child so the supervisor's teardown reaps it promptly, then
 	// disarm the backstop (the child is reaped by boundedStop; SIGCONT is idempotent).

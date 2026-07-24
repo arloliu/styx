@@ -516,10 +516,13 @@ func hostParsePIDTag(response string) (pid int, body string, ok bool) {
 func TestHost_ShmCrashRestart_NoMisdeliveryNoDuplicate(t *testing.T) {
 	// Given: a host pinned to shm, a PID-tagged crashy echo plugin with a restart
 	// budget, and a hook counting any unary response the runtime discards as a
-	// late/duplicate delivery.
+	// late/duplicate delivery. The hook is restored only after the host is stopped and
+	// its receive loop joined (below), so a trailing duplicate cannot slip past
+	// restoration; the seam itself is atomic, so the reader's load never races it.
 	var discarded atomic.Int64
-	restore := styx.SetDuplicateUnaryResponseHookForTest(func(uint64) { discarded.Add(1) })
-	defer restore()
+	hook := func(uint64) { discarded.Add(1) }
+	restore := styx.SetDuplicateUnaryResponseHookForTest(hook)
+	t.Cleanup(restore) // registered first -> runs LAST, after the host-stop cleanup joins the loop
 
 	h := styx.NewHost(styx.HostConfig{
 		Plugins: []styx.PluginSpec{{
@@ -532,16 +535,21 @@ func TestHost_ShmCrashRestart_NoMisdeliveryNoDuplicate(t *testing.T) {
 		}},
 	})
 	require.NoError(t, h.Start(t.Context()))
-	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	t.Cleanup(func() { _ = h.Stop(context.Background()) }) // registered second -> runs FIRST (join)
 	client := echopb.NewEchoClient(h.Plugin("echo"))
 
-	// say sends one call under its OWN short deadline, so a wedged call returns to the
-	// retry loop rather than hanging, and rejects any misdelivered/malformed response.
+	// say sends one call under its OWN short deadline. A post-restart call is expected
+	// prompt, so a deadline is a defect, not a benign miss: fail on it. That keeps the
+	// late-vs-duplicate argument honest — no attempt is left timed-out with a response
+	// that could arrive later and trip the hook — so every hook fire is a true duplicate.
 	say := func(msg string) (int, error) {
 		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 		defer cancel()
 		resp, err := client.Say(ctx, &echopb.SayRequest{Message: msg})
 		if err != nil {
+			require.NotErrorIs(t, err, styx.ErrDeadlineExceeded,
+				"a call timed out — a wedged attempt could leave a late response the oracle would miscount")
+
 			return 0, err
 		}
 		pid, body, ok := hostParsePIDTag(resp.GetMessage())
@@ -570,10 +578,6 @@ func TestHost_ShmCrashRestart_NoMisdeliveryNoDuplicate(t *testing.T) {
 
 		break
 	}
-
-	// Then: the restart answered a unique request correctly from a live process (the old
-	// one is dead, so a success is necessarily a fresh generation), and NO duplicate or
-	// late response was ever delivered for a completed call.
 	require.NotZero(t, gen1PID, "the host did not transparently restart the crashed shm plugin in time")
 	if gen1PID == gen0PID {
 		// PID reuse is possible: the crashed process is reaped before the restart, so the
@@ -583,6 +587,14 @@ func TestHost_ShmCrashRestart_NoMisdeliveryNoDuplicate(t *testing.T) {
 		t.Logf("plugin PID %d was reused across the restart; the successful post-crash call still proves recovery",
 			gen0PID)
 	}
+
+	// Then: stop the host and JOIN its receive loop, so any trailing duplicate the reader
+	// would process after the caller woke has been observed, and only then assert no
+	// duplicate or late response was ever delivered for a completed call.
+	sctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	require.NoError(t, h.Stop(sctx))
+	cancel()
+	restore() // safe now: the receive loop is joined, no further hook fires
 	require.Zero(t, discarded.Load(),
 		"a duplicate or late unary response was delivered across the crash-restart (misdelivery)")
 }

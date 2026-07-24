@@ -38,10 +38,11 @@
 //
 // Above the deterministic matrix, two seeded layers add breadth. A single-fault
 // layer SIGKILLs at a randomly chosen window each iteration. A multi-fault layer
-// composes 2+ data-plane window faults per seeded run — a chain of heterogeneous
-// crash/poison sessions against the one persistent host — and asserts the host's fd
-// count returns exactly to baseline across the whole composition, the no-accumulation
-// interaction a single fault cannot reach. Both log their seed (and the multi-fault
+// composes 2+ DISTINCT data-plane window faults per seeded run — a chain of
+// independent sessions drawn from the crash windows and the corruption fault, so a
+// composition may be all crashes or mix in the corruption — against the one persistent
+// host, and asserts the host's fd count returns exactly to baseline across the whole
+// composition, the no-accumulation interaction a single fault cannot reach. Both log their seed (and the multi-fault
 // layer its full composition) so any failing run is replayable; the same seed always
 // reproduces the same sequence. Setting STYX_CHAOS_SOAK to any non-empty value opts
 // into a longer budget (more runs, longer compositions) for a local soak; unset — the
@@ -67,15 +68,17 @@
 //     asserts only that the host's in-flight call is bounded by its own context — the
 //     transport-level guarantee, complementary to the supervisor-level classification.
 //   - fd-transfer / ready-ack attach crash windows on the control-plane attach path: a
-//     plugin dies at each plugin-side pluginAttachSHM step (recv-fds, the two eventfd
-//     wraps, attach, ack-send) before it sends AttachRegionAck, and the supervisor
-//     classifies the death as a typed spawn/attach failure with the host's fd and
-//     region-mapping counts back at baseline and no poisoned residue for the next spawn
-//     (internal/supervisor's attach-crash-window matrix, driven by the -tags failpoint
-//     crash-attach fixture through STYX_CRASH_AT_ATTACH_STEP). The host-side pre-send
-//     steps (region create, the two eventfd creates) run before any fd is transferred,
-//     so no transferred fd is child-owned yet (the child is spawned, but has received
-//     nothing); their
+//     plugin dies at each plugin-side pluginAttachSHM step. The five PRE-ack steps
+//     (recv-fds, the two eventfd wraps, attach, ack-send) die before AttachRegionAck
+//     reaches the host, which classifies each as a typed spawn/attach failure; the sixth,
+//     POST-ack, dies just after the ack, so the host receives it, reaches Ready, and only
+//     then classifies a crashed Ready instance. Either way the host's fd and
+//     region-mapping counts return to baseline with no poisoned residue for the next
+//     spawn (internal/supervisor's attach-crash-window matrix plus its post-ack test,
+//     driven by the -tags failpoint crash-attach fixture through
+//     STYX_CRASH_AT_ATTACH_STEP). The host-side pre-send steps (region create, the two
+//     eventfd creates) run before any fd is transferred, so no transferred fd is
+//     child-owned yet (the child is spawned, but has received nothing); their
 //     partial-cleanup stays covered by the data plane's error-injection unit table.
 //
 // Two further boundaries stand on their own:
