@@ -45,6 +45,14 @@ const (
 // watcher, publication, handler-termination, teardown emission) are deliberately NOT
 // promoted through this handle.
 //
+// The doc comments in this file use a few recurring stream-protocol terms: STREAM_OPEN,
+// STREAM_MSG, and STREAM_CLOSE are the wire frame kinds a stream sends as it opens,
+// carries a message, and half-closes; "credit" is a per-direction limit on how many
+// unacknowledged messages one side may have in flight before it must wait for the peer
+// to acknowledge more; and a stream is "half-closed" in a direction once that direction
+// has sent its STREAM_CLOSE (or, for server-streaming, at establishment) while the other
+// direction may still be live. See docs/specs/stream-protocol.md for the full protocol.
+//
 // The wrapper also closes stream-protocol.md §7.4's local-abort gap the raw byte
 // methods leave open: on the OPENER side a caller-context cancellation the runtime
 // surfaces without terminating (a pre-admission or credit-blocked cancel), and a local

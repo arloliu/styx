@@ -54,9 +54,11 @@ const (
 
 // GeometryDefault returns the frozen ABI's recommended default profile
 // (shm-abi.md §1): ring capacity 4096, lifecycle reserve 256, and per-direction
-// size classes {64 B ×4096, 4 KiB ×1024, 1 MiB ×26} — at most 64 MiB total. It
-// suits a general workload; a memory-constrained deployment should prefer
-// GeometryLean or an explicit geometry sized to its peak concurrency.
+// size classes {64 B ×4096, 4 KiB ×1024, 1 MiB ×26} — at most 64 MiB total.
+//
+// It suits a general workload; a memory-constrained deployment should prefer
+// GeometryLean or an explicit geometry sized to its peak concurrency. See
+// docs/configuration.md for what these numbers mean in practice.
 func GeometryDefault() ShmGeometry {
 	classes := []ShmSizeClass{
 		{SlabSize: 64, SlabCount: 4096},
@@ -75,8 +77,11 @@ func GeometryDefault() ShmGeometry {
 // GeometryLean returns the lean device-gateway profile recorded in
 // bench/shm/REPORT.md: ring capacity 512, lifecycle reserve 32, and per-direction
 // size classes {512 B ×64, 4096 B ×64} — a region of roughly 0.6 MiB sized to a
-// 32-concurrent-call peak. Scale the class counts and C−R to the peak concurrent
-// in-flight calls, plus headroom.
+// 32-concurrent-call peak.
+//
+// Scale the class counts and RingCapacity minus LifecycleReserve to the peak
+// concurrent in-flight calls, plus headroom, for a workload with a different
+// peak. See docs/configuration.md.
 func GeometryLean() ShmGeometry {
 	classes := []ShmSizeClass{
 		{SlabSize: 512, SlabCount: 64},

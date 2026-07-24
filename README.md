@@ -123,17 +123,33 @@ state-preserving hot-reload ([`examples/hot-reload/`](examples/hot-reload/)).
 Coming from `hashicorp/go-plugin`? See
 [docs/migration-from-go-plugin.md](docs/migration-from-go-plugin.md).
 
+## Configuration
+
+The Quickstart above leaves every `PluginSpec` and `PluginServerConfig` field at
+its default. Real deployments usually set at least one of: `Transport` (which
+data-plane transport to negotiate — shared memory, Unix domain sockets, or let
+the host pick), `Geometry` (the shape and capacity of the shared-memory
+region), `Restart` (the crash-restart policy), or `Services` (the version
+range a host requires from a plugin).
+
+See [docs/configuration.md](docs/configuration.md) for the full field-by-field
+guide, including a plain-language walkthrough of shared-memory geometry (ring
+capacity, lifecycle reserve, size classes) for readers who don't already know
+those terms.
+
 ## Status
 
 The framework is complete on both data-plane transports:
 
 - **Transports.** Shared memory (memfd rings + payload arena + eventfd wakeups)
-  and Unix domain sockets. Each plugin selects its transport on `PluginSpec`:
-  the default offers shared memory, preferred, and falls back to UDS only when a
-  plugin does not offer shared memory — never a silent downgrade when shared
-  memory is pinned. At a 64-byte payload with one in-flight call, the measured
-  round-trip p50 is 2.11 µs on shared memory versus 8.15 µs on UDS
-  ([bench/shm/REPORT.md](bench/shm/REPORT.md)).
+  and Unix domain sockets. Each plugin selects its transport via
+  `PluginSpec.Transport`: `TransportAuto` (the default) offers shared memory,
+  preferred, and falls back to UDS only when a plugin does not offer shared
+  memory; `TransportSHM` pins shared memory with never a silent downgrade.
+  At a 64-byte payload with one in-flight call, the measured round-trip p50 is
+  2.11 µs on shared memory versus 8.15 µs on UDS
+  ([bench/shm/REPORT.md](bench/shm/REPORT.md)). See
+  [docs/configuration.md](docs/configuration.md) for the full set of values.
 - **RPC.** Unary and streaming (server-, client-, and bidirectional streaming),
   with version-negotiated handshake, deadline and cancellation propagation, and
   a comprehensive, retryability-classified error taxonomy. Under load, a
@@ -141,7 +157,9 @@ The framework is complete on both data-plane transports:
   deadline-bounded for streaming sends, while a starved unary send can outlive
   its call deadline (see the migration guide's provisioning section);
   provisioning the geometry for peak concurrency (or opting into
-  `StrictCapacity`) avoids it.
+  `StrictCapacity`) avoids it — see
+  [docs/configuration.md](docs/configuration.md#shared-memory-geometry) for how
+  to size a geometry.
 - **Lifecycle.** Supervised plugins with a restart policy, crash detection, a
   progress-based heartbeat, and hot-reload that hands a plugin's sealed,
   verified state to a freshly spawned successor without dropping accepted calls
