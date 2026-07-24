@@ -38,6 +38,15 @@ func soakDuration() time.Duration {
 	return defaultDuration
 }
 
+// transportSHM and transportUDS name the two data-plane transports the soak
+// drives. They double as PluginSpec.Transport values and as the classifier's
+// transport argument, so a poisoned outcome can be accepted on uds but rejected
+// on shm.
+const (
+	transportSHM = "shm"
+	transportUDS = "uds"
+)
+
 // ledgerShards splits the pending-call table so submit/resolve on 6M calls over
 // 60s never serialize on one lock. Only in-flight ids are held (resolve deletes),
 // so the tables stay tiny regardless of total call volume.
@@ -57,10 +66,12 @@ type ledgerShard struct {
 // The buckets match this echo-mode workload's contract, not the whole styx error
 // surface: a completion is a nil error; a cancellation is the caller's own
 // ErrCanceled; an accepted failure is one of the typed outcomes a kill, a reload
-// cutoff, backpressure, or a stream deadline legitimately produces. Anything else
-// — an application Status, a raw crash or panic error (which never appear per
-// call), a stream EOF (block mode never ends a stream cleanly), or an unknown
-// error — is outside the contract and counts as unexpected.
+// cutoff, backpressure, or a stream deadline legitimately produces — including an
+// application *Status when a block-mode handler returns its context error, and a
+// transport-scoped ErrPoisoned (uds only; see isAcceptedFailure). Anything else —
+// a raw crash or panic error (which never appear per call), a stream EOF (block
+// mode never ends a stream cleanly), or an unknown error — is outside the contract
+// and counts as unexpected.
 type ledger struct {
 	nextID atomic.Uint64
 	shards [ledgerShards]ledgerShard
@@ -97,10 +108,12 @@ func (l *ledger) submit() uint64 {
 	return id
 }
 
-// resolve retires id into one terminal bucket. An id that is not currently
-// pending — already resolved, or never issued — is a double-resolve and is
-// counted as a defect instead of being classified.
-func (l *ledger) resolve(id uint64, err error) {
+// resolve retires id into one terminal bucket. transport is the call's data-plane
+// (transportSHM or transportUDS), which the classifier needs because a poisoned
+// outcome is contract-legal on uds but a conformance defect on shm. An id that is
+// not currently pending — already resolved, or never issued — is a double-resolve
+// and is counted as a defect instead of being classified.
+func (l *ledger) resolve(id uint64, transport string, err error) {
 	sh := &l.shards[id%ledgerShards]
 	sh.mu.Lock()
 	_, pending := sh.pending[id]
@@ -117,7 +130,7 @@ func (l *ledger) resolve(id uint64, err error) {
 		l.completed.Add(1)
 	case isCanceled(err):
 		l.canceled.Add(1)
-	case isAcceptedFailure(err):
+	case isAcceptedFailure(transport, err):
 		l.failedTyped.Add(1)
 		if errors.Is(err, styx.ErrOutcomeUnknown) {
 			l.outcomeUnknown.Add(1)
@@ -172,15 +185,23 @@ func isCanceled(err error) bool {
 }
 
 // isAcceptedFailure reports whether err is one of the documented data-plane
-// failures this workload's faults legitimately produce: an instance killed
-// mid-flight (ErrPluginUnavailable before publish, ErrOutcomeUnknown after; and
-// ErrPoisoned when the killed peer left a half-written descriptor the host
-// rejects as a conformance fault, or ErrStreamAlreadyClosed when a stream open
-// races that crash), a reload cutoff refusing a new call (ErrDrained), transient
-// backpressure under load (ErrBackpressure), or a streaming call reaching its own
-// deadline — surfacing either as ErrDeadlineExceeded client-side, or as an
-// application *Status when the block-mode handler returns its context error first
-// and the framework maps that returned error to a status.
+// failures this workload's faults legitimately produce on the given transport: an
+// instance killed mid-flight (ErrPluginUnavailable before publish,
+// ErrOutcomeUnknown after), a reload cutoff refusing a new call (ErrDrained),
+// transient backpressure under load (ErrBackpressure), or a streaming call
+// reaching its own deadline — surfacing either as ErrDeadlineExceeded
+// client-side, or as an application *Status when the block-mode handler returns
+// its context error first and the framework maps that returned error to a status.
+//
+// ErrPoisoned is accepted only on uds: a uds STREAM_OPEN torn mid-write can leave
+// a partial descriptor the host rejects and poisons. On shm the producer publishes
+// the complete descriptor before the tail store and consumers read only after
+// observing that store, so a poisoned shm outcome is a conformance defect that must
+// surface as unexpected, never be accepted. ErrStreamAlreadyClosed is not accepted
+// on either transport: it means a stream completed normally before its opener
+// returned, which the block-mode fixture (send once, then wait for context
+// termination) never does — a crash instead records a concrete outcome — so it
+// would mask a stream-lifecycle defect.
 //
 // The control-plane and routing sentinels (ErrServiceNotFound, ErrMethodNotFound,
 // ErrIncompatible) are excluded: the workload only ever calls a valid method on a
@@ -188,17 +209,17 @@ func isCanceled(err error) bool {
 // or PluginPanicError is also excluded — errors.go documents PluginCrashError as
 // event-only, and this echo workload never panics — so either would surface as
 // unexpected.
-func isAcceptedFailure(err error) bool {
+func isAcceptedFailure(transport string, err error) bool {
 	switch {
 	case errors.Is(err, styx.ErrPluginUnavailable),
 		errors.Is(err, styx.ErrOutcomeUnknown),
 		errors.Is(err, styx.ErrDrained),
 		errors.Is(err, styx.ErrBackpressure),
-		errors.Is(err, styx.ErrPoisoned),
-		errors.Is(err, styx.ErrStreamAlreadyClosed),
 		errors.Is(err, styx.ErrDeadlineExceeded),
 		errors.Is(err, context.DeadlineExceeded):
 		return true
+	case errors.Is(err, styx.ErrPoisoned):
+		return transport == transportUDS
 	}
 
 	var status *styx.Status
@@ -460,7 +481,7 @@ func (w *worker) unaryLoop(ctx context.Context, stop <-chan struct{}) {
 		callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		id := w.led.submit()
 		resp, err := w.client.Say(callCtx, &echopb.SayRequest{Message: "unary"})
-		w.led.resolve(id, err)
+		w.led.resolve(id, w.name, err)
 		if err == nil {
 			if pid, ok := parsePIDTag(resp.GetMessage()); ok {
 				w.pids.add(pid)
@@ -485,12 +506,12 @@ func (w *worker) streamCancelLoop(ctx context.Context, stop <-chan struct{}) {
 		id := w.led.submit()
 		st, err := w.stream.Feed(callCtx, &echopb.SayRequest{Message: "stream"})
 		if err != nil {
-			w.led.resolve(id, err)
+			w.led.resolve(id, w.name, err)
 			cancel()
 
 			continue
 		}
-		w.led.resolve(id, drainStream(st, cancel))
+		w.led.resolve(id, w.name, drainStream(st, cancel))
 		cancel()
 	}
 }
@@ -510,12 +531,12 @@ func (w *worker) streamDeadlineLoop(ctx context.Context, stop <-chan struct{}) {
 		id := w.led.submit()
 		st, err := w.stream.Feed(callCtx, &echopb.SayRequest{Message: "stream"})
 		if err != nil {
-			w.led.resolve(id, err)
+			w.led.resolve(id, w.name, err)
 			cancel()
 
 			continue
 		}
-		w.led.resolve(id, drainStream(st, nil))
+		w.led.resolve(id, w.name, drainStream(st, nil))
 		cancel()
 	}
 }
@@ -639,7 +660,7 @@ func TestSoak(t *testing.T) {
 
 	// A throwaway start/stop first, so any one-time lazy initialization is already
 	// counted in the baselines below rather than looking like a leak afterward.
-	warm := newWorker(t, "shm", newLedger())
+	warm := newWorker(t, transportSHM, newLedger())
 	warm.stop(t)
 
 	baselineFD := testutil.CountOpenFDs(t)
@@ -648,8 +669,8 @@ func TestSoak(t *testing.T) {
 
 	led := newLedger()
 	workers := []*worker{
-		newWorker(t, "shm", led),
-		newWorker(t, "uds", led),
+		newWorker(t, transportSHM, led),
+		newWorker(t, transportUDS, led),
 	}
 
 	stop := make(chan struct{})
@@ -723,7 +744,7 @@ func TestSoak(t *testing.T) {
 func TestReloadDrainUnderLoad(t *testing.T) {
 	drainDuration := min(max(soakDuration()/8, 4*time.Second), 15*time.Second)
 
-	for _, transport := range []string{"shm", "uds"} {
+	for _, transport := range []string{transportSHM, transportUDS} {
 		t.Run(transport, func(t *testing.T) {
 			led := newLedger()
 			w := newWorker(t, transport, led)

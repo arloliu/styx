@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
@@ -137,7 +138,7 @@ func TestDefect_MisaccountedCall(t *testing.T) {
 	lost := newLedger()
 	a := lost.submit()
 	_ = lost.submit() // never resolved
-	lost.resolve(a, nil)
+	lost.resolve(a, transportSHM, nil)
 	require.Error(t, lost.check(), "the ledger must fail when a submitted call never resolves")
 
 	// A balancing double-resolve: id a2 resolves twice while id b2 never resolves,
@@ -146,14 +147,31 @@ func TestDefect_MisaccountedCall(t *testing.T) {
 	balancing := newLedger()
 	a2 := balancing.submit()
 	_ = balancing.submit() // never resolved
-	balancing.resolve(a2, nil)
-	balancing.resolve(a2, nil) // second resolve of the same id
+	balancing.resolve(a2, transportSHM, nil)
+	balancing.resolve(a2, transportSHM, nil) // second resolve of the same id
 	require.Error(t, balancing.check(),
 		"the ledger must fail when one id resolves twice while another never resolves")
 
 	// An outcome outside the contract lands in unexpected.
 	unrecognized := newLedger()
 	c := unrecognized.submit()
-	unrecognized.resolve(c, errors.New("styx soak test: an outcome outside the workload contract"))
+	unrecognized.resolve(c, transportSHM, errors.New("styx soak test: an outcome outside the workload contract"))
 	require.Error(t, unrecognized.check(), "the ledger must fail on an outcome outside the contract")
+}
+
+// TestDefect_PoisonTransportScope proves the ledger accepts ErrPoisoned only on
+// uds. A uds STREAM_OPEN torn mid-write can legitimately poison; on shm the
+// producer publishes a complete descriptor before its tail store, so a poisoned
+// shm outcome is a conformance defect the ledger must surface as unexpected
+// rather than mask.
+func TestDefect_PoisonTransportScope(t *testing.T) {
+	onUDS := newLedger()
+	u := onUDS.submit()
+	onUDS.resolve(u, transportUDS, styx.ErrPoisoned)
+	require.NoError(t, onUDS.check(), "a poisoned outcome on uds is an accepted failure")
+
+	onSHM := newLedger()
+	s := onSHM.submit()
+	onSHM.resolve(s, transportSHM, styx.ErrPoisoned)
+	require.Error(t, onSHM.check(), "a poisoned outcome on shm must surface as a conformance defect")
 }
