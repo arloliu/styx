@@ -3,6 +3,7 @@ package transport_test
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -1076,4 +1077,285 @@ func TestUDS_RecvReserving_ReservesBeforeRead(t *testing.T) {
 	_, err = b.RecvReserving(ctx, func() { reserves++ })
 	require.Error(t, err)
 	require.Zero(t, reserves, "a canceled readiness wait consumes nothing and reserves nothing")
+}
+
+// Test the receive-timeout hoist contract by exact syscall observation, filtering
+// recorded calls to SO_RCVTIMEO (the shared seam also carries SO_SNDTIMEO for
+// Send, which programs every time and is deliberately excluded here):
+//   - construction programs the steady-state timeout exactly once per side;
+//   - no-deadline receives and distant-deadline receives (remaining > the
+//     steady-state value) both hit the cache — zero additional syscalls;
+//   - under a tight deadline, every recorded arm carries a duration no larger
+//     than the budget remaining when the Recv call started, plus 1us
+//     (unix.NsecToTimeval rounds the desired duration up to the next
+//     microsecond, and remaining only shrinks after the start snapshot, so
+//     start-remaining is a sound upper bound for every arm within the call).
+//     Arms are split into a readiness phase (waitReadable) and a read phase
+//     (fdReader.Read) by the readiness-wait hook's firing point, and each
+//     phase asserts only a lower bound (>=1 readiness arm, >=2 read arms):
+//     an interrupted peek or a short header/payload read legitimately adds
+//     more arms in either phase, and the shrinking remaining reprograms on
+//     every syscall by design, so an upper bound would reject a valid run;
+//   - the next no-deadline receive restores the steady-state value with
+//     exactly one call (the header read's cache miss reprograms; the
+//     payload read's cache hit issues nothing further).
+func TestUDSTransport_Recv_ProgramsTimeoutOnlyOnChange(t *testing.T) {
+	type call struct {
+		opt int
+		d   time.Duration
+	}
+	var calls []call
+	restore := transport.SetSetsockoptTimevalForTest(func(fd, level, opt int, tv *unix.Timeval) error {
+		calls = append(calls, call{opt: opt, d: time.Duration(tv.Nano())})
+
+		return unix.SetsockoptTimeval(fd, level, opt, tv)
+	})
+	t.Cleanup(restore)
+
+	rcvCalls := func() []call {
+		var out []call
+		for _, c := range calls {
+			if c.opt == unix.SO_RCVTIMEO {
+				out = append(out, c)
+			}
+		}
+
+		return out
+	}
+
+	// Given: a connected pair. NewUDSTransport now programs the steady-state
+	// receive timeout at construction, once per side.
+	a, b := newTestTransportPair(t)
+	require.Len(t, rcvCalls(), 2, "each side's construction programs its own SO_RCVTIMEO exactly once")
+	steady := calls[0].d
+	for _, c := range rcvCalls() {
+		require.Equal(t, steady, c.d, "both sides construct with the same steady-state timeout")
+	}
+	calls = nil // reset: the scenarios below count only their own calls
+
+	// When: N no-deadline receives, driven by frames already sent so Recv never blocks.
+	const n = 3
+	for i := range n {
+		require.NoError(t, a.Send(t.Context(), transport.Frame{CallID: uint64(i), Kind: transport.FrameUnaryReq}))
+	}
+	for range n {
+		_, err := b.Recv(t.Context())
+		require.NoError(t, err)
+	}
+
+	// Then: the no-deadline path hits the cache every time — zero additional syscalls.
+	require.Empty(t, rcvCalls(), "no-deadline receives must reprogram nothing once the cache matches")
+
+	// When: N distant-deadline receives (remaining well past the steady-state value).
+	for i := range n {
+		require.NoError(t, a.Send(t.Context(),
+			transport.Frame{CallID: uint64(100 + i), Kind: transport.FrameUnaryReq}))
+	}
+	for range n {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		_, err := b.Recv(ctx)
+		cancel()
+		require.NoError(t, err)
+	}
+
+	// Then
+	require.Empty(t, rcvCalls(), "a distant deadline (remaining well past steady-state) must also hit the cache")
+
+	// When: a tight deadline (remaining well under the steady-state value), against
+	// a frame already sent so RecvReserving's peek and the header/payload reads all
+	// complete without genuinely blocking on the socket. One monotonic snapshot
+	// taken immediately before the call bounds every arm the call records — a
+	// per-syscall snapshot could not be ordered against the arms.
+	//
+	// lastReadinessBoundary marks how many SO_RCVTIMEO calls had been recorded
+	// the moment the readiness-wait hook last fired. waitReadable's loop always
+	// calls setSocketTimeout before invoking the hook (uds.go's waitReadable),
+	// so every call recorded at or before this boundary belongs to the
+	// readiness phase, and every call recorded after it belongs to the read
+	// phase (fdReader.Read, which never touches this hook) — a partition that
+	// holds regardless of how many readiness-loop iterations an interrupted
+	// peek adds, and is sensitive to either call site being removed: dropping
+	// waitReadable's call leaves the hook firing with nothing recorded before
+	// it (boundary stays 0), and dropping fdReader.Read's call leaves nothing
+	// recorded after it.
+	lastReadinessBoundary := 0
+	restoreHook := transport.SetReadinessWaitHookForTest(func() {
+		lastReadinessBoundary = len(rcvCalls())
+	})
+	t.Cleanup(restoreHook)
+
+	require.NoError(t, a.Send(t.Context(),
+		transport.Frame{CallID: 200, Kind: transport.FrameUnaryReq, Payload: []byte("tight")}))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Millisecond)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	startRemaining := time.Until(deadline)
+	_, err := b.RecvReserving(ctx, func() {})
+	require.NoError(t, err)
+	restoreHook()
+
+	// Then: at least one readiness-phase arm and at least two read-phase arms
+	// (37-byte header and 5-byte payload each arrive whole in a single
+	// read(2), so the base case is exactly one header-read arm and one
+	// payload-read arm; empirically stable at 1 and 2 respectively across 30
+	// repeated -race runs while writing this test). Neither bound is an upper
+	// bound: an interrupted readiness peek or a short header/payload read
+	// legitimately adds more arms in its own phase, and must not fail this
+	// test. Every recorded arm is also bounded by the pre-call snapshot, plus
+	// the Timeval round-up to the next microsecond.
+	tight := rcvCalls()
+	readinessArms := tight[:lastReadinessBoundary]
+	readArms := tight[lastReadinessBoundary:]
+	require.GreaterOrEqual(t, len(readinessArms), 1,
+		"waitReadable's readiness peek must reprogram the tight timeout at least once")
+	require.GreaterOrEqual(t, len(readArms), 2,
+		"the header read and payload read must each reprogram the tight timeout at least once")
+	for _, c := range tight {
+		require.LessOrEqual(t, c.d, startRemaining+time.Microsecond,
+			"every arm programmed during a tight-deadline Recv must not exceed the call's start-remaining budget")
+	}
+	calls = nil
+
+	// When: the next no-deadline receive after a tight deadline.
+	require.NoError(t, a.Send(t.Context(),
+		transport.Frame{CallID: 201, Kind: transport.FrameUnaryReq, Payload: []byte("restore")}))
+	_, err = b.Recv(t.Context())
+	require.NoError(t, err)
+
+	// Then: exactly one restoring syscall, back to the steady-state value.
+	restored := rcvCalls()
+	require.Len(t, restored, 1, "returning to the steady-state value after a tight deadline reprograms exactly once")
+	require.Equal(t, steady, restored[0].d, "the restoring call reprograms back to the steady-state timeout")
+}
+
+// Test that a failed SO_RCVTIMEO reprogram surfaces the error, leaves the
+// receive-timeout cache at its old value rather than advancing it to the
+// value the failed call attempted to program, and that the next receive
+// therefore retries the seam instead of trusting the failed attempt. This
+// pins setSocketTimeout's ordering: the cache update happens only after
+// setsockoptTimeval succeeds, never before.
+func TestUDSTransport_Recv_RetriesTimeoutAfterFailedCacheRestore(t *testing.T) {
+	type call struct {
+		opt int
+		d   time.Duration
+	}
+	var calls []call
+	var failNextRcv bool
+	injected := errors.New("injected setsockopt failure")
+	restore := transport.SetSetsockoptTimevalForTest(func(fd, level, opt int, tv *unix.Timeval) error {
+		calls = append(calls, call{opt: opt, d: time.Duration(tv.Nano())})
+		if opt == unix.SO_RCVTIMEO && failNextRcv {
+			failNextRcv = false
+
+			return injected
+		}
+
+		return unix.SetsockoptTimeval(fd, level, opt, tv)
+	})
+	t.Cleanup(restore)
+
+	rcvCalls := func() []call {
+		var out []call
+		for _, c := range calls {
+			if c.opt == unix.SO_RCVTIMEO {
+				out = append(out, c)
+			}
+		}
+
+		return out
+	}
+
+	// Given: a connected pair (construction records the steady-state value
+	// this scenario compares later calls against), then a tight-deadline
+	// receive that leaves the cache holding a non-steady value — the same
+	// setup the main counting test uses to reach the tight regime.
+	a, b := newTestTransportPair(t)
+	steady := calls[0].d
+	calls = nil
+
+	require.NoError(t, a.Send(t.Context(),
+		transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: []byte("setup")}))
+	tightCtx, tightCancel := context.WithTimeout(t.Context(), 5*time.Millisecond)
+	_, err := b.Recv(tightCtx)
+	tightCancel()
+	require.NoError(t, err)
+	require.NotEmpty(t, rcvCalls(), "the tight-deadline setup receive must move the cache away from steady")
+	calls = nil
+
+	// When: the next (untimed) receive attempts to restore the steady value,
+	// but the seam fails that exact SO_RCVTIMEO call. The peer's frame is
+	// already sent, so the failure happens before any byte of it is read.
+	failNextRcv = true
+	require.NoError(t, a.Send(t.Context(),
+		transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq, Payload: []byte("fails")}))
+	_, err = b.Recv(t.Context())
+
+	// Then: the receive surfaces the injected error, unwrapped — no byte of
+	// this frame was ever read (the failure happens before the read(2) that
+	// would consume any of it), so abortFrame's poison-on-started rule never
+	// triggers and the transport stays usable.
+	require.ErrorIs(t, err, injected)
+	require.NotErrorIs(t, err, transport.ErrPoisoned,
+		"a setsockopt failure before any byte is read must not poison the transport")
+	require.NotErrorIs(t, err, transport.ErrClosed,
+		"a setsockopt failure before any byte is read must not close the transport")
+	calls = nil
+
+	// When: the next receive (the "fails" frame's bytes are still queued —
+	// nothing was consumed by the failed attempt above, so no new Send is
+	// needed).
+	_, err = b.Recv(t.Context())
+
+	// Then: it succeeds, AND it reprogrammed the timeout — proving the failed
+	// call above left the cache at its old (tight) value instead of advancing
+	// it to the steady value it failed to program. Because the cache still
+	// disagrees, this receive's desired steady value misses it and retries
+	// the syscall, this time successfully.
+	require.NoError(t, err)
+	retried := rcvCalls()
+	require.NotEmpty(t, retried, "the cache must not have advanced on the failed call, so this retries the seam")
+	for _, c := range retried {
+		require.Equal(t, steady, c.d, "the retry reprograms back to the steady-state timeout")
+	}
+	calls = nil
+
+	// When: one more untimed receive, on a fresh frame.
+	require.NoError(t, a.Send(t.Context(),
+		transport.Frame{CallID: 3, Kind: transport.FrameUnaryReq, Payload: []byte("settled")}))
+	_, err = b.Recv(t.Context())
+
+	// Then: the successful retry above did advance the cache, so this receive
+	// hits it — zero further syscalls.
+	require.NoError(t, err)
+	require.Empty(t, rcvCalls(), "the successful retry must have advanced the cache back to steady")
+}
+
+// Test NewUDSTransport returning a precise error, and closing nothing
+// caller-owned, when the seam that programs the initial receive timeout
+// fails — the fd stays open and owned by the caller, matching the existing
+// SO_TYPE-mismatch failure's contract.
+func TestNewUDSTransport_ReturnsError_WhenInitialTimeoutProgrammingFails(t *testing.T) {
+	// Given: a valid SOCK_STREAM fd pair, and a seam that fails the initial
+	// SO_RCVTIMEO programming NewUDSTransport now performs.
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = unix.Close(fds[0]); _ = unix.Close(fds[1]) })
+
+	injected := errors.New("injected setsockopt failure")
+	restore := transport.SetSetsockoptTimevalForTest(func(fd, level, opt int, tv *unix.Timeval) error {
+		return injected
+	})
+	t.Cleanup(restore)
+
+	// When
+	tr, err := transport.NewUDSTransport(fds[0], false)
+
+	// Then: a precise, wrapped error and no Transport.
+	require.Nil(t, tr)
+	require.ErrorIs(t, err, injected)
+
+	// And: the caller still owns fds[0] — the failed constructor closed nothing
+	// of the caller's. A still-open fd answers getsockopt without error.
+	_, sockErr := unix.GetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_TYPE)
+	require.NoError(t, sockErr, "the constructor must not close the caller-owned fd on failure")
 }

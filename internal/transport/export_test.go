@@ -19,6 +19,16 @@ func SetPeekSyscallForTest(
 	return func() { peekSyscall = prev }
 }
 
+// SetSetsockoptTimevalForTest swaps the socket-timeout syscall seam and
+// returns a restore func, so the external test package can observe exactly
+// when timeouts are programmed.
+func SetSetsockoptTimevalForTest(fn func(fd, level, opt int, tv *unix.Timeval) error) (restore func()) {
+	orig := setsockoptTimeval
+	setsockoptTimeval = fn
+
+	return func() { setsockoptTimeval = orig }
+}
+
 // WriteFrameUnchecked re-exports writeFrame for transport_test: it skips
 // Send's Kind/size validation so a test can put a frame Send itself would
 // never produce (a reserved streaming Kind, an oversized payload) onto

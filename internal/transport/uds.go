@@ -48,6 +48,11 @@ var (
 // production always uses the unix package.
 var peekSyscall = unix.Recvmsg
 
+// setsockoptTimeval is the socket-timeout syscall, indirect so a test can
+// observe exactly when and with what value a timeout is programmed. Only
+// tests reassign it (via the export_test.go setter), and they restore it.
+var setsockoptTimeval = unix.SetsockoptTimeval
+
 // readinessWaitHook, when non-nil, is invoked immediately before waitReadable blocks in
 // the readiness peek — test-only, letting a test prove a reserving reader has reached the
 // readiness wait (and so holds no reservation) before it asserts quiescence. Nil in
@@ -81,6 +86,25 @@ type UDSTransport struct {
 	closed    atomic.Bool
 	closeOnce sync.Once
 
+	// lastRcvTimeout caches the receive timeout most recently programmed into
+	// the socket, so a receive re-issues the setsockopt syscall only when the
+	// desired value differs. Only the receiving goroutine touches it (the
+	// transport permits one in-flight Recv), so it needs no lock.
+	lastRcvTimeout time.Duration
+
+	// rcvTvScratch and sndTvScratch are the unix.Timeval buffers setSocketTimeout
+	// reuses across calls instead of taking the address of a fresh stack local:
+	// setsockoptTimeval is an indirect call (a package-level func var, so a test
+	// can observe or fail it), and passing a stack local's address through an
+	// indirect call forces the compiler to heap-allocate it on every call. A field
+	// on this already-heap-resident struct pays that cost once, at construction,
+	// not per Send/Recv. Splitting into two fields (never one shared field) keeps
+	// concurrent Send and Recv race-free without a lock: rcvTvScratch is touched
+	// only by the receive path, which the transport permits only one in-flight
+	// goroutine for; sndTvScratch is touched only while writeFull holds writeMu.
+	rcvTvScratch unix.Timeval
+	sndTvScratch unix.Timeval
+
 	// sentCount and recvCount are cumulative frame counters exposed via FrameCounter.
 	// Each increments exactly once per fully-completed Send/Recv, never on rejection
 	// or mid-frame abort. They are the heartbeat produce/consume counters.
@@ -112,7 +136,9 @@ func (t *UDSTransport) headerLen() int {
 // 45 bytes with the control word appended when true. Both peers derive it from
 // the same negotiated compatibility tuple, ensuring they agree on frame length.
 // fd must already be CLOEXEC; NewUDSTransport does not set it. Returns an error
-// if fd is not a SOCK_STREAM socket.
+// if fd is not a SOCK_STREAM socket, or if the initial receive timeout cannot be
+// programmed; either way the caller still owns fd (NewUDSTransport closes nothing
+// of the caller's on failure).
 func NewUDSTransport(fd int, streaming bool) (*UDSTransport, error) {
 	sockType, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
 	if err != nil {
@@ -123,7 +149,17 @@ func NewUDSTransport(fd int, streaming bool) (*UDSTransport, error) {
 		return nil, fmt.Errorf("transport: fd %d: expected SOCK_STREAM, got socket type %d", fd, sockType)
 	}
 
-	return &UDSTransport{fd: fd, streaming: streaming}, nil
+	t := &UDSTransport{fd: fd, streaming: streaming}
+
+	// Program the steady-state receive timeout once up front, so setSocketTimeout's
+	// cache starts already matching it and the first receive issues no syscall.
+	t.rcvTvScratch = unix.NsecToTimeval(pollInterval.Nanoseconds())
+	if err := setsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &t.rcvTvScratch); err != nil {
+		return nil, fmt.Errorf("transport: fd %d: setsockopt(SO_RCVTIMEO): %w", fd, err)
+	}
+	t.lastRcvTimeout = pollInterval
+
+	return t, nil
 }
 
 // Send blocks until f is fully written or ctx is done.
@@ -349,7 +385,7 @@ func (t *UDSTransport) waitReadable(ctx context.Context) error {
 		if t.closed.Load() {
 			return ErrClosed
 		}
-		if err := setSocketTimeout(ctx, t.fd, unix.SO_RCVTIMEO); err != nil {
+		if err := t.setSocketTimeout(ctx, unix.SO_RCVTIMEO); err != nil {
 			return err
 		}
 
@@ -434,7 +470,7 @@ func (t *UDSTransport) writeFull(ctx context.Context, buf []byte, started *bool)
 			return ErrClosed
 		}
 
-		if err := setSocketTimeout(ctx, t.fd, unix.SO_SNDTIMEO); err != nil {
+		if err := t.setSocketTimeout(ctx, unix.SO_SNDTIMEO); err != nil {
 			return err
 		}
 
@@ -488,7 +524,7 @@ func (r *fdReader) Read(p []byte) (int, error) {
 			return 0, ErrClosed
 		}
 
-		if err := setSocketTimeout(r.ctx, r.t.fd, unix.SO_RCVTIMEO); err != nil {
+		if err := r.t.setSocketTimeout(r.ctx, unix.SO_RCVTIMEO); err != nil {
 			return 0, err
 		}
 
@@ -673,9 +709,17 @@ func decodeHeader(buf []byte, streaming bool) (Frame, uint32) {
 	return f, payloadLen
 }
 
-// setSocketTimeout sets SO_SNDTIMEO/SO_RCVTIMEO to at most pollInterval,
-// clamped tighter by ctx's deadline so context cancellation is observed within one poll.
-func setSocketTimeout(ctx context.Context, fd, opt int) error {
+// setSocketTimeout sets SO_SNDTIMEO/SO_RCVTIMEO to at most pollInterval, clamped
+// tighter by ctx's deadline so context cancellation is observed within one poll.
+// For SO_RCVTIMEO it consults t.lastRcvTimeout first and issues the syscall only
+// when the desired value differs, so the common no-deadline/distant-deadline
+// receive path (the constant pollInterval value) reprograms nothing. A tighter
+// deadline's shrinking remaining budget never matches the cache, so it always
+// reprograms — required, since reusing a longer cached timeout could overshoot
+// the deadline. SO_SNDTIMEO always reprograms: Send permits concurrent callers
+// serialized by writeMu, so a send-side cache needs its own locking design and
+// is out of scope here.
+func (t *UDSTransport) setSocketTimeout(ctx context.Context, opt int) error {
 	d := pollInterval
 
 	if deadline, ok := ctx.Deadline(); ok {
@@ -688,9 +732,28 @@ func setSocketTimeout(ctx context.Context, fd, opt int) error {
 		return context.DeadlineExceeded
 	}
 
-	tv := unix.NsecToTimeval(d.Nanoseconds())
+	if opt == unix.SO_RCVTIMEO && d == t.lastRcvTimeout {
+		return nil // already programmed — the common receive path issues no syscall
+	}
 
-	return unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, opt, &tv)
+	// Reuse this transport's own scratch Timeval instead of a fresh stack local:
+	// setsockoptTimeval is an indirect call, so a stack local's address passed
+	// through it would be forced to heap-escape on every call (see the scratch
+	// fields' doc comment on UDSTransport).
+	tv := &t.sndTvScratch
+	if opt == unix.SO_RCVTIMEO {
+		tv = &t.rcvTvScratch
+	}
+	*tv = unix.NsecToTimeval(d.Nanoseconds())
+	if err := setsockoptTimeval(t.fd, unix.SOL_SOCKET, opt, tv); err != nil {
+		return err
+	}
+
+	if opt == unix.SO_RCVTIMEO {
+		t.lastRcvTimeout = d
+	}
+
+	return nil
 }
 
 // isTimeoutErrno reports whether err is the errno from SO_RCVTIMEO/SO_SNDTIMEO

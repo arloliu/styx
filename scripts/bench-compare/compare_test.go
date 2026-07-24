@@ -384,6 +384,44 @@ func TestEvaluate_CommonModeLatencyIsAdvisoryOnly(t *testing.T) {
 	}
 }
 
+// Test the documented designed-failure outcome for a hoist-style change to the
+// uds reference: a faster uds reference (allocations unchanged) leaves the
+// shm-vs-grpc ratio and floor untouched but fails the shm-vs-uds ratio check,
+// since the uds reference is what got faster. This is the shape of the outcome
+// a receive-timeout syscall hoist on the uds transport produces — recorded here
+// so the gate's own tests document that outcome as designed, not noise.
+func TestEvaluate_FasterUDSReferenceFailsShmVsUDSRatioOnly(t *testing.T) {
+	rows := []string{
+		row("grpc", 100, 200, 150), row("grpc", 100, 200, 150), row("grpc", 100, 200, 150),
+		// uds sped up from the baseline's 40us to 20us; allocations unchanged.
+		row("uds", 20, 40, 17), row("uds", 20, 40, 17), row("uds", 20, 40, 17),
+		row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19),
+	}
+	rep := evalRows(t, baselineRatio10, rows...)
+
+	if !rep.failed() {
+		t.Fatal("a faster uds reference must fail the shm-vs-uds ratio check")
+	}
+
+	// Exactly one hard check must fail — not just "the uds ratio check is among
+	// the failures" — so a regression that also breaks the grpc ratio, the
+	// floor, a reps count, or an allocs/op check would be caught here too,
+	// rather than passing unnoticed alongside the expected uds-ratio failure.
+	var failedNames []string
+	for _, c := range rep.hard {
+		if !c.pass {
+			failedNames = append(failedNames, c.name)
+		}
+	}
+	if len(failedNames) != 1 {
+		t.Fatalf("exactly one hard check must fail for a faster-uds-only change, got %d: %v",
+			len(failedNames), failedNames)
+	}
+	if want := "shm ratio vs uds"; failedNames[0] != want {
+		t.Errorf("the one failing check must be %q, got %q", want, failedNames[0])
+	}
+}
+
 // Test that a missing or malformed baseline is an error, never a silent pass.
 func TestLoadBaseline_MissingAndMalformed(t *testing.T) {
 	if _, err := loadBaseline([]byte("")); err == nil {

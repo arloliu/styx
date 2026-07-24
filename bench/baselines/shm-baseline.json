@@ -1,5 +1,5 @@
 {
-  "_comment": "Regression baseline for the shared-memory transport gate, for the 64-byte, concurrency-1 cells. The latency medians (p50_us, p99_us) are the recorded numbers from bench/shm/REPORT.md's summary table (regime=default). The allocs_per_op are machine-invariant (allocation counts do not depend on CPU speed) and reflect the current transport code: production-shm 19, production-shm-sync 17, and grpc-uds 158 match REPORT.md, while production-uds is 19 here versus REPORT.md's 17 because the socket transport's per-op allocation changed across the transport commits merged after that report was written (confirmed reproducible across runs). Ratios used by the gate are computed from the stored p50 medians, not stored. To refresh, recapture a bench run: copy the latency medians and take the allocs from the current run; do not hand-edit measured values.",
+  "_comment": "Regression baseline for the shared-memory transport gate, for the 64-byte, concurrency-1 cells. Recaptured after the uds transport's per-receive SO_RCVTIMEO hoist (internal/transport/uds.go): the receive timeout is now cached and reprogrammed only when it changes, which sped up the production-uds reference cell and, by design of the ratio gate, shifted the shm-vs-uds ratio below the prior baseline's tolerance. The shm-vs-grpc ratio had separately drifted below tolerance from movement in the untouched grpc-uds reference cell, observed in captures both before and after the hoist. All four cells below come from one captured run (median of 10 reps per cell); latency medians and allocs copied together per this file's own refresh policy, none hand-edited. allocs_per_op is unchanged from the prior baseline for every cell. To refresh, recapture a bench run: copy the latency medians and take the allocs from the current run; do not hand-edit measured values.",
   "policy": {
     "payload_bytes": 64,
     "concurrency": 1,
@@ -11,9 +11,9 @@
     "uds_ref": "production-uds"
   },
   "cells": {
-    "production-shm": {"p50_us": 2.11, "p99_us": 6.18, "allocs_per_op": 19.0},
-    "production-shm-sync": {"p50_us": 2.43, "p99_us": 6.86, "allocs_per_op": 17.0},
-    "production-uds": {"p50_us": 8.15, "p99_us": 21.15, "allocs_per_op": 19.0},
-    "grpc-uds": {"p50_us": 17.16, "p99_us": 86.26, "allocs_per_op": 158.0}
+    "production-shm": {"p50_us": 2.16, "p99_us": 5.98, "allocs_per_op": 19.0},
+    "production-shm-sync": {"p50_us": 1.62, "p99_us": 4.47, "allocs_per_op": 17.0},
+    "production-uds": {"p50_us": 7.49, "p99_us": 15.42, "allocs_per_op": 19.0},
+    "grpc-uds": {"p50_us": 15.71, "p99_us": 106.57, "allocs_per_op": 158.0}
   }
 }
