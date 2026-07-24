@@ -516,9 +516,11 @@ func hostParsePIDTag(response string) (pid int, body string, ok bool) {
 func TestHost_ShmCrashRestart_NoMisdeliveryNoDuplicate(t *testing.T) {
 	// Given: a host pinned to shm, a PID-tagged crashy echo plugin with a restart
 	// budget, and a hook counting any unary response the runtime discards as a
-	// late/duplicate delivery. The hook is restored only after the host is stopped and
-	// its receive loop joined (below), so a trailing duplicate cannot slip past
-	// restoration; the seam itself is atomic, so the reader's load never races it.
+	// late/duplicate delivery. The hook stays installed through the assertion — which
+	// runs with the host STILL RUNNING, after a FIFO flush (below) drains any queued
+	// duplicate through the reader — so no shutdown window can suppress it; the seam is
+	// atomic, so the reader's load never races the cleanup restore, which runs only after
+	// the host-stop cleanup joins the loop.
 	var discarded atomic.Int64
 	hook := func(uint64) { discarded.Add(1) }
 	restore := styx.SetDuplicateUnaryResponseHookForTest(hook)
@@ -559,10 +561,16 @@ func TestHost_ShmCrashRestart_NoMisdeliveryNoDuplicate(t *testing.T) {
 		return pid, nil
 	}
 
-	// When: a unique request before the crash, a SIGKILL, then unique requests until the
-	// transparent restart answers one.
+	// When: a unique request before the crash, a FIFO flush, a SIGKILL, then unique
+	// requests until the transparent restart answers one, then a final FIFO flush.
 	gen0PID, err := say("before-crash-7f3a")
 	require.NoError(t, err)
+	// A further request whose response is received flushes gen0's response ring: because
+	// that ring is FIFO, receiving this proves the reader already drained past any
+	// duplicate of the before-crash response BEFORE the crash tears the connection down.
+	_, err = say("flush-gen0")
+	require.NoError(t, err)
+
 	require.NoError(t, syscall.Kill(gen0PID, syscall.SIGKILL))
 
 	var gen1PID int
@@ -587,14 +595,19 @@ func TestHost_ShmCrashRestart_NoMisdeliveryNoDuplicate(t *testing.T) {
 		t.Logf("plugin PID %d was reused across the restart; the successful post-crash call still proves recovery",
 			gen0PID)
 	}
+	// A final flush on the live connection, same FIFO argument: receiving its response
+	// proves the reader drained past any duplicate of the after-restart response.
+	_, err = say("flush-gen1")
+	require.NoError(t, err)
 
-	// Then: stop the host and JOIN its receive loop, so any trailing duplicate the reader
-	// would process after the caller woke has been observed, and only then assert no
-	// duplicate or late response was ever delivered for a completed call.
-	sctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	require.NoError(t, h.Stop(sctx))
-	cancel()
-	restore() // safe now: the receive loop is joined, no further hook fires
+	// Then: assert zero discards WITH THE HOST STILL RUNNING — there is no Stop/shutdown
+	// window that could suppress a queued duplicate before the reader sees it. The inbound
+	// descriptor ring is single-producer/single-consumer FIFO: the producer publishes in
+	// tail order (shm-abi.md §8) and the one reader drains head->tail in that order, so a
+	// flush response delivered through Recv proves every earlier-published frame —
+	// including any trailing duplicate of a completed call — already passed through the
+	// receive path, where the hook records a discard. Cleanup then stops the host and
+	// restores the hook after the reader joins.
 	require.Zero(t, discarded.Load(),
 		"a duplicate or late unary response was delivered across the crash-restart (misdelivery)")
 }
