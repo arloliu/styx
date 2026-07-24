@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.5.1
 // - protoc             v6.30.2
-// source: bench/spike/baseline/pingpb/ping.proto
+// source: bench/internal/benchbaseline/pingpb/ping.proto
 
 package pingpb
 
@@ -117,5 +117,5 @@ var Ping_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "bench/spike/baseline/pingpb/ping.proto",
+	Metadata: "bench/internal/benchbaseline/pingpb/ping.proto",
 }

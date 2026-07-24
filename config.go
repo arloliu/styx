@@ -28,12 +28,15 @@ type PluginServerConfig struct {
 	// ContinueAfterPanic selects the handler-panic policy. false (the default) is
 	// the enterprise profile: a handler panic is recovered at the dispatch
 	// boundary, the panicking call is replied its panic outcome, and the process
-	// then taints and terminates so the supervisor restarts it per policy. true
-	// keeps the process serving after a handler panic — an explicit opt-in, safe
-	// only if every handler guarantees its own isolation, because after a panic the
-	// process state is whatever the panicking handler left behind. A panic in the
-	// Styx runtime itself (outside handler frames) is never recovered under either
-	// setting. The policy is read once when serving begins; see panic_policy.go.
+	// then taints and terminates so the supervisor restarts it per policy. That
+	// reply is guaranteed to a unary caller but best-effort to a streaming one,
+	// which may lose it to teardown — panic_policy.go documents the full
+	// delivery-guarantee split by call kind. true keeps the process serving after a
+	// handler panic — an explicit opt-in, safe only if every handler guarantees its
+	// own isolation, because after a panic the process state is whatever the
+	// panicking handler left behind. A panic in the Styx runtime itself (outside
+	// handler frames) is never recovered under either setting. The policy is read
+	// once when serving begins; see panic_policy.go.
 	ContinueAfterPanic bool
 
 	// Transports is the plugin's data-plane transport allowlist — the transports it

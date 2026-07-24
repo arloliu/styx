@@ -1,5 +1,3 @@
-// Package benchresults defines the spike benchmark suite's machine-readable
-// output row and JSONL writer.
 package benchbaseline
 
 import (
@@ -9,7 +7,8 @@ import (
 	"time"
 )
 
-// Result is one row of the spike benchmark suite's machine-readable output.
+// Result is one row of a benchmark suite's machine-readable output, written by
+// both the spike benchmark and the production shared-memory benchmark.
 type Result struct {
 	Impl         string  `json:"impl"`
 	PayloadBytes int     `json:"payload_bytes"`
@@ -33,18 +32,15 @@ type Result struct {
 	// N bytes per call" claim.
 	AllocsPerOp float64 `json:"allocs_per_op"`
 
-	// WakeupSyscallsPerOp is populated only for impl=="shm-spike" (the
-	// defining metric for the shared-memory transport); every other impl
-	// reports 0 rather than an approximate, misleading number for a metric that
-	// doesn't apply to it. Even for shm-spike, the value covers only the
-	// HOST-observable half of a round trip (the write(2) SignalHP issues
-	// to wake a parked plugin, plus the read(2) the host's own Wait
-	// issues when it blocks for a response) — the plugin's own
-	// read(2)/write(2) syscalls happen in a separate OS process and are
-	// not visible from the host without additional cross-process
-	// instrumentation, which is out of scope for the spike. See
-	// bench/spike/harness.Bootstrap.SignalSyscallCount/
-	// ResponseSyscallCount.
+	// WakeupSyscallsPerOp is populated for the shared-memory transports — the
+	// shm-spike prototype and the production-shm rows — the defining metric for a
+	// shared-memory data plane; every other impl reports 0 rather than an
+	// approximate, misleading number for a metric that doesn't apply to it. Even
+	// there, the value covers only the HOST-observable half of a round trip (the
+	// write(2) issued to wake a parked plugin, plus the read(2) the host's own wait
+	// issues when it blocks for a response) — the plugin's own read(2)/write(2)
+	// syscalls happen in a separate OS process and are not visible from the host
+	// without additional cross-process instrumentation, which is out of scope here.
 	WakeupSyscallsPerOp float64 `json:"wakeup_syscalls_per_op"`
 
 	Samples   int       `json:"samples"`

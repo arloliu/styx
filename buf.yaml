@@ -11,4 +11,4 @@ modules:
       # protoc-gen-go-grpc (ping_grpc.pb.go) for an apples-to-apples gRPC
       # comparison, so the styx generator must not also emit a Ping client/server
       # here — the two would redeclare the same PingClient/NewPingClient symbols.
-      - bench/spike/baseline/pingpb
+      - bench/internal/benchbaseline/pingpb

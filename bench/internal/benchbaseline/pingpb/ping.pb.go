@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.10
 // 	protoc        v6.30.2
-// source: bench/spike/baseline/pingpb/ping.proto
+// source: bench/internal/benchbaseline/pingpb/ping.proto
 
 package pingpb
 
@@ -30,7 +30,7 @@ type EchoRequest struct {
 
 func (x *EchoRequest) Reset() {
 	*x = EchoRequest{}
-	mi := &file_bench_spike_baseline_pingpb_ping_proto_msgTypes[0]
+	mi := &file_bench_internal_benchbaseline_pingpb_ping_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -42,7 +42,7 @@ func (x *EchoRequest) String() string {
 func (*EchoRequest) ProtoMessage() {}
 
 func (x *EchoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bench_spike_baseline_pingpb_ping_proto_msgTypes[0]
+	mi := &file_bench_internal_benchbaseline_pingpb_ping_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -55,7 +55,7 @@ func (x *EchoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EchoRequest.ProtoReflect.Descriptor instead.
 func (*EchoRequest) Descriptor() ([]byte, []int) {
-	return file_bench_spike_baseline_pingpb_ping_proto_rawDescGZIP(), []int{0}
+	return file_bench_internal_benchbaseline_pingpb_ping_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *EchoRequest) GetPayload() []byte {
@@ -74,7 +74,7 @@ type EchoResponse struct {
 
 func (x *EchoResponse) Reset() {
 	*x = EchoResponse{}
-	mi := &file_bench_spike_baseline_pingpb_ping_proto_msgTypes[1]
+	mi := &file_bench_internal_benchbaseline_pingpb_ping_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -86,7 +86,7 @@ func (x *EchoResponse) String() string {
 func (*EchoResponse) ProtoMessage() {}
 
 func (x *EchoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_bench_spike_baseline_pingpb_ping_proto_msgTypes[1]
+	mi := &file_bench_internal_benchbaseline_pingpb_ping_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -99,7 +99,7 @@ func (x *EchoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EchoResponse.ProtoReflect.Descriptor instead.
 func (*EchoResponse) Descriptor() ([]byte, []int) {
-	return file_bench_spike_baseline_pingpb_ping_proto_rawDescGZIP(), []int{1}
+	return file_bench_internal_benchbaseline_pingpb_ping_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *EchoResponse) GetPayload() []byte {
@@ -109,36 +109,36 @@ func (x *EchoResponse) GetPayload() []byte {
 	return nil
 }
 
-var File_bench_spike_baseline_pingpb_ping_proto protoreflect.FileDescriptor
+var File_bench_internal_benchbaseline_pingpb_ping_proto protoreflect.FileDescriptor
 
-const file_bench_spike_baseline_pingpb_ping_proto_rawDesc = "" +
+const file_bench_internal_benchbaseline_pingpb_ping_proto_rawDesc = "" +
 	"\n" +
-	"&bench/spike/baseline/pingpb/ping.proto\x12\x06pingpb\"'\n" +
+	".bench/internal/benchbaseline/pingpb/ping.proto\x12\x06pingpb\"'\n" +
 	"\vEchoRequest\x12\x18\n" +
 	"\apayload\x18\x01 \x01(\fR\apayload\"(\n" +
 	"\fEchoResponse\x12\x18\n" +
 	"\apayload\x18\x01 \x01(\fR\apayload29\n" +
 	"\x04Ping\x121\n" +
-	"\x04Echo\x12\x13.pingpb.EchoRequest\x1a\x14.pingpb.EchoResponseB5Z3github.com/arloliu/styx/bench/spike/baseline/pingpbb\x06proto3"
+	"\x04Echo\x12\x13.pingpb.EchoRequest\x1a\x14.pingpb.EchoResponseB=Z;github.com/arloliu/styx/bench/internal/benchbaseline/pingpbb\x06proto3"
 
 var (
-	file_bench_spike_baseline_pingpb_ping_proto_rawDescOnce sync.Once
-	file_bench_spike_baseline_pingpb_ping_proto_rawDescData []byte
+	file_bench_internal_benchbaseline_pingpb_ping_proto_rawDescOnce sync.Once
+	file_bench_internal_benchbaseline_pingpb_ping_proto_rawDescData []byte
 )
 
-func file_bench_spike_baseline_pingpb_ping_proto_rawDescGZIP() []byte {
-	file_bench_spike_baseline_pingpb_ping_proto_rawDescOnce.Do(func() {
-		file_bench_spike_baseline_pingpb_ping_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_bench_spike_baseline_pingpb_ping_proto_rawDesc), len(file_bench_spike_baseline_pingpb_ping_proto_rawDesc)))
+func file_bench_internal_benchbaseline_pingpb_ping_proto_rawDescGZIP() []byte {
+	file_bench_internal_benchbaseline_pingpb_ping_proto_rawDescOnce.Do(func() {
+		file_bench_internal_benchbaseline_pingpb_ping_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_bench_internal_benchbaseline_pingpb_ping_proto_rawDesc), len(file_bench_internal_benchbaseline_pingpb_ping_proto_rawDesc)))
 	})
-	return file_bench_spike_baseline_pingpb_ping_proto_rawDescData
+	return file_bench_internal_benchbaseline_pingpb_ping_proto_rawDescData
 }
 
-var file_bench_spike_baseline_pingpb_ping_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
-var file_bench_spike_baseline_pingpb_ping_proto_goTypes = []any{
+var file_bench_internal_benchbaseline_pingpb_ping_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_bench_internal_benchbaseline_pingpb_ping_proto_goTypes = []any{
 	(*EchoRequest)(nil),  // 0: pingpb.EchoRequest
 	(*EchoResponse)(nil), // 1: pingpb.EchoResponse
 }
-var file_bench_spike_baseline_pingpb_ping_proto_depIdxs = []int32{
+var file_bench_internal_benchbaseline_pingpb_ping_proto_depIdxs = []int32{
 	0, // 0: pingpb.Ping.Echo:input_type -> pingpb.EchoRequest
 	1, // 1: pingpb.Ping.Echo:output_type -> pingpb.EchoResponse
 	1, // [1:2] is the sub-list for method output_type
@@ -148,26 +148,26 @@ var file_bench_spike_baseline_pingpb_ping_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_bench_spike_baseline_pingpb_ping_proto_init() }
-func file_bench_spike_baseline_pingpb_ping_proto_init() {
-	if File_bench_spike_baseline_pingpb_ping_proto != nil {
+func init() { file_bench_internal_benchbaseline_pingpb_ping_proto_init() }
+func file_bench_internal_benchbaseline_pingpb_ping_proto_init() {
+	if File_bench_internal_benchbaseline_pingpb_ping_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_bench_spike_baseline_pingpb_ping_proto_rawDesc), len(file_bench_spike_baseline_pingpb_ping_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_bench_internal_benchbaseline_pingpb_ping_proto_rawDesc), len(file_bench_internal_benchbaseline_pingpb_ping_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_bench_spike_baseline_pingpb_ping_proto_goTypes,
-		DependencyIndexes: file_bench_spike_baseline_pingpb_ping_proto_depIdxs,
-		MessageInfos:      file_bench_spike_baseline_pingpb_ping_proto_msgTypes,
+		GoTypes:           file_bench_internal_benchbaseline_pingpb_ping_proto_goTypes,
+		DependencyIndexes: file_bench_internal_benchbaseline_pingpb_ping_proto_depIdxs,
+		MessageInfos:      file_bench_internal_benchbaseline_pingpb_ping_proto_msgTypes,
 	}.Build()
-	File_bench_spike_baseline_pingpb_ping_proto = out.File
-	file_bench_spike_baseline_pingpb_ping_proto_goTypes = nil
-	file_bench_spike_baseline_pingpb_ping_proto_depIdxs = nil
+	File_bench_internal_benchbaseline_pingpb_ping_proto = out.File
+	file_bench_internal_benchbaseline_pingpb_ping_proto_goTypes = nil
+	file_bench_internal_benchbaseline_pingpb_ping_proto_depIdxs = nil
 }

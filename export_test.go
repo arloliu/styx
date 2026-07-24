@@ -13,6 +13,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// TransportsForTest returns the server's resolved data-plane transport allowlist,
+// the exact set it advertises at handshake. It lets an external test prove the
+// allowlist is construction-fixed: mutating the slice passed to NewPluginServer
+// must not change what this returns.
+func (s *PluginServer) TransportsForTest() []string { return s.transports }
+
 // InProcessStreamPairForTest wires a *ClientConn (client end) to s's registered
 // stream handlers (plugin end) over an in-process streaming socketpair, and
 // returns the client conn plus a stop func. It lets an external test — including

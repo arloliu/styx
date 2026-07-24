@@ -860,14 +860,18 @@ func defaultPluginTransports() []string {
 	return []string{control.TransportSHM, control.TransportUDS}
 }
 
-// resolvePluginTransports returns the configured allowlist, or the default when
-// none was set (an empty or nil PluginServerConfig.Transports).
+// resolvePluginTransports returns a server-owned copy of the configured
+// allowlist, or the default when none was set (an empty or nil
+// PluginServerConfig.Transports). The clone is what makes the allowlist
+// construction-fixed: without it the server would alias the caller's slice, so a
+// post-construction mutation of that slice could inject an unknown transport past
+// the constructor's validation or race the handshake's read of it.
 func resolvePluginTransports(transports []string) []string {
 	if len(transports) == 0 {
 		return defaultPluginTransports()
 	}
 
-	return transports
+	return slices.Clone(transports)
 }
 
 // pluginBaseOffer builds the plugin's negotiation offer for a transport allowlist

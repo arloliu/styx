@@ -36,6 +36,22 @@ func TestNewPluginServer_PanicsOnUnknownTransport(t *testing.T) {
 	}, "the default (empty) allowlist must be accepted")
 }
 
+// Test the transport allowlist is construction-fixed: mutating the caller's slice
+// after NewPluginServer must not change what the server advertises, because the
+// constructor validates then clones it. Without the clone the mutation would
+// inject an unknown transport past validation or race the handshake read.
+func TestNewPluginServer_TransportsAreConstructionFixed(t *testing.T) {
+	caller := []string{"uds", "shm"}
+	srv := styx.NewPluginServer(styx.PluginServerConfig{Transports: caller})
+
+	// Mutate the caller's slice to garbage after construction.
+	caller[0] = "tcp"
+	caller[1] = "garbage"
+
+	require.Equal(t, []string{"uds", "shm"}, srv.TransportsForTest(),
+		"the server must keep the validated allowlist, not alias the caller's slice")
+}
+
 // Test PluginServer panicking when two registered services share a ServiceID
 func TestPluginServer_RegisterService_PanicsOnServiceIDCollision(t *testing.T) {
 	// Given
