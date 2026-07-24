@@ -160,6 +160,15 @@ func (a *switchArena) Alloc(size uint32) (arena.SlabHandle, []byte, error) {
 	return arena.SlabHandle{Offset: 128, Length: size, Generation: 1, Sequence: 1}, a.slab, nil
 }
 
+// reExhaust returns the arena to the exhausted state so a test can drive a
+// SECOND data intent into the stuck carry after a first one has been placed,
+// exercising the self-retry backoff's per-carry reset.
+func (a *switchArena) reExhaust() {
+	a.mu.Lock()
+	a.freed = false
+	a.mu.Unlock()
+}
+
 func (a *switchArena) Free(arena.SlabHandle) error { return nil }
 
 // dataFullRing returns ring.ErrFull for a payload-bearing data push and records
@@ -572,6 +581,223 @@ func TestWriter_ResumesStuckData_OnRetrySignal(t *testing.T) {
 	require.Len(t, pushed, 1)
 	require.Equal(t, ring.KindUnaryReq, pushed[0].Kind())
 	require.Equal(t, uint64(7), pushed[0].CallID())
+}
+
+// Test that a data intent set aside on arena backpressure resumes on the
+// writer's own self-retry timer, with NO lifecycle traffic and no signalRetry:
+// once space frees, the writer re-attempts the carry on its backoff schedule and
+// publishes it. The timer is the production resume path; retry/signalRetry are
+// the test seam.
+func TestWriter_StuckDataIntent_ResumesViaTimer_NoLifecycleTraffic(t *testing.T) {
+	// Given a running writer whose arena starts exhausted, so a payload-bearing
+	// data intent goes stuck and is set aside.
+	rr := &recordRing{}
+	sa := &switchArena{allocated: make(chan struct{}, 1)}
+	w := newWriterFromParts(rr, sa, 2, 2, admitBlock)
+	w.start()
+	t.Cleanup(w.stop)
+
+	dataI := intent{
+		frame: transport.Frame{CallID: 9, Kind: transport.FrameUnaryReq, Payload: []byte("timer")},
+		lane:  laneData,
+		done:  make(chan error, 1),
+	}
+	w.dataQueue <- dataI
+
+	// Wait until the intent is provably stuck (its first Alloc failed).
+	<-sa.allocated
+
+	// When space frees but NO lifecycle frame is sent and signalRetry is never
+	// called: only the writer's own self-retry timer can resume the carry.
+	sa.release()
+
+	// Then the set-aside submit completes on its own within a generous liveness
+	// bound (the resume-latency claim is the benchmark's; this asserts only that
+	// resume happens without external traffic).
+	select {
+	case err := <-dataI.done:
+		require.NoError(t, err)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("stuck data never resumed via the self-retry timer")
+	}
+	pushed := rr.snapshot()
+	require.Len(t, pushed, 1)
+	require.Equal(t, ring.KindUnaryReq, pushed[0].Kind())
+	require.Equal(t, uint64(9), pushed[0].CallID())
+}
+
+// Test that a writer stopped while a data intent is set aside with the self-retry
+// timer armed exits cleanly: the timer is disarmed on the shutdown path, the carry
+// is reported exactly once with transport.ErrClosed, and stop's join returns. The
+// completion callback fires on every report call, so it is an exactly-once oracle
+// independent of the capacity-1 done channel: a duplicate report during shutdown —
+// which the full done buffer would silently drop — still increments the counter and
+// fails the test.
+func TestWriter_StopWithArmedRetryTimer_DisarmsAndReportsCarryExactlyOnce(t *testing.T) {
+	// Given a running writer whose arena is always exhausted, so a submitted data
+	// intent goes stuck and arms the self-retry timer, and stays stuck.
+	rr := &recordRing{}
+	sa := &signalArena{allocated: make(chan struct{}, 1)}
+	w := newWriterFromParts(rr, sa, 2, 2, admitBlock)
+	w.start()
+
+	var reports atomic.Int64
+	var published atomic.Bool
+	published.Store(true) // any report overwrites this; a teardown disposal sets false
+	dataI := intent{
+		frame:    transport.Frame{CallID: 3, Kind: transport.FrameUnaryReq, Payload: []byte("armed")},
+		lane:     laneData,
+		done:     make(chan error, 1),
+		onReport: func(p bool) { reports.Add(1); published.Store(p) },
+	}
+	w.dataQueue <- dataI
+
+	// Wait until the carry is provably stuck (its Alloc failed), so the timer is
+	// armed when the writer stops.
+	<-sa.allocated
+
+	// When the writer stops with the timer armed.
+	w.stop() // returns only once run has disarmed, drained, and exited
+
+	// Then the carry was reported exactly once, as a teardown disposal (not a
+	// publish), and no descriptor was published. Reads are after stop's join, which
+	// happens-after every report on the writer goroutine.
+	require.Equal(t, int64(1), reports.Load(), "the stuck carry must be reported exactly once at stop")
+	require.False(t, published.Load(), "the stuck carry must be disposed at teardown, not published")
+	require.ErrorIs(t, <-dataI.done, transport.ErrClosed)
+	require.Empty(t, rr.snapshot(), "a stuck carry must not publish at stop")
+}
+
+// Test that the self-retry backoff resets per carry: a second data intent set
+// aside after the first was placed starts its backoff at retryInitialInterval, not
+// wherever the first carry's doubling left off. The interval observer reports each
+// armed interval exactly, so the assertion is on the programmed schedule, not on
+// wall-clock latency.
+func TestWriter_RetryBackoff_ResetsPerCarry(t *testing.T) {
+	// Given a writer whose interval observer records every armed retry interval.
+	var mu sync.Mutex
+	var intervals []time.Duration
+	rr := &recordRing{}
+	sa := &switchArena{allocated: make(chan struct{}, 1)}
+	w := newWriterFromParts(rr, sa, 2, 2, admitBlock)
+	w.retryObserve = func(d time.Duration) {
+		mu.Lock()
+		intervals = append(intervals, d)
+		mu.Unlock()
+	}
+	w.start()
+	t.Cleanup(w.stop)
+
+	snapshotIntervals := func() []time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]time.Duration, len(intervals))
+		copy(out, intervals)
+
+		return out
+	}
+
+	// When a first data intent is set aside and its backoff doubles at least once.
+	data1 := intent{
+		frame: transport.Frame{CallID: 11, Kind: transport.FrameUnaryReq, Payload: []byte("one")},
+		lane:  laneData,
+		done:  make(chan error, 1),
+	}
+	w.dataQueue <- data1
+	<-sa.allocated
+	require.Eventually(t, func() bool {
+		iv := snapshotIntervals()
+
+		// Literal fixed values: first arm 100us, first doubling 200us.
+		return len(iv) >= 2 && iv[0] == 100*time.Microsecond && iv[1] == 200*time.Microsecond
+	}, testTimeout, 50*time.Microsecond, "first carry's backoff never doubled from the initial interval")
+
+	// And the first carry is placed, then a second carry is set aside.
+	sa.release()
+	require.NoError(t, recvWithin(t, data1.done, "first data intent never resumed"))
+	firstCarryArms := len(snapshotIntervals())
+
+	sa.reExhaust()
+	data2 := intent{
+		frame: transport.Frame{CallID: 12, Kind: transport.FrameUnaryReq, Payload: []byte("two")},
+		lane:  laneData,
+		done:  make(chan error, 1),
+	}
+	w.dataQueue <- data2
+	<-sa.allocated
+
+	// Then the second carry's first armed interval is the initial one again.
+	var secondCarryFirst time.Duration
+	require.Eventually(t, func() bool {
+		iv := snapshotIntervals()
+		if len(iv) <= firstCarryArms {
+			return false
+		}
+		secondCarryFirst = iv[firstCarryArms]
+
+		return true
+	}, testTimeout, 50*time.Microsecond, "second carry never armed the retry timer")
+	require.Equal(t, 100*time.Microsecond, secondCarryFirst,
+		"a new carry's backoff must restart at the 100us initial interval, not carry over")
+
+	sa.release()
+	require.NoError(t, recvWithin(t, data2.done, "second data intent never resumed"))
+}
+
+// Test the exact self-retry backoff schedule of a carry that stays stuck: the
+// interval doubles from 100us and holds at the 5ms cap. The observer reports the
+// programmed interval (not wall-clock), so the whole schedule is asserted exactly,
+// including the cap and its repetition. The expected values are literals — the
+// initial interval is fixed at 100us and the backoff cap at 5ms — so a mutation
+// of either production constant fails against the fixed sequence rather than
+// moving both sides in step.
+func TestWriter_RetryBackoff_DoublesToCapThenHolds(t *testing.T) {
+	// The two production constants carry the fixed values; the schedule below
+	// and every other backoff assertion use these literals directly.
+	require.Equal(t, 100*time.Microsecond, retryInitialInterval, "the initial interval is fixed at 100us")
+	require.Equal(t, 5*time.Millisecond, retryMaxInterval, "the backoff cap is fixed at 5ms")
+
+	// Given a running writer whose arena stays exhausted, so the set-aside carry's
+	// timer fires repeatedly without placing, and an observer recording each armed
+	// interval.
+	var mu sync.Mutex
+	var intervals []time.Duration
+	sa := &signalArena{allocated: make(chan struct{}, 1)}
+	w := newWriterFromParts(&recordRing{}, sa, 2, 2, admitBlock)
+	w.retryObserve = func(d time.Duration) {
+		mu.Lock()
+		intervals = append(intervals, d)
+		mu.Unlock()
+	}
+	w.start()
+	t.Cleanup(w.stop)
+
+	dataI := intent{
+		frame: transport.Frame{CallID: 8, Kind: transport.FrameUnaryReq, Payload: []byte("backoff")},
+		lane:  laneData,
+		done:  make(chan error, 1),
+	}
+	w.dataQueue <- dataI
+	<-sa.allocated
+
+	// When the timer has fired enough times to double past the cap and hold there.
+	want := []time.Duration{
+		100 * time.Microsecond, 200 * time.Microsecond, 400 * time.Microsecond,
+		800 * time.Microsecond, 1600 * time.Microsecond, 3200 * time.Microsecond,
+		5 * time.Millisecond, 5 * time.Millisecond, 5 * time.Millisecond, // 3200*2 = 6400 > cap, so hold at 5ms
+	}
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return len(intervals) >= len(want)
+	}, 5*time.Second, 200*time.Microsecond, "backoff schedule never reached the cap")
+
+	// Then the observed programmed schedule is exactly the doubling-to-cap sequence.
+	mu.Lock()
+	got := append([]time.Duration(nil), intervals[:len(want)]...)
+	mu.Unlock()
+	require.Equal(t, want, got, "backoff must double from 100us to the 5ms cap and then hold at the cap")
 }
 
 // Test the lifecycle lane's non-abandonable-after-enqueue contract (LS1,

@@ -12,6 +12,16 @@ var (
 	fpBeforeWakeupArm   func()
 	fpAfterSlabRelease  func()
 	fpBeforeUnmap       func()
+
+	// fpPrePublishGate fires in the data-lane place path immediately before the
+	// producer's pre-publish teardown re-check, on both the arena-full and
+	// ring-full retry paths. It is not part of the Failpoints crash-window set:
+	// those windows are the multi-process crash-recovery matrix (see the chaos
+	// package's AllWindows), each driven to a peer and killed. This seam instead
+	// closes an in-process shutdown-race window — a self-retry timer resuming a
+	// carry just as teardown is actuated — so it is installed on its own, like the
+	// writer's other in-process test seams, not through the Failpoints struct.
+	fpPrePublishGate func()
 )
 
 // Failpoints bundles the crash-window hooks a test installs (via

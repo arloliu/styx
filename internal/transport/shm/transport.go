@@ -1034,37 +1034,67 @@ func slabInClass(classes []shm.SizeClass, off, storedLen uint64) bool {
 	return true
 }
 
-// StopWriter implements transport.WriterStopper: it stops the outbound writer and
-// performs the frozen shutdown teardown wake — a seq_cst store of shutdown = 1 and
-// a write to BOTH per-direction eventfds (shm-abi.md §14) — WITHOUT unmapping the
-// region. It is the release-free prefix of Close: Close is this stop-and-wake
-// composed with the region release (region.Close's munmap), and a later Close
-// still releases the mapping exactly once (closeOnce). Because it never unmaps, it
-// takes only the closing gate's READ side — the same side a blocking Recv holds
-// for its whole call — so it is callable while a Recv is parked, which is exactly
-// the parked consumer this wake must release: the store + eventfd writes unpark
-// that Recv (and the peer's, via the shared shutdown word and the fixed both-
-// eventfd wake), and it returns transport.ErrClosed. Idempotent; a call after a
-// full Close (region already unmapped) is a no-op, guarded by the closed flag under
-// the read side. The writer join (outbound.stop) runs before the gate, mirroring
-// Close, and drains every queued intent with transport.ErrClosed so a parked
-// lifecycle Send also returns.
-func (t *Transport) StopWriter() error {
-	t.outbound.stop()
-
+// shutdownWake is the shared stop prefix StopWriter and Close both run: it
+// actuates the frozen shutdown teardown wake and THEN joins the writer, in that
+// order. Actuating shutdown before the join is what closes the self-retry
+// timer's publish race: every placement attempt whose producer pre-publish gate
+// (writer.go's prePublishFault) runs after this returns observes the shared
+// shutdown word and is rejected with its slab rolled back, so a timer (or
+// lifecycle) wake that resumes a carry during the join cannot publish a frame the
+// teardown contract owes transport.ErrClosed. The narrowed guarantee is exactly
+// the frozen bound: a writer already PAST its pre-publish gate may still make a
+// descriptor visible before the join completes, and the consumer-side final gate
+// (shm-abi.md §14) is what keeps the peer from dispatching it.
+//
+// Ordering constraints:
+//   - The shutdown store (shm-abi.md §14: shutdown = 1 + both eventfds, no poison
+//     cause) touches the mapping, so it runs under the closing gate's READ side,
+//     which excludes a concurrent munmap. Idempotent when the region is already
+//     closed: a prior full Close actuated shutdown and released the mapping, which
+//     must not be touched again, so this returns without joining (the writer is
+//     already stopped).
+//   - The read side is released BEFORE the writer join. The join must not hold any
+//     side of the closing gate: a Send blocked in the writer holds the read side
+//     for its whole call (see Send), so joining under a write side would deadlock,
+//     and the join drains every queued intent with transport.ErrClosed, which is
+//     what unblocks that Send.
+//
+// poison.Shutdown is coalescing, so a StopWriter followed by a Close (each running
+// this prefix) actuates the same graceful wake without a second observable effect.
+func (t *Transport) shutdownWake() {
 	t.closeMu.RLock()
-	defer t.closeMu.RUnlock()
-
 	if t.closed {
-		// A full Close already released the mapping; shutdown was actuated there and
-		// the shutdownPtr/region must not be touched again.
-		return nil
+		t.closeMu.RUnlock()
+
+		return
 	}
-	// shm-abi.md §14 graceful teardown wake: shutdown = 1 + both eventfds, no poison
-	// cause. The eventfds are the caller's fds, not region-mapped memory, so writing
-	// them is safe without the write side; only the shutdownPtr store touches the
-	// mapping, and the held read side excludes a concurrent munmap.
+	// §14 graceful teardown wake under the read side. The eventfds are the
+	// caller's fds, not region-mapped memory, so writing them needs no gate; only
+	// the shutdownPtr store touches the mapping, which the read side keeps mapped.
 	t.poison.Shutdown()
+	t.closeMu.RUnlock()
+
+	// Join the writer only after shutdown is actuated, so the producer's
+	// pre-publish gate rejects any placement that reaches it during the join.
+	t.outbound.stop()
+}
+
+// StopWriter implements transport.WriterStopper: it performs the frozen shutdown
+// teardown wake — a seq_cst store of shutdown = 1 and a write to BOTH
+// per-direction eventfds (shm-abi.md §14) — and joins the outbound writer,
+// WITHOUT unmapping the region. It is the release-free prefix of Close: Close is
+// this stop-and-wake composed with the region release (region.Close's munmap),
+// and a later Close still releases the mapping exactly once (closeOnce). Because
+// it never unmaps, it holds only the closing gate's READ side for the shutdown
+// store — the same side a blocking Recv holds for its whole call — so it is
+// callable while a Recv is parked, which is exactly the parked consumer this wake
+// must release: the store + eventfd writes unpark that Recv (and the peer's, via
+// the shared shutdown word and the fixed both-eventfd wake), and it returns
+// transport.ErrClosed. The writer join drains every queued intent with
+// transport.ErrClosed so a parked lifecycle Send also returns. Idempotent; a call
+// after a full Close (region already unmapped) is a no-op.
+func (t *Transport) StopWriter() error {
+	t.shutdownWake()
 
 	return nil
 }
@@ -1086,14 +1116,17 @@ func (t *Transport) SetInboundBeforeBlockForTest(fn func()) {
 }
 
 // SetWriterStuckObserverForTest installs fn, invoked each time this transport's
-// outbound writer parks with a data intent set aside on arena or ring backpressure
-// (the stuck-carry wake state) — the state in which a submitted data frame is
-// enqueued in the writer but cannot publish and, absent lifecycle traffic or a
-// retry signal, stays there until teardown drains it with transport.ErrClosed. It
-// is test-only observability with no production effect (the observer is unset in
-// every normal path) and is stored atomically, so it is safe to call after Attach
-// has started the writer. A test uses it to prove an OPEN is genuinely queued
-// behind a stopped writer, not merely absent.
+// outbound writer parks with a data intent set aside on arena or ring
+// backpressure (the stuck-carry wake state) — the state in which a submitted data
+// frame is enqueued but cannot yet publish.
+// The writer resumes it on its own self-retry timer once space frees,
+// and a lifecycle intent or teardown also preempts it;
+// the observer fires each time run re-enters this park.
+// It is test-only observability with no production effect, unset in every normal
+// path and stored atomically, so it is safe to call after Attach has started the
+// writer.
+// A test uses it to prove an OPEN is genuinely queued behind a stopped writer,
+// not merely absent.
 func (t *Transport) SetWriterStuckObserverForTest(fn func()) {
 	t.outbound.setOnBlock(func(s blockSite) {
 		if s == blockStuckCarry {
@@ -1102,26 +1135,34 @@ func (t *Transport) SetWriterStuckObserverForTest(fn func()) {
 	})
 }
 
-// Close performs teardown step 4: stops the outbound writer (draining pending
-// intents with transport.ErrClosed) and unmaps the region, exactly once even
-// under concurrent or repeated calls (shm-abi.md §16). Steps 1-3 (admission
-// stop, waiter wake, goroutine join) are the caller's; the region fd and
-// eventfds are the caller's to close.
+// Close performs teardown step 4: it runs the shared stop prefix — the frozen §14
+// graceful wake (which unparks a Recv on either side) and the outbound writer
+// join (draining pending intents with transport.ErrClosed) — then unmaps the
+// region, exactly once even under concurrent or repeated calls (shm-abi.md §16).
+// The caller still owns admission stop and closing the region fd and the eventfds;
+// the wake and the writer join are Close's, done here via the shared prefix.
 //
-// Close is StopWriter composed with the region release. A prior StopWriter
-// leaves shutdown already set, which is harmless (the store is idempotent).
+// Close is StopWriter composed with the region release: it runs the same shared
+// stop prefix (shutdownWake — actuate the §14 graceful wake, then join the
+// writer) and then takes the closing gate's WRITE side to unmap. A prior
+// StopWriter leaves shutdown already set, which is harmless (the store is
+// coalescing).
 //
-// closeOnce alone dedupes Close but does not exclude a Send/Recv still
-// touching the mapping when munmap runs (a real fd-reuse hazard). The munmap
-// runs under closeMu's write side, which waits for every in-flight Send/Recv
-// (holding the read side) to finish first, and sets closed = true so any
-// Send/Recv that starts afterward observes it and returns transport.ErrClosed
-// immediately, before touching the mapping. outbound.stop() runs before that:
-// it joins the writer and drains every queued intent with transport.ErrClosed,
-// unblocking any caller blocked in Send's submit.
+// The write side is taken only AFTER the shared prefix's writer join: the join
+// holds no side of the closing gate and drains every queued intent with
+// transport.ErrClosed, so a Send parked in the writer (holding the read side)
+// returns and releases it before the write side is requested — taking the write
+// side before the join would deadlock against that Send.
+//
+// closeOnce alone dedupes Close but does not exclude a Send/Recv still touching
+// the mapping when munmap runs (a real fd-reuse hazard). The munmap runs under
+// closeMu's write side, which waits for every in-flight Send/Recv (holding the
+// read side) to finish first, and sets closed = true so any Send/Recv that starts
+// afterward observes it and returns transport.ErrClosed immediately, before
+// touching the mapping.
 func (t *Transport) Close() error {
 	t.closeOnce.Do(func() {
-		t.outbound.stop()
+		t.shutdownWake()
 
 		t.closeMu.Lock()
 		defer t.closeMu.Unlock()

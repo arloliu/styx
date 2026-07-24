@@ -100,6 +100,19 @@ func assertBoundedCompletion(t *testing.T, oc Outcome) {
 	require.LessOrEqual(t, oc.Delivered, oc.Issued, "window %s: more calls delivered than issued", oc.Window)
 
 	if oc.Delivered < oc.Issued {
+		// The close-path window drives the peer through a real Transport.Close,
+		// which actuates the frozen §14 graceful teardown wake (the shutdown word
+		// plus both eventfds) before it unmaps. That wake crosses the region to the
+		// host's outstanding call, so it legitimately ends in transport.ErrClosed —
+		// the honest "the peer closed the connection" signal, carrying no poison
+		// cause — rather than a caller-context timeout. Every other window SIGKILLs
+		// a peer that ran no teardown code, so only a caller-context termination is
+		// acceptable there. TeardownError reports ErrPoisoned (never ErrClosed) for
+		// a poisoned region, so an ErrClosed outcome proves a graceful shutdown, not
+		// a masked fault.
+		if oc.Window == WindowBeforeUnmap && errors.Is(oc.Err, transport.ErrClosed) {
+			return
+		}
 		assertCtxTermination(t, oc.Err, oc.Window)
 	}
 }

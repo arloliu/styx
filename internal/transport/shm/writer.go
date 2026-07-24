@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/arloliu/styx/internal/arena"
 	"github.com/arloliu/styx/internal/ring"
@@ -130,12 +131,12 @@ type writer struct {
 	// lifetime, read only by single-producer-ownership assertions.
 	started atomic.Bool
 
-	// retry wakes run to re-attempt a set-aside data intent after backpressure may
-	// have cleared. It is a deliberately-unwired seam: no production caller signals
-	// it yet — the cross-process consumer→producer "space-available" wake that would
-	// is not specified for this milestone (shm-abi.md §11/§12 define only
-	// producer→consumer wakes); a test drives it directly. Until then a set-aside
-	// data intent resumes on the next lifecycle intent or at shutdown. See signalRetry.
+	// retry wakes run to re-attempt a set-aside data intent. It is a test-only
+	// seam driven by signalRetry: production resumes a set-aside data intent on
+	// run's own backoff timer (see run's stuck-carry wake), which needs no
+	// channel because it is owned by the run goroutine alone. A signalRetry wake
+	// and a timer fire drive the same idempotent non-blocking place retry, so a
+	// test can force a resume without waiting on the timer.
 	retry chan struct{}
 
 	mode admissionMode
@@ -198,6 +199,22 @@ type writer struct {
 	// atomic pointer so a test can install it after start without racing run's
 	// reads at park points. It must not block run indefinitely.
 	onBlock atomic.Pointer[func(blockSite)]
+
+	// retryObserve is a test-only observation hook reporting each interval the
+	// backpressure self-retry timer is armed or re-armed with, so a test can prove
+	// the backoff schedule (initial interval, doubling, cap, per-carry reset)
+	// without asserting on wall-clock latency. It is set before start and read
+	// only by the run goroutine, so it needs no synchronization; it is nil in
+	// production, where the guarded call is a no-op.
+	retryObserve func(time.Duration)
+
+	// onStuckWake is a test-only observation hook reporting which arm of the
+	// stuck-carry wake select fired (timer, signalRetry, or lifecycle), so a test
+	// can identify the wake that drove a resume and force an ordering by
+	// observation rather than by timing. It is set before start and read only by
+	// the run goroutine, so it needs no synchronization; it is nil in production,
+	// where the guarded call is a no-op.
+	onStuckWake func(resumeCause)
 
 	// closeMu guards the closed flag and, held for read across an enqueue, forms
 	// the barrier stop waits on: stop takes the write lock only after closing
@@ -324,6 +341,15 @@ func (w *writer) setOnBlock(fn func(blockSite)) {
 func (w *writer) notifyBlock(s blockSite) {
 	if fn := w.onBlock.Load(); fn != nil {
 		(*fn)(s)
+	}
+}
+
+// reportStuckWake reports which stuck-carry wake arm fired to the installed
+// observation hook, if any. It is a no-op in every production build (onStuckWake
+// unset), a single nil check on the cold wake path.
+func (w *writer) reportStuckWake(c resumeCause) {
+	if w.onStuckWake != nil {
+		w.onStuckWake(c)
 	}
 }
 
@@ -526,6 +552,18 @@ func (w *writer) runEdgeHook() {
 // derived from the stream count.
 const lifecycleBurstBound = 4
 
+// retryInitialInterval is the first delay run's backpressure self-retry timer
+// waits before re-attempting a set-aside data intent. Every fresh carry starts
+// here: the backoff never carries across intents, so a new carry's first retry
+// is always this soon after it is set aside.
+const retryInitialInterval = 100 * time.Microsecond
+
+// retryMaxInterval caps the self-retry backoff: run doubles the interval on each
+// timer-driven retry that still cannot place, up to this ceiling. It bounds the
+// retry cadence (how often a stuck carry re-probes for space); it is NOT a
+// completion-latency guarantee — a carry still parks until space frees.
+const retryMaxInterval = 5 * time.Millisecond
+
 // blockSite names the blocking select run is about to park on, reported through
 // the test-only onBlock observation hook so a test can prove run reached a
 // specific wake state before it delivers a burst. It has no production meaning:
@@ -541,6 +579,75 @@ const (
 	blockStuckCarry
 )
 
+// resumeCause names which arm of the stuck-carry wake select fired, reported
+// through the test-only onStuckWake observation hook so a test can identify the
+// wake that drove a resume and force a specific ordering by observation rather
+// than by timing. It has no production meaning: onStuckWake is nil in every
+// production build (see the field's doc).
+type resumeCause uint8
+
+const (
+	// resumeTimer is the self-retry timer fire arm (retry.fired).
+	resumeTimer resumeCause = iota
+	// resumeSignal is the signalRetry test-seam arm (w.retry).
+	resumeSignal
+	// resumeLifecycle is the lifecycle-intent arm (w.lifecycleQueue).
+	resumeLifecycle
+)
+
+// retryTimer is run's backpressure self-retry timer, owned solely by the run
+// goroutine. Its channel enters the stuck-carry wake select through fired, which
+// is nil (a disabled select case) whenever no carry is set aside. Go's timer
+// channels are synchronized with Stop/Reset, so once Stop returns no stale fire
+// can be received: disarm never drains the channel — the legacy "if !Stop() { <-C
+// }" idiom deadlocks on the path where the select already consumed the fire.
+// Nil-ing fired is what retires the case.
+type retryTimer struct {
+	timer    *time.Timer
+	fired    <-chan time.Time
+	interval time.Duration
+	// observe reports each armed interval to a test; nil in production, where the
+	// guarded call is a no-op.
+	observe func(time.Duration)
+}
+
+// arm starts a fresh carry's backoff at retryInitialInterval. Every carry starts
+// here, so the backoff never carries across intents.
+func (r *retryTimer) arm() {
+	r.interval = retryInitialInterval
+	if r.timer == nil {
+		r.timer = time.NewTimer(r.interval)
+	} else {
+		// The previous carry disarmed with Stop, so this Reset re-arms a stopped
+		// timer with no stale fire pending (Go timer-channel contract).
+		r.timer.Reset(r.interval)
+	}
+	r.fired = r.timer.C
+	if r.observe != nil {
+		r.observe(r.interval)
+	}
+}
+
+// backoff doubles the interval up to retryMaxInterval and re-arms. It is called
+// only after a timer-selected retry that still could not place — the fire was
+// already consumed from the channel, so Reset re-arms directly.
+func (r *retryTimer) backoff() {
+	r.interval = min(r.interval*2, retryMaxInterval)
+	r.timer.Reset(r.interval)
+	if r.observe != nil {
+		r.observe(r.interval)
+	}
+}
+
+// disarm stops the timer and retires its select case (placement succeeded, the
+// carry failed terminally, or shutdown). It never drains the channel.
+func (r *retryTimer) disarm() {
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+	r.fired = nil
+}
+
 // run is the single writer goroutine's loop. Each turn (stream-protocol.md §5.3):
 // (1) publish at most B lifecycle intents in queue order while the queue is
 // non-empty (strict lifecycle-over-data priority, design §12, bounded at B so
@@ -551,14 +658,25 @@ const (
 // the fourth. The writer blocks only when it has nothing to do. While a data
 // intent is stuck it neither pulls more data (which would exceed the queue
 // bound) nor blocks on data-lane progress: it waits only for a lifecycle intent,
-// the retry seam, or shutdown, so lifecycle always preempts the backpressure.
-// Reclaiming a slab does not by itself resume the stuck data: the
-// consumer→producer "space-available" wake is not wired for this milestone
-// (shm-abi.md §11/§12 specify only producer→consumer wakes) and the retry seam
-// has no production caller yet, so absent further lifecycle traffic the set-aside
-// intent resumes at shutdown.
+// a self-retry timer fire, the test retry seam, or shutdown, so lifecycle always
+// preempts the backpressure.
+//
+// The self-retry timer is what resumes a stuck data intent absent other traffic.
+// The cross-process consumer→producer "space-available" wake is deliberately not
+// wired (shm-abi.md §11/§12 specify only producer→consumer wakes); instead run
+// re-attempts the set-aside carry on a bounded backoff timer it owns alone. The
+// timer is armed only while a carry is set aside and is never touched on the
+// un-backpressured path.
 func (w *writer) run() {
 	var stuck *carry
+
+	// retry is run's backpressure self-retry timer (see retryTimer): armed while a
+	// carry is set aside, disarmed otherwise. timerFired records that the last
+	// stuck wake was a timer fire (already consumed from the channel), so Step 2's
+	// still-stuck branch knows to double and re-arm directly rather than leave a
+	// lifecycle/signalRetry wake's existing schedule untouched.
+	retry := retryTimer{observe: w.retryObserve}
+	timerFired := false
 
 	// staged holds a lifecycle intent a blocking wake select received. The wake
 	// does not publish it there — that publish would be outside Step 1's B counter,
@@ -600,14 +718,26 @@ func (w *writer) run() {
 		// data-lane resources here — a fresh dequeue is what keeps data from
 		// starving when lifecycle is continuously non-empty (step 3 loops).
 		if stuck != nil {
-			if w.place(stuck) == emitDone {
+			switch {
+			case w.place(stuck) == emitDone:
+				// Placed (or terminally failed and reported): disarm before the
+				// carry slot is cleared, so a stale fire already in flight is
+				// retired (its select case goes nil).
 				stuck = nil
+				retry.disarm()
+			case timerFired:
+				// A timer-selected retry that still cannot place: double the
+				// interval (capped) and re-arm. A lifecycle or signalRetry wake
+				// leaves the armed timer's existing schedule untouched.
+				retry.backoff()
 			}
+			timerFired = false
 		} else {
 			select {
 			case i := <-w.dataQueue:
 				if c := w.emit(i); c != nil {
 					stuck = c
+					retry.arm() // fresh carry set aside: start the backoff at the initial interval
 				}
 			default:
 			}
@@ -626,14 +756,28 @@ func (w *writer) run() {
 			select {
 			case i := <-w.lifecycleQueue:
 				// Stage, do not publish here: the next turn's Step 1 emits it as a
-				// counted intent so the burst bound holds across this wake.
+				// counted intent so the burst bound holds across this wake. The
+				// armed timer keeps its existing schedule.
+				w.reportStuckWake(resumeLifecycle)
 				staged = i
 				haveStaged = true
+			case <-retry.fired:
+				// Self-retry timer fired: loop back so Step 2's non-blocking place
+				// retry re-attempts the carry. The fire is consumed here, so a
+				// still-stuck retry doubles and re-arms (Step 2); a placed retry
+				// disarms.
+				w.reportStuckWake(resumeTimer)
+				timerFired = true
 			case <-w.retry:
-				// Space may have freed; loop back so step 2's non-blocking place
-				// retry re-attempts the set-aside intent. Lifecycle still preempts;
-				// shutdown still drains.
+				// signalRetry test seam: same idempotent place retry as a timer
+				// fire, but the armed timer keeps its existing schedule (not a
+				// timer fire, so no double-and-re-arm).
+				w.reportStuckWake(resumeSignal)
 			case <-w.shutdown:
+				// Disarm before draining: the run goroutine is exiting, so the
+				// timer must be stopped and its select case retired to leave no
+				// pending fire behind.
+				retry.disarm()
 				w.drainAndStop(stuck)
 
 				return
@@ -652,6 +796,7 @@ func (w *writer) run() {
 		case i := <-w.dataQueue:
 			if c := w.emit(i); c != nil {
 				stuck = c
+				retry.arm() // fresh carry set aside: start the backoff at the initial interval
 			}
 		case <-w.shutdown:
 			w.drainAndStop(nil)
@@ -716,13 +861,13 @@ func (w *writer) emit(i intent) *carry {
 	return nil
 }
 
-// signalRetry wakes run to re-attempt a set-aside data intent. It is the resume
-// seam for the consumer→producer "space-available" wake, which is not specified
-// for this milestone and has no production caller yet (shm-abi.md §11/§12 define
-// only producer→consumer wakes); a test drives it directly. The send is
-// non-blocking into a cap-1 coalescing channel, so it never blocks the signaller,
-// and a spurious or coalesced wake is harmless because the retry is an idempotent
-// non-blocking place.
+// signalRetry wakes run to re-attempt a set-aside data intent immediately,
+// without waiting on the backoff timer. It is a test-only seam with no production
+// caller: production resumes a set-aside carry on run's own self-retry timer.
+// The send is non-blocking into a cap-1 coalescing channel, so it never blocks
+// the signaller, and a spurious or coalesced wake is harmless because the retry
+// is an idempotent non-blocking place; a wake that arrives while the timer is
+// armed leaves the timer's schedule untouched.
 func (w *writer) signalRetry() {
 	select {
 	case w.retry <- struct{}{}:
@@ -749,6 +894,15 @@ func (w *writer) place(c *carry) emitResult {
 			c.h = w.pendingSlab.h
 			c.hasSlab = w.pendingSlab.present
 		}
+	}
+
+	// Failpoint PrePublishGate: the carry is built (slab reserved if any) and
+	// about to re-check teardown, on both the arena-full and ring-full retry
+	// paths. A shutdown-race test pauses the writer here, actuates teardown, then
+	// releases, so the pre-publish gate below runs after teardown was actuated and
+	// must roll the reservation back (shm-abi.md §8).
+	if failpointEnabled && fpPrePublishGate != nil {
+		fpPrePublishGate()
 	}
 
 	// Pre-publish gate (shm-abi.md §8/§16): a fault observed here means the

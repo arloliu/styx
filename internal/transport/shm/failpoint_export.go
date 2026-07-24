@@ -25,3 +25,12 @@ func ClearFailpoints() {
 	fpAfterSlabRelease = nil
 	fpBeforeUnmap = nil
 }
+
+// SetPrePublishGate installs (or, with nil, clears) the pre-publish-gate seam
+// fired in the data-lane place path immediately before the producer's teardown
+// re-check, on both the arena-full and ring-full retry paths. It is separate
+// from SetFailpoints because fpPrePublishGate is an in-process shutdown-race
+// seam, not one of the multi-process crash-recovery windows the Failpoints
+// struct enumerates (see fpPrePublishGate's doc). It exists only under -tags
+// failpoint, so the default build compiles the seam out entirely.
+func SetPrePublishGate(fn func()) { fpPrePublishGate = fn }

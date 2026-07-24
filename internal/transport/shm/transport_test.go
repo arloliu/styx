@@ -1223,6 +1223,93 @@ func TestTransport_StopWriter_WakesParkedRecvWithoutUnmap_ThenCloseReleasesOnce(
 	require.Equal(t, int32(1), counting.closes.Load(), "the later Close unmaps exactly once")
 }
 
+// Test that StopWriter and Close, sharing one stop prefix, compose safely under
+// concurrency: many StopWriter and Close callers racing while a Recv is parked
+// holding the closing gate's read side, then repeated StopWriter after Close, must
+// not deadlock, must unmap exactly once, and must report the parked Recv exactly
+// once with the graceful transport.ErrClosed. The shared prefix takes the read
+// side only for the shutdown store and joins the writer holding no gate side, so
+// Close's later write side never contends with the join or the parked reader.
+func TestTransport_StopWriterAndClose_ComposeUnderConcurrency(t *testing.T) {
+	// Given an attached Transport whose region records every munmap.
+	region, err := shm.CreateRegion(roundTripLayout())
+	require.NoError(t, err)
+	inEFD, err := event.NewEventFD()
+	require.NoError(t, err)
+	outEFD, err := event.NewEventFD()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = inEFD.Close()
+		_ = outEFD.Close()
+		_ = region.Close()
+	})
+
+	counting := &countingRegion{}
+	restore := swapAttachSeams(
+		func(fd int, size uint64) (regionHandle, error) {
+			r, e := shm.OpenRegion(fd, size)
+			if e != nil {
+				return nil, e
+			}
+			counting.inner = r
+
+			return counting, nil
+		},
+		attachNewArena, attachNewWriter,
+	)
+	host, err := Attach(AttachParams{
+		RegionFD: region.FD(), ExpectedSize: region.Layout().RegionSize, Role: RoleHost,
+		InboundEFD: inEFD, OutboundEFD: outEFD, Config: validConfig(false),
+	})
+	restore()
+	require.NoError(t, err)
+
+	// Given a Recv parked on the inbound direction, holding the closing gate's read
+	// side for its whole call.
+	recvDone := make(chan error, 1)
+	go func() {
+		_, e := host.Recv(context.Background())
+		recvDone <- e
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for !host.inboundPark.IsParked() {
+		if time.Now().After(deadline) {
+			t.Fatal("reader never parked; cannot exercise the concurrent stop against a held read side")
+		}
+		runtime.Gosched()
+	}
+
+	// When many StopWriter and Close callers race, then StopWriter repeats after
+	// Close has already unmapped.
+	var wg sync.WaitGroup
+	for i := range 16 {
+		if i%2 == 0 {
+			wg.Go(func() { _ = host.StopWriter() })
+		} else {
+			wg.Go(func() { _ = host.Close() })
+		}
+	}
+	wg.Wait()
+	require.NoError(t, host.StopWriter())
+	require.NoError(t, host.Close())
+
+	// Then the parked Recv was reported exactly once with the graceful cause, and
+	// the region was unmapped exactly once — no deadlock, no double-unmap.
+	select {
+	case e := <-recvDone:
+		require.ErrorIs(t, e, transport.ErrClosed)
+		require.NotErrorIs(t, e, ErrPoisoned)
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent stop did not wake the parked Recv")
+	}
+	select {
+	case e := <-recvDone:
+		t.Fatalf("parked Recv reported more than once: %v", e)
+	default:
+	}
+	require.Equal(t, int32(1), counting.closes.Load(), "the region must be unmapped exactly once")
+}
+
 // Test many concurrent Send callers and a single Recv caller (Recv's lastSeen
 // field is owned by exactly one consumer, so only Send is safely
 // multi-caller, per doc.go) racing a Close call on the same Transport, under
