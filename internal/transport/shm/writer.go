@@ -119,6 +119,17 @@ type writer struct {
 	barrier  chan struct{} // closed by stop once no submit can enqueue, gating run's final drain
 	stopped  chan struct{} // closed by run once it has fully drained and returned
 
+	// started is stored synchronously by start, before it launches run.
+	// A same-goroutine read observing false therefore proves start has not been
+	// invoked — has not reached the launch point — with no timing assumption,
+	// since a completed same-goroutine start has already stored true.
+	// This is the one fact a channel or drain observation cannot establish,
+	// because a launched-but-unscheduled run leaves every lifecycle channel in
+	// its unstarted state.
+	// It is a diagnostic marker with no behavior branch: one store per writer
+	// lifetime, read only by single-producer-ownership assertions.
+	started atomic.Bool
+
 	// retry wakes run to re-attempt a set-aside data intent after backpressure may
 	// have cleared. It is a deliberately-unwired seam: no production caller signals
 	// it yet — the cross-process consumer→producer "space-available" wake that would
@@ -296,6 +307,7 @@ func (w *writer) prePublishFault() error {
 // start launches the single writer goroutine. It must be called exactly once,
 // before stop.
 func (w *writer) start() {
+	w.started.Store(true) // synchronous, before the goroutine exists: see the started field
 	go w.run()
 }
 

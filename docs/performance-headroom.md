@@ -28,30 +28,84 @@ relative multiple, because the production transport's warm p50 (~2.1 µs) is abo
 a microsecond slower than the prototype's (~1.1 µs — derived from the recorded
 14.9× prototype ratio, not a directly recorded median).
 
-## Where the microsecond went — a hypothesis
+## Where the microsecond went
 
-The benchmark report offers a reason for the gap and labels it a hypothesis. The
-production transport routes every send through a single writer goroutine fed by a
-two-lane intent queue; the prototype's send path was inline (the calling goroutine
-wrote its frame straight to the ring). That design is deliberate — it buys
-single-producer/single-consumer safety, keeps lifecycle traffic from starving data
-traffic, and makes poisoning and recovery well-defined — but it adds a
-caller-to-writer goroutine hop on each send the inline path never paid, and the
-report attributes the roughly one-microsecond difference to that hop.
+The benchmark report offers a reason for the gap. The production transport routes
+every send through a single writer goroutine fed by a two-lane intent queue; the
+prototype's send path was inline (the calling goroutine wrote its frame straight to
+the ring). That design is deliberate — it buys single-producer/single-consumer
+safety, keeps lifecycle traffic from starving data traffic, and makes poisoning and
+recovery well-defined — but it adds a caller-to-writer goroutine hop on each send
+the inline path never paid, and the report attributed the roughly one-microsecond
+difference to that hop.
 
-Read this as a hypothesis, not a measured cause. The comparison is not a
-controlled A/B: the prototype ran as two processes while the production rerun runs
-as an in-process transport pair, so scheduler and heap sharing differ between them.
-The honest statement is that production is about a microsecond slower on the
-mechanism that mattered, with the writer-goroutine hop the report's suspected — but
-unverified — reason.
+That attribution began as a hypothesis, not a measured cause: the original
+comparison was not a controlled A/B — the prototype ran as two processes while the
+production rerun runs as an in-process transport pair, so scheduler and heap sharing
+differ between them.
+
+### What the controlled A/B measured
+
+A controlled A/B now measures the hop in isolation
+([`internal/transport/shm/writer_hop_bench_test.go`](../internal/transport/shm/writer_hop_bench_test.go)).
+Two cells send the identical 64-byte payload frame through the writer's real
+build → slab-claim → ring-push → producer-owned reclaim path, over real ring and
+arena backing. The only difference between them is the hop:
+
+- **inline** — the calling goroutine runs the emit step directly, no writer
+  goroutine started for the direction;
+- **via the writer** — the same prebuilt, reused intent is handed to the running
+  writer goroutine (lane-channel enqueue + scheduler handoff + emit + completion
+  wake).
+
+A parity test asserts the two cells allocate identically
+(one allocation, 256 B per operation, enforced — not eyeballed),
+so the difference is the hop and not allocation.
+On this box (AMD Ryzen 9 9950X3D), medians over twenty runs:
+
+- inline emit: **140.9 ns/op**
+- via the writer goroutine: **413.9 ns/op**
+- single-send hop = **273.0 ns** (n=20, p < 0.001, negligible run-to-run variance)
+
+The warm unary round trip pays a production send on **each** end
+(the host request and the plugin response),
+so the quantity to set beside the ~1 µs round-trip residual is **2 × the hop**: **≈ 546 ns**.
+The recorded round-trip residual is ≈ **1.0 µs**
+(production warm p50 ≈ 2.1 µs minus the prototype's ≈ 1.1 µs).
+2 × the hop and the residual are the same order of magnitude — 2 × the hop is roughly half the residual.
+
+A CPU profile of the via-the-writer cell shows its added on-CPU cost is scheduler and channel synchronization.
+The send's real work (arena alloc/free, ring push, descriptor build) is present identically in the inline arm;
+what the writer arm adds on top is `runtime.selectgo`, `runtime.lock2`/`unlock2`,
+`runtime.casgstatus` (goroutine park and unpark), `runtime.chanrecv`/`chansend`,
+sudog acquire/release, and `futex` — the machinery the hypothesis names.
+
+**Verdict: magnitude consistent with the hypothesis.**
+The in-harness hop is real, and its added cost is scheduler and channel synchronization;
+2 × the hop is the same order of magnitude as the ~1 µs round-trip residual.
+That is magnitude consistency, not proof of causation.
+The residual came from a two-process prototype set against an in-process production rerun —
+a scheduling and heap-topology difference this in-process A/B cannot reproduce —
+and 2 × the hop is only about half the residual, so the remainder is unattributed.
+A tighter experiment — a same-harness two-direction inline-versus-writer round-trip A/B —
+is the next rung if the residual ever needs attributing.
+
+One context measurement the A/B also records:
+the full production `submit()` path measures **526.8 ns/op at three allocations (384 B)** —
+about 113 ns and two allocations more than the via-the-writer hop cell.
+That gap is `submit`'s production-wrapper overhead over the cell's bare queue send, not allocation alone:
+`submit` builds a fresh intent and completion channel per call (the two extra allocations)
+and runs `enqueue`'s close-lock, its closed check, its context/shutdown admission select,
+and its post-enqueue context wait — none of which the hop cell's direct queue send performs.
+It is real `Send` cost, but it is not the hop, and it is excluded from the A/B above.
 
 ## Levers, and what each actually improves
 
 Two changes have been identified in adjacent work. Stated honestly, neither
 directly reclaims the warm, uncontended shared-memory p50 the gate reads — each
-improves a different path — and the warm-path reclaim itself rests on the
-unverified writer-hop hypothesis above:
+improves a different path — and the warm-path reclaim itself targets the
+writer-hop, which the A/B above finds magnitude-consistent with, but not proven to
+be the sole source of, the residual:
 
 - **Hoist the per-receive socket receive timeout.** The Unix-domain-socket receive
   path sets its receive timeout (`SO_RCVTIMEO`, clamped to each call's deadline) on
@@ -68,9 +122,10 @@ unverified writer-hop hypothesis above:
   off the backpressure path (the report sizes them to avoid it), so it does not move
   their warm p50 either.
 
-The warm-path gap itself would be reclaimed only by reducing the send-side
-scheduling the writer-hop hypothesis points at, which no one has yet confirmed is
-the cause. These are recorded as directions, not as a plan.
+The send-side scheduling the writer hop pays is one path toward the warm-path gap.
+The A/B above measures that hop in isolation at the same order of magnitude as about half the residual;
+the rest of the residual is unattributed, so what else moves the warm p50 is not established here.
+These are recorded as directions, not as a plan.
 
 ## What is gated today
 
