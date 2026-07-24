@@ -103,7 +103,7 @@ func NewPluginServer(cfg PluginServerConfig) *PluginServer {
 	s := &PluginServer{
 		services:           make(map[uint64]registeredService),
 		metricsInterval:    resolveMetricsInterval(cfg.MetricsInterval),
-		transports:         resolvePluginTransports(cfg.Transports),
+		transports:         resolvePluginTransports(transportNames(cfg.Transports)),
 		continueAfterPanic: cfg.ContinueAfterPanic,
 	}
 	if cfg.Metrics != nil {
@@ -115,12 +115,13 @@ func NewPluginServer(cfg PluginServerConfig) *PluginServer {
 
 // RegisterService installs desc against impl (the user's service
 // implementation, e.g. `&ImageProcessor{}`), to be called from the
-// dispatch loop once Serve starts. Registering two services whose
-// ServiceID collides (FNV-64 collision — checked again here, defense in
-// depth against the code generator's own generation-time check missing a
-// cross-package collision) panics immediately: this is a startup-time
-// configuration
-// error, not a runtime condition to recover from.
+// dispatch loop once Serve starts.
+//
+// Registering two services whose ServiceID collides (an FNV-64 collision —
+// checked again here, defense in depth against the code generator's own
+// generation-time check missing a cross-package collision) panics
+// immediately: this is a startup-time configuration error, not a runtime
+// condition to recover from.
 func (s *PluginServer) RegisterService(desc *ServiceDesc, impl any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -862,7 +863,7 @@ func defaultPluginTransports() []string {
 
 // resolvePluginTransports returns a server-owned copy of the configured
 // allowlist, or the default when none was set (an empty or nil
-// PluginServerConfig.Transports). The clone is what makes the allowlist
+// PluginServerConfig.Transports, converted to plain strings). The clone is what makes the allowlist
 // construction-fixed: without it the server would alias the caller's slice, so a
 // post-construction mutation of that slice could inject an unknown transport past
 // the constructor's validation or race the handshake's read of it.

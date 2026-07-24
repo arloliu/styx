@@ -29,7 +29,7 @@ func runEchoUnaryWorkload(t *testing.T, transport string, inputs []string) []una
 	t.Helper()
 
 	h := styx.NewHost(styx.HostConfig{
-		Plugins: []styx.PluginSpec{{Name: "echo", Path: echoPluginBin, Transport: transport}},
+		Plugins: []styx.PluginSpec{{Name: "echo", Path: echoPluginBin, Transport: styx.Transport(transport)}},
 	})
 	require.NoError(t, h.Start(t.Context()))
 	stopHostInCleanup(t, h)
@@ -61,7 +61,7 @@ func runEchoStreamingWorkload(t *testing.T, transport, seed string) []string {
 
 	h := styx.NewHost(styx.HostConfig{
 		Plugins: []styx.PluginSpec{{
-			Name: "echo", Path: echoPluginBin, Transport: transport,
+			Name: "echo", Path: echoPluginBin, Transport: styx.Transport(transport),
 			RequireStreaming: true, Services: []styx.ServiceRequirement{echopb.EchoStreamRequirement()},
 		}},
 	})

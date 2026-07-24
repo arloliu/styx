@@ -48,17 +48,21 @@ type HostConfig struct {
 	// Metrics optionally receives this host's built-in instrumentation for
 	// every plugin it supervises (RPC latency, bytes moved, timeouts,
 	// cancellations, restarts, heartbeat misses, backpressure). One sink covers
-	// all plugins; each signal carries a "plugin" label. nil (the default)
-	// disables host-side metrics entirely — no dispatcher goroutine runs and no
-	// hot path allocates. Passing observe.NoopMetricsSink() enables the
-	// (harmless) machinery with a discarding sink.
+	// all plugins; each signal carries a "plugin" label.
+	//
+	// nil (the default) disables host-side metrics entirely — no dispatcher
+	// goroutine runs and no hot path allocates. Passing
+	// observe.NoopMetricsSink() enables the (harmless) machinery with a
+	// discarding sink.
 	Metrics observe.MetricsSink
 
 	// Logger optionally receives Styx's structured internal diagnostics — plugin
 	// lifecycle transitions and faults. Delivery goes through the same bounded,
 	// panic-isolated worker as metrics, so a slow or panicking Logger neither
-	// stalls the event relay nor crashes the process. nil (the default) disables
-	// lifecycle logging entirely — no logger goroutine runs.
+	// stalls the event relay nor crashes the process.
+	//
+	// nil (the default) disables lifecycle logging entirely — no logger
+	// goroutine runs.
 	Logger observe.Logger
 
 	// MetricsInterval sets the cadence of the periodic reporter for the
@@ -75,64 +79,81 @@ type PluginSpec struct {
 	Env     []string // additional vars merged onto the sanitized base env
 	Restart RestartPolicy
 
-	// BinarySHA256 optionally pins the plugin binary's identity. When
-	// non-nil, Start verifies it host-side, before any
-	// supervisor is created for this plugin, and fails the plugin with
-	// *IncompatibleError on mismatch. nil disables pinning.
+	// BinarySHA256 optionally pins the plugin binary's identity.
+	//
+	// When non-nil, Start verifies it host-side, before any supervisor is
+	// created for this plugin, and fails the plugin with *IncompatibleError on
+	// a mismatch. nil (the default) disables pinning.
 	BinarySHA256 []byte
 
-	// Services optionally declares, per service this Host intends to call
-	// on this plugin, the version range the plugin must satisfy — the host
-	// declares a required version range per service it intends to call,
-	// and a plugin that cannot satisfy it fails handshake with the
-	// offending service named in the error. Typically populated from a
-	// generated `<Service>Requirement()` value rather than constructed by
-	// hand. Start sends this on the Hello offer; the plugin's own
-	// control.Negotiate call enforces it against its advertised
-	// ServiceVersions, and a violation surfaces as *IncompatibleError
-	// naming the offending service. nil (the default) declares no
-	// requirements — every service version is accepted.
+	// Services optionally declares, per service this Host intends to call on
+	// this plugin, the version range the plugin must satisfy. Typically
+	// populated from a generated `<Service>Requirement()` value rather than
+	// constructed by hand.
+	//
+	// Start sends this on the Hello handshake offer; the plugin's own
+	// negotiation enforces it against its advertised versions, and a violation
+	// surfaces as *IncompatibleError naming the offending service. nil (the
+	// default) declares no requirements — every service version is accepted.
 	Services []ServiceRequirement
 
 	// RequireStreaming declares that this Host's client calls streaming methods
-	// on this plugin, so the streaming feature is marked required in the handshake
-	// offer (stream-protocol.md §11.2): a plugin that cannot stream fails the
-	// handshake at startup with *IncompatibleError rather than the incompatibility
-	// surfacing only at the first OpenStream. Generated streaming client code sets
-	// it; the default (false) offers streaming as optional, so a non-streaming
-	// plugin still negotiates unary calls.
+	// on this plugin, so the streaming feature is marked required in the
+	// handshake offer (stream-protocol.md §11.2): a plugin that cannot stream
+	// fails the handshake at startup with *IncompatibleError, rather than the
+	// incompatibility surfacing only at the first OpenStream call.
+	//
+	// Generated streaming client code sets it; the default (false) offers
+	// streaming as optional, so a non-streaming plugin still negotiates unary
+	// calls.
 	RequireStreaming bool
 
-	// Transport selects this plugin's data-plane transport: "shm" pins the
-	// shared-memory transport (a plugin that cannot speak it fails the handshake,
-	// never a silent downgrade to uds), "uds" pins Unix-domain sockets, and "auto"
-	// (also the empty-string default) offers both with the shared-memory transport
-	// preferred, falling back to uds only when the plugin does not offer it.
-	Transport string
+	// Transport selects this plugin's data-plane transport.
+	//
+	// TransportSHM pins the shared-memory transport: a plugin that cannot speak it
+	// fails the handshake rather than silently downgrading. TransportUDS pins Unix
+	// domain sockets. TransportAuto (also the zero-value default) offers both,
+	// preferring shared memory and falling back to Unix domain sockets only when
+	// the plugin does not offer shared memory.
+	//
+	// See docs/configuration.md for a worked example of choosing between them.
+	Transport Transport
 
-	// Geometry is the host-authored shared-memory region geometry, used when the
-	// shared-memory transport is negotiated. The zero value selects the default
-	// profile (GeometryDefault); a profile helper (GeometryDefault, GeometryLean)
-	// or an explicit ShmGeometry overrides it. Ignored for the uds transport.
+	// Geometry is the host-authored shape of the shared-memory region — its
+	// capacity and payload size classes — used when the shared-memory transport
+	// is negotiated. Ignored for the uds transport.
+	//
+	// The zero value selects the default profile (GeometryDefault); a profile
+	// helper (GeometryDefault, GeometryLean) or an explicit ShmGeometry
+	// overrides it. See docs/configuration.md for a plain-language explanation
+	// of what a geometry's fields mean and how to size one.
 	Geometry ShmGeometry
 
-	// MaxDataInflight is the host-selected peak concurrent data frames, carried to
-	// the plugin so both sides admit identically (shm-abi.md §18). Zero falls back
-	// to the geometry's data budget C − R. Ignored for the uds transport.
+	// MaxDataInflight is the host-selected peak number of concurrent data calls,
+	// carried to the plugin so both sides admit identically (shm-abi.md §18).
+	// Ignored for the uds transport.
+	//
+	// Zero (the default) falls back to the geometry's own data budget:
+	// RingCapacity minus LifecycleReserve.
 	MaxDataInflight int
 
 	// StrictCapacity opts into the frozen ABI's optional STRICT certification
-	// (shm-abi.md §18): the transport additionally requires MaxDataInflight not to
-	// exceed any reachable size class's usable slab count, so no admitted data call
-	// can ever hit arena exhaustion. A geometry that fails STRICT is refused at
-	// spawn with a typed error naming the offending class. Off by default; a
-	// non-STRICT geometry is still valid and simply experiences typed backpressure
-	// under load. Ignored for the uds transport.
+	// (shm-abi.md §18): the transport additionally requires MaxDataInflight not
+	// to exceed any reachable size class's usable slab count, so no admitted
+	// data call can ever run out of slabs for its size. Ignored for the uds
+	// transport.
+	//
+	// A geometry that fails this check is refused at spawn with a typed error
+	// naming the offending class, rather than the shortfall surfacing later as
+	// backpressure under load. Off by default; a geometry that doesn't opt in
+	// is still valid and simply experiences typed backpressure under load
+	// instead. See docs/configuration.md.
 	StrictCapacity bool
 }
 
-// ServiceRequirement is the host's declared acceptable version range for
-// one service it intends to call on a plugin, fed to PluginSpec.Services.
+// ServiceRequirement is the host's declared acceptable version range for one
+// service it intends to call on a plugin, fed to PluginSpec.Services.
+//
 // A generated `<Service>Requirement()` returns the exact-version form
 // (MinVersion == MaxVersion == the generated service's own version) most
 // callers should pass; a wider range is a hand-authored option this type
@@ -272,17 +293,19 @@ func NewHost(cfg HostConfig) *Host {
 	return h
 }
 
-// Start spawns every configured plugin, completes its handshake, and
-// begins supervisor heartbeat monitoring for each — one
-// internal/supervisor.Supervisor per PluginSpec, running in its
-// own goroutine for the plugin's whole life. Start blocks per plugin only
-// until that plugin's FIRST attempt either reaches Ready or gives up
-// (Config.Restart.Max exceeded on the first attempt already, e.g. the
-// zero-value RestartPolicy{}); once Ready, ongoing heartbeat monitoring
-// and any later restarts continue in the background and are reported only
-// via Events. A single plugin's failure does not abort the others; it is
-// reported via Events and Start's returned error is the combined
-// (errors.Join) set of any that failed.
+// Start spawns every configured plugin, completes its handshake, and begins
+// supervisor heartbeat monitoring for each — one supervisor per PluginSpec,
+// running in its own goroutine for the plugin's whole life.
+//
+// Start blocks per plugin only until that plugin's FIRST attempt either
+// reaches Ready or gives up (its restart budget exhausted on the first
+// attempt already, e.g. the zero-value RestartPolicy{}); once Ready, ongoing
+// heartbeat monitoring and any later restarts continue in the background and
+// are reported only via Events.
+//
+// A single plugin's failure does not abort the others; it is reported via
+// Events, and Start's returned error is the combined (errors.Join) set of any
+// that failed.
 func (h *Host) Start(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -339,7 +362,7 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 		// transport, preferred, with a uds fallback. The host authors geometry
 		// (converted from the public ShmGeometry) and selects peak concurrency and
 		// the optional STRICT certification.
-		Transport:       resolveTransport(spec.Transport),
+		Transport:       string(resolveTransport(spec.Transport)),
 		ShmLayout:       spec.Geometry.toLayout(),
 		MaxDataInflight: spec.MaxDataInflight,
 		StrictCapacity:  spec.StrictCapacity,
@@ -682,13 +705,14 @@ func (h *Host) Plugin(name string) *ClientConn {
 }
 
 // Events returns a channel of supervisor lifecycle events for every plugin
-// this Host manages (the Starting/Ready/Unhealthy/Crashed/Restarting/
-// GaveUp event stream). Delivery follows the same non-blocking, bounded,
-// two-class contract internal/supervisor.EventBus documents:
-// informational events (Starting, Ready, Unhealthy, Restarting) drop the
-// oldest queued one once the reader falls behind; Crashed and GaveUp
-// coalesce to the latest instead of ever being silently dropped, even
-// under a sustained burst from many plugins with no reader at all.
+// this Host manages — the EventStarting/EventReady/EventUnhealthy/
+// EventCrashed/EventRestarting/EventGaveUp stream described on EventKind.
+//
+// Delivery never blocks, even under a sustained burst from many plugins with
+// no reader at all: an informational event (Starting, Ready, Unhealthy,
+// Restarting) drops the oldest queued one once the reader falls behind, while
+// Crashed and GaveUp instead coalesce to the latest one, so a critical event
+// is never silently dropped the way an informational one may be.
 func (h *Host) Events() <-chan Event {
 	return h.events
 }
@@ -868,13 +892,15 @@ func translateEventErr(name string, err error) error {
 }
 
 // resolveTransport maps a PluginSpec.Transport value to the supervisor's
-// transport preference, defaulting the empty string to "auto" — so a plugin with
-// no explicit choice offers the shared-memory transport preferred, with a uds
-// fallback. Any other value passes through: "shm" pins shared memory, "uds" pins
-// Unix-domain sockets, and an unrecognized value degrades to uds at the offer.
-func resolveTransport(t string) string {
+// transport preference, defaulting the zero value to TransportAuto so a plugin
+// with no explicit choice offers the shared-memory transport preferred, with a
+// uds fallback.
+//
+// Any other value passes through unchanged; an unrecognized value degrades to
+// uds at the offer.
+func resolveTransport(t Transport) Transport {
 	if t == "" {
-		return "auto"
+		return TransportAuto
 	}
 
 	return t
@@ -973,7 +999,7 @@ func toHandshakeOffer(o control.Offer) HandshakeOffer {
 	return HandshakeOffer{
 		ProtocolMin: o.ProtocolMin,
 		ProtocolMax: o.ProtocolMax,
-		Transports:  o.Transports,
+		Transports:  namedTransports(o.Transports),
 		Codecs:      o.Codecs,
 		Features:    names,
 		Services:    services,

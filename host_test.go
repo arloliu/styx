@@ -445,7 +445,7 @@ func TestHost_ShmAttachFailsAfterNegotiation_IsSpawnFailure_NoDowngrade(t *testi
 				Plugins: []styx.PluginSpec{{
 					Name:            "ready",
 					Path:            fixtureReadyPlugin,
-					Transport:       transport,
+					Transport:       styx.Transport(transport),
 					Geometry:        styx.GeometryLean(), // C = 512, R = 32 => C - R = 480
 					MaxDataInflight: 1000,                // exceeds the data budget: negotiates shm, fails attach
 				}},

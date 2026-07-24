@@ -48,18 +48,20 @@ const (
 )
 
 // PluginCrashError reports that a plugin process exited unexpectedly.
+//
 // It appears only in Host.Events() event errors, never as a per-call error:
 // per-call errors are the bare sentinels ErrPluginUnavailable (crash
 // detected before the request was published, retryable) or ErrOutcomeUnknown
 // (crash detected after publish, outcome unknown, not retryable).
 //
-// ExitStatus follows the convention also used by Python's subprocess
-// module and many process supervisors: a non-negative value is the
-// process's own exit code; a negative value -N means it was terminated by
-// signal N (e.g. -9 for a SIGKILL teardown fallback). ExitStatusKnown is
-// false (ExitStatus then meaningless, always 0) when the reaped process's
-// exit status could not be determined — e.g. a crash detected before the
-// process was ever spawned, or before internal/lifecycle.Teardown ran.
+// ExitStatus follows the convention also used by Python's subprocess module
+// and many process supervisors: a non-negative value is the process's own
+// exit code; a negative value -N means it was terminated by signal N (e.g. -9
+// for a SIGKILL teardown fallback).
+//
+// ExitStatusKnown is false (ExitStatus then meaningless, always 0) when the
+// reaped process's exit status could not be determined — e.g. a crash
+// detected before the process was ever spawned, or before its teardown ran.
 type PluginCrashError struct {
 	Plugin          string
 	ExitStatus      int
@@ -142,35 +144,62 @@ func (e *IncompatibleError) Is(target error) bool {
 // imports internal/control, so it stays a plain, stable, printable value.
 type HandshakeOffer struct {
 	ProtocolMin, ProtocolMax uint32
-	Transports               []string
+	Transports               []Transport
 	Codecs                   []string
 	Features                 []string // names only; required/optional detail is in Reason
 
-	// Services carries the structured per-service version data available
-	// for this side. IncompatibleError carries both sides' offers: on
-	// HostOffer, the host's declared
-	// requirements (PluginSpec.Services). On PluginOffer, when the
-	// failure came from a real handshake rejection
-	// (control.IncompatibleToHelloAck), the plugin's own advertised
-	// versions — reported as a degenerate exact-version "requirement"
-	// (MinVersion == MaxVersion == the version actually advertised), the
-	// same shape a generated `<Service>Requirement()` produces, since a
-	// plugin's Offer has no distinct "requirement" of its own to report.
+	// Services carries the structured per-service version data available for
+	// this side. IncompatibleError carries both sides' offers: on HostOffer,
+	// the host's declared requirements (PluginSpec.Services).
+	//
+	// On PluginOffer, when the failure came from a real handshake rejection,
+	// the plugin's own advertised versions — reported as a degenerate
+	// exact-version "requirement" (MinVersion == MaxVersion == the version
+	// actually advertised), the same shape a generated
+	// `<Service>Requirement()` produces, since a plugin's offer has no
+	// distinct "requirement" of its own to report.
+	//
 	// nil when no per-service data was available for this side.
 	Services []ServiceRequirement
 }
 
 var (
+	// ErrPluginUnavailable reports that a call was not admitted because no live
+	// instance is routed for the named plugin — it isn't running, its prior
+	// instance is still stopping, or a crash was detected before the request
+	// was ever published. It is retryable.
 	ErrPluginUnavailable = errors.New("styx: plugin unavailable")
-	ErrDrained           = errors.New("styx: plugin draining")
-	ErrOutcomeUnknown    = errors.New("styx: call outcome unknown")
-	ErrIncompatible      = errors.New("styx: incompatible handshake")
-	ErrDeadlineExceeded  = errors.New("styx: deadline exceeded")
-	ErrCanceled          = errors.New("styx: call canceled")
-	ErrBackpressure      = errors.New("styx: backpressure")
-	ErrPoisoned          = errors.New("styx: region poisoned")
-	ErrServiceNotFound   = errors.New("styx: service not found")
-	ErrMethodNotFound    = errors.New("styx: method not found")
+	// ErrDrained reports that a call was refused at a hot-reload's admission
+	// cutoff, before it was ever submitted. It is retryable.
+	ErrDrained = errors.New("styx: plugin draining")
+	// ErrOutcomeUnknown reports that a call's request may or may not have
+	// reached the plugin before a crash or teardown, so its side effects (if
+	// any) are unknown. It is not retryable — reissuing the call could repeat
+	// an effect it already had.
+	ErrOutcomeUnknown = errors.New("styx: call outcome unknown")
+	// ErrIncompatible reports a handshake negotiation failure. errors.Is(err,
+	// ErrIncompatible) matches any *IncompatibleError; errors.As recovers the
+	// structured detail (see IncompatibleError).
+	ErrIncompatible = errors.New("styx: incompatible handshake")
+	// ErrDeadlineExceeded reports that the call's context deadline elapsed
+	// before a terminal outcome arrived.
+	ErrDeadlineExceeded = errors.New("styx: deadline exceeded")
+	// ErrCanceled reports that the caller's context was canceled before a
+	// terminal outcome arrived.
+	ErrCanceled = errors.New("styx: call canceled")
+	// ErrBackpressure reports that a shared-memory send was refused because its
+	// ring or payload arena was full. It is retryable once capacity frees up.
+	ErrBackpressure = errors.New("styx: backpressure")
+	// ErrPoisoned reports that a conformance violation desynchronized a
+	// shared-memory region, tearing the connection down. It is not retryable on
+	// the same instance; the supervisor's restart policy runs.
+	ErrPoisoned = errors.New("styx: region poisoned")
+	// ErrServiceNotFound reports that the called service has no handler
+	// registered on the plugin.
+	ErrServiceNotFound = errors.New("styx: service not found")
+	// ErrMethodNotFound reports that the called method has no handler
+	// registered within its service on the plugin.
+	ErrMethodNotFound = errors.New("styx: method not found")
 	// ErrPluginStopping reports that a Start or Reload named a plugin whose
 	// previous instance is still shutting down: a Stop deadline expired before
 	// that instance's supervisor joined, so the name is retained in a stopping
