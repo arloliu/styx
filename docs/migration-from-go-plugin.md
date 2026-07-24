@@ -36,10 +36,13 @@ has no magic cookie; compatibility is established by the version negotiation at
 handshake.
 
 Each plugin picks its data-plane transport. On the host, `PluginSpec.Transport`
-defaults to offering shared memory (preferred) with a Unix-domain-socket
-fallback; `"shm"` or `"uds"` pins one. A pinned `"shm"` that the plugin cannot
-speak fails the handshake rather than silently downgrading. On the plugin,
-`PluginServerConfig.Transports` is the allowlist of what it advertises.
+defaults to `TransportAuto`: offering shared memory (preferred) with a
+Unix-domain-socket fallback; `TransportSHM` or `TransportUDS` pins one. A pinned
+`TransportSHM` that the plugin cannot speak fails the handshake rather than
+silently downgrading. On the plugin, `PluginServerConfig.Transports` is the
+allowlist of what it advertises. See
+[docs/configuration.md](configuration.md) for the full set of `PluginSpec`
+knobs, including the shared-memory geometry.
 
 ## Defining the contract
 

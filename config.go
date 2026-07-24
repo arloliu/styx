@@ -25,35 +25,45 @@ type PluginServerConfig struct {
 	// uses one second. Ignored when Metrics is nil.
 	MetricsInterval time.Duration
 
-	// ContinueAfterPanic selects the handler-panic policy. false (the default) is
-	// the enterprise profile: a handler panic is recovered at the dispatch
-	// boundary, the panicking call is replied its panic outcome, and the process
-	// then taints and terminates so the supervisor restarts it per policy. That
-	// reply is guaranteed to a unary caller but best-effort to a streaming one,
-	// which may lose it to teardown — panic_policy.go documents the full
-	// delivery-guarantee split by call kind. true keeps the process serving after a
-	// handler panic — an explicit opt-in, safe only if every handler guarantees its
-	// own isolation, because after a panic the process state is whatever the
-	// panicking handler left behind. A panic in the Styx runtime itself (outside
-	// handler frames) is never recovered under either setting. The policy is read
-	// once when serving begins; see panic_policy.go.
+	// ContinueAfterPanic selects the handler-panic policy.
+	//
+	// false (the default) is the enterprise profile: a handler panic is
+	// recovered at the dispatch boundary, the panicking call is replied its
+	// panic outcome, and the process then taints and terminates so the
+	// supervisor restarts it per policy. That reply is guaranteed to a unary
+	// caller but best-effort to a streaming one, which may lose it to teardown
+	// — panic_policy.go documents the full delivery-guarantee split by call
+	// kind.
+	//
+	// true keeps the process serving after a handler panic — an explicit
+	// opt-in, safe only if every handler guarantees its own isolation, because
+	// after a panic the process state is whatever the panicking handler left
+	// behind.
+	//
+	// A panic in the Styx runtime itself (outside handler frames) is never
+	// recovered under either setting. The policy is read once when serving
+	// begins; see panic_policy.go.
 	ContinueAfterPanic bool
 
 	// Transports is the plugin's data-plane transport allowlist — the transports it
-	// advertises during handshake negotiation. nil or empty (the default)
-	// advertises both "shm" and "uds", letting the host pick per its own
-	// preference; set it to just "uds" for a uds-only plugin, or "shm" for a
-	// shared-memory-only one. Every entry must be a known transport ("shm" or
-	// "uds"); NewPluginServer panics on an unknown name, so a typo fails at
-	// construction rather than silently never matching any host offer.
-	Transports []string
+	// advertises during handshake negotiation.
+	//
+	// nil or empty (the default) advertises both TransportSHM and TransportUDS,
+	// letting the host pick per its own preference. Set it to just
+	// []Transport{TransportUDS} for a uds-only plugin, or []Transport{TransportSHM}
+	// for a shared-memory-only one.
+	//
+	// Every entry must be a known transport (TransportSHM or TransportUDS);
+	// NewPluginServer panics on an unknown name, so a typo fails at construction
+	// rather than silently never matching any host offer.
+	Transports []Transport
 }
 
 // validatePluginTransports panics if names contains a transport this build does
 // not know, turning a typo into an immediate, well-located construction failure
 // instead of a handshake that silently never finds a common transport. An empty
 // list is valid — it selects the default allowlist.
-func validatePluginTransports(names []string) {
+func validatePluginTransports(names []Transport) {
 	for _, name := range names {
 		if name != control.TransportSHM && name != control.TransportUDS {
 			panic(fmt.Sprintf(

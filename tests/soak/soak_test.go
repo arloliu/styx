@@ -421,7 +421,7 @@ func newWorker(t *testing.T, transport string, led *ledger) *worker {
 			Path:             crashyPluginBin,
 			Args:             []string{"echo"},
 			Env:              []string{"STYX_ECHO_PID_TAG=1", "STYX_ECHO_STREAM=block"},
-			Transport:        transport,
+			Transport:        styx.Transport(transport),
 			RequireStreaming: true,
 			Services:         []styx.ServiceRequirement{echopb.EchoStreamRequirement()},
 			// The soak kills and reloads the instance many times; a lifetime cap

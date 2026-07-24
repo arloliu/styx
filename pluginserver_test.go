@@ -24,11 +24,11 @@ import (
 // typo fails immediately rather than silently never matching any host offer.
 func TestNewPluginServer_PanicsOnUnknownTransport(t *testing.T) {
 	require.Panics(t, func() {
-		styx.NewPluginServer(styx.PluginServerConfig{Transports: []string{"tcp"}})
+		styx.NewPluginServer(styx.PluginServerConfig{Transports: []styx.Transport{"tcp"}})
 	}, "an unknown transport name must fail at construction")
 
 	require.NotPanics(t, func() {
-		styx.NewPluginServer(styx.PluginServerConfig{Transports: []string{"uds", "shm"}})
+		styx.NewPluginServer(styx.PluginServerConfig{Transports: []styx.Transport{"uds", "shm"}})
 	}, "the known transports must be accepted")
 
 	require.NotPanics(t, func() {
@@ -41,7 +41,7 @@ func TestNewPluginServer_PanicsOnUnknownTransport(t *testing.T) {
 // constructor validates then clones it. Without the clone the mutation would
 // inject an unknown transport past validation or race the handshake read.
 func TestNewPluginServer_TransportsAreConstructionFixed(t *testing.T) {
-	caller := []string{"uds", "shm"}
+	caller := []styx.Transport{"uds", "shm"}
 	srv := styx.NewPluginServer(styx.PluginServerConfig{Transports: caller})
 
 	// Mutate the caller's slice to garbage after construction.
