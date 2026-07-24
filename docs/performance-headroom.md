@@ -4,8 +4,9 @@ This note records the shared-memory transport's original small-payload speed
 aspiration, where the transport actually stands against it today, why the gap
 exists, and the concrete levers that could close it. It exists so the aspiration
 and its path survive as a reference for future performance work — not as a
-commitment to do that work now. All numbers here are the recorded medians from
-[bench/shm/REPORT.md](../bench/shm/REPORT.md); nothing is projected.
+commitment to do that work now. The measured results in this document come
+from recorded benchmark captures; each states its kind — median, percentile,
+geomean, allocation count, or range — where it appears.
 
 ## The aspiration and today's numbers
 
@@ -99,43 +100,110 @@ and runs `enqueue`'s close-lock, its closed check, its context/shutdown admissio
 and its post-enqueue context wait — none of which the hop cell's direct queue send performs.
 It is real `Send` cost, but it is not the hop, and it is excluded from the A/B above.
 
+### Open decision: an inline-send fast path
+
+The controlled A/B leaves an open question rather than a closed one:
+the hop is real and measured, but it is magnitude-consistent with roughly half the residual,
+not proof that it is the sole or even the dominant cause.
+A fast path that lets the calling goroutine emit inline, skipping the writer hop on the common case,
+would close the gap the A/B can attribute — but it is not a small change.
+The writer goroutine is the single owner of send-side state for its direction:
+the single-producer/single-consumer discipline the ring depends on,
+the priority ordering between the control and data lanes,
+and the poison/recovery state machine all currently assume one goroutine originates every send.
+An inline path would need to either preserve that ownership under concurrent inline callers or redesign it,
+and either way the redesign touches the same three concerns at once.
+
+That is enough surface area to warrant its own plan,
+not a change folded into this one.
+The evidence to bring into that plan, if it is opened:
+
+- the measured hop — inline emit 140.9 ns/op versus via-the-writer 413.9 ns/op,
+  a 273.0 ns single-send hop (n=20, p < 0.001);
+- the round-trip framing — two sends per warm unary call,
+  so 2 × the hop (≈ 546 ns) sets against the ≈ 1.0 µs residual,
+  the same order of magnitude, roughly half;
+- the profile of where the added cost goes — `runtime.selectgo`, `runtime.lock2`/`unlock2`,
+  `runtime.casgstatus` (goroutine park and unpark), `runtime.chanrecv`/`chansend`, and `futex` —
+  scheduler and channel synchronization, not the send's real work, which is identical in both arms;
+- the open remainder — roughly half the ≈ 1.0 µs residual is unattributed by this A/B,
+  so an inline-send plan should expect to explain that remainder too, not just the hop.
+
+Whether to open that plan is a decision for the repository owner,
+not something this note schedules on its own.
+
 ## Levers, and what each actually improves
 
-Two changes have been identified in adjacent work. Stated honestly, neither
-directly reclaims the warm, uncontended shared-memory p50 the gate reads — each
-improves a different path — and the warm-path reclaim itself targets the
-writer-hop, which the A/B above finds magnitude-consistent with, but not proven to
-be the sole source of, the residual:
+Three changes have been implemented and benchmarked in adjacent work.
+Stated honestly, none of the three reclaims the warm, uncontended shared-memory p50 the gate reads —
+each speeds a different path, and the warm-path reclaim itself is the open inline-send question above,
+not something any of these three attempts:
 
-- **Hoist the per-receive socket receive timeout.** The Unix-domain-socket receive
-  path sets its receive timeout (`SO_RCVTIMEO`, clamped to each call's deadline) on
-  every receive, a syscall per receive; the drain work noted it can be set once at
-  setup instead. This helps the UDS transport, not the shared-memory warm path —
-  the shared-memory data plane parks on eventfds, not socket timeouts.
+- **Hoist the per-receive socket receive timeout.**
+  The Unix-domain-socket receive path used to set its receive timeout
+  (`SO_RCVTIMEO`, clamped to each call's deadline) on every receive, a syscall per receive.
+  It now caches the last-programmed value and reprograms only when the deadline actually changes.
+  Measured on a clean capture of the four gated cells,
+  the `production-uds` reference cell got faster at every percentile —
+  p50 7.91 → 7.49 µs, p95 11.19 → 9.76 µs, p99 20.81 → 15.43 µs, p999 63.45 → 60.64 µs —
+  with allocations per operation unchanged (19).
+  This speeds the Unix-domain-socket path, including the `production-uds` cell the gate uses as a reference,
+  not the shared-memory data plane, which parks on eventfds, not socket timeouts.
+  Because the reference cell got faster, the shm-vs-uds ratio check now fails
+  against the checked-in baseline — the designed outcome of a faster reference,
+  not a shared-memory regression.
+  The shm-vs-gRPC ratio check fails on the same capture too, but for an unrelated reason:
+  the untouched `grpc-uds` cell's own measured latency has drifted from the checked-in baseline,
+  a drift already present before this change as well.
+  The checked-in baseline predates this change; a full-run recapture is prepared and awaits approval.
 
-- **Wire the space-available wake.** The shared-memory transport wakes the consumer
-  when the producer publishes, but has no wake back from consumer to producer when
-  a slab frees, so a backpressured send resumes only when other lifecycle traffic
-  runs the writer (bounded by the caller's deadline meanwhile). Wiring it would
-  improve backpressured-send resume latency and remove the sizing floor the report
-  describes under its arena-sizing discussion — but the gated cells are provisioned
-  off the backpressure path (the report sizes them to avoid it), so it does not move
-  their warm p50 either.
+- **The codec's reflection-free fast path.**
+  Message encoding and decoding now take a reflection-free path (generated by vtprotobuf)
+  whenever a message provides one, falling back to the existing reflection-based path otherwise;
+  the wire format and codec name are unchanged.
+  Measured across 64-byte, 4-KiB, and 1-MiB marshal and unmarshal cells,
+  the reflection path is 50.9% slower geomean and allocates 162% more (geomean) than the fast path.
+  The fast path holds at a fixed 1 allocation per operation for marshal (versus 5 for reflection)
+  and 8 for unmarshal (versus 11), independent of payload size;
+  at 1 MiB the raw payload copy dominates and the latency gap washes out into noise,
+  while the allocation win persists.
+  This speeds message encoding and decoding for typed calls through the RPC layer,
+  not the raw-frame shared-memory data plane the gate measures —
+  that data plane exchanges raw frames and never calls into the codec.
+  A separate, cross-process benchmark measures a complete 64-byte call end to end
+  across repeated captures: roughly 3.1-4.1 µs over the shared-memory transport,
+  roughly 9.3-11.5 µs over Unix-domain sockets.
+  That cell's own analysis treats the gap above the shared-memory transport's own recorded p50
+  as an upper bound on the whole RPC layer's overhead — the generated stub, per-call dispatch
+  bookkeeping, and codec marshal/unmarshal together, not codec cost in isolation —
+  at roughly 1.4-1.9 µs; it is advisory context for where this lever matters,
+  not a measurement of this codec change by itself.
+  No p95/p99/p999 percentiles are available for the codec microbenchmark itself;
+  Go's benchmark harness reports only a per-op median and allocation counts.
 
-The send-side scheduling the writer hop pays is one path toward the warm-path gap.
-The A/B above measures that hop in isolation at the same order of magnitude as about half the residual;
-the rest of the residual is unattributed, so what else moves the warm p50 is not established here.
-These are recorded as directions, not as a plan.
+- **Resume a backpressured send on the writer's own retry timer.**
+  A send that finds its slab arena or ring full now resumes on the writer's own bounded backoff timer —
+  a configured 100 µs initial interval, doubling to a configured 5 ms cap — instead of waiting
+  for unrelated lifecycle traffic to run the writer, with no new cross-process wake and no ABI change.
+  Measured resume latency: p50 ≈ 1054 µs, p99 ≈ 1059 µs, p999 ≈ 1077 µs —
+  tightly distributed and well under that configured 5 ms cap.
+  The warm, uncontended publish path this change does not touch
+  measured a per-op median of 52.5 → 52.0 ns/op before and after,
+  with 0 allocations either side — within noise, structurally unchanged.
+  This bounds how long a capacity-exhausted send waits before retrying;
+  the gated cells are provisioned to avoid that path entirely, so it does not move their warm p50.
+
+These are recorded as measured outcomes, not as a plan for further work.
 
 ## What is gated today
 
 The merge gate does not enforce the original 10×. It holds both small-payload
-shared-memory cells at or above **7×** versus gRPC-over-UDS — the floor both the
-multiplexed (8.1×) and synchronous (7.1×) cells clear on the recorded run — and
-separately fails any run whose shm-vs-gRPC or shm-vs-UDS ratio regresses past
-tolerance from the checked-in baseline, or whose allocations per operation
-increase. Absolute latency is reported but not gated, because hosted-runner noise
-moves it far more than the ratios.
+shared-memory cells at or above a configured **7×** floor versus gRPC-over-UDS —
+one both the multiplexed (8.1×) and synchronous (7.1×) cells clear on the
+recorded run — and separately fails any run whose shm-vs-gRPC or shm-vs-UDS
+ratio regresses past tolerance from the checked-in baseline, or whose
+allocations per operation increase. Absolute latency is reported but not
+gated, because hosted-runner noise moves it far more than the ratios.
 
 The ratio gates are common-mode-invariant by construction: a latency movement
 shared across both the styx transport and gRPC on one runner leaves the ratios
@@ -151,3 +219,28 @@ matters.
 If the levers above are taken and the warm p50 returns toward the prototype's, the
 floor can be raised back toward the original aspiration with a fresh recorded
 baseline.
+
+### Raising the floor: an open decision, not yet made
+
+Whether to raise the gate's floor back toward the original 10× is a decision for the repository owner
+and has not been made.
+What now exists is evidence relevant to that decision, not a change to the floor itself:
+
+- the writer-hop A/B above, magnitude-consistent with roughly half the warm-path residual
+  but not proof of sole causation, so it does not by itself show the warm p50 will move;
+- the socket receive-timeout hoist, which speeds the `production-uds` reference cell
+  rather than the shared-memory warm path, and whose own ratio-gate baseline still needs a recapture;
+- the codec fast path, which speeds the RPC layer's encode/decode cost,
+  not the raw-frame shared-memory data plane the gate measures;
+- the backpressure retry timer, which bounds a capacity-exhaustion path
+  the gated cells are provisioned to avoid, not the warm path.
+
+None of the four moves the gated warm shm p50 on its own.
+The gate's checked-in baseline and its recorded benchmark report are unchanged by this note —
+no fresh capture was taken here, and neither should be hand-edited outside a real capture,
+per the baseline's own refresh policy.
+If the floor is raised, the recapture must be a full four-cell capture —
+`production-shm`, `production-shm-sync`, `production-uds`, and `grpc-uds` — taken from one run,
+with latency medians and allocation counts copied from it together, not assembled
+from separate runs or edited by hand, taken once the perf changes that justified
+the raise are in the codebase, so the baseline reflects the shipped code.
