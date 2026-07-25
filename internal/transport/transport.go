@@ -30,6 +30,14 @@ var ErrUnimplementedFrameKind = errors.New("transport: unimplemented frame kind"
 // allocation for that payload).
 var ErrPayloadTooLarge = errors.New("transport: payload exceeds MaxFrameSize")
 
+// ErrInvalidPayloadSize is returned by PayloadFillSender.SendPayloadFill,
+// before any intent is enqueued, when the declared payload size is negative.
+// It bounds the low end of the same range ErrPayloadTooLarge bounds at the top.
+// The two are distinct because they mean different things: a size above the
+// maximum is a payload this transport cannot carry, while a negative one is not
+// a length at all — the caller computed it wrong.
+var ErrInvalidPayloadSize = errors.New("transport: negative payload size")
+
 // ErrMalformedStatusFrame is returned by Recv when a FrameUnaryErr frame's
 // body cannot be decoded into a Status — a length prefix inside the status
 // body overruns the (already MaxFrameSize-bounded) body, or the body is
@@ -222,6 +230,54 @@ type ReportingSender interface {
 	// SendReporting is Send that returns whether the frame was enqueued and invokes
 	// onReport exactly once at its resolution.
 	SendReporting(ctx context.Context, f Frame, onReport func(published bool)) (enqueued bool, err error)
+}
+
+// PayloadFillSender is an optional Transport capability letting a caller produce a
+// frame's payload directly into the transport's own send buffer, instead of marshaling
+// it into a slice the transport then copies. Only the shared-memory transport has a
+// send buffer worth filling in place; uds omits the capability and its callers fall
+// back to Send.
+//
+// The frame's Payload and Status fields are not read: size and fill are the payload.
+//
+// size is the exact payload length, validated synchronously at admission —
+// 0 <= size <= the transport's per-direction max payload — before any intent is
+// enqueued, so a size the transport cannot carry is rejected on the calling goroutine
+// (ErrInvalidPayloadSize below zero, ErrPayloadTooLarge above the maximum) and fill
+// never runs.
+//
+// fill is invoked at most once, on the transport's writer goroutine, over a dst of
+// exactly size bytes. It must not block and must not retain dst: it holds up every
+// other outbound frame for its whole duration, and dst is buffer space the peer may
+// read the instant the frame publishes. A size of 0 carries an empty payload and skips
+// fill entirely — "at most once" allows zero.
+//
+// fill MUST write all size bytes. Writing fewer is a caller bug no transport can
+// detect: fill reports no byte count, the buffer it is handed is reused rather than
+// zeroed, and any checksum is computed over the window after fill returns — so a short
+// write ships the previous payload's residue to the peer under a valid checksum.
+// Writing more is caught structurally, since dst is exactly size long and the overrun
+// fails that one frame. A caller whose size came from a marshaler MUST therefore
+// compare the byte count the marshaler reports written against size and return an
+// error from fill when they disagree.
+//
+// If SendPayloadFill returns early because ctx is done, fill is guaranteed either
+// already complete or never to run, so the message it reads is safe to reuse the
+// moment the call returns. That guarantee costs promptness, and the trade is
+// deliberate. Once the writer has begun filling, the call blocks until the frame's
+// fate is decided — publication or transport shutdown — and returns that outcome
+// rather than the context error, because the fate is settled by then and reporting a
+// delivered frame as a cancellation would make the caller misclassify it. The wait is
+// bounded by publication or shutdown, NOT by the fill: a filled frame may still wait
+// for send-buffer space and its caller waits with it. Backpressure the transport hits
+// before the fill begins — no destination buffer yet — remains fully cancellable.
+// What the caller buys is that it always learns the frame's true fate, where a Send
+// abandoned after acceptance learns only that acceptance is unknown
+// (AcceptanceClassifier).
+type PayloadFillSender interface {
+	// SendPayloadFill is Send for a frame whose payload fill writes into the
+	// transport's send buffer, with size its exact length.
+	SendPayloadFill(ctx context.Context, f Frame, size int, fill func(dst []byte) error) error
 }
 
 // FrameCounter is an optional Transport capability exposing cumulative counts of

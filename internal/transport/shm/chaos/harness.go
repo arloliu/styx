@@ -524,6 +524,45 @@ func (s *session) hostSend(ctx context.Context, id uint64, payload []byte) error
 	return s.host.Send(ctx, transport.Frame{CallID: id, Kind: transport.FrameUnaryReq, Payload: payload})
 }
 
+// hostSendFill publishes the same unary request hostSend does, produced the other
+// way: the bytes are written straight into the transport's slab by a callback the
+// writer goroutine runs (transport.PayloadFillSender), with no caller-side buffer
+// for the writer to copy from.
+//
+// A host end that does not implement the capability is a harness error rather than
+// a silent fall back to hostSend, which would leave the fill path untested while
+// every assertion still passed.
+func (s *session) hostSendFill(ctx context.Context, id uint64, payload []byte) error {
+	pf, ok := s.host.(transport.PayloadFillSender)
+	if !ok {
+		return errors.New("chaos: host transport cannot send fill-mode payloads")
+	}
+
+	return pf.SendPayloadFill(ctx,
+		transport.Frame{CallID: id, Kind: transport.FrameUnaryReq}, len(payload),
+		func(dst []byte) error {
+			copy(dst, payload) // dst is exactly len(payload) bytes, so this writes all of them
+
+			return nil
+		})
+}
+
+// hostSendFor publishes one unary request in the payload mode id selects: odd
+// CallIDs take the copy path, even ones the fill path. Every scenario sends
+// through it, so both modes are live in the same crash window, the same
+// starvation wedge, and against the same poisoned region — a fault that only one
+// mode reaches cannot hide behind the other. The peer echoes both identically:
+// the two modes differ only in who writes the slab, so a response never reveals
+// which produced the request, and the delivery contract asserted on it is one
+// contract, not two.
+func (s *session) hostSendFor(ctx context.Context, id uint64, payload []byte) error {
+	if id%2 == 0 {
+		return s.hostSendFill(ctx, id, payload)
+	}
+
+	return s.hostSend(ctx, id, payload)
+}
+
 // hostRecvFor drains inbound frames until id's response arrives or ctx ends,
 // returning the echoed payload. It is for HEALTHY single-call round trips only
 // (warm-ups, the corruption and wedge scenarios), where the peer answers exactly
@@ -573,7 +612,7 @@ func awaitBounded[T any](hard time.Duration, fn func() (T, error)) (result T, ti
 // used for warm-up calls that must complete normally before the triggering
 // event.
 func (s *session) hostCall(ctx context.Context, id uint64, payload []byte) ([]byte, error) {
-	if err := s.hostSend(ctx, id, payload); err != nil {
+	if err := s.hostSendFor(ctx, id, payload); err != nil {
 		return nil, err
 	}
 
@@ -713,7 +752,7 @@ func (s *session) driveSendPath(ctx context.Context, oc Outcome, spec WindowSpec
 		issued[id] = want
 		batch = append(batch, id)
 		sctx, cancel := context.WithTimeout(ctx, callTimeout)
-		err := s.hostSend(sctx, id, want)
+		err := s.hostSendFor(sctx, id, want)
 		cancel()
 		if err != nil {
 			return oc, fmt.Errorf("chaos: trigger send %d: %w", id, err)
@@ -749,7 +788,7 @@ func (s *session) driveClosePath(ctx context.Context, oc Outcome) (Outcome, erro
 	// Issue but do not await: the call is outstanding on the host when the peer is
 	// commanded to tear down and park at BeforeUnmap.
 	sctx, cancelSend := context.WithTimeout(ctx, callTimeout)
-	err := s.hostSend(sctx, id, want)
+	err := s.hostSendFor(sctx, id, want)
 	cancelSend()
 	if err != nil {
 		return oc, fmt.Errorf("chaos: close-path trigger send: %w", err)
@@ -890,7 +929,7 @@ func RunCorruptDescriptor(ctx context.Context, peerBin string) (Outcome, error) 
 	// mutated before any read observes it (do not reuse a read-loop that starts
 	// before the request, difftest.Run's shape).
 	sctx, cancelSend := context.WithTimeout(ctx, callTimeout)
-	err = s.hostSend(sctx, id, want)
+	err = s.hostSendFor(sctx, id, want)
 	cancelSend()
 	if err != nil {
 		return oc, fmt.Errorf("chaos: corrupt trigger send: %w", err)
@@ -927,10 +966,12 @@ func RunCorruptDescriptor(ctx context.Context, peerBin string) (Outcome, error) 
 	oc.Completed = true
 	oc.Err = rerr
 
-	// A conformance fault poisons the region (shm-abi.md §16); prove it through
-	// the exported ErrPoisoned a subsequent Send observes.
+	// A conformance fault poisons the region (shm-abi.md §16); prove it through the
+	// exported ErrPoisoned a subsequent send observes. The probe's CallID is even, so
+	// it takes the fill path: a poisoned region must be refused at fill-send admission
+	// too, before any intent is enqueued.
 	pctx, cancelProbe := context.WithTimeout(ctx, callTimeout)
-	perr := s.hostSend(pctx, id+1, want)
+	perr := s.hostSendFor(pctx, id+1, want)
 	cancelProbe()
 	oc.Poisoned = errors.Is(perr, shmtransport.ErrPoisoned)
 
@@ -1057,7 +1098,7 @@ func RunStarveArena(ctx context.Context, peerBin string) (StarveOutcome, error) 
 		wg.Go(func() {
 			//nolint:gosec // small non-negative index; +1 cannot overflow
 			id := uint64(i + 1)
-			errs[i] = s.hostSend(sctx, id, starvePayload(id))
+			errs[i] = s.hostSendFor(sctx, id, starvePayload(id))
 		})
 	}
 

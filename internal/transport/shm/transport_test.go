@@ -1,6 +1,7 @@
 package shm
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/arloliu/styx/internal/arena"
 	"github.com/arloliu/styx/internal/event"
 	"github.com/arloliu/styx/internal/ring"
 	"github.com/arloliu/styx/internal/shm"
@@ -2199,6 +2201,319 @@ func TestTransport_RecvReserving_ReservesOncePerDeliveredFrame(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(7), f.CallID)
 	require.Equal(t, 1, reserves, "reserve fires exactly once for a delivered frame")
+}
+
+// blockedWriterEndpoints is newEndpoints with both writers' run goroutines held
+// at their first park. It installs the park hook through the construction seam,
+// BEFORE Attach launches the goroutine, so the hold is in place from the very
+// first park rather than racing one that may already have happened by the time a
+// post-Attach hook could be installed.
+//
+// A held writer touches neither of its intent queues, which is what makes a
+// queue-length read on the test goroutine a stable observation rather than a race
+// against a drain. Both ends are held because holding is by construction seam and
+// the seam does not distinguish them; tests using this drive one direction and
+// only ever receive on the other, which needs no writer.
+//
+// The returned release lets both writers run again. It also runs at cleanup —
+// registered after newEndpoints', so it runs BEFORE it — because Close joins the
+// writer goroutine and would hang on a still-held one after a failed assertion.
+func blockedWriterEndpoints(t *testing.T, layout shm.Layout, cfg Config) (*endpoints, func()) {
+	t.Helper()
+
+	gate := make(chan struct{})
+	held := make(chan struct{})
+	var heldOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate) }) }
+
+	prev := attachNewWriter
+	t.Cleanup(func() { attachNewWriter = prev })
+	attachNewWriter = func(
+		r *ring.Ring, a *arena.Arena, c Config, gen uint32, capacity uint64, signal func(), poison *PoisonFlag,
+	) *writer {
+		w := prev(r, a, c, gen, capacity, signal, poison)
+		w.setOnBlock(func(blockSite) {
+			heldOnce.Do(func() { close(held) })
+			<-gate
+		})
+
+		return w
+	}
+
+	ep := newEndpoints(t, layout, cfg)
+	attachNewWriter = prev
+	t.Cleanup(release)
+
+	select {
+	case <-held:
+	case <-time.After(testTimeout):
+		t.Fatal("no writer reached its first park, so nothing is holding the intent queues")
+	}
+
+	return ep, release
+}
+
+// sendFillWithin runs one fill send on its own goroutine and returns its result,
+// failing within testTimeout rather than hanging if the send does not return. It
+// is for sends expected to resolve without the writer's help: against a held
+// writer, a send that reaches the submission queue parks until release, so a
+// bounded wait turns "admission stopped rejecting synchronously" into a named
+// failure instead of a wedged test binary.
+func sendFillWithin(t *testing.T, tr *Transport, f transport.Frame, size int, fill func([]byte) error) error {
+	t.Helper()
+
+	res := make(chan error, 1)
+	go func() { res <- tr.SendPayloadFill(t.Context(), f, size, fill) }()
+
+	return recvWithin(t, res, "fill send did not return: it was not refused on the calling goroutine")
+}
+
+// Test a fill send end to end through the transport: the writer hands the
+// callback a window of exactly the declared size, publishes the frame from the
+// bytes it wrote, and the peer's consumer — which verifies the negotiated CRC32C,
+// computed over the filled slab — delivers them unchanged alongside every
+// descriptor field the copy path carries.
+func TestTransport_SendPayloadFill_RoundTripsUnaryFrame_FilledIntoTheSlab(t *testing.T) {
+	// Given a host and plugin attached to one region with checksums negotiated.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(true))
+	want := []byte("marshalled straight into the slab")
+	f := transport.Frame{
+		CallID: 42, Kind: transport.FrameUnaryReq, Service: 11, Method: 22, Budget: 5 * time.Millisecond,
+	}
+
+	// When the host sends it in fill mode.
+	var window int
+	err := ep.host.SendPayloadFill(t.Context(), f, len(want), func(dst []byte) error {
+		window = len(dst)
+		copy(dst, want)
+
+		return nil
+	})
+
+	// Then the callback was handed exactly the declared size, and the frame arrives
+	// with those bytes and its descriptor fields intact.
+	require.NoError(t, err)
+	require.Equal(t, len(want), window, "fill must be handed a window of exactly size bytes")
+
+	got := recvOne(t, ep.plugin)
+	require.Equal(t, f.CallID, got.CallID)
+	require.Equal(t, f.Kind, got.Kind)
+	require.Equal(t, f.Service, got.Service)
+	require.Equal(t, f.Method, got.Method)
+	require.Equal(t, f.Budget, got.Budget)
+	require.Equal(t, want, got.Payload)
+}
+
+// Test that size 0 is the admitted low end of the range, not a rejection: the
+// frame publishes carrying an empty payload and the callback is skipped, since a
+// zero-byte window has nothing for it to write ("at most once" allows zero).
+func TestTransport_SendPayloadFill_CarriesEmptyPayload_WhenSizeIsZero(t *testing.T) {
+	// Given a host and plugin attached to one region.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+	// When the host sends a fill frame declaring no payload bytes.
+	var ran atomic.Bool
+	err := ep.host.SendPayloadFill(t.Context(), dataReqFrame(9), 0, func([]byte) error {
+		ran.Store(true)
+
+		return nil
+	})
+
+	// Then it publishes with an empty payload and the callback never ran.
+	require.NoError(t, err)
+	require.False(t, ran.Load(), "a zero-size fill has nothing to write, so its callback must be skipped")
+
+	got := recvOne(t, ep.plugin)
+	require.Equal(t, uint64(9), got.CallID)
+	require.Empty(t, got.Payload)
+}
+
+// Test that a size outside 0..max_payload is refused on the calling goroutine,
+// before any intent reaches the writer — the property that keeps an unsliceable
+// length off the writer goroutine, which trusts the size it is given.
+//
+// Two independent pieces of evidence place each rejection at admission rather
+// than at the writer's own fail-closed guard. The writer is held at its park, so
+// it drains nothing and an enqueued intent would still be sitting in the data
+// queue. And each size is chosen so the writer would NOT have rejected it the
+// same way: the oversize case is above this transport's config-lowered limit but
+// still inside the writer's geometry-derived guard, so an enqueued intent would
+// have filled and published; the negative case comes back with the invalid-size
+// sentinel, which the writer never produces (its guard reports
+// transport.ErrPayloadTooLarge for a negative length).
+func TestTransport_SendPayloadFill_RejectsOutOfRangeSize_BeforeEnqueueingAnyIntent(t *testing.T) {
+	// Given a held host writer and a callback that records if it ever runs.
+	ep, release := blockedWriterEndpoints(t, roundTripLayout(), validConfig(false))
+	var ran atomic.Bool
+	fill := func([]byte) error {
+		ran.Store(true)
+
+		return nil
+	}
+
+	// Config.MaxPayload lowers this transport's limit below the largest slab, so
+	// this size is one the transport refuses and the writer would have accepted.
+	// With no checksum negotiated the writer's guard is its largest slab exactly,
+	// no trailer subtracted.
+	oversize := int(ep.host.maxPayload) + 1
+	require.False(t, ep.host.checksum, "the writer's guard below assumes no CRC trailer")
+	require.LessOrEqual(t, oversize, int(ep.host.outbound.maxStored),
+		"the oversize case must stay inside the writer's own guard, or it proves nothing about admission")
+
+	// When sizes on either side of the admitted range are sent.
+	tooLarge := sendFillWithin(t, ep.host, dataReqFrame(1), oversize, fill)
+	negative := sendFillWithin(t, ep.host, dataReqFrame(2), -1, fill)
+
+	// Then both are refused with their own error, and neither reached the writer.
+	require.ErrorIs(t, tooLarge, transport.ErrPayloadTooLarge)
+	require.ErrorIs(t, negative, transport.ErrInvalidPayloadSize)
+	require.NotErrorIs(t, negative, transport.ErrPayloadTooLarge,
+		"a negative size rejected by the writer would carry the writer's error instead")
+	require.Empty(t, ep.host.outbound.dataQueue, "a rejected fill send must enqueue no intent")
+	require.False(t, ran.Load(), "a rejected fill send must never run its callback")
+
+	// And the transport is unharmed: released, an in-range fill send still publishes.
+	release()
+	want := []byte("still healthy")
+	require.NoError(t, ep.host.SendPayloadFill(t.Context(), dataReqFrame(3), len(want), func(dst []byte) error {
+		copy(dst, want)
+
+		return nil
+	}))
+	got := recvOne(t, ep.plugin)
+	require.Equal(t, uint64(3), got.CallID)
+	require.Equal(t, want, got.Payload)
+}
+
+// Test cancellation on the pre-enqueue side of the handshake: a caller whose
+// context is already done when it reaches a full submission queue never gets an
+// intent onto that queue, so its callback can never run. The queue is full and
+// the writer is held, so the enqueue's only ready select arm is the context —
+// the outcome is structural, not a scheduling coincidence.
+func TestTransport_SendPayloadFill_ReturnsContextError_WhenCancelledBeforeEnqueue(t *testing.T) {
+	// Given a held writer whose single data-queue slot is already occupied.
+	cfg := validConfig(false)
+	cfg.DataQueueDepth = 1
+	ep, release := blockedWriterEndpoints(t, roundTripLayout(), cfg)
+
+	occupied := make(chan error, 1)
+	go func() {
+		occupied <- ep.host.SendPayloadFill(t.Context(), dataReqFrame(1), 4, func(dst []byte) error {
+			copy(dst, []byte("keep"))
+
+			return nil
+		})
+	}()
+	require.Eventually(t, func() bool { return len(ep.host.outbound.dataQueue) == 1 },
+		testTimeout, time.Millisecond, "the occupying fill intent never reached the queue")
+
+	// When a second fill send arrives with an already-cancelled context.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	var ran atomic.Bool
+	err := ep.host.SendPayloadFill(ctx, dataReqFrame(2), 4, func([]byte) error {
+		ran.Store(true)
+
+		return nil
+	})
+
+	// Then it returns the context error having enqueued nothing, so its callback
+	// can never run.
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, ran.Load())
+	require.Len(t, ep.host.outbound.dataQueue, 1, "a context-refused fill send must not join the queue")
+
+	// And the occupying send, which was never cancelled, still publishes.
+	release()
+	require.NoError(t, recvWithin(t, occupied, "the occupying fill send never returned"))
+	require.Equal(t, uint64(1), recvOne(t, ep.plugin).CallID)
+}
+
+// Test cancellation on the post-enqueue side: a caller cancelled while its intent
+// is still queued wins the abandonment handshake, so the frame is never filled and
+// never published, and the message the callback would have read is safe to reuse
+// the moment the send returns.
+//
+// The evidence is ordered rather than inferred. The writer is held at its park, so
+// the intent provably sits in the queue un-dequeued when the context fires; the
+// caller's context error is what proves it won the handshake. Only then is the
+// writer released and driven to a full stop, so it has provably dequeued and
+// disposed of the intent, and the callback is checked after that. Run with -race.
+func TestTransport_SendPayloadFill_AbandonsQueuedIntent_WhenCancelledAfterEnqueue(t *testing.T) {
+	// Given a held writer and an enqueued fill send.
+	ep, release := blockedWriterEndpoints(t, roundTripLayout(), validConfig(false))
+
+	var ran atomic.Bool
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		result <- ep.host.SendPayloadFill(ctx, dataReqFrame(7), 8, func([]byte) error {
+			ran.Store(true)
+
+			return nil
+		})
+	}()
+	require.Eventually(t, func() bool { return len(ep.host.outbound.dataQueue) == 1 },
+		testTimeout, time.Millisecond, "the fill intent never reached the writer's data queue")
+
+	// When the caller's context fires while the intent is still queued.
+	cancel()
+
+	// Then the caller returns its context error — proof it won the abandonment
+	// handshake, and therefore that the frame was never published.
+	require.ErrorIs(t, recvWithin(t, result, "cancelled fill send did not return"), context.Canceled)
+
+	// And once the writer has been released and fully drained, so it has provably
+	// disposed of the abandoned intent, the callback never ran and nothing published.
+	release()
+	ep.host.outbound.stop()
+	require.False(t, ran.Load(), "fill must never run for an intent its caller abandoned")
+	require.Zero(t, ep.host.FramesSent(), "an abandoned fill intent must never publish")
+}
+
+// Test what a fill callback that writes fewer than size bytes actually ships, so
+// the "fill MUST write exactly size bytes" contract is recorded as a caller
+// obligation with teeth rather than as advice.
+//
+// The transport cannot detect the shortfall: the callback reports no byte count,
+// the arena hands back reused memory it does not zero, and the CRC32C is computed
+// over the window AFTER the callback returns. So the unwritten tail — the previous
+// payload's bytes — reaches the peer under a checksum the consumer verifies and
+// accepts. Closing this inside the transport would cost a full-window write before
+// every fill, which is exactly the copy the fill mode exists to remove; the check
+// belongs where a byte count exists, at the caller that marshalled.
+//
+// The residue is deterministic, not incidental: the geometry has exactly one
+// usable slab in the class both frames land in, so the second send must reuse the
+// first's bytes. A future change that makes an under-write safe should replace
+// this test deliberately, not discover it failing. Run with -race.
+func TestTransport_SendPayloadFill_ShipsSlabResidue_WhenFillWritesFewerThanSizeBytes(t *testing.T) {
+	// Given a geometry with a single usable slab in the class both frames use, and
+	// checksums negotiated so the consumer verifies every delivered frame.
+	ep := newEndpoints(t, noSlabWrapLayout(), validConfig(true))
+	const payloadLen = 32
+	residue := bytes.Repeat([]byte{0xAA}, payloadLen)
+
+	// The first frame fills that slab and is consumed, so the writer's head-gated
+	// reclaim frees it before the next allocation — which can only return it again.
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: residue}))
+	require.Equal(t, residue, recvOne(t, ep.plugin).Payload)
+
+	// When a fill send declares the same size but writes only its first four bytes.
+	short := []byte("GOOD")
+	require.NoError(t, ep.host.SendPayloadFill(t.Context(), dataReqFrame(2), payloadLen, func(dst []byte) error {
+		copy(dst, short)
+
+		return nil
+	}))
+
+	// Then the peer accepts the frame — the checksum covers the residue too — and
+	// the bytes the callback never wrote arrive as the previous payload's.
+	got := recvOne(t, ep.plugin)
+	require.Equal(t, uint64(2), got.CallID)
+	require.Equal(t, append(short, residue[len(short):]...), got.Payload,
+		"an under-writing fill ships the slab's prior contents; only the caller can prevent it")
 }
 
 // Test that RecvReserving reserves nothing when its context is already canceled:

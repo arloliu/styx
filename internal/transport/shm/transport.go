@@ -211,6 +211,7 @@ var (
 	_ transport.ByteCounter             = (*Transport)(nil)
 	_ transport.ReservingReceiver       = (*Transport)(nil)
 	_ transport.ReportingSender         = (*Transport)(nil)
+	_ transport.PayloadFillSender       = (*Transport)(nil)
 	_ transport.ArenaOccupancyReporter  = (*Transport)(nil)
 	_ transport.RingDepthReporter       = (*Transport)(nil)
 	_ transport.WakeupSyscallCounter    = (*Transport)(nil)
@@ -605,22 +606,83 @@ func (t *Transport) SendReporting(
 	return enqueued, err
 }
 
+// SendPayloadFill is Send with the transport.PayloadFillSender contract: the frame
+// carries no payload bytes, and the writer allocates the slab and calls fill to
+// produce them straight into it — one copy from the caller's message into shared
+// memory instead of a marshal into a slice the writer then copies.
+//
+// Admission is Send's, with size standing in for the wire payload's length, and it
+// runs on the calling goroutine BEFORE any intent is enqueued: a closed, poisoned, or
+// shut-down region is refused here (shm-abi.md §16's producer-side detection), a
+// negative size with transport.ErrInvalidPayloadSize, and a size above the negotiated
+// per-direction max_payload (shm-abi.md §18, geometry-derived — NOT the uds framing
+// constant) with transport.ErrPayloadTooLarge. That bound is the one check standing
+// between a caller's declared length and the writer goroutine, which trusts it and
+// slices a window of exactly that many bytes out of the slab; the writer's own
+// build-time guard is a fail-closed backstop, not this check's equal.
+//
+// It is a data-lane entry only. Fill callbacks belong to payload-bearing kinds; CANCEL
+// and STREAM_ACK store no payload for one to write, and a fill send on either fails on
+// the writer's report rather than publishing.
+//
+// It holds the closing gate's read side for its whole call, like Send, and for one
+// reason more: the admission check reads region-mapped memory on the calling goroutine
+// AND the callback writes into the mapped arena on the writer goroutine, so Close must
+// not unmap while either is in flight.
+func (t *Transport) SendPayloadFill(
+	ctx context.Context, f transport.Frame, size int, fill func(dst []byte) error,
+) error {
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+
+	if t.closed {
+		return transport.ErrClosed
+	}
+	if terr := t.teardownError(); terr != nil {
+		return terr
+	}
+	if size < 0 {
+		return transport.ErrInvalidPayloadSize
+	}
+	if size > int(t.maxPayload) {
+		return transport.ErrPayloadTooLarge
+	}
+
+	err := t.outbound.submitFill(ctx, f, size, fill)
+	if errors.Is(err, ErrBackpressure) {
+		return fmt.Errorf("%w: %w", transport.ErrBackpressure, err)
+	}
+
+	return err
+}
+
 // AcceptanceUnknown reports whether a failed Send left the frame's acceptance
-// unknown (transport.AcceptanceClassifier). On the shared-memory data lane submit
-// enqueues the intent and then waits on the writer's report or the caller's
-// context; nothing consults the context after the enqueue, so a context error
-// CANNOT be proven pre-enqueue, and the writer may still publish an enqueued intent
-// — a context result is "unknown" and the sender MUST assume acceptance
-// (stream-protocol.md §4.5's publication boundary). Every non-context failure is a
-// definitively NEGATIVE result: the frame can never become observable to a live
-// peer. Some are pre-enqueue rejections — a payload over max_payload, a full
-// reject-mode queue (ErrBackpressure), or a closed / poisoned / shut-down region
-// refused at the admission gate. Others surface AFTER enqueue — a pre-publication
+// unknown (transport.AcceptanceClassifier). On the shared-memory data lane a wire
+// send (Send, SendReporting) enqueues the intent and then waits on the writer's
+// report or the caller's context; nothing consults the context after the enqueue,
+// so a context error CANNOT be proven pre-enqueue, and the writer may still publish
+// an enqueued intent — a context result is "unknown" and the sender MUST assume
+// acceptance (stream-protocol.md §4.5's publication boundary). Every non-context
+// failure is a definitively NEGATIVE result: the frame can never become observable
+// to a live peer. Some are pre-enqueue rejections — a payload over max_payload, a
+// declared fill size outside 0..max_payload, a full reject-mode queue
+// (ErrBackpressure), or a closed / poisoned / shut-down region refused at the
+// admission gate. Others surface AFTER enqueue — a pre-publication
 // writer fault or a ring-push error — but the writer reports those only when it wrote
 // NO descriptor to the tail (Ring.Push publishes nothing on error), so nothing was
 // published there either; a shutdown ErrClosed is on an already-dead region. In every
 // case the failed frame cannot later be acted on by a live peer, which is the property
 // the caller relies on.
+//
+// A fill send (SendPayloadFill) is the exception to the context-error reasoning above,
+// and it errs in the safe direction. That path DOES consult the context after the
+// enqueue: it returns a context error only when the caller won the abandonment
+// handshake, which is proof the frame was never filled and never published — a
+// definitively negative result this classifier nonetheless reports as unknown, because
+// it sees the error alone and cannot tell which send produced it. Over-reporting
+// unknown is spec-safe (the caller sends a CANCEL the peer discards as unmatched), and
+// no fill caller needs the classifier: SendPayloadFill hands it the stronger fact
+// directly.
 func (t *Transport) AcceptanceUnknown(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
