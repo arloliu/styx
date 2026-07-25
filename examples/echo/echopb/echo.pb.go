@@ -109,6 +109,94 @@ func (x *SayResponse) GetMessage() string {
 	return ""
 }
 
+type BlobRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Payload       []byte                 `protobuf:"bytes,1,opt,name=payload,proto3" json:"payload,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BlobRequest) Reset() {
+	*x = BlobRequest{}
+	mi := &file_examples_echo_echo_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BlobRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BlobRequest) ProtoMessage() {}
+
+func (x *BlobRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_examples_echo_echo_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BlobRequest.ProtoReflect.Descriptor instead.
+func (*BlobRequest) Descriptor() ([]byte, []int) {
+	return file_examples_echo_echo_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *BlobRequest) GetPayload() []byte {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+type BlobResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Payload       []byte                 `protobuf:"bytes,1,opt,name=payload,proto3" json:"payload,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BlobResponse) Reset() {
+	*x = BlobResponse{}
+	mi := &file_examples_echo_echo_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BlobResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BlobResponse) ProtoMessage() {}
+
+func (x *BlobResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_examples_echo_echo_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BlobResponse.ProtoReflect.Descriptor instead.
+func (*BlobResponse) Descriptor() ([]byte, []int) {
+	return file_examples_echo_echo_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *BlobResponse) GetPayload() []byte {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
 var File_examples_echo_echo_proto protoreflect.FileDescriptor
 
 const file_examples_echo_echo_proto_rawDesc = "" +
@@ -118,9 +206,14 @@ const file_examples_echo_echo_proto_rawDesc = "" +
 	"SayRequest\x12\x18\n" +
 	"\amessage\x18\x01 \x01(\tR\amessage\"'\n" +
 	"\vSayResponse\x12\x18\n" +
-	"\amessage\x18\x01 \x01(\tR\amessage22\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\"'\n" +
+	"\vBlobRequest\x12\x18\n" +
+	"\apayload\x18\x01 \x01(\fR\apayload\"(\n" +
+	"\fBlobResponse\x12\x18\n" +
+	"\apayload\x18\x01 \x01(\fR\apayload2a\n" +
 	"\x04Echo\x12*\n" +
-	"\x03Say\x12\x10.echo.SayRequest\x1a\x11.echo.SayResponse2\x9e\x01\n" +
+	"\x03Say\x12\x10.echo.SayRequest\x1a\x11.echo.SayResponse\x12-\n" +
+	"\x04Blob\x12\x11.echo.BlobRequest\x1a\x12.echo.BlobResponse2\x9e\x01\n" +
 	"\n" +
 	"EchoStream\x120\n" +
 	"\aCollect\x12\x10.echo.SayRequest\x1a\x11.echo.SayResponse(\x01\x12-\n" +
@@ -139,22 +232,26 @@ func file_examples_echo_echo_proto_rawDescGZIP() []byte {
 	return file_examples_echo_echo_proto_rawDescData
 }
 
-var file_examples_echo_echo_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_examples_echo_echo_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_examples_echo_echo_proto_goTypes = []any{
-	(*SayRequest)(nil),  // 0: echo.SayRequest
-	(*SayResponse)(nil), // 1: echo.SayResponse
+	(*SayRequest)(nil),   // 0: echo.SayRequest
+	(*SayResponse)(nil),  // 1: echo.SayResponse
+	(*BlobRequest)(nil),  // 2: echo.BlobRequest
+	(*BlobResponse)(nil), // 3: echo.BlobResponse
 }
 var file_examples_echo_echo_proto_depIdxs = []int32{
 	0, // 0: echo.Echo.Say:input_type -> echo.SayRequest
-	0, // 1: echo.EchoStream.Collect:input_type -> echo.SayRequest
-	0, // 2: echo.EchoStream.Feed:input_type -> echo.SayRequest
-	0, // 3: echo.EchoStream.Chat:input_type -> echo.SayRequest
-	1, // 4: echo.Echo.Say:output_type -> echo.SayResponse
-	1, // 5: echo.EchoStream.Collect:output_type -> echo.SayResponse
-	1, // 6: echo.EchoStream.Feed:output_type -> echo.SayResponse
-	1, // 7: echo.EchoStream.Chat:output_type -> echo.SayResponse
-	4, // [4:8] is the sub-list for method output_type
-	0, // [0:4] is the sub-list for method input_type
+	2, // 1: echo.Echo.Blob:input_type -> echo.BlobRequest
+	0, // 2: echo.EchoStream.Collect:input_type -> echo.SayRequest
+	0, // 3: echo.EchoStream.Feed:input_type -> echo.SayRequest
+	0, // 4: echo.EchoStream.Chat:input_type -> echo.SayRequest
+	1, // 5: echo.Echo.Say:output_type -> echo.SayResponse
+	3, // 6: echo.Echo.Blob:output_type -> echo.BlobResponse
+	1, // 7: echo.EchoStream.Collect:output_type -> echo.SayResponse
+	1, // 8: echo.EchoStream.Feed:output_type -> echo.SayResponse
+	1, // 9: echo.EchoStream.Chat:output_type -> echo.SayResponse
+	5, // [5:10] is the sub-list for method output_type
+	0, // [0:5] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -171,7 +268,7 @@ func file_examples_echo_echo_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_examples_echo_echo_proto_rawDesc), len(file_examples_echo_echo_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

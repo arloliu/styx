@@ -21,6 +21,7 @@ const (
 const (
 	echoServiceID             = 0xedc54b402664edff // fnv1a64("echo.Echo")
 	echoSayMethodID           = 0x9836aa19fa8ee240 // fnv1a64("Say")
+	echoBlobMethodID          = 0xec9bb4a7c11e93aa // fnv1a64("Blob")
 	EchoServiceVersion uint32 = 1
 )
 
@@ -36,6 +37,7 @@ func EchoRequirement() styx.ServiceRequirement {
 
 type EchoClient interface {
 	Say(ctx context.Context, req *SayRequest) (*SayResponse, error)
+	Blob(ctx context.Context, req *BlobRequest) (*BlobResponse, error)
 }
 
 type echoClient struct{ conn *styx.ClientConn }
@@ -50,8 +52,17 @@ func (c *echoClient) Say(ctx context.Context, req *SayRequest) (*SayResponse, er
 	return resp, nil
 }
 
+func (c *echoClient) Blob(ctx context.Context, req *BlobRequest) (*BlobResponse, error) {
+	resp := &BlobResponse{}
+	if err := c.conn.InvokeID(ctx, echoServiceID, echoBlobMethodID, req, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
 type EchoServer interface {
 	Say(ctx context.Context, req *SayRequest) (*SayResponse, error)
+	Blob(ctx context.Context, req *BlobRequest) (*BlobResponse, error)
 }
 
 func RegisterEchoServer(srv *styx.PluginServer, impl EchoServer) {
@@ -69,6 +80,17 @@ func RegisterEchoServer(srv *styx.PluginServer, impl EchoServer) {
 						return nil, err
 					}
 					return impl.Say(ctx, req)
+				},
+			},
+			{
+				MethodName: "Blob",
+				MethodID:   echoBlobMethodID,
+				Handler: func(s any, ctx context.Context, dec func(proto.Message) error) (proto.Message, error) {
+					req := &BlobRequest{}
+					if err := dec(req); err != nil {
+						return nil, err
+					}
+					return impl.Blob(ctx, req)
 				},
 			},
 		},

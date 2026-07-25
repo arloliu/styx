@@ -35,6 +35,13 @@ func (s *counterServer) Say(_ context.Context, req *echopb.SayRequest) (*echopb.
 	return &echopb.SayResponse{Message: strconv.FormatUint(n, 10) + ":" + req.GetMessage()}, nil
 }
 
+// Blob echoes the payload back unchanged, satisfying the shared Echo service
+// interface; the hot-reload state this example carries tracks only Say's
+// call count, so Blob does not touch it.
+func (s *counterServer) Blob(_ context.Context, req *echopb.BlobRequest) (*echopb.BlobResponse, error) {
+	return &echopb.BlobResponse{Payload: req.GetPayload()}, nil
+}
+
 // counterState registers the plugin's reload state handoff over the same counter.
 // SaveState runs on the predecessor once it has drained and frozen (its snapshot
 // is sealed and verified by the host); RestoreState runs on the freshly spawned
