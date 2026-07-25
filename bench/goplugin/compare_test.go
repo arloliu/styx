@@ -24,7 +24,7 @@ import (
 // configurable via the public API). 64 bytes of headroom keeps all three
 // arms on the same payload tier without cutting the margin to the exact
 // observed 4-byte overhead.
-var payloadSizes = []int{64, 4096, 1048512}
+var payloadSizes = []int{64, 4096, 16384, 65536, 262144, 1048512}
 var concurrencyLevels = []int{1, 8, 64, 512}
 
 // compareBaseline is the uniform shape BenchmarkCompare drives every
