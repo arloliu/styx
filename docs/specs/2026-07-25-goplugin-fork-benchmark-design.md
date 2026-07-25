@@ -105,9 +105,18 @@ package across the module boundary for something this small).
   `styx-uds` (`styx.TransportUDS`) — both styx arms built the same way
   `bench/rpc/bench_test.go` already does, importing
   `github.com/arloliu/styx` and `github.com/arloliu/styx/examples/echo/echopb`.
-- Payload matrix: `{64, 4096, 1048576}` bytes — the canonical three-point
-  matrix from the design doc's benchmark plan (`docs/specs/2026-07-16-styx-design.md`
-  §22), not the narrower `{64, 4096}` `bench/rpc` currently uses.
+- Payload matrix: `{64, 4096, 1048512}` bytes — close to the canonical
+  three-point matrix from the design doc's benchmark plan
+  (`docs/specs/2026-07-16-styx-design.md` §22), not the narrower
+  `{64, 4096}` `bench/rpc` currently uses, but the top tier is 64 bytes
+  short of the canonical `1048576` (1 MiB): the styx-shm/styx-uds arms send
+  this payload wrapped in an `echopb.SayRequest`, whose protobuf envelope
+  (field tag + varint length prefix) adds a few bytes of overhead, and a
+  full 1048576-byte payload would exceed `transport.MaxFrameSize` (also
+  hard-coded at exactly `1048576`, not configurable via the public API).
+  This is exactly why `bench/rpc` itself never tests 1048576 — it hits the
+  same codec-envelope-vs-frame-limit interaction and stays at `{64, 4096}`
+  to avoid it entirely.
 - Concurrency: `{1, 8, 64, 512}`, matching the existing full-matrix
   convention used in `bench/shm`.
 - Results written via the copied `Result`/`WriteJSONL` to
