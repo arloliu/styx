@@ -2873,11 +2873,22 @@ func TestWriter_FillSends_PublishOnlyWhatTheyReport_UnderRandomizedCancellation(
 			wantIDs[oc.id] = struct{}{}
 		}
 	}
+	// A count is the wrong gate here: got legitimately contains wire-path
+	// frames whose sends reported acceptance-unknown (context error) yet were
+	// published anyway (Transport.AcceptanceUnknown), so len(got) says nothing
+	// about whether any particular wanted ID has arrived. Wait for every
+	// wanted ID to be present instead.
 	require.Eventually(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 
-		return len(got) >= len(wantIDs)
+		for id := range wantIDs {
+			if _, ok := got[id]; !ok {
+				return false
+			}
+		}
+
+		return true
 	}, testTimeout, time.Millisecond, "not every reported-published frame arrived")
 
 	stopRecv()
@@ -3058,11 +3069,22 @@ func TestWriter_FillMode_SurvivesRandomizedFaultStorm_OnALiveRegion(t *testing.T
 			wantIDs[e.id] = struct{}{}
 		}
 	}
+	// A count is the wrong gate here: got legitimately contains wire-path
+	// frames whose sends reported acceptance-unknown (context error) yet were
+	// published anyway (Transport.AcceptanceUnknown), so len(got) says nothing
+	// about whether any particular wanted ID has arrived. Wait for every
+	// wanted ID to be present instead.
 	require.Eventually(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 
-		return len(got) >= len(wantIDs)
+		for id := range wantIDs {
+			if _, ok := got[id]; !ok {
+				return false
+			}
+		}
+
+		return true
 	}, testTimeout, time.Millisecond, "not every reported-published frame arrived")
 
 	counts := map[string]int{}
