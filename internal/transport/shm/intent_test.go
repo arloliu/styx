@@ -1,6 +1,7 @@
 package shm
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -54,4 +55,73 @@ func TestMapKind_RejectsUnsupportedKind(t *testing.T) {
 
 	// Then
 	require.ErrorIs(t, err, errUnsupportedKind)
+}
+
+// Test that the fill abandonment handshake admits exactly one winner: whichever
+// of the writer's claim and the caller's abandon lands first takes the intent,
+// and the loser is told it lost. This is the whole safety argument for running a
+// caller's closure on the writer goroutine, so it is pinned directly on the
+// state word rather than only through the writer.
+func TestPayloadFill_AdmitsExactlyOneWinner_PerHandshake(t *testing.T) {
+	t.Run("writer claims first: the caller's abandon loses", func(t *testing.T) {
+		// Given a pending fill.
+		p := &payloadFill{size: 4}
+
+		// When the writer claims it and the caller then tries to abandon it.
+		claimed := p.claim()
+		abandoned := p.abandon()
+
+		// Then only the claim won, and the intent never reads as abandoned — the
+		// caller must wait for the writer's report.
+		require.True(t, claimed)
+		require.False(t, abandoned)
+		require.False(t, p.abandoned())
+	})
+
+	t.Run("caller abandons first: the writer's claim loses", func(t *testing.T) {
+		// Given a pending fill.
+		p := &payloadFill{size: 4}
+
+		// When the caller abandons it and the writer then tries to claim it.
+		abandoned := p.abandon()
+		claimed := p.claim()
+
+		// Then only the abandon won, and the writer sees an abandoned intent it
+		// must discard without filling.
+		require.True(t, abandoned)
+		require.False(t, claimed)
+		require.True(t, p.abandoned())
+	})
+
+	t.Run("a terminal state is never left or re-entered", func(t *testing.T) {
+		// Given a claimed fill.
+		p := &payloadFill{size: 4}
+		require.True(t, p.claim())
+
+		// When either transition is retried.
+		// Then both fail: the word only ever leaves pending, and only once.
+		require.False(t, p.claim())
+		require.False(t, p.abandon())
+		require.False(t, p.abandoned())
+	})
+
+	t.Run("concurrent claim and abandon: exactly one wins", func(t *testing.T) {
+		// Given many independent fills, each raced by a claimer and an abandoner.
+		const rounds = 2000
+
+		// When both transitions are attempted concurrently on each.
+		for range rounds {
+			p := &payloadFill{size: 4}
+
+			var wg sync.WaitGroup
+			var claimed, abandoned bool
+			wg.Go(func() { claimed = p.claim() })
+			wg.Go(func() { abandoned = p.abandon() })
+			wg.Wait()
+
+			// Then exactly one side won, and the observable state agrees with it.
+			require.NotEqual(t, claimed, abandoned, "exactly one of claim/abandon must win")
+			require.Equal(t, abandoned, p.abandoned())
+		}
+	})
 }

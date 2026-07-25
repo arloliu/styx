@@ -2,6 +2,7 @@ package shm
 
 import (
 	"errors"
+	"sync/atomic"
 
 	"github.com/arloliu/styx/internal/ring"
 	"github.com/arloliu/styx/internal/transport"
@@ -34,6 +35,101 @@ var errLaneKindMismatch = errors.New("shm: frame kind not valid for its lane")
 // channel. The frame is never published on an unexpected lane; poisoning is
 // the consumer's job, not the producer's.
 var errUnknownLane = errors.New("shm: unknown lane")
+
+// errSendAbandoned is reported for a fill-mode intent whose caller won the
+// abandonment handshake: the caller's context fired while the intent was still
+// pending, so the caller took it out of the writer's hands and returned its own
+// context error. The frame is never filled and never published. The winning
+// caller has already returned and never reads this value; it is delivered only
+// so the intent resolves exactly once, like every other outcome.
+var errSendAbandoned = errors.New("shm: fill send abandoned by its caller")
+
+// errFillOnDescriptorOnlyKind is returned for a fill-mode intent on a kind that
+// stores no payload (CANCEL, STREAM_ACK): there is nothing for its callback to
+// write. This is an in-process caller bug, surfaced on the completion channel
+// rather than published — publishing it would leave the handshake word pending
+// on a frame that reached the ring, the one state the handshake forbids.
+var errFillOnDescriptorOnlyKind = errors.New("shm: fill payload on a descriptor-only frame kind")
+
+// errFillPanic reports that a caller-supplied payload-fill callback panicked on
+// the writer goroutine; the recovered value is wrapped into the message. The
+// frame fails terminally and the writer goroutine survives, because a user
+// codec bug must cost one frame, not the transport.
+var errFillPanic = errors.New("shm: payload fill panicked")
+
+// The abandonment-handshake states of a fill-mode intent, held in
+// payloadFill.state.
+//
+// A wire intent is safe to abandon because its bytes are an immutable snapshot
+// taken at submit: the writer may emit it whether or not its caller is still
+// waiting. A fill intent has no bytes yet — its closure reads a message the
+// caller still owns — so running the closure after the caller has resumed is a
+// data race. The state word is the handshake that makes exactly one of the two
+// outcomes happen:
+//
+//   - fillPending: the intent is queued, or set aside on arena backpressure.
+//     Either side may still claim it.
+//   - fillFilling: the writer claimed it (stampPayload, right after the slab
+//     allocation succeeds and right before it runs the callback). From here the
+//     writer owns the frame's fate, and a cancelling caller MUST wait for the
+//     writer's report rather than return its context error.
+//   - fillAbandoned: the caller claimed it when its context fired. The writer
+//     never runs the callback and never publishes the frame, so winning this
+//     transition is the caller's proof that the frame was never published.
+//
+// Both transitions are compare-and-swap out of fillPending, so exactly one can
+// win and neither terminal state is ever left. The load-bearing invariant is
+// that NO publish path may leave the word at fillPending: that would let a
+// caller win the abandonment CAS after its frame was already on the wire and
+// report a delivered request as a context error.
+const (
+	fillPending uint32 = iota
+	fillFilling
+	fillAbandoned
+)
+
+// payloadFill is an intent's fill-mode payload contract: the exact byte count
+// the frame stores, the caller-supplied callback that produces those bytes
+// straight into the slab (saving the copy a wire payload costs), and the
+// handshake state word above. The intent references it by pointer so the caller
+// and the writer share one state word across the intent copy the queue makes.
+type payloadFill struct {
+	// size is the frame's exact payload length, known before the bytes exist.
+	// The writer hands fn a window of exactly this many bytes because
+	// codec.SizedMarshaler.MarshalTo requires len(dst) == Size(m) exactly.
+	size int
+	// fn writes exactly size bytes into dst. It is invoked at most once, on the
+	// single writer goroutine, and must neither block nor retain dst past its
+	// return: it holds up every other outbound frame for its whole duration, and
+	// dst is shared-memory the consumer may read the instant the frame publishes.
+	fn func(dst []byte) error
+	// state is the abandonment handshake word (see the fill* constants).
+	state atomic.Uint32
+}
+
+// claim transitions the intent from pending to filling and reports whether the
+// writer won. Only the writer goroutine calls it, immediately before it runs
+// fn. A false result means the caller already abandoned the intent, which must
+// then be neither filled nor published.
+func (p *payloadFill) claim() bool {
+	return p.state.CompareAndSwap(fillPending, fillFilling)
+}
+
+// abandon transitions the intent from pending to abandoned and reports whether
+// the caller won. Only the submitting caller calls it, when its context fires.
+// A true result is proof the frame was never published, so the caller returns
+// its context error; a false result means the writer already claimed the intent
+// and the caller MUST instead return the writer's report.
+func (p *payloadFill) abandon() bool {
+	return p.state.CompareAndSwap(fillPending, fillAbandoned)
+}
+
+// abandoned reports whether the caller won the abandonment CAS. The writer
+// checks it at dequeue so an abandoned intent is discarded before any
+// caller-supplied code runs.
+func (p *payloadFill) abandoned() bool {
+	return p.state.Load() == fillAbandoned
+}
 
 // lane selects which of the writer's two bounded queues an intent joins.
 // The split lets the lifecycle lane take strict priority over the data lane
@@ -76,8 +172,16 @@ type intent struct {
 	// the encoded Status for status-bearing frames. This snapshot ensures the
 	// bytes stamped are exactly those admission validated, and remain unchanged
 	// if the caller mutates the frame after Send. nil for test-constructed
-	// intents, which build falls back to computing from frame.
+	// intents, which build falls back to computing from frame, and nil for a
+	// fill intent, whose bytes do not exist until the writer asks for them.
 	wire []byte
+	// fill, when non-nil, replaces wire with the fill-mode payload contract:
+	// the writer allocates the slab and calls back into the caller to marshal
+	// directly into it. The two payload modes are mutually exclusive — a fill
+	// intent leaves wire nil — and only the data lane ever uses fill. Status
+	// frames and every lifecycle kind carry bytes the writer itself produces
+	// (wirePayload), which are immutable and need no handshake.
+	fill *payloadFill
 	// done is buffered with capacity 1 so the writer's completion send never
 	// blocks, even if the caller already abandoned the intent on context cancel.
 	// This ensures a caller that returned early can never wedge the writer.

@@ -2,6 +2,9 @@ package shm
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
+	"hash/crc32"
 	"math"
 	"math/rand/v2"
 	"sync"
@@ -2267,4 +2270,857 @@ func TestWriter_Report_InvokesOnReportOnce(t *testing.T) {
 	}
 	w.report(discarded, transport.ErrClosed)
 	require.Equal(t, []bool{false}, disc, "a teardown/discard report is not a publish")
+}
+
+// gateAllocArena is a payloadArena double that parks the writer INSIDE Alloc:
+// it signals reached on entry, waits for release, then serves a fixed handle. It
+// records every freed handle. That park is the one window a fill intent can be
+// abandoned after its slab exists — between the allocation and the writer's
+// claim CAS — so a test can drive that window deterministically instead of
+// hoping to hit it.
+type gateAllocArena struct {
+	reached chan struct{}
+	release chan struct{}
+	handle  arena.SlabHandle
+	mu      sync.Mutex
+	freed   []arena.SlabHandle
+}
+
+func (a *gateAllocArena) Alloc(size uint32) (arena.SlabHandle, []byte, error) {
+	select {
+	case a.reached <- struct{}{}:
+	default:
+	}
+	<-a.release
+
+	return a.handle, make([]byte, size), nil
+}
+
+func (a *gateAllocArena) Free(h arena.SlabHandle) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.freed = append(a.freed, h)
+
+	return nil
+}
+
+func (a *gateAllocArena) freedSnapshot() []arena.SlabHandle {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	out := make([]arena.SlabHandle, len(a.freed))
+	copy(out, a.freed)
+
+	return out
+}
+
+// fillIntent builds a fill-mode data intent whose callback writes payload into
+// the window the writer hands it, mirroring dataIntent for the wire path.
+func fillIntent(id uint64, payload []byte) intent {
+	return intent{
+		frame: dataReqFrame(id),
+		lane:  laneData,
+		fill:  &payloadFill{size: len(payload), fn: func(dst []byte) error { copy(dst, payload); return nil }},
+		done:  make(chan error, 1),
+	}
+}
+
+// Test the fill payload mode's happy path: the writer allocates the slab, hands
+// the callback a window of exactly the declared size, and stamps the descriptor
+// from the handle — the same descriptor the copy path produces, with the bytes
+// written straight into shared memory instead of copied from a heap buffer.
+func TestWriter_FillsSlabDirectly_OnFillIntent(t *testing.T) {
+	// Given an arena serving a known slab and a fill intent declaring its size.
+	sa := &stubArena{offset: 4096, generation: 7, sequence: 9}
+	w := newWriterFromParts(&recordRing{}, sa, 1, 1, admitBlock)
+	payload := []byte("filled-in-place")
+
+	var gotLen int
+	i := intent{
+		frame: transport.Frame{
+			CallID: 3, Kind: transport.FrameUnaryReq, Service: 11, Method: 22, Budget: 5 * time.Millisecond,
+		},
+		lane: laneData,
+		fill: &payloadFill{size: len(payload), fn: func(dst []byte) error {
+			gotLen = len(dst)
+			copy(dst, payload)
+
+			return nil
+		}},
+		done: make(chan error, 1),
+	}
+
+	// When building it.
+	d, st := w.build(i)
+
+	// Then the callback saw an exact-size window (what codec.SizedMarshaler
+	// requires), the bytes are in the slab, and the descriptor is stamped from the
+	// handle exactly as the copy path stamps it.
+	require.Equal(t, buildOK, st)
+	require.Equal(t, len(payload), gotLen, "fill must get a window of exactly the declared size")
+	require.Equal(t, payload, sa.slab[:len(payload)])
+	require.Equal(t, ring.KindUnaryReq, d.Kind())
+	require.Equal(t, uint64(3), d.CallID())
+	require.Equal(t, uint64(11), d.ServiceID())
+	require.Equal(t, uint64(22), d.MethodID())
+	require.Equal(t, int64(5*time.Millisecond), d.BudgetNS())
+	require.Equal(t, uint32(4096), d.PayloadOffset())
+	require.Equal(t, uint32(len(payload)), d.PayloadLength())
+	require.Equal(t, uint32(7), d.Generation())
+	require.Equal(t, uint64(9), d.AllocSeq())
+	require.Equal(t, uint16(0), d.Flags())
+
+	// And the intent was claimed, so no late abandon can contradict a publish.
+	require.False(t, i.fill.abandon(), "a filled intent must no longer be abandonable")
+}
+
+// Test that a zero-size fill frame takes the no-slab encoding and skips the
+// callback (there are no bytes for it to write), yet is still claimed — an
+// unclaimed publish would let a late abandon report a delivered frame as a
+// context error.
+func TestWriter_StampsZeroSizeFillDescriptor_WithoutSlabOrCallback(t *testing.T) {
+	// Given a writer whose arena must not be touched, and a zero-size fill intent.
+	w := newWriterFromParts(&recordRing{}, noArena{}, 1, 1, admitBlock)
+
+	var ran atomic.Bool
+	i := intent{
+		frame: transport.Frame{CallID: 5, Kind: transport.FrameUnaryResp},
+		lane:  laneData,
+		fill:  &payloadFill{size: 0, fn: func([]byte) error { ran.Store(true); return nil }},
+		done:  make(chan error, 1),
+	}
+
+	// When building it.
+	d, st := w.build(i)
+
+	// Then no slab is allocated, the callback never ran, and the "no slab"
+	// encoding holds.
+	require.Equal(t, buildOK, st)
+	require.False(t, ran.Load(), "a zero-size fill has nothing to write")
+	require.Equal(t, uint32(0), d.PayloadOffset())
+	require.Equal(t, uint32(0), d.PayloadLength())
+	require.Equal(t, uint64(0), d.AllocSeq())
+
+	// And it was claimed anyway, so the publish below cannot be contradicted.
+	require.False(t, i.fill.abandon(), "a published fill intent must no longer be abandonable")
+}
+
+// Test that a fill callback returning an error fails the frame terminally and
+// gives the slab back: the caller's error is reported, nothing is published, and
+// the arena is exactly where it started.
+func TestWriter_ReportsFillError_AndFreesSlab(t *testing.T) {
+	// Given an arena recording frees and a fill intent whose callback fails.
+	af := &allocFreeArena{handle: arena.SlabHandle{Offset: 512, Length: 8, Sequence: 3}}
+	w := newWriterFromParts(panicOnPushRing{}, af, 1, 1, admitBlock)
+	wantErr := errors.New("codec exploded")
+	i := intent{
+		frame: dataReqFrame(1),
+		lane:  laneData,
+		fill:  &payloadFill{size: 8, fn: func([]byte) error { return wantErr }},
+		done:  make(chan error, 1),
+	}
+
+	// When building it (panicOnPushRing would panic if it ever reached a publish).
+	_, st := w.build(i)
+
+	// Then the build failed terminally, the caller's error is on the intent, and
+	// the slab it allocated was returned.
+	require.Equal(t, buildFailed, st)
+	require.ErrorIs(t, <-i.done, wantErr)
+	require.Equal(t, []arena.SlabHandle{af.handle}, af.freed, "a failed fill must give its slab back")
+	require.Equal(t, slabRef{}, w.pendingSlab, "a failed fill must leave no pending-slab bookkeeping")
+}
+
+// Test that a panicking fill callback — caller-supplied code running on the
+// single writer goroutine — costs exactly one frame and nothing else. All four
+// properties are asserted together against a REAL arena, because "no panic
+// escaped" alone would also hold for a writer that leaked the slab, wedged, or
+// died: the intent reports the panic, the slab's occupancy is fully restored,
+// the writer goroutine survives, and later sends in BOTH payload modes still
+// publish on the same writer.
+func TestWriter_SurvivesFillPanic_WithoutLeakingSlabOrWriter(t *testing.T) {
+	// Given a running writer over a real ring and arena, at a known occupancy.
+	ra := realArena(t)
+	rr := &recordRing{}
+	w := newWriterFromParts(rr, ra, 2, 2, admitBlock)
+	w.start()
+	t.Cleanup(w.stop)
+
+	baseline := ra.OccupancyBytes()
+
+	// When a fill callback panics on the writer goroutine.
+	err := w.submitFill(t.Context(), dataReqFrame(1), 16, func([]byte) error {
+		panic("codec bug")
+	})
+
+	// Then the panic is reported to that frame's caller as an error.
+	require.ErrorIs(t, err, errFillPanic)
+	require.ErrorContains(t, err, "codec bug", "the recovered value must reach the caller")
+
+	// And the slab is freed: arena occupancy is exactly back to its baseline.
+	require.Equal(t, baseline, ra.OccupancyBytes(), "a panicking fill must not strand its slab")
+
+	// And the writer goroutine survived: both payload modes still publish, in
+	// order, on the same writer.
+	require.NoError(t, w.submit(t.Context(),
+		transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq, Payload: []byte("wire-after-panic")}, laneData))
+	want := []byte("fill-after-panic")
+	require.NoError(t, w.submitFill(t.Context(), dataReqFrame(3), len(want), func(dst []byte) error {
+		copy(dst, want)
+
+		return nil
+	}))
+
+	pushed := rr.snapshot()
+	require.Len(t, pushed, 2, "only the panicking frame must be lost")
+	require.Equal(t, uint64(2), pushed[0].CallID())
+	require.Equal(t, uint64(3), pushed[1].CallID())
+}
+
+// Test that arena backpressure still parks a fill intent BEFORE any caller code
+// runs: allocation comes first, so an exhausted arena sets the intent aside with
+// its callback untouched and its handshake word still pending — which is what
+// keeps a fill send cancellable exactly when backpressure makes cancellation
+// matter. When space frees, the same intent resumes and fills normally.
+func TestWriter_ParksFillIntent_BeforeRunningFill_WhenArenaExhausted(t *testing.T) {
+	// Given a running writer whose arena starts exhausted.
+	sw := &switchArena{allocated: make(chan struct{}, 1)}
+	rr := &recordRing{}
+	w := newWriterFromParts(rr, sw, 1, 1, admitBlock)
+	w.start()
+	t.Cleanup(w.stop)
+
+	var ran atomic.Bool
+	want := []byte("late-fill")
+	i := intent{
+		frame: dataReqFrame(1),
+		lane:  laneData,
+		fill: &payloadFill{size: len(want), fn: func(dst []byte) error {
+			ran.Store(true)
+			copy(dst, want)
+
+			return nil
+		}},
+		done: make(chan error, 1),
+	}
+	w.dataQueue <- i
+
+	// When the writer has provably attempted (and failed) the allocation.
+	<-sw.allocated
+
+	// Then the callback has not run and the intent is still abandonable.
+	require.False(t, ran.Load(), "fill must not run before a slab exists")
+	require.True(t, i.fill.abandon(), "a park on arena backpressure must leave the intent abandonable")
+
+	// And when space frees for a fresh intent, the fill runs and publishes.
+	sw.release()
+	second := fillIntent(2, want)
+	w.dataQueue <- second
+	require.NoError(t, recvWithin(t, second.done, "resumed fill intent never published"))
+
+	pushed := rr.snapshot()
+	require.Len(t, pushed, 1, "only the un-abandoned intent publishes")
+	require.Equal(t, uint64(2), pushed[0].CallID())
+	require.Equal(t, want, sw.slab[:len(want)])
+}
+
+// Test that a CRC-negotiated fill frame is byte-identical to the copy path's:
+// the checksum is computed from the filled slab, so a fill and a wire frame with
+// the same payload produce the same trailer and the same CRC32C_PRESENT flag
+// (shm-abi.md §5).
+func TestWriter_FillChecksum_MatchesCopyPath_WhenNegotiated(t *testing.T) {
+	// Given two checksum-negotiated writers over identical arenas, and one payload.
+	payload := []byte("checksum this payload")
+
+	wireArena := &stubArena{offset: 4096, generation: 7, sequence: 9}
+	wireWriter := newWriterFromParts(&recordRing{}, wireArena, 1, 1, admitBlock)
+	wireWriter.checksum = true
+
+	fillArena := &stubArena{offset: 4096, generation: 7, sequence: 9}
+	fillWriter := newWriterFromParts(&recordRing{}, fillArena, 1, 1, admitBlock)
+	fillWriter.checksum = true
+
+	// When the same payload is stamped through each payload mode.
+	wireDesc, wireSt := wireWriter.build(intent{
+		frame: transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: payload},
+		lane:  laneData,
+		done:  make(chan error, 1),
+	})
+	fillDesc, fillSt := fillWriter.build(fillIntent(1, payload))
+
+	// Then both slabs, both trailers, and both descriptors agree.
+	require.Equal(t, buildOK, wireSt)
+	require.Equal(t, buildOK, fillSt)
+	require.Equal(t, wireArena.slab, fillArena.slab, "fill must produce the same slab bytes as the copy path")
+	require.Equal(t, crc32.Checksum(payload, castagnoliTable),
+		binary.LittleEndian.Uint32(fillArena.slab[len(payload):]))
+	require.NotZero(t, fillDesc.Flags()&flagCRC32CPresent)
+	require.Equal(t, wireDesc.Flags(), fillDesc.Flags())
+	require.Equal(t, wireDesc.PayloadLength(), fillDesc.PayloadLength())
+}
+
+// Test the abandonment half of the handshake end to end: a fill send cancelled
+// while the writer is busy elsewhere is discarded unpublished, and its callback
+// NEVER runs afterwards.
+//
+// The evidence is ordered, not inferred. The writer is parked mid-publish on an
+// unrelated frame, so the fill intent provably sits in the queue, un-dequeued,
+// when its caller's context fires; the caller's ctx.Err() return is what proves
+// it won the abandonment CAS. Only then is the writer released and driven all
+// the way to a full stop, so it has provably dequeued and disposed of the
+// intent. The flag is read after that, on the test goroutine: a false reading
+// there means the callback did not run before the caller returned AND did not
+// run after it — the exact property that makes the caller's message safe to
+// reuse the moment the send returns. Run with -race.
+func TestWriter_SubmitFill_DiscardsAbandonedIntent_WithoutEverRunningFill(t *testing.T) {
+	// Given a running writer parked mid-publish inside a gated Push, holding the
+	// queue behind it.
+	g := &gateRing{reached: make(chan struct{}, 1), release: make(chan struct{})}
+	w := newWriterFromParts(g, &stubArena{}, 4, 4, admitBlock)
+	w.start()
+
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(g.release) }) }
+	t.Cleanup(releaseGate)
+	t.Cleanup(w.stop)
+
+	blocker := fillIntent(1, []byte("blocker"))
+	w.dataQueue <- blocker
+	<-g.reached // the writer is inside Push for the blocker, not touching the queue
+
+	// When a second fill send is submitted and then cancelled.
+	var ran atomic.Bool
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		result <- w.submitFill(ctx, dataReqFrame(2), 8, func([]byte) error {
+			ran.Store(true)
+
+			return nil
+		})
+	}()
+	require.Eventually(t, func() bool { return len(w.dataQueue) == 1 },
+		testTimeout, time.Millisecond, "the fill intent never reached the queue")
+	cancel()
+
+	// Then the caller returns its context error — proof it won the abandonment CAS
+	// and therefore that the frame was never published.
+	require.ErrorIs(t, recvWithin(t, result, "cancelled fill send did not return"), context.Canceled)
+
+	// And once the writer is released and fully drained — so it has provably
+	// dequeued and disposed of the abandoned intent — the callback still never ran.
+	releaseGate()
+	w.stop()
+	require.False(t, ran.Load(), "fill must never run for an intent its caller abandoned")
+
+	// And nothing was published for the abandoned call.
+	for _, d := range g.pushed {
+		require.NotEqual(t, uint64(2), d.CallID(), "an abandoned fill intent must never publish")
+	}
+}
+
+// Test the other half of the handshake: a caller whose context fires AFTER the
+// writer has claimed the intent must block until the writer reports, and must
+// return that report — never its context error. The frame's fate is already
+// decided at that point, so reporting a delivered request as a cancellation
+// would make the invoke path misclassify it.
+//
+// The race is made deterministic by parking the writer INSIDE the callback: the
+// claim CAS has provably already happened when the context is cancelled. Run
+// with -race.
+func TestWriter_SubmitFill_ReturnsWriterReport_WhenCancelLosesToTheClaim(t *testing.T) {
+	t.Run("frame publishes: the cancelled caller still gets nil", func(t *testing.T) {
+		// Given a running writer parked inside a fill callback, so the intent is
+		// already claimed.
+		rr := &recordRing{}
+		w := newWriterFromParts(rr, &stubArena{}, 2, 2, admitBlock)
+		w.start()
+		t.Cleanup(w.stop)
+
+		filling := make(chan struct{})
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+		ctx, cancel := context.WithCancel(t.Context())
+		result := make(chan error, 1)
+		go func() {
+			result <- w.submitFill(ctx, dataReqFrame(1), 4, func(dst []byte) error {
+				close(filling)
+				<-release
+				copy(dst, []byte("done"))
+
+				return nil
+			})
+		}()
+		<-filling
+
+		// When the caller's context fires while the writer holds the claim.
+		cancel()
+
+		// Then the caller does NOT return: it must wait out the fill.
+		select {
+		case err := <-result:
+			t.Fatalf("fill send returned on ctx cancel after losing the claim CAS: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		// And when the fill completes and the frame publishes, the caller returns
+		// the writer's report — success, not the context error.
+		releaseOnce.Do(func() { close(release) })
+		require.NoError(t, recvWithin(t, result, "fill send never returned the writer's report"))
+		require.Len(t, rr.snapshot(), 1)
+	})
+
+	t.Run("frame fails: the cancelled caller gets the build error", func(t *testing.T) {
+		// Given the same setup, with a callback that fails after the cancellation.
+		w := newWriterFromParts(panicOnPushRing{}, &allocFreeArena{}, 2, 2, admitBlock)
+		w.start()
+		t.Cleanup(w.stop)
+
+		filling := make(chan struct{})
+		release := make(chan struct{})
+		wantErr := errors.New("marshal failed")
+
+		ctx, cancel := context.WithCancel(t.Context())
+		result := make(chan error, 1)
+		go func() {
+			result <- w.submitFill(ctx, dataReqFrame(1), 4, func([]byte) error {
+				close(filling)
+				<-release
+
+				return wantErr
+			})
+		}()
+		<-filling
+
+		// When the caller's context fires and the fill then fails.
+		cancel()
+		close(release)
+
+		// Then the caller gets the build error, never the context error: the
+		// frame's fate was decided by the writer, not by the cancellation.
+		err := recvWithin(t, result, "fill send never returned the writer's report")
+		require.ErrorIs(t, err, wantErr)
+		require.NotErrorIs(t, err, context.Canceled)
+	})
+}
+
+// Test the one window where an abandonment lands after a slab already exists:
+// between the allocation and the writer's claim CAS. The writer must give the
+// slab back and discard the intent unpublished rather than fill and publish it.
+// The window is forced by parking the writer inside Alloc, so the caller's
+// cancellation provably lands after the allocation and before the claim. Run
+// with -race.
+func TestWriter_SubmitFill_FreesSlab_WhenAbandonLandsAfterAlloc(t *testing.T) {
+	// Given a running writer parked inside its arena's Alloc.
+	handle := arena.SlabHandle{Offset: 512, Length: 8, Sequence: 3}
+	ga := &gateAllocArena{reached: make(chan struct{}, 1), release: make(chan struct{}), handle: handle}
+	w := newWriterFromParts(panicOnPushRing{}, ga, 2, 2, admitBlock)
+	w.start()
+	t.Cleanup(w.stop)
+
+	var ran atomic.Bool
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		result <- w.submitFill(ctx, dataReqFrame(1), 8, func([]byte) error {
+			ran.Store(true)
+
+			return nil
+		})
+	}()
+	<-ga.reached // the slab is about to exist; the claim CAS has not happened
+
+	// When the caller's context fires in that window.
+	cancel()
+	require.ErrorIs(t, recvWithin(t, result, "cancelled fill send did not return"), context.Canceled)
+
+	// Then, once the writer resumes out of Alloc and disposes of the intent
+	// (panicOnPushRing would panic if it ever tried to publish), the callback
+	// never ran and the slab it had already allocated was returned.
+	close(ga.release)
+	w.stop()
+	require.False(t, ran.Load(), "fill must never run for an intent its caller abandoned")
+	require.Equal(t, []arena.SlabHandle{handle}, ga.freedSnapshot(),
+		"a slab allocated for an abandoned intent must be freed exactly once")
+}
+
+// Test the fill mode's end-to-end safety property against a real region, under
+// randomized cancellation and both payload modes mixed on one writer:
+//
+//   - a send that returned a context error was NEVER published (the peer never
+//     sees that call) and its callback NEVER ran, so the caller's message is
+//     safe to reuse the moment the send returns;
+//   - a send that returned nil WAS published and arrives with its exact bytes.
+//
+// Together those are the abandonment handshake's contract stated as an
+// observable outcome rather than as a state-word assertion. Checksums are
+// negotiated, so every delivered frame also had its CRC verified by the real
+// consumer. This is an in-process pair, so -race covers it; it makes no
+// cross-process claim. Run with -race.
+func TestWriter_FillSends_PublishOnlyWhatTheyReport_UnderRandomizedCancellation(t *testing.T) {
+	// Given a real host/plugin pair with checksums negotiated, and a drainer.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(true))
+
+	var mu sync.Mutex
+	got := make(map[uint64][]byte)
+	recvCtx, stopRecv := context.WithCancel(t.Context())
+	defer stopRecv()
+
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for {
+			f, err := ep.plugin.Recv(recvCtx)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			got[f.CallID] = f.Payload
+			mu.Unlock()
+		}
+	}()
+
+	// When 128 sends run concurrently, alternating payload modes, each racing a
+	// cancellation scheduled at a randomized point relative to its own submission.
+	const sends = 128
+	//nolint:gosec // reproducible randomized coverage, not a security context
+	rng := rand.New(rand.NewPCG(20260725, 1))
+
+	type outcome struct {
+		id      uint64
+		payload []byte
+		err     error
+		fill    bool
+		ran     *atomic.Bool
+	}
+	outcomes := make([]outcome, sends)
+
+	var wg sync.WaitGroup
+	for k := range sends {
+		id := uint64(k + 1)
+		payload := make([]byte, rng.IntN(49))
+		for b := range payload {
+			payload[b] = byte(id)
+		}
+		delay := time.Duration(rng.IntN(200)) * time.Microsecond
+		ran := &atomic.Bool{}
+		outcomes[k] = outcome{id: id, payload: payload, fill: id%2 == 1, ran: ran}
+
+		wg.Go(func() {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			time.AfterFunc(delay, cancel)
+
+			frame := transport.Frame{CallID: id, Kind: transport.FrameUnaryReq}
+			if id%2 == 0 {
+				frame.Payload = payload
+				outcomes[k].err = ep.host.Send(ctx, frame)
+
+				return
+			}
+			outcomes[k].err = ep.host.outbound.submitFill(ctx, frame, len(payload), func(dst []byte) error {
+				ran.Store(true)
+				copy(dst, payload)
+
+				return nil
+			})
+		})
+	}
+	wg.Wait()
+
+	// Then every send that reported success is delivered with its exact bytes.
+	wantIDs := make(map[uint64]struct{})
+	for _, oc := range outcomes {
+		if oc.err == nil {
+			wantIDs[oc.id] = struct{}{}
+		}
+	}
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return len(got) >= len(wantIDs)
+	}, testTimeout, time.Millisecond, "not every reported-published frame arrived")
+
+	stopRecv()
+	<-drained
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	fillPublished, fillAbandoned := 0, 0
+	for _, oc := range outcomes {
+		delivered, ok := got[oc.id]
+		if oc.err == nil {
+			require.True(t, ok, "call %d reported published but never arrived", oc.id)
+			require.Equal(t, oc.payload, delivered, "call %d arrived with the wrong bytes", oc.id)
+			if oc.fill {
+				fillPublished++
+			}
+
+			continue
+		}
+
+		require.ErrorIs(t, oc.err, context.Canceled, "call %d failed for an unexpected reason", oc.id)
+		if !oc.fill {
+			// The wire path keeps its documented acceptance-unknown semantics: a
+			// cancelled wire send abandons an already-enqueued intent the writer may
+			// still publish (Transport.AcceptanceUnknown). Nothing to assert about
+			// delivery here — the contrast is the point.
+			continue
+		}
+
+		// A fill send's context error is the abandonment CAS's proof of
+		// non-publication, so it is a hard "never happened": the peer never sees the
+		// call, and the callback never ran, which is what makes the caller's message
+		// safe to reuse the moment the send returns.
+		require.False(t, ok, "call %d returned a context error but was published", oc.id)
+		require.False(t, oc.ran.Load(), "call %d returned a context error but its fill ran", oc.id)
+		fillAbandoned++
+	}
+
+	// And the run exercised both directions of the fill race rather than
+	// degenerating into "everything published" or "everything abandoned". The
+	// deterministic tests above pin each direction on its own; this guards the
+	// randomized layer against going vacuously one-sided.
+	t.Logf("fill sends: published=%d abandoned=%d", fillPublished, fillAbandoned)
+	require.Positive(t, fillPublished, "the run must publish some fill sends")
+	require.Positive(t, fillAbandoned, "the run must abandon some fill sends")
+}
+
+// storm fault kinds injected into a fill callback by the randomized storm below.
+const (
+	stormFillOK = iota
+	stormFillError
+	stormFillPanic
+)
+
+// stormFill builds one storm entry's fill callback: it records that the writer
+// ran it, then injects the entry's fault or writes the entry's payload into the
+// window it was handed.
+func stormFill(fault int, payload []byte, ran *atomic.Bool) func(dst []byte) error {
+	return func(dst []byte) error {
+		ran.Store(true)
+		switch fault {
+		case stormFillError:
+			return errors.New("injected fill failure")
+		case stormFillPanic:
+			panic("injected fill panic")
+		}
+		copy(dst, payload)
+
+		return nil
+	}
+}
+
+// Test the fill payload mode against a live region under a randomized fault
+// storm: cancellations racing the handshake, fill callbacks returning errors,
+// fill callbacks panicking, and wire sends interleaved on the same writer, over
+// a geometry small enough that arena backpressure is routine rather than
+// exceptional.
+//
+// This is the fill-mode counterpart to the cross-process chaos suite, which
+// cannot reach this path yet — it drives the host through the exported transport
+// surface, and no fill entry point exists there. What it asserts is the same
+// shape: not "it still works", but that the survivor's behavior is exactly the
+// contract. No send is misreported (only frames whose send returned nil arrive,
+// and they arrive intact), a caller that got a context error had its callback
+// never run, and after the storm the writer is still live and its arena is
+// unleaked — proven by a quiet run of round trips through a slab pool small
+// enough that even a few stranded slabs would wedge it.
+//
+// In-process pair, so -race covers it; it makes no cross-process claim. Run with
+// -race.
+func TestWriter_FillMode_SurvivesRandomizedFaultStorm_OnALiveRegion(t *testing.T) {
+	// Given a real host/plugin pair over a three-slab small class, with checksums
+	// negotiated and a drainer recycling slabs.
+	ep := newEndpoints(t, reclaimLayout(), validConfig(true))
+
+	var mu sync.Mutex
+	got := make(map[uint64][]byte)
+	recvCtx, stopRecv := context.WithCancel(t.Context())
+	defer stopRecv()
+
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for {
+			f, err := ep.plugin.Recv(recvCtx)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			got[f.CallID] = f.Payload
+			mu.Unlock()
+		}
+	}()
+
+	// When 192 sends run concurrently, mixing payload modes, randomized
+	// cancellation, and injected fill errors and panics.
+	const storm = 192
+	//nolint:gosec // reproducible randomized coverage, not a security context
+	rng := rand.New(rand.NewPCG(20260725, 2))
+
+	type entry struct {
+		id      uint64
+		payload []byte
+		fill    bool
+		fault   int
+		err     error
+		ran     *atomic.Bool
+	}
+	entries := make([]entry, storm)
+
+	var wg sync.WaitGroup
+	for k := range storm {
+		id := uint64(k + 1)
+		payload := make([]byte, 1+rng.IntN(48))
+		for b := range payload {
+			payload[b] = byte(id)
+		}
+		fill := rng.IntN(2) == 0
+		fault := stormFillOK
+		if fill {
+			switch rng.IntN(8) {
+			case 0:
+				fault = stormFillError
+			case 1:
+				fault = stormFillPanic
+			}
+		}
+		delay := time.Duration(rng.IntN(400)) * time.Microsecond
+		ran := &atomic.Bool{}
+		entries[k] = entry{id: id, payload: payload, fill: fill, fault: fault, ran: ran}
+
+		wg.Go(func() {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			// A fault-injecting entry is never cancelled, so its callback provably
+			// runs and the fault paths get a fixed, seed-determined population. An
+			// entry cannot meaningfully test both anyway: an abandoned intent's
+			// callback never runs, so its injected fault would simply not happen.
+			if fault == stormFillOK {
+				time.AfterFunc(delay, cancel)
+			}
+
+			frame := transport.Frame{CallID: id, Kind: transport.FrameUnaryReq}
+			if !fill {
+				frame.Payload = payload
+				entries[k].err = ep.host.Send(ctx, frame)
+
+				return
+			}
+			entries[k].err = ep.host.outbound.submitFill(ctx, frame, len(payload), stormFill(fault, payload, ran))
+		})
+	}
+	wg.Wait()
+
+	// Then every send that reported success arrives with its exact bytes, and
+	// nothing that reported a failure was ever published.
+	wantIDs := make(map[uint64]struct{})
+	for _, e := range entries {
+		if e.err == nil {
+			wantIDs[e.id] = struct{}{}
+		}
+	}
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return len(got) >= len(wantIDs)
+	}, testTimeout, time.Millisecond, "not every reported-published frame arrived")
+
+	counts := map[string]int{}
+	mu.Lock()
+	for _, e := range entries {
+		delivered, ok := got[e.id]
+		if e.err == nil {
+			require.True(t, ok, "call %d reported published but never arrived", e.id)
+			require.Equal(t, e.payload, delivered, "call %d arrived with the wrong bytes", e.id)
+			counts["published"]++
+
+			continue
+		}
+		if !e.fill {
+			// The wire path keeps its acceptance-unknown semantics on a cancelled
+			// send (Transport.AcceptanceUnknown), so delivery is not asserted here.
+			counts["wire-failed"]++
+
+			continue
+		}
+
+		require.False(t, ok, "call %d failed but was published: %v", e.id, e.err)
+		switch {
+		case errors.Is(e.err, context.Canceled):
+			// The abandonment CAS's proof of non-publication also means no
+			// caller code ran, whatever fault that callback would have injected.
+			require.False(t, e.ran.Load(), "call %d returned a context error but its fill ran", e.id)
+			counts["fill-abandoned"]++
+		case errors.Is(e.err, errFillPanic):
+			require.Equal(t, stormFillPanic, e.fault, "call %d reported a panic it never raised", e.id)
+			counts["fill-panicked"]++
+		default:
+			require.Equal(t, stormFillError, e.fault, "call %d failed unexpectedly: %v", e.id, e.err)
+			counts["fill-errored"]++
+		}
+	}
+	mu.Unlock()
+	t.Logf("storm outcomes: %v", counts)
+	require.Positive(t, counts["published"])
+	require.Positive(t, counts["fill-abandoned"], "the storm must exercise the abandonment race")
+	require.Positive(t, counts["fill-panicked"], "the storm must exercise the fill-panic path")
+	require.Positive(t, counts["fill-errored"], "the storm must exercise the fill-error path")
+
+	// And the writer survived it all with nothing stranded: a quiet run of round
+	// trips through the same three-slab class publishes and arrives, which a
+	// leaked slab or a dead writer goroutine could not do.
+	for k := range 32 {
+		id := uint64(1_000_000 + k)
+		want := []byte{byte(k), byte(k + 1), byte(k + 2)}
+		require.NoError(t, ep.host.outbound.submitFill(t.Context(),
+			transport.Frame{CallID: id, Kind: transport.FrameUnaryReq}, len(want),
+			func(dst []byte) error { copy(dst, want); return nil }))
+
+		require.Eventuallyf(t, func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+
+			return got[id] != nil
+		}, testTimeout, time.Millisecond, "post-storm call %d never arrived", id)
+
+		mu.Lock()
+		require.Equal(t, want, got[id])
+		mu.Unlock()
+	}
+
+	stopRecv()
+	<-drained
+}
+
+// Test that a fill intent on a kind storing no payload is failed closed rather
+// than published: the callback would have nothing to write, and a publish there
+// would leave the abandonment handshake word pending on a frame that reached the
+// ring — the state the handshake exists to make impossible.
+func TestWriter_RejectsFillOnDescriptorOnlyKind(t *testing.T) {
+	// Given a CANCEL intent wrongly carrying a fill payload.
+	w := newWriterFromParts(panicOnPushRing{}, noArena{}, 1, 1, admitBlock)
+	var ran atomic.Bool
+	i := intent{
+		frame: cancelFrame(1),
+		lane:  laneLifecycle,
+		fill:  &payloadFill{size: 4, fn: func([]byte) error { ran.Store(true); return nil }},
+		done:  make(chan error, 1),
+	}
+
+	// When building it.
+	_, st := w.build(i)
+
+	// Then it is a terminal caller-bug error, the callback never ran, and the
+	// intent stays abandonable because nothing was ever claimed or published.
+	require.Equal(t, buildFailed, st)
+	require.ErrorIs(t, <-i.done, errFillOnDescriptorOnlyKind)
+	require.False(t, ran.Load())
+	require.True(t, i.fill.abandon())
 }

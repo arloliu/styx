@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"sync"
 	"sync/atomic"
@@ -67,8 +68,10 @@ const (
 	// buildStuck means the arena had no free slab; the intent must be retried
 	// later, without a slab leak (nothing was allocated).
 	buildStuck
-	// buildFailed means a terminal caller-bug error was already reported on the
-	// intent's completion channel.
+	// buildFailed means the intent is terminally resolved and its outcome was
+	// already reported on its completion channel, so it must not be published:
+	// a caller-bug error, a failed or panicking payload fill, or a fill intent
+	// its caller abandoned.
 	buildFailed
 )
 
@@ -417,6 +420,53 @@ func (w *writer) submit(ctx context.Context, frame transport.Frame, l lane) erro
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// submitFill queues a fill-mode data-lane frame and waits for the writer's
+// result. The frame carries no payload bytes: size is the exact payload length
+// and fill writes exactly that many bytes into the slab the writer allocates,
+// running on the writer goroutine. size is trusted here — the transport surface
+// bounds it against the negotiated max_payload before this is reached, and
+// stampPayload's build-time guard fails a bad one closed rather than allocating
+// from it.
+//
+// The post-enqueue wait is the CAS abandonment handshake (see payloadFill).
+// When the caller's context fires:
+//
+//   - winning the pending -> abandoned CAS proves the writer never started the
+//     fill, and therefore can never publish this frame, so the caller returns
+//     its context error and its message is safe to reuse the moment this
+//     returns;
+//   - losing that CAS means the writer already claimed the intent, so the
+//     frame's fate is decided and the caller MUST return the writer's report —
+//     nil if the frame published, the build error if it did not. Returning the
+//     context error here would report a delivered request as a cancellation and
+//     make the invoke path misclassify it. That wait is normally one marshal
+//     long; a frame already filled but set aside on a full ring window waits for
+//     that window instead, which is the wait an un-cancelled caller would take.
+//
+// It is a data-lane entry only. The lifecycle lane carries writer-produced bytes
+// with no caller closure to race, and LS1 makes it non-abandonable anyway.
+func (w *writer) submitFill(ctx context.Context, frame transport.Frame, size int, fill func(dst []byte) error) error {
+	pf := &payloadFill{size: size, fn: fill}
+	i := intent{frame: frame, lane: laneData, fill: pf, done: make(chan error, 1)}
+
+	// All-or-nothing (enqueue's doc): an error here provably pushed no intent, so
+	// there is nothing to abandon and fill can never run.
+	if err := w.enqueue(ctx, i, laneData); err != nil {
+		return err
+	}
+
+	select {
+	case err := <-i.done:
+		return err
+	case <-ctx.Done():
+		if pf.abandon() {
+			return ctx.Err()
+		}
+
+		return <-i.done
 	}
 }
 
@@ -881,6 +931,27 @@ func (w *writer) signalRetry() {
 // aside and keep serving lifecycle instead of blocking on data-lane backpressure
 // (design §12).
 func (w *writer) place(c *carry) emitResult {
+	// A fill intent whose caller won the abandonment CAS must be neither filled
+	// nor published: winning that CAS is the caller's proof the frame never
+	// reached the peer, and the caller has already returned its context error and
+	// resumed using the message the fill closure would read. Discard it here,
+	// before the build runs any caller-supplied code.
+	//
+	// In practice this is reached with no slab held: a carry that already built
+	// has claimed its intent (stampPayload's CAS), which no caller can then
+	// abandon, and a carry set aside on arena backpressure allocated nothing. The
+	// free below makes "an abandoned intent leaks no slab" structural rather than
+	// an argument about which states can coexist.
+	if f := c.i.fill; f != nil && f.abandoned() {
+		if c.hasSlab {
+			_ = w.arena.Free(c.h)
+			c.hasSlab = false
+		}
+		w.report(c.i, errSendAbandoned)
+
+		return emitDone
+	}
+
 	if !c.built {
 		d, st := w.build(c.i)
 		switch st {
@@ -960,9 +1031,14 @@ func (w *writer) publishSeq() uint64 {
 
 // build turns an intent into a ready-to-push ring descriptor. It validates the
 // frame kind and its lane, stamps the descriptor fields, and for a payload-bearing
-// data frame allocates a slab and copies the payload in. It returns buildStuck if
-// the arena is exhausted (nothing allocated, safe to retry) and buildFailed after
-// reporting a terminal caller-bug or oversize error on the intent.
+// data frame allocates a slab and puts the payload in it — copied from the
+// intent's wire snapshot, or produced by its fill callback. It returns buildStuck
+// if the arena is exhausted (nothing allocated, safe to retry) and buildFailed
+// after reporting a terminal outcome on the intent.
+//
+// Every path that can lead to a publish takes a fill intent out of fillPending
+// first, so a caller can never win the abandonment CAS for a frame that reached
+// the ring (see the fill* constants).
 func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 	var d ring.Descriptor
 
@@ -1010,6 +1086,17 @@ func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 	d.SetReserved(i.frame.Control)
 
 	if descriptorOnly {
+		// A descriptor-only frame stores no payload at all, so a fill callback has
+		// nothing to write and this intent could only have been built by mistake.
+		// Fail it closed here rather than publish it with its handshake word still
+		// pending, which a late abandonment CAS could then win for a frame that did
+		// reach the ring.
+		if i.fill != nil {
+			w.report(i, errFillOnDescriptorOnlyKind)
+
+			return d, buildFailed
+		}
+
 		// Descriptor-only frame (CANCEL): no slab, no service/method/budget, no
 		// payload-layout flags. payload_offset/payload_length/alloc_seq stay 0 as
 		// the reserved "no slab" encoding (shm-abi.md §5).
@@ -1020,15 +1107,8 @@ func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 	d.SetMethodID(i.frame.Method)
 	d.SetBudgetNS(int64(i.frame.Budget))
 
-	// Prefer the snapshot submit took at admission time, so the stamped bytes
-	// are exactly the bytes Send validated even if the caller has since
-	// mutated the frame. A directly-constructed intent (test seams) leaves
-	// wire nil, so it falls back to computing it from the frame here.
-	wire := i.wire
-	if wire == nil {
-		wire = wirePayload(i.frame)
-	}
-	if len(wire) == 0 && !w.checksum {
+	wire, msgLen := payloadOf(i)
+	if msgLen == 0 && !w.checksum {
 		// Empty-payload data frame with no negotiated payload-layout features:
 		// stored_length == 0, so no slab is allocated and the descriptor keeps the
 		// "no slab" encoding (offset/length/alloc_seq 0), shm-abi.md §5. When the
@@ -1038,10 +1118,44 @@ func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 		// A status-bearing frame (FrameUnaryErr/FrameStreamErr) never reaches this
 		// branch: EncodeStatus always returns at least statusHeadSize bytes, so its
 		// wire payload is never empty.
+		//
+		// A zero-size fill frame publishes no bytes, so its callback is skipped —
+		// there is nothing for it to write, and invoking it "at most once" allows
+		// zero. It must still be claimed: publishing while the state word is
+		// fillPending would let a cancelling caller win the abandonment CAS
+		// afterwards and report this published frame as a context error.
+		if i.fill != nil && !i.fill.claim() {
+			w.report(i, errSendAbandoned)
+
+			return d, buildFailed
+		}
+
 		return d, buildOK
 	}
 
-	return w.stampPayload(i, d, wire)
+	return w.stampPayload(i, d, wire, msgLen)
+}
+
+// payloadOf returns the bytes a data intent stamps and the exact payload length
+// its descriptor carries, for either payload mode.
+//
+// A wire intent prefers the snapshot submit took at admission time, so the
+// stamped bytes are exactly the bytes Send validated even if the caller has
+// since mutated the frame; a directly-constructed intent (test seams) leaves
+// wire nil and falls back to computing it from the frame. A fill intent has no
+// bytes at all until the writer runs its callback into the slab, so it reports a
+// nil slice and the length its caller declared.
+func payloadOf(i intent) (wire []byte, msgLen int) {
+	if i.fill != nil {
+		return nil, i.fill.size
+	}
+
+	wire = i.wire
+	if wire == nil {
+		wire = wirePayload(i.frame)
+	}
+
+	return wire, len(wire)
 }
 
 // wirePayload returns the bytes a frame stores in its slab: the encoded
@@ -1060,14 +1174,23 @@ func wirePayload(f transport.Frame) []byte {
 	return f.Payload
 }
 
-// stampPayload allocates a slab holding wire (a frame's wirePayload: its raw
-// Payload, or a FrameUnaryErr's encoded Status) and, under the negotiated
-// checksum feature, a trailing CRC32C, copies wire in, and stamps the
-// descriptor's offset/length/generation/alloc_seq from the returned handle
-// (shm-abi.md §5/§6). It first reclaims slabs the consumer released, so
-// continuous traffic never leaks (§6). ErrExhausted is typed backpressure
-// (retry later); ErrTooLarge is a terminal reject.
-func (w *writer) stampPayload(i intent, d ring.Descriptor, wire []byte) (ring.Descriptor, buildStatus) {
+// stampPayload allocates a slab holding msgLen payload bytes and, under the
+// negotiated checksum feature, a trailing CRC32C; fills the payload window;
+// and stamps the descriptor's offset/length/generation/alloc_seq from the
+// returned handle (shm-abi.md §5/§6). It first reclaims slabs the consumer
+// released, so continuous traffic never leaks (§6). ErrExhausted is typed
+// backpressure (retry later); ErrTooLarge is a terminal reject.
+//
+// The payload window is filled one of two ways. A wire intent passes its bytes
+// in wire (a frame's wirePayload: its raw Payload, or a FrameUnaryErr's encoded
+// Status) and they are copied in. A fill intent passes wire nil and msgLen from
+// its declared size, and the caller's callback writes the bytes straight into
+// the slab — see fillSlab. Either way the slab is written once, entirely before
+// the descriptor is published, so the two modes are indistinguishable to the
+// consumer.
+func (w *writer) stampPayload(
+	i intent, d ring.Descriptor, wire []byte, msgLen int,
+) (ring.Descriptor, buildStatus) {
 	crcTrailer := 0
 	if w.checksum {
 		crcTrailer = crc32TrailerLen
@@ -1076,18 +1199,20 @@ func (w *writer) stampPayload(i intent, d ring.Descriptor, wire []byte) (ring.De
 	// The transport surface bounds payload length before submit, so this is a
 	// defensive fail-closed guard against a caller bug: without it an oversize
 	// length would truncate in the uint32 cast, alloc a too-small slab, and panic
-	// in the copy below inside the writer goroutine. Reject it terminally instead.
-	// The bound is this direction's derived max_payload (its largest slab minus
-	// overhead, shm-abi.md §18), so a valid geometry whose largest class exceeds
-	// 1 MiB is not rejected here; it falls back to the uds framing constant only in
-	// isolated tests with no attached region (maxStored 0). Both are far below
-	// math.MaxUint32, so past this guard every uint32 cast is safe.
-	msgLen := len(wire)
+	// slicing the payload window below inside the writer goroutine. Reject it
+	// terminally instead. A negative length — reachable only from a fill intent,
+	// whose size is declared rather than measured — is the same class of caller
+	// bug and fails closed through the same reject, before it can reach the cast.
+	// The upper bound is this direction's derived max_payload (its largest slab
+	// minus overhead, shm-abi.md §18), so a valid geometry whose largest class
+	// exceeds 1 MiB is not rejected here; it falls back to the uds framing constant
+	// only in isolated tests with no attached region (maxStored 0). Both are far
+	// below math.MaxUint32, so past this guard every uint32 cast is safe.
 	maxMsg := transport.MaxFrameSize
 	if w.maxStored != 0 {
 		maxMsg = int(w.maxStored) - crcTrailer
 	}
-	if msgLen > maxMsg {
+	if msgLen < 0 || msgLen > maxMsg {
 		w.report(i, transport.ErrPayloadTooLarge)
 
 		return d, buildFailed
@@ -1107,6 +1232,9 @@ func (w *writer) stampPayload(i intent, d ring.Descriptor, wire []byte) (ring.De
 	h, buf, err := w.arena.Alloc(uint32(storedLen))
 	if err != nil {
 		if errors.Is(err, arena.ErrExhausted) {
+			// Typed backpressure: nothing was allocated and, for a fill intent, the
+			// state word is untouched — so a set-aside fill intent stays abandonable
+			// by its caller, which is exactly when cancellation responsiveness matters.
 			return d, buildStuck
 		}
 		w.report(i, err) // ErrTooLarge: payload exceeds the largest size class
@@ -1123,11 +1251,27 @@ func (w *writer) stampPayload(i intent, d ring.Descriptor, wire []byte) (ring.De
 		return d, buildFailed
 	}
 
-	copy(buf[:msgLen], wire)
+	// The payload window is exactly msgLen bytes at slab offset 0: under
+	// layout_version = 1 the trace block of shm-abi.md §5 is out of scope and never
+	// present, so the slab is [payload][optional 4B CRC]. Handing fill a window of
+	// exactly the declared size is required, not merely tidy —
+	// codec.SizedMarshaler.MarshalTo rejects any other length because the vtproto
+	// fill it wraps writes back to front.
+	if i.fill != nil {
+		if st := w.fillSlab(i, h, buf[:msgLen]); st != buildOK {
+			return d, st
+		}
+	} else {
+		copy(buf[:msgLen], wire)
+	}
+
 	if w.checksum {
 		// CRC32C over the message payload only (shm-abi.md §5), 4 LE bytes right
-		// after it; trace is out of scope, so the slab is [payload][4B CRC].
-		binary.LittleEndian.PutUint32(buf[msgLen:storedLen], crc32.Checksum(wire, castagnoliTable))
+		// after it. It is computed from the FILLED SLAB rather than from wire: a
+		// fill intent has no wire slice to checksum, and for a wire intent the slab
+		// window now holds exactly the bytes just copied in, so both modes produce
+		// the same checksum by construction rather than by two parallel code paths.
+		binary.LittleEndian.PutUint32(buf[msgLen:storedLen], crc32.Checksum(buf[:msgLen], castagnoliTable))
 		d.SetFlags(d.Flags() | flagCRC32CPresent)
 	}
 
@@ -1145,6 +1289,56 @@ func (w *writer) stampPayload(i intent, d ring.Descriptor, wire []byte) (ring.De
 	w.pendingSlab = slabRef{h: h, present: true}
 
 	return d, buildOK
+}
+
+// fillSlab runs a fill intent's caller-supplied marshal callback over window,
+// the exact-size payload region of its freshly allocated slab. It returns
+// buildOK once the slab holds the frame's bytes, or buildFailed after reporting
+// a terminal outcome on the intent.
+//
+// It claims the intent first (pending -> filling). Losing that CAS means the
+// caller won the abandonment race in the window since Alloc: the frame must
+// never be published, so the slab goes back and the intent is discarded
+// unpublished. Winning it is what makes the callback safe to run — the caller is
+// either still parked on the report or now committed to waiting for it, so the
+// message the closure reads cannot be retired underneath it.
+//
+// The callback is caller-supplied code running on the single writer goroutine,
+// so it is recover-wrapped: a user codec bug must cost this one frame, never
+// poison the region or take the writer down with it. On error or panic the slab
+// is freed — which also unwinds its arena occupancy — and w.pendingSlab is left
+// as build reset it, because stampPayload records the slab only after this
+// returns buildOK. So a failed fill leaves no slab, no occupancy, and no
+// bookkeeping behind, and the writer's next turn proceeds normally.
+func (w *writer) fillSlab(i intent, h arena.SlabHandle, window []byte) buildStatus {
+	if !i.fill.claim() {
+		_ = w.arena.Free(h)
+		w.report(i, errSendAbandoned)
+
+		return buildFailed
+	}
+
+	if err := runFill(i.fill.fn, window); err != nil {
+		_ = w.arena.Free(h)
+		w.report(i, err)
+
+		return buildFailed
+	}
+
+	return buildOK
+}
+
+// runFill invokes fn over dst and converts a panic into an error wrapping
+// errFillPanic, so a panicking codec fails one frame instead of unwinding the
+// writer goroutine out of its run loop.
+func runFill(fn func(dst []byte) error, dst []byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: %v", errFillPanic, r)
+		}
+	}()
+
+	return fn(dst)
 }
 
 // published records, for reclaim, the slab a just-pushed descriptor references
