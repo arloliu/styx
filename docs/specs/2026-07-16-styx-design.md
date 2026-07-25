@@ -270,8 +270,10 @@ sequence. Phases, each with an explicit acknowledgement and deadline:
    answer is already in local memory, so this covers a scheduling hiccup, not a network
    — and it deliberately ignores the reload caller's cancellation, since by this point
    the reload is committed and cancelling could only discard answers already in hand.
-   Anything still unanswered when the bound expires is failed as outcome-unknown and
-   counted on `styx.reload.dropped.count`.
+   Anything still unanswered when the bound expires is at risk of being failed as
+   outcome-unknown, and that many are counted on `styx.reload.dropped.count` — an
+   upper bound on the loss rather than an exact count, since the reader keeps running
+   through the first teardown steps and may still resolve some of them.
 
 **Rollback is defined from every pre-promotion phase, and it reverses the freeze.**
 An abort during phase 1 (cutoff) is trivial: nothing is frozen and no successor exists,

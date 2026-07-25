@@ -208,10 +208,13 @@ away answers the host is already holding.
 
 The wait is bounded at one second, so a plugin whose responses somehow never
 arrive cannot stall a reload. Calls still unanswered when that bound expires
-do fail with `ErrOutcomeUnknown`, and each one is counted on
-`styx.reload.dropped.count` (labeled with the plugin name). That counter
-should sit at zero; a non-zero value means a reload genuinely lost work a
-caller cannot safely retry, and is worth an alert.
+are at risk of failing with `ErrOutcomeUnknown`, and that many are counted on
+`styx.reload.dropped.count` (labeled with the plugin name). The counter is an
+upper bound on what was actually lost, never an under-count: the connection's
+reader keeps running through the first teardown steps and may still resolve
+some of those calls. The counter should sit at zero; a non-zero value means a
+reload put work at risk that a caller cannot safely retry, and is worth an
+alert.
 
 The three per-phase deadlines are fixed defaults today, not `PluginSpec`
 fields: 30 seconds for drain, 10 seconds for the snapshot exchange, and 30

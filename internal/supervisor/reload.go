@@ -36,7 +36,9 @@ type reloadRequest struct {
 //
 // It returns ErrReloadUnavailable if this Supervisor cannot reload (no admission
 // gate was configured or the serving loop has stopped), and ctx's error if ctx is
-// done before the transaction completes.
+// done before the transaction commits. Cancellation aborts only a reload that has
+// not yet promoted; past that point the successor is already routing, there is
+// nothing left to abandon, and the transaction runs to completion and returns nil.
 func (s *Supervisor) Reload(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
