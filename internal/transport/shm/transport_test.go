@@ -2203,28 +2203,47 @@ func TestTransport_RecvReserving_ReservesOncePerDeliveredFrame(t *testing.T) {
 	require.Equal(t, 1, reserves, "reserve fires exactly once for a delivered frame")
 }
 
-// blockedWriterEndpoints is newEndpoints with both writers' run goroutines held
-// at their first park. It installs the park hook through the construction seam,
+// heldWriters is how many parks blockedWriterEndpoints must observe before its
+// hold covers every writer: newEndpoints attaches two ends and each Attach
+// constructs exactly one outbound writer. The helper checks the count it actually
+// hooked against this, so a change to either shape fails loudly instead of
+// silently leaving a writer running.
+const heldWriters = 2
+
+// blockedWriterEndpoints is newEndpoints with every writer's run goroutine held
+// at its first park. It installs the park hook through the construction seam,
 // BEFORE Attach launches the goroutine, so the hold is in place from the very
 // first park rather than racing one that may already have happened by the time a
 // post-Attach hook could be installed.
 //
 // A held writer touches neither of its intent queues, which is what makes a
 // queue-length read on the test goroutine a stable observation rather than a race
-// against a drain. Both ends are held because holding is by construction seam and
-// the seam does not distinguish them; tests using this drive one direction and
-// only ever receive on the other, which needs no writer.
+// against a drain. The hold is only as good as its weakest writer, so this waits
+// for EVERY writer to report its own park, not for the first park to arrive: a
+// writer still runnable when the helper returns takes a full turn before it parks,
+// and that turn's non-blocking data dequeue (run's step 2) claims, fills, and
+// publishes an intent a test has already submitted — leaving the queue length the
+// test polls at zero with nothing left to observe. Both ends are held because
+// holding is by construction seam and the seam does not distinguish them; tests
+// using this drive one direction and only ever receive on the other, which needs
+// no writer.
 //
-// The returned release lets both writers run again. It also runs at cleanup —
+// The returned release lets every writer run again. It also runs at cleanup —
 // registered after newEndpoints', so it runs BEFORE it — because Close joins the
 // writer goroutine and would hang on a still-held one after a failed assertion.
 func blockedWriterEndpoints(t *testing.T, layout shm.Layout, cfg Config) (*endpoints, func()) {
 	t.Helper()
 
 	gate := make(chan struct{})
-	held := make(chan struct{})
-	var heldOnce, releaseOnce sync.Once
+	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(gate) }) }
+
+	// held carries one token per writer, sent under that writer's own sync.Once, so
+	// one writer parking cannot stand in for another. Its buffer covers every token
+	// so the send never blocks: a writer wedged on an unreceived token would never
+	// reach the gate, and the cleanup release could not free it for Close's join.
+	held := make(chan struct{}, heldWriters)
+	hooked := 0
 
 	prev := attachNewWriter
 	t.Cleanup(func() { attachNewWriter = prev })
@@ -2232,8 +2251,10 @@ func blockedWriterEndpoints(t *testing.T, layout shm.Layout, cfg Config) (*endpo
 		r *ring.Ring, a *arena.Arena, c Config, gen uint32, capacity uint64, signal func(), poison *PoisonFlag,
 	) *writer {
 		w := prev(r, a, c, gen, capacity, signal, poison)
+		hooked++
+		var parkedOnce sync.Once
 		w.setOnBlock(func(blockSite) {
-			heldOnce.Do(func() { close(held) })
+			parkedOnce.Do(func() { held <- struct{}{} })
 			<-gate
 		})
 
@@ -2243,11 +2264,14 @@ func blockedWriterEndpoints(t *testing.T, layout shm.Layout, cfg Config) (*endpo
 	ep := newEndpoints(t, layout, cfg)
 	attachNewWriter = prev
 	t.Cleanup(release)
+	require.Equal(t, heldWriters, hooked, "the park hook must cover every writer, or the hold is partial")
 
-	select {
-	case <-held:
-	case <-time.After(testTimeout):
-		t.Fatal("no writer reached its first park, so nothing is holding the intent queues")
+	for range heldWriters {
+		select {
+		case <-held:
+		case <-time.After(testTimeout):
+			t.Fatal("a writer never reached its first park, so its intent queues are unheld")
+		}
 	}
 
 	return ep, release
