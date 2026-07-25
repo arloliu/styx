@@ -751,14 +751,12 @@ func BenchmarkBaselines(b *testing.B) {
 	resultsDirExists(b)
 	regime := currentRegime()
 	verifyRegime(b, regime)
-	pluginBin := buildGoPluginServerForBench(b)
 	impls := []benchbaseline.Baseline{
 		benchbaseline.NewDirect(),
 		benchbaseline.NewRawUDS(),
 		benchbaseline.NewNetRPC(),
 		benchbaseline.NewGRPCUDS(),
 		benchbaseline.NewGRPCTCP(),
-		benchbaseline.NewGoPlugin(pluginBin),
 	}
 	for _, impl := range impls {
 		if err := impl.Start(); err != nil {
@@ -777,21 +775,6 @@ func BenchmarkBaselines(b *testing.B) {
 			}
 		}
 	}
-}
-
-func buildGoPluginServerForBench(b *testing.B) string {
-	b.Helper()
-	dir := b.TempDir()
-	out := filepath.Join(dir, "goplugin-ping-server")
-	cmd := exec.Command("go", "build", "-o", out,
-		"github.com/arloliu/styx/bench/internal/benchbaseline/cmd/goplugin-ping-server")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		b.Fatal(err)
-	}
-
-	return out
 }
 
 // BenchmarkSpikeIdleToActive measures the park/wake metric
