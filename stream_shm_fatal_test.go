@@ -134,32 +134,21 @@ func waitReaderCommitted(t *testing.T, ch <-chan struct{}, who string) {
 	}
 }
 
-// requirePeerNeverOpened drains the peer's ordered event stream and fails if any
-// OPEN observation appears — the still-queued ordering must keep the queued OPEN
-// unpublished, so the peer terminates having seen only park events, never an OPEN.
-func requirePeerNeverOpened(t *testing.T, ch <-chan peerEvent) {
-	t.Helper()
-	for {
-		select {
-		case e := <-ch:
-			require.NotEqual(t, peerOpen, e,
-				"the peer observed the queued OPEN; the stopped writer did not prevent its publication")
-		default:
-			return
-		}
-	}
-}
-
-// holdOpenQueuedInWriter enqueues a real STREAM_OPEN that stays queued and
-// unpublished in the host's outbound writer, and returns once that state is
-// PROVEN reached. It first exhausts the host→plugin arena with one small data
+// holdOpenQueuedInWriter enqueues a real STREAM_OPEN that starts out queued and
+// unpublished in the host's outbound writer, and returns once that set-aside state
+// is PROVEN reached. It first exhausts the host→plugin arena with one small data
 // frame while the peer is not consuming (so the writer reclaims nothing), then
-// enqueues the OPEN: the writer dequeues it, cannot allocate a slab, sets it
-// aside, and parks in the stuck-carry state — the point the returned observer
-// gate fires. The returned channel carries the OPEN Send's eventual disposition
-// (transport.ErrClosed once teardown drains the set-aside intent). The caller must
-// not start the peer until this returns, since the stuck writer does not resume
-// the set-aside OPEN when the peer later advances the ring head.
+// enqueues the OPEN: the writer dequeues it, cannot allocate a slab, sets it aside,
+// and parks in the stuck-carry state — the point the returned observer gate fires.
+//
+// The returned channel carries the OPEN Send's eventual disposition. That
+// disposition is now a race: the writer arms a self-retry timer while the carry is
+// set aside, so once the consuming peer frees a slab the timer can resume and
+// publish the OPEN (Send returns nil) while the writer is still live; if the
+// teardown shutdown word lands first, the pre-publish gate rolls the carry back
+// instead (Send returns transport.ErrClosed). The caller must not start the peer
+// until this returns, so the OPEN is provably set aside before either side of that
+// race can begin.
 func holdOpenQueuedInWriter(t *testing.T, pair *shmtest.Pair, host *shmFatalHostTransport) <-chan error {
 	t.Helper()
 	hostShm, ok := pair.Host.(*shmtransport.Transport)
@@ -191,6 +180,51 @@ func holdOpenQueuedInWriter(t *testing.T, pair *shmtest.Pair, host *shmFatalHost
 	return openQueued
 }
 
+// requireQueuedOpenOutcome asserts the coupled disposition of a queued STREAM_OPEN
+// that raced the teardown: openQueued carries the set-aside OPEN's Send result (the
+// authoritative record of which side won), and seen is the peer's dispatch count,
+// read after the peer's terminal error so it counts only dispatches BEFORE the §14
+// wake. Three outcomes are legitimate, from the writer's self-retry timer resuming
+// the carry into the space the consuming peer frees, racing the shutdown word:
+//   - published then dispatched (nil, 1): the live writer published before the
+//     shutdown word and the peer dispatched it before its wake;
+//   - published then skipped (nil, 0): the live writer published, but the
+//     consumer-side §14 gate declined to dispatch the in-flight descriptor once
+//     teardown was actuated (the frozen tolerated race);
+//   - rolled back (ErrClosed, 0): the shutdown word landed before the carry could be
+//     placed, so the pre-publish gate rolled it back unpublished.
+//
+// The three are separated by hard implications, never a weaker any-of, so a live
+// stream leaking through teardown (a dispatch past the wake, a second dispatch, or a
+// dispatch of a rolled-back OPEN) fails the test.
+func requireQueuedOpenOutcome(t *testing.T, openQueued <-chan error, seen int64) {
+	t.Helper()
+
+	var openErr error
+	select {
+	case openErr = <-openQueued:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the queued OPEN's Send never returned after teardown")
+	}
+
+	// The peer dispatches the queued OPEN at most once and never after its §14 wake:
+	// a second dispatch, or any dispatch past the wake, would leak a live stream.
+	require.LessOrEqual(t, seen, int64(1),
+		"the peer must dispatch the queued OPEN at most once, never after its §14 wake")
+	// A dispatched OPEN was necessarily published by the still-live writer — the peer
+	// cannot read a frame the writer never pushed.
+	if seen == 1 {
+		require.NoError(t, openErr, "a dispatched OPEN must have been published by the live writer")
+	}
+	// The Send resolves as published (nil) or rolled back (ErrClosed), and a
+	// rolled-back OPEN never reaches the peer.
+	if openErr != nil {
+		require.ErrorIs(t, openErr, transport.ErrClosed,
+			"the queued OPEN's Send must resolve as published (nil) or rolled back (ErrClosed)")
+		require.Equal(t, int64(0), seen, "a rolled-back OPEN must never reach the peer")
+	}
+}
+
 // Test the connection-fatal fallback end to end over a REAL shared-memory pair: a
 // definitive terminal-CANCEL publication failure fails the connection, the plane's
 // fatal watcher responds through stopTransportWriter, and — because the shm
@@ -205,12 +239,22 @@ func holdOpenQueuedInWriter(t *testing.T, pair *shmtest.Pair, host *shmFatalHost
 // test deterministically.
 //
 // Two orderings are covered. OPEN-published-first: the peer observes a real
-// STREAM_OPEN before the fault, then re-parks. OPEN-still-queued: a real STREAM_OPEN
-// is genuinely enqueued in the writer but held unpublished behind an exhausted arena
-// — the writer parks with it set aside — so the stopped writer prevents its
-// publication and the peer never observes it. Gates, never elapsed time, order the
-// assertions; the timeouts are failsafes that turn a stranded reader into a failure
-// rather than a hang.
+// STREAM_OPEN before the fault, then re-parks.
+//
+// OPEN-still-queued: a real STREAM_OPEN is genuinely enqueued in the writer but
+// held unpublished behind an exhausted arena — the writer parks with it set aside.
+// Its outcome is a legitimate race, not a fixed one: the writer's self-retry timer
+// resumes the set-aside carry once the consuming peer frees a slab, racing the
+// teardown shutdown word. Three outcomes are legitimate — published then dispatched,
+// published then skipped by the consumer-side §14 gate, or rolled back unpublished
+// by the pre-publish gate — so the assertions couple the set-aside OPEN's Send
+// disposition to the peer's dispatch count by hard implications rather than a weaker
+// any-of. Across all three the enduring invariant holds: nothing publishes after the
+// shutdown word is actuated, so the peer dispatches the queued OPEN at most once and
+// never after its §14 wake.
+//
+// Gates, never elapsed time, order the assertions; the timeouts are failsafes that
+// turn a stranded reader into a failure rather than a hang.
 func TestStreamPlane_FatalFallback_RealSHM_TearsDownPeerAndLocalReader(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -272,10 +316,16 @@ func TestStreamPlane_FatalFallback_RealSHM_TearsDownPeerAndLocalReader(t *testin
 			}()
 
 			// The peer: the plugin end. It reports each STREAM_OPEN it observes (on the
-			// shared ordered stream) and its terminal error. It must never observe an
-			// OPEN in the still-queued ordering. When it starts differs by ordering (see
-			// below): the still-queued case must not let the peer consume — and so free
-			// the arena — until the OPEN is already set aside.
+			// shared ordered stream and in peerOpenSeen) and its terminal error. When it
+			// starts differs by ordering (see below): the still-queued case must not let
+			// the peer consume — and so free the arena — until the OPEN is set aside.
+			//
+			// peerOpenSeen counts OPEN dispatches independently of the peerEvents
+			// channel, since waitPeerEvent below may drain a peerOpen while advancing to
+			// a park; every dispatch it counts happens before the peer's terminal error,
+			// so a count read after peerDone is final and cannot include a post-wake
+			// dispatch.
+			var peerOpenSeen atomic.Int64
 			peerDone := make(chan error, 1)
 			startPeer := func() {
 				go func() {
@@ -287,6 +337,7 @@ func TestStreamPlane_FatalFallback_RealSHM_TearsDownPeerAndLocalReader(t *testin
 							return
 						}
 						if f.Kind == transport.FrameStreamOpen {
+							peerOpenSeen.Add(1)
 							select {
 							case peerEvents <- peerOpen:
 							default:
@@ -363,16 +414,7 @@ func TestStreamPlane_FatalFallback_RealSHM_TearsDownPeerAndLocalReader(t *testin
 			}
 
 			if !tc.publishOpen {
-				// The stopped writer prevented the queued OPEN's publication: the peer
-				// terminated without ever observing it, and the queued Send drained with
-				// the graceful shutdown cause rather than publishing.
-				requirePeerNeverOpened(t, peerEvents)
-				select {
-				case e := <-openQueued:
-					require.ErrorIs(t, e, transport.ErrClosed)
-				case <-time.After(5 * time.Second):
-					t.Fatal("the queued OPEN's Send never returned after teardown")
-				}
+				requireQueuedOpenOutcome(t, openQueued, peerOpenSeen.Load())
 			}
 		})
 	}
