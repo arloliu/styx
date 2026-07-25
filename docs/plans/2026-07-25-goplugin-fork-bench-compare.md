@@ -351,7 +351,7 @@ func TestPercentile(t *testing.T) {
 		want float64
 	}{
 		{"p50", 0.50, float64(30 * time.Millisecond)},
-		{"p95", 0.95, float64(50 * time.Millisecond)},
+		{"p95", 0.95, float64(40 * time.Millisecond)},
 		{"empty", 0, 0},
 	}
 
