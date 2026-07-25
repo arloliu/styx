@@ -13,12 +13,12 @@ import (
 
 // stubHandler adapts a func to the ServiceHandler interface for tests.
 type stubHandler struct {
-	fn func(ctx context.Context, methodID uint64, payload []byte) ([]byte, *rpcruntime.Status, error)
+	fn func(ctx context.Context, methodID uint64, payload []byte) (rpcruntime.Response, *rpcruntime.Status, error)
 }
 
 func (h stubHandler) Handle(
 	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
-) ([]byte, *rpcruntime.Status, error) {
+) (rpcruntime.Response, *rpcruntime.Status, error) {
 	if onHandlerEntry != nil {
 		onHandlerEntry()
 	}
@@ -35,10 +35,12 @@ func TestDispatcher_InflightCount_ReflectsExecutingHandler(t *testing.T) {
 	d := rpcruntime.NewDispatcher()
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	d.Register(7, stubHandler{fn: func(_ context.Context, _ uint64, _ []byte) ([]byte, *rpcruntime.Status, error) {
+	d.Register(7, stubHandler{fn: func(
+		_ context.Context, _ uint64, _ []byte,
+	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		close(entered)
 		<-release
-		return []byte("ok"), nil, nil
+		return rpcruntime.Response{Payload: []byte("ok")}, nil, nil
 	}})
 	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
 	require.Zero(t, d.InflightCount())
@@ -68,10 +70,12 @@ func TestDispatcher_LeaseTable_HeldWhileHandlerRuns(t *testing.T) {
 	d.SetLeaseTable(lt)
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	d.Register(7, stubHandler{fn: func(_ context.Context, _ uint64, _ []byte) ([]byte, *rpcruntime.Status, error) {
+	d.Register(7, stubHandler{fn: func(
+		_ context.Context, _ uint64, _ []byte,
+	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		close(entered)
 		<-release
-		return []byte("ok"), nil, nil
+		return rpcruntime.Response{Payload: []byte("ok")}, nil, nil
 	}})
 	req := transport.Frame{CallID: 42, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
 
@@ -103,8 +107,10 @@ func TestDispatcher_Obligation_StaysOpenUntilResponsePublished(t *testing.T) {
 	d := rpcruntime.NewDispatcher()
 	lt := rpcruntime.NewLeaseTable()
 	d.SetLeaseTable(lt)
-	d.Register(7, stubHandler{fn: func(context.Context, uint64, []byte) ([]byte, *rpcruntime.Status, error) {
-		return []byte("ok"), nil, nil
+	d.Register(7, stubHandler{fn: func(
+		context.Context, uint64, []byte,
+	) (rpcruntime.Response, *rpcruntime.Status, error) {
+		return rpcruntime.Response{Payload: []byte("ok")}, nil, nil
 	}})
 	req := transport.Frame{CallID: 9, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
 
@@ -166,7 +172,9 @@ func TestDispatcher_LeaseTable_ReleasedOnHandlerPanic(t *testing.T) {
 	d := rpcruntime.NewDispatcher()
 	lt := rpcruntime.NewLeaseTable()
 	d.SetLeaseTable(lt)
-	d.Register(7, stubHandler{fn: func(_ context.Context, _ uint64, _ []byte) ([]byte, *rpcruntime.Status, error) {
+	d.Register(7, stubHandler{fn: func(
+		_ context.Context, _ uint64, _ []byte,
+	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		panic("boom")
 	}})
 	req := transport.Frame{CallID: 5, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
@@ -185,10 +193,12 @@ func TestDispatcher_Dispatch_InvokesHandlerAndReturnsResponseFrame(t *testing.T)
 	d := rpcruntime.NewDispatcher()
 	var gotMethod uint64
 	var gotPayload []byte
-	d.Register(7, stubHandler{fn: func(_ context.Context, m uint64, p []byte) ([]byte, *rpcruntime.Status, error) {
+	d.Register(7, stubHandler{fn: func(
+		_ context.Context, m uint64, p []byte,
+	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		gotMethod = m
 		gotPayload = p
-		return []byte("resp"), nil, nil
+		return rpcruntime.Response{Payload: []byte("resp")}, nil, nil
 	}})
 	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3, Payload: []byte("req")}
 
@@ -209,9 +219,11 @@ func TestDispatcher_Dispatch_SkipsHandler_WhenBudgetAlreadyElapsed(t *testing.T)
 	// Given
 	d := rpcruntime.NewDispatcher()
 	invoked := false
-	d.Register(7, stubHandler{fn: func(context.Context, uint64, []byte) ([]byte, *rpcruntime.Status, error) {
+	d.Register(7, stubHandler{fn: func(
+		context.Context, uint64, []byte,
+	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		invoked = true
-		return nil, nil, nil
+		return rpcruntime.Response{}, nil, nil
 	}})
 	// recvAt in the past so the budget is already elapsed relative to now.
 	recvAt := time.Now().Add(-time.Second)
@@ -233,8 +245,10 @@ func TestDispatcher_Dispatch_SkipsHandler_WhenBudgetAlreadyElapsed(t *testing.T)
 func TestDispatcher_Dispatch_EmitsStatusFrame_WhenHandlerReturnsStatus(t *testing.T) {
 	// Given
 	d := rpcruntime.NewDispatcher()
-	d.Register(7, stubHandler{fn: func(context.Context, uint64, []byte) ([]byte, *rpcruntime.Status, error) {
-		return []byte("ignored"), &rpcruntime.Status{Code: 5, Message: "not found"}, nil
+	d.Register(7, stubHandler{fn: func(
+		context.Context, uint64, []byte,
+	) (rpcruntime.Response, *rpcruntime.Status, error) {
+		return rpcruntime.Response{Payload: []byte("ignored")}, &rpcruntime.Status{Code: 5, Message: "not found"}, nil
 	}})
 	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3, Payload: []byte("req")}
 
@@ -275,8 +289,10 @@ func TestDispatcher_Dispatch_EmitsServiceNotFoundStatus_WhenServiceUnregistered(
 func TestDispatcher_Dispatch_EmitsInternalStatus_WhenHandlerReturnsPlainError(t *testing.T) {
 	// Given
 	d := rpcruntime.NewDispatcher()
-	d.Register(7, stubHandler{fn: func(context.Context, uint64, []byte) ([]byte, *rpcruntime.Status, error) {
-		return nil, nil, errors.New("codec boom")
+	d.Register(7, stubHandler{fn: func(
+		context.Context, uint64, []byte,
+	) (rpcruntime.Response, *rpcruntime.Status, error) {
+		return rpcruntime.Response{}, nil, errors.New("codec boom")
 	}})
 	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
 
@@ -297,18 +313,20 @@ func TestDispatcher_Dispatch_CancelsHandlerContext_OnMatchingCancelFrame(t *test
 	d := rpcruntime.NewDispatcher()
 	started := make(chan struct{})
 	var handlerErr error
-	d.Register(7, stubHandler{fn: func(ctx context.Context, _ uint64, _ []byte) ([]byte, *rpcruntime.Status, error) {
+	d.Register(7, stubHandler{fn: func(
+		ctx context.Context, _ uint64, _ []byte,
+	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		close(started)
 		<-ctx.Done()
 		handlerErr = ctx.Err()
 
-		return nil, nil, ctx.Err()
+		return rpcruntime.Response{}, nil, ctx.Err()
 	}})
 	req := transport.Frame{CallID: 42, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
 
 	// When: run the request handler concurrently, wait for it to start, then
 	// deliver a CANCEL frame for the same call ID.
-	done := make(chan []transport.Frame, 1)
+	done := make(chan []rpcruntime.ResponseEnvelope, 1)
 	go func() { done <- d.Dispatch(t.Context(), req, time.Now()) }()
 	<-started
 	out := d.Dispatch(t.Context(), transport.Frame{CallID: 42, Kind: transport.FrameCancel}, time.Now())

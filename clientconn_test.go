@@ -3,6 +3,8 @@ package styx
 import (
 	"context"
 	"encoding/binary"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,7 +44,7 @@ type echoHandler struct {
 
 func (h echoHandler) Handle(
 	_ context.Context, _ uint64, payload []byte, onHandlerEntry func(),
-) ([]byte, *rpcruntime.Status, error) {
+) (rpcruntime.Response, *rpcruntime.Status, error) {
 	// Honor the handler-entry contract: a non-nil callback runs exactly once before any
 	// handler behavior.
 	if onHandlerEntry != nil {
@@ -50,17 +52,18 @@ func (h echoHandler) Handle(
 	}
 	var msg wrapperspb.StringValue
 	if err := h.codec.Unmarshal(payload, &msg); err != nil {
-		return nil, nil, err
+		return rpcruntime.Response{}, nil, err
 	}
 
-	out, err := h.codec.Marshal(&msg)
-
-	return out, nil, err
+	// Return the message rather than encoded bytes, as the generated service
+	// adapter does, so this loop exercises the same response send path.
+	return rpcruntime.Response{Msg: &msg}, nil, nil
 }
 
 // runInProcessDispatchLoop drives dispatcher over tr until tr is closed,
 // standing in for the plugin-side serving loop internal/lifecycle will
-// eventually own.
+// eventually own. It sends each response through sendUnaryResponse, the same
+// encode-and-send step the real serve loop uses.
 func runInProcessDispatchLoop(tr transport.Transport, dispatcher *rpcruntime.Dispatcher) {
 	for {
 		f, err := tr.Recv(context.Background())
@@ -68,8 +71,8 @@ func runInProcessDispatchLoop(tr transport.Transport, dispatcher *rpcruntime.Dis
 			return
 		}
 
-		for _, rf := range dispatcher.Dispatch(context.Background(), f, time.Now()) {
-			if sendErr := tr.Send(context.Background(), rf); sendErr != nil {
+		for _, env := range dispatcher.Dispatch(context.Background(), f, time.Now()) {
+			if sendErr := sendUnaryResponse(context.Background(), tr, codec.Proto{}, env); sendErr != nil {
 				return
 			}
 		}
@@ -210,4 +213,216 @@ func TestClientConn_Invoke_ReturnsErrCanceled_ForCanceledContext(t *testing.T) {
 
 	// Then
 	require.ErrorIs(t, err, ErrCanceled)
+}
+
+// heldFillTransport holds every payload-fill send until the caller's context
+// ends, then reports the context error without ever running the callback — the
+// disposition a real writer produces when a cancelling caller wins the
+// abandonment handshake against a writer queue that has not reached the intent.
+// It records whether a callback ever ran, so a test can assert the request was
+// never encoded, not merely never delivered.
+type heldFillTransport struct {
+	entered  chan struct{}
+	fillRuns atomic.Int64
+	sends    atomic.Int64
+	closed   chan struct{}
+	clOnce   sync.Once
+}
+
+func newHeldFillTransport() *heldFillTransport {
+	return &heldFillTransport{entered: make(chan struct{}, 1), closed: make(chan struct{})}
+}
+
+func (t *heldFillTransport) Send(_ context.Context, _ transport.Frame) error {
+	t.sends.Add(1)
+
+	return nil
+}
+
+func (t *heldFillTransport) Recv(ctx context.Context) (transport.Frame, error) {
+	select {
+	case <-t.closed:
+		return transport.Frame{}, transport.ErrClosed
+	case <-ctx.Done():
+		return transport.Frame{}, ctx.Err()
+	}
+}
+
+func (t *heldFillTransport) Close() error {
+	t.clOnce.Do(func() { close(t.closed) })
+
+	return nil
+}
+
+func (t *heldFillTransport) SendPayloadFill(
+	ctx context.Context, _ transport.Frame, _ int, fill func(dst []byte) error,
+) error {
+	select {
+	case t.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	_ = fill // never invoked: an abandoned fill send is one the writer never claimed.
+
+	return ctx.Err()
+}
+
+// failingFillTransport runs the fill callback and reports its error verbatim,
+// modeling the shared-memory writer's own disposition for a callback that fails:
+// the slab is freed and the frame is discarded unpublished.
+type failingFillTransport struct {
+	heldFillTransport
+	fillErr atomic.Pointer[error]
+}
+
+func (t *failingFillTransport) SendPayloadFill(
+	_ context.Context, _ transport.Frame, size int, fill func(dst []byte) error,
+) error {
+	err := fill(make([]byte, size))
+	t.fillErr.Store(&err)
+
+	return err
+}
+
+// Test the invoke path producing its request straight into the transport's send
+// buffer when the transport and codec both support it, instead of marshaling it
+// into a wire buffer the transport copies. Without the fill send this round trip
+// still succeeds, so the path counters — not the result — are what prove the
+// lever engaged.
+func TestClientConn_Invoke_TakesTheFillPath_WhenTransportAndCodecSupportIt(t *testing.T) {
+	// Given
+	inner, pluginTr := newInProcessTransportPairForTest(t)
+	clientTr := newFillCountingTransport(inner)
+	cdc := sizedTestCodec{}
+	cc := newClientConn("echo", rpcruntime.NewTable(1), clientTr, cdc)
+
+	dispatcher := rpcruntime.NewDispatcher()
+	dispatcher.Register(fnv64a("test.Echo"), echoHandler{codec: cdc})
+	go runInProcessDispatchLoop(pluginTr, dispatcher)
+
+	resp := &wrapperspb.StringValue{}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	// When
+	err := cc.Invoke(ctx, "test.Echo", "Say", wrapperspb.String("hello"), resp)
+
+	// Then the request went through the fill path, no wire send happened, and the
+	// filled bytes are the encoded request.
+	require.NoError(t, err)
+	require.Equal(t, "hello", resp.Value)
+	require.Equal(t, int64(1), clientTr.fillSends.Load())
+	require.Equal(t, int64(0), clientTr.wireSends.Load())
+	want, merr := cdc.Marshal(wrapperspb.String("hello"))
+	require.NoError(t, merr)
+	require.Equal(t, want, *clientTr.lastFill.Load())
+}
+
+// Test the uds regression: with no fill support the invoke path marshals first
+// and sends the frame exactly as it always has, and the round trip is unchanged.
+func TestClientConn_Invoke_FallsBackToTheWirePath_OverUDS(t *testing.T) {
+	// Given a plain uds pair, which implements no fill capability.
+	clientTr, pluginTr := newInProcessTransportPairForTest(t)
+	cdc := sizedTestCodec{}
+	cc := newClientConn("echo", rpcruntime.NewTable(1), clientTr, cdc)
+
+	dispatcher := rpcruntime.NewDispatcher()
+	dispatcher.Register(fnv64a("test.Echo"), echoHandler{codec: cdc})
+	go runInProcessDispatchLoop(pluginTr, dispatcher)
+
+	resp := &wrapperspb.StringValue{}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	// When
+	err := cc.Invoke(ctx, "test.Echo", "Say", wrapperspb.String("hello"), resp)
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, "hello", resp.Value)
+	_, ok := resolvePayloadFiller(clientTr, cdc, wrapperspb.String("hello"))
+	require.False(t, ok, "uds must keep the marshal-then-send path")
+}
+
+// Test a fill send abandoned on the caller's context terminating the call
+// locally. The abandonment handshake makes that context error proof the request
+// was never published, so the call is canceled in the table — no CANCEL frame is
+// owed for a request the peer never saw — and the caller's context error is
+// returned directly rather than an unknown outcome.
+func TestClientConn_Invoke_CancelsLocally_WhenTheFillSendIsAbandoned(t *testing.T) {
+	// Given a transport that holds every fill send until the caller's context ends.
+	tr := newHeldFillTransport()
+	table := rpcruntime.NewTable(1)
+	cc := newClientConn("echo", table, tr, sizedTestCodec{})
+	ctx, cancel := context.WithCancel(t.Context())
+
+	// When the caller's context ends while the send is held.
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- cc.Invoke(ctx, "test.Echo", "Say", wrapperspb.String("x"), &wrapperspb.StringValue{})
+	}()
+	select {
+	case <-tr.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the invoke never reached the fill send")
+	}
+	cancel()
+
+	// Then the caller sees its own cancellation...
+	var err error
+	select {
+	case err = <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the invoke did not return after its context was canceled")
+	}
+	require.ErrorIs(t, err, ErrCanceled)
+	require.NotErrorIs(t, err, ErrOutcomeUnknown, "a won abandonment is proof of non-publication")
+
+	// ...the request was never encoded, and no CANCEL frame was owed.
+	require.Equal(t, int64(0), tr.fillRuns.Load())
+	require.Equal(t, int64(0), tr.sends.Load())
+
+	// ...and the call left no entry behind: Table.Cancel finds nothing to
+	// terminate, which it only reports for an ID already removed by its own
+	// terminal transition.
+	require.False(t, table.Cancel(1), "the call table entry must be cleaned up")
+	require.False(t, table.Publish(1))
+}
+
+// Test the same split for a deadline rather than a cancel, so the caller sees the
+// deadline error and not a cancellation.
+func TestClientConn_Invoke_ReportsDeadline_WhenTheFillSendIsAbandonedByDeadline(t *testing.T) {
+	// Given
+	tr := newHeldFillTransport()
+	table := rpcruntime.NewTable(1)
+	cc := newClientConn("echo", table, tr, sizedTestCodec{})
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancel()
+
+	// When
+	err := cc.Invoke(ctx, "test.Echo", "Say", wrapperspb.String("x"), &wrapperspb.StringValue{})
+
+	// Then
+	require.ErrorIs(t, err, ErrDeadlineExceeded)
+	require.False(t, table.Cancel(1), "the call table entry must be cleaned up")
+}
+
+// Test a fill callback that under-writes its window failing the send rather than
+// publishing residue: the request never reaches the peer, and the caller learns
+// the outcome is unknown instead of receiving a silently corrupt reply.
+func TestClientConn_Invoke_FailsTheSend_WhenTheFillCallbackWritesShort(t *testing.T) {
+	// Given a codec that leaves the last byte of the fill window unwritten.
+	tr := &failingFillTransport{heldFillTransport: *newHeldFillTransport()}
+	table := rpcruntime.NewTable(1)
+	cc := newClientConn("echo", table, tr, shortMarshalCodec{})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	// When
+	err := cc.Invoke(ctx, "test.Echo", "Say", wrapperspb.String("hello"), &wrapperspb.StringValue{})
+
+	// Then the send failed on the byte-count check and nothing was published.
+	require.ErrorIs(t, err, ErrOutcomeUnknown)
+	require.ErrorIs(t, *tr.fillErr.Load(), errShortSizedMarshal)
+	require.Equal(t, int64(0), tr.sends.Load())
 }

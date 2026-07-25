@@ -83,12 +83,12 @@ func TestServiceHandler_RecoverPanic_RepliesPanicStatus_AndTaints(t *testing.T) 
 	h := newServiceHandler(registeredService{desc: desc}, codec.Proto{}, pc)
 
 	// When the panicking method is dispatched.
-	payload, status, err := h.Handle(t.Context(), fnv64a("Boom"), nil, nil)
+	resp, status, err := h.Handle(t.Context(), fnv64a("Boom"), nil, nil)
 
 	// Then the panic is recovered as a status reply, not propagated, and the
 	// session is tainted for controlled termination.
 	require.NoError(t, err)
-	require.Nil(t, payload)
+	require.Zero(t, resp, "a panicking handler yields no response")
 	require.NotNil(t, status)
 	require.Equal(t, rpcruntime.StatusCodeHandlerPanic, status.Code)
 	require.Equal(t, "handler boom", status.Message)
@@ -109,31 +109,33 @@ func TestServiceHandler_ContinueAfterPanic_RepliesPanicStatus_WithoutTaint(t *te
 
 	req, merr := codec.Proto{}.Marshal(wrapperspb.String("hi"))
 	require.NoError(t, merr)
-	echoPayload, echoStatus, echoErr := h.Handle(t.Context(), fnv64a("Echo"), req, nil)
+	echoResp, echoStatus, echoErr := h.Handle(t.Context(), fnv64a("Echo"), req, nil)
 
 	// Then the session is never tainted and the subsequent call succeeds.
 	require.False(t, pc.shouldTerminate())
 	require.NoError(t, echoErr)
 	require.Nil(t, echoStatus)
-	require.NotNil(t, echoPayload)
+	require.NotNil(t, echoResp.Msg)
 }
 
-// Test a runtime panic outside the handler frame still crashing rather than recovering
-func TestServiceHandler_RuntimePanicOutsideHandler_StillPanics(t *testing.T) {
-	// Given a handler that returns normally but a codec whose response marshal
-	// panics — a Styx-runtime frame, not a handler frame.
-	desc := newPanicTestService()
-	pc := newPanicController(false)
-	h := newServiceHandler(registeredService{desc: desc}, panicOnMarshalCodec{}, pc)
+// Test the response marshal panicking outside the handler frame still crashing
+// rather than being recovered. The marshal runs on the send path now, after the
+// handler returned and outside its recover boundary, so the panic must propagate
+// out of the serve goroutine exactly as any other runtime panic does.
+func TestSendUnaryResponse_PropagatesMarshalPanic_OutsideHandlerBoundary(t *testing.T) {
+	// Given a dispatched response and a codec whose Marshal panics, over a
+	// transport with no payload-fill support so the marshal runs inline here
+	// rather than inside the transport's own recover-wrapped fill.
+	_, pluginTr := newInProcessTransportPairForTest(t)
+	env := rpcruntime.ResponseEnvelope{
+		Frame: transport.Frame{CallID: 1, Kind: transport.FrameUnaryResp},
+		Msg:   wrapperspb.String("hi"),
+	}
 
-	req, merr := codec.Proto{}.Marshal(wrapperspb.String("hi"))
-	require.NoError(t, merr)
-
-	// When/Then the marshal panic is NOT recovered by the handler-panic boundary.
+	// When/Then the marshal panic is not converted into an error or swallowed.
 	require.Panics(t, func() {
-		_, _, _ = h.Handle(t.Context(), fnv64a("Echo"), req, nil)
+		_ = sendUnaryResponse(t.Context(), pluginTr, panicOnMarshalCodec{}, env)
 	})
-	require.False(t, pc.shouldTerminate())
 }
 
 // unaryPanicHarness wires a client to a plugin serve loop running one service with
@@ -154,7 +156,9 @@ func setupUnaryPanicHarness(t *testing.T, continueAfterPanic bool) *unaryPanicHa
 
 	clientTr, pluginTr := newInProcessTransportPairForTest(t)
 	serveResult := make(chan error, 1)
-	go func() { serveResult <- runServeLoop(context.Background(), pluginTr, dispatcher, nil, pc, nil) }()
+	go func() {
+		serveResult <- runServeLoop(context.Background(), pluginTr, codec.Proto{}, dispatcher, nil, pc, nil)
+	}()
 
 	cc := newClientConn("p", rpcruntime.NewTable(firstGeneration), clientTr, codec.Proto{})
 
@@ -279,7 +283,7 @@ func setupStreamPanicHarness(t *testing.T, continueAfterPanic bool) *streamPanic
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		serveResult <- runServeLoop(context.Background(), pluginTr, d, srv, pc, nil)
+		serveResult <- runServeLoop(context.Background(), pluginTr, codec.Proto{}, d, srv, pc, nil)
 	}()
 	t.Cleanup(func() {
 		_ = pluginTr.Close()
@@ -585,7 +589,7 @@ func setupInterleaveHarness(t *testing.T) *interleaveHarness {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		serveResult <- runServeLoop(context.Background(), pluginTr, d, srv, pc, nil)
+		serveResult <- runServeLoop(context.Background(), pluginTr, codec.Proto{}, d, srv, pc, nil)
 	}()
 	t.Cleanup(func() {
 		release()
@@ -779,7 +783,7 @@ func setupUnaryInterleaveHarness(t *testing.T) *unaryInterleaveHarness {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		serveResult <- runServeLoop(context.Background(), pluginTr, dispatcher, srv, pc, nil)
+		serveResult <- runServeLoop(context.Background(), pluginTr, codec.Proto{}, dispatcher, srv, pc, nil)
 	}()
 	t.Cleanup(func() {
 		release()

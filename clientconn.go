@@ -493,11 +493,21 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 		return translateCtxErr(err)
 	}
 
-	payload, err := state.codec.Marshal(req)
-	if err != nil {
-		c.admission.Leave()
+	// Prefer producing the request bytes straight into the transport's send
+	// buffer. When either side cannot (see resolvePayloadFiller), marshal into a
+	// wire buffer the transport copies — the path every send took before, kept
+	// byte-for-byte: in particular a marshal failure still fails the call here,
+	// before any table entry exists to classify.
+	pf, useFill := resolvePayloadFiller(state.tr, state.codec, req)
+	var payload []byte
+	if !useFill {
+		var err error
+		payload, err = state.codec.Marshal(req)
+		if err != nil {
+			c.admission.Leave()
 
-		return fmt.Errorf("styx: invoke: marshal request: %w", err)
+			return fmt.Errorf("styx: invoke: marshal request: %w", err)
+		}
 	}
 
 	var budget time.Duration
@@ -527,20 +537,16 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 			Payload: payload,
 		}
 
-		// carry-forward: the per-call ctx never flows into transport.Send
-		// — a slow or already-expired caller deadline must not poison the
-		// whole connection for every other in-flight call. The budget
-		// already carried in f bounds the call from here on; the Table's
-		// own deadline timer (inside wait, below) is what actually reaps
-		// it if the peer never responds in time.
-		if sendErr := state.tr.Send(context.Background(), f); sendErr != nil {
-			// Backpressure transitions are counted inside the transport, at the
-			// admission decision point where they can be ordered structurally, and
-			// sampled by the periodic reporter (transport.BackpressureEdgeCounter) —
-			// not classified here, where nothing orders a completion with the
-			// admission decision that produced it.
-			cause := fmt.Errorf("styx: invoke: send request: %w: %w", sendErr, ErrOutcomeUnknown)
-			state.table.OutcomeUnknown(callID, cause)
+		if unpublished := sendRequest(ctx, state, callID, f, pf, useFill); unpublished != nil {
+			// The request provably never reached the peer and the call is already
+			// terminal, so there is no response to wait for: release the publication
+			// barrier and return the caller's own context error.
+			c.admission.Leave()
+			if m != nil {
+				c.recordAbandoned(m, start, unpublished)
+			}
+
+			return translateCtxErr(unpublished)
 		}
 	}
 	// The request has been published (or Publish lost to a racing terminal, so
@@ -563,6 +569,66 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 	}
 
 	return translateResult(result, state.codec, resp)
+}
+
+// sendRequest publishes callID's request frame and classifies a send failure.
+//
+// The two paths deliberately send under different contexts. A wire Send is
+// issued under context.Background(): once the frame is enqueued nothing can
+// prove whether the transport still published it, so abandoning it on the
+// caller's context would leave the call's outcome unknowable, and a slow or
+// already-expired caller deadline must not poison the connection for every other
+// in-flight call. The budget carried in f, and the Table's own deadline timer,
+// bound the call from there on. A fill send is issued under the per-call ctx,
+// because transport.PayloadFillSender's abandonment handshake makes a context
+// error proof that the frame was never published.
+//
+// It returns non-nil ONLY for that proven-unpublished case, carrying the context
+// error the caller must return: the call is terminated locally — Table.Cancel
+// touches no transport, and no CANCEL frame is owed for a request the peer never
+// saw — and no response can arrive. Every other send failure is classified into
+// the table as an unknown outcome and surfaces through the response wait,
+// exactly as before.
+//
+// The split reads the error class directly rather than asking
+// transport.AcceptanceClassifier: that classifier sees only the error and must
+// answer conservatively for both send shapes at once, while this call site knows
+// which send produced it — and only the fill send is issued under a cancellable
+// context, so only the fill send can return a context error at all.
+func sendRequest(
+	ctx context.Context, state *connState, callID uint64, f transport.Frame, pf payloadFiller, useFill bool,
+) error {
+	var sendErr error
+	if useFill {
+		sendErr = pf.sender.SendPayloadFill(ctx, f, pf.size, pf.fill)
+	} else {
+		sendErr = state.tr.Send(context.Background(), f)
+	}
+	if sendErr == nil {
+		return nil
+	}
+
+	if useFill && isContextErr(sendErr) {
+		state.table.Cancel(callID)
+
+		return sendErr
+	}
+
+	// Backpressure transitions are counted inside the transport, at the
+	// admission decision point where they can be ordered structurally, and
+	// sampled by the periodic reporter (transport.BackpressureEdgeCounter) —
+	// not classified here, where nothing orders a completion with the
+	// admission decision that produced it.
+	cause := fmt.Errorf("styx: invoke: send request: %w: %w", sendErr, ErrOutcomeUnknown)
+	state.table.OutcomeUnknown(callID, cause)
+
+	return nil
+}
+
+// isContextErr reports whether err is (or wraps) one of the two context
+// terminations, the pair translateCtxErr maps into the styx taxonomy.
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // abandon reacts to wait returning because ctx was abandoned locally

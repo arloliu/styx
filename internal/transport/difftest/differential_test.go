@@ -211,7 +211,7 @@ type blockingHandler struct {
 
 func (h *blockingHandler) Handle(
 	ctx context.Context, _ uint64, _ []byte, onHandlerEntry func(),
-) ([]byte, *rpcruntime.Status, error) {
+) (rpcruntime.Response, *rpcruntime.Status, error) {
 	// Honor the handler-entry contract: a non-nil callback runs exactly once before any
 	// handler behavior.
 	if onHandlerEntry != nil {
@@ -220,7 +220,7 @@ func (h *blockingHandler) Handle(
 	close(h.invoked)
 	<-ctx.Done()
 
-	return nil, nil, ctx.Err()
+	return rpcruntime.Response{}, nil, ctx.Err()
 }
 
 // Test that a terminal transport failure occurring while a call is
@@ -342,7 +342,7 @@ func newSpyHandler() *spyHandler {
 // identically to one served by the plain scenario dispatcher.
 func (s *spyHandler) Handle(
 	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
-) ([]byte, *rpcruntime.Status, error) {
+) (rpcruntime.Response, *rpcruntime.Status, error) {
 	// Honor the handler-entry contract: a non-nil callback runs exactly once at the top of
 	// this handler frame, before any spy behavior. The forwarded scenarioHandler would run
 	// the callback again, so pass nil down to keep it single-invocation.

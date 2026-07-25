@@ -212,7 +212,10 @@ func TestStreamServer_HandlerError_TerminatesStreamAndReachesOpener(t *testing.T
 	srv := newStreamServer(pluginTr, handlers, codec.Proto{}, rpcruntime.NewLeaseTable())
 	d := rpcruntime.NewDispatcher()
 	done := make(chan struct{})
-	go func() { defer close(done); _ = runServeLoop(context.Background(), pluginTr, d, srv, nil, nil) }()
+	go func() {
+		defer close(done)
+		_ = runServeLoop(context.Background(), pluginTr, codec.Proto{}, d, srv, nil, nil)
+	}()
 	t.Cleanup(func() { _ = pluginTr.Close(); <-done; srv.teardown(ErrPluginUnavailable) })
 
 	table := rpcruntime.NewTable(firstGeneration)
@@ -423,7 +426,7 @@ func TestRunServeLoop_FeatureAbsent_PoisonsOnStreamFrame(t *testing.T) {
 	tr := newRecordingStreamTransport(transport.Frame{CallID: 1, Kind: transport.FrameStreamOpen, Control: 4})
 	d := rpcruntime.NewDispatcher()
 	done := make(chan struct{})
-	go func() { defer close(done); _ = runServeLoop(context.Background(), tr, d, nil, nil, nil) }()
+	go func() { defer close(done); _ = runServeLoop(context.Background(), tr, codec.Proto{}, d, nil, nil, nil) }()
 
 	select {
 	case <-done:
@@ -1131,7 +1134,7 @@ func TestRunServeLoop_TransportPoison_FailsInstance(t *testing.T) {
 
 	d := rpcruntime.NewDispatcher()
 	errCh := make(chan error, 1)
-	go func() { errCh <- runServeLoop(context.Background(), pluginTr, d, nil, nil, nil) }()
+	go func() { errCh <- runServeLoop(context.Background(), pluginTr, codec.Proto{}, d, nil, nil, nil) }()
 
 	header := rawOversizedHeader()
 	_, err = unix.Write(fds[1], header)

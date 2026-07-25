@@ -40,7 +40,7 @@ type labelHandler struct {
 
 func (h labelHandler) Handle(
 	_ context.Context, _ uint64, payload []byte, onHandlerEntry func(),
-) ([]byte, *rpcruntime.Status, error) {
+) (rpcruntime.Response, *rpcruntime.Status, error) {
 	// Honor the handler-entry contract: a non-nil callback runs exactly once before any
 	// handler behavior.
 	if onHandlerEntry != nil {
@@ -48,12 +48,10 @@ func (h labelHandler) Handle(
 	}
 	var req wrapperspb.StringValue
 	if err := h.codec.Unmarshal(payload, &req); err != nil {
-		return nil, nil, err
+		return rpcruntime.Response{}, nil, err
 	}
 
-	out, err := h.codec.Marshal(wrapperspb.String(h.label + ":" + req.GetValue()))
-
-	return out, nil, err
+	return rpcruntime.Response{Msg: wrapperspb.String(h.label + ":" + req.GetValue())}, nil, nil
 }
 
 // newLabeledConnState builds one connection generation backed by an

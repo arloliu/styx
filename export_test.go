@@ -10,6 +10,7 @@ import (
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/transport"
+	"github.com/arloliu/styx/internal/transport/shm/shmtest"
 	"golang.org/x/sys/unix"
 )
 
@@ -53,7 +54,7 @@ func InProcessStreamPairForTest(s *PluginServer) (*ClientConn, func(), error) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = runServeLoop(context.Background(), pluginTr, dispatcher, srv, nil, nil)
+		_ = runServeLoop(context.Background(), pluginTr, codec.Proto{}, dispatcher, srv, nil, nil)
 	}()
 
 	cc := newClientConn("p", rpcruntime.NewTable(firstGeneration), clientTr, codec.Proto{})
@@ -63,6 +64,49 @@ func InProcessStreamPairForTest(s *PluginServer) (*ClientConn, func(), error) {
 		_ = pluginTr.Close()
 		<-done
 		srv.teardown(ErrPluginUnavailable)
+	}
+
+	return cc, stop, nil
+}
+
+// InProcessSHMPairForTest wires a *ClientConn (client end) to s's registered
+// unary services (plugin end) over an in-process shared-memory transport pair,
+// both ends using cdc, and returns the client conn plus a stop func. It is the
+// shared-memory counterpart of InProcessStreamPairForTest, and exists because
+// the payload-fill send path only engages on a transport with a send buffer of
+// its own — which uds does not have — so a test proving the round trip and its
+// allocation profile has to run over the real shm transport, driving GENERATED
+// client stubs against a GENERATED server registration. cdc is a parameter so a
+// test can also run the identical round trip through a codec with no
+// sized-marshal support and compare the two.
+//
+// stop closes both ends and the region, and joins the serve loop, in the order
+// runServing's own teardown uses.
+func InProcessSHMPairForTest(s *PluginServer, cdc codec.Codec) (*ClientConn, func(), error) {
+	pair, err := shmtest.NewInProcessPair(firstGeneration, shmtest.DefaultConfig())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	dispatcher := rpcruntime.NewDispatcher()
+	s.mu.Lock()
+	for _, rs := range s.services {
+		dispatcher.Register(rs.desc.ServiceID, newServiceHandler(rs, cdc, nil))
+	}
+	s.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = runServeLoop(context.Background(), pair.Plugin, cdc, dispatcher, nil, nil, nil)
+	}()
+
+	cc := newClientConn("p", rpcruntime.NewTable(firstGeneration), pair.Host, cdc)
+
+	stop := func() {
+		_ = pair.Plugin.Close()
+		<-done
+		_ = pair.Close()
 	}
 
 	return cc, stop, nil

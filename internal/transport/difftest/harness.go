@@ -280,25 +280,25 @@ type scenarioHandler struct{}
 // post-handler budget checks), and unknown methods report StatusCodeMethodNotFound.
 func (scenarioHandler) Handle(
 	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
-) ([]byte, *rpcruntime.Status, error) {
+) (rpcruntime.Response, *rpcruntime.Status, error) {
 	// Handler-entry callback runs exactly once before handler behavior.
 	if onHandlerEntry != nil {
 		onHandlerEntry()
 	}
 	switch methodID {
 	case methodEcho:
-		return payload, nil, nil
+		return rpcruntime.Response{Payload: payload}, nil, nil
 	case methodAppErr:
-		return nil, &rpcruntime.Status{Code: uint32(appErrorCode), Message: appErrorMessage}, nil
+		return rpcruntime.Response{}, &rpcruntime.Status{Code: uint32(appErrorCode), Message: appErrorMessage}, nil
 	case methodSlow:
 		select {
 		case <-time.After(slowHandlerDelay):
 		case <-ctx.Done():
 		}
 
-		return payload, nil, nil
+		return rpcruntime.Response{Payload: payload}, nil, nil
 	default:
-		return nil, &rpcruntime.Status{
+		return rpcruntime.Response{}, &rpcruntime.Status{
 			Code:    rpcruntime.StatusCodeMethodNotFound,
 			Message: fmt.Sprintf("difftest: method %d not found", methodID),
 		}, nil
@@ -356,8 +356,8 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 		}
 
 		recvAt := time.Now()
-		for _, resp := range d.Dispatch(ctx, f, recvAt) {
-			if sendErr := tr.Send(ctx, resp); sendErr != nil {
+		for _, env := range d.Dispatch(ctx, f, recvAt) {
+			if sendErr := tr.Send(ctx, env.Frame); sendErr != nil {
 				return
 			}
 		}
