@@ -590,14 +590,14 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 // terminal that fits each; the caller returns translateSendFailure of it and never
 // waits for a response, since none can arrive:
 //
-//   - a context error — the caller's own cancel or deadline won the abandonment
-//     handshake. The call terminates CANCELED or DEADLINE to match what the
-//     caller sees, and no CANCEL frame is owed for a request the peer never saw
-//     (Table's terminals touch no transport).
 //   - transport.ErrPayloadFillFailed — this message could not be encoded. The
 //     transport discarded the frame and released its buffer, so the call is
 //     provably not dispatched and terminates REJECTED, the retryable
 //     not-dispatched class, rather than being reported as an unknown outcome.
+//   - a context error — the caller's own cancel or deadline won the abandonment
+//     handshake. The call terminates CANCELED or DEADLINE to match what the
+//     caller sees, and no CANCEL frame is owed for a request the peer never saw
+//     (Table's terminals touch no transport).
 //
 // Every other send failure keeps the unknown-outcome classification and surfaces
 // through the response wait, exactly as before.
@@ -607,6 +607,13 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 // answer conservatively for both send shapes at once, while this call site knows
 // which send produced it — and only the fill send is issued under a cancellable
 // context, so only the fill send can return a context error at all.
+//
+// ErrPayloadFillFailed is checked before the context classes, not after: a
+// genuine cancellation always arrives as a bare context error (the abandonment
+// handshake returns ctx.Err() directly, never wrapped), so checking it first
+// changes nothing for that case, but it does mean a fill-callback error that
+// happened to wrap a context error still classifies as the encode failure it
+// is, rather than being mistaken for the caller's own cancellation.
 func sendRequest(
 	ctx context.Context, state *connState, callID uint64, f transport.Frame, pf payloadFiller, useFill bool,
 ) error {
@@ -622,16 +629,16 @@ func sendRequest(
 
 	if useFill {
 		switch {
+		case errors.Is(sendErr, transport.ErrPayloadFillFailed):
+			state.table.Reject(callID, fmt.Errorf("styx: invoke: marshal request: %w", sendErr))
+
+			return sendErr
 		case errors.Is(sendErr, context.DeadlineExceeded):
 			state.table.DeadlineExceeded(callID)
 
 			return sendErr
 		case errors.Is(sendErr, context.Canceled):
 			state.table.Cancel(callID)
-
-			return sendErr
-		case errors.Is(sendErr, transport.ErrPayloadFillFailed):
-			state.table.Reject(callID, fmt.Errorf("styx: invoke: marshal request: %w", sendErr))
 
 			return sendErr
 		}

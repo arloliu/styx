@@ -209,6 +209,20 @@ func (c shortOnRequestCodec) MarshalTo(m proto.Message, dst []byte) (int, error)
 	return n, nil
 }
 
+// panicOnRequestCodec panics inside the sized marshal of a marked BlobRequest —
+// a codec bug on the HOST's request encode, which on the shared-memory path
+// runs on the same transport writer goroutine as the response encode above.
+// Responses and unmarked messages take the ordinary path.
+type panicOnRequestCodec struct{ codec.Proto }
+
+func (c panicOnRequestCodec) MarshalTo(m proto.Message, dst []byte) (int, error) {
+	if req, ok := m.(*echopb.BlobRequest); ok && faulted(req.GetPayload()) {
+		panic("codec boom: request marshal panicked")
+	}
+
+	return c.Proto.MarshalTo(m, dst)
+}
+
 // Test a codec that panics while encoding a response into the shared-memory
 // transport's send buffer costing exactly one call.
 //
@@ -275,6 +289,43 @@ func TestClientConn_Invoke_FailsOneCall_WhenTheRequestCodecUnderReports_OverShar
 	// Then the caller sees the encode failure — not an unknown outcome, because
 	// the transport demonstrably discarded the frame — and no residue was
 	// published under a valid checksum.
+	require.Error(t, err)
+	require.Nil(t, resp)
+	require.ErrorIs(t, err, transport.ErrPayloadFillFailed)
+	require.NotErrorIs(t, err, styx.ErrOutcomeUnknown)
+	require.ErrorContains(t, err, "styx: invoke: marshal request")
+
+	// ...and the connection is unharmed: the next call completes normally.
+	require.False(t, pair.ServeLoopExited())
+	ok, err := client.Blob(ctx, &echopb.BlobRequest{Payload: []byte("healthy")})
+	require.NoError(t, err)
+	require.Equal(t, []byte("healthy"), ok.GetPayload())
+	requireNoOwedObligations(t, pair)
+}
+
+// Test a codec that panics while encoding a request into the shared-memory
+// transport's send buffer costing exactly one call, not the host process.
+//
+// The panic runs on the host's own transport writer goroutine, which recovers
+// it exactly as the plugin's writer goroutine recovers a panicking response
+// encode above. Before that recovery existed for the request side, this same
+// panic would have unwound an unrecovered writer goroutine and crashed the
+// host — the request never reaches the plugin, so there is no serve loop or
+// obligation on the other end to protect; what this proves is that the host
+// survives its own codec's bug.
+func TestClientConn_Invoke_FailsOneCall_WhenTheRequestCodecPanics_OverSharedMemory(t *testing.T) {
+	// Given a host whose codec panics on one marked message.
+	pair := newBlobPair(t, panicOnRequestCodec{})
+	client := echopb.NewEchoClient(pair.Conn)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	// When the marked call runs.
+	resp, err := client.Blob(ctx, &echopb.BlobRequest{Payload: markedPayload(1024)})
+
+	// Then the caller sees the encode failure — not an unknown outcome, because
+	// the transport demonstrably discarded the frame before it was ever published —
+	// and the host process is still standing.
 	require.Error(t, err)
 	require.Nil(t, resp)
 	require.ErrorIs(t, err, transport.ErrPayloadFillFailed)
