@@ -935,6 +935,65 @@ func TestOpenStream_ShmAmbiguousAcceptance_EmitsOwedTeardown(t *testing.T) {
 		"the owed teardown pair (CANCEL + STREAM_ERR) must be emitted after the published OPEN")
 }
 
+// A peer that answers the whole exchange while the opener is still parked in its
+// STREAM_OPEN send must not cost the caller that answer. The OPEN send is bounded by
+// the stream's OWN context, and the peer's completion cancels exactly that context, so
+// on a transport whose send parks the opener (shared memory) the send reports a
+// cancellation for a frame the peer received and answered in full. The completion is
+// itself the proof of delivery, so OpenStream returns the stream: the caller drains
+// every payload the peer sent, then reads the clean end of stream.
+func TestOpenStream_CompletionCancelsOpenSend_ReturnsDrainableStream(t *testing.T) {
+	// Given: a client over an shm-semantics transport whose STREAM_OPEN send parks on
+	// the stream's context and reports its error, opening a server-streaming call —
+	// half-closed-local at establishment, so the peer's single STREAM_CLOSE completes
+	// the stream on its own (stream-protocol.md §6.3).
+	tr := newShmAmbiguousTransport()
+	table := rpcruntime.NewTable(firstGeneration)
+	cc := newClientConn("p", table, tr, codec.Proto{})
+	t.Cleanup(func() { _ = tr.Close() })
+
+	strCh := make(chan *Stream, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		st, e := cc.OpenStream(t.Context(), "s", "m", WithServerStreamRequest([]byte("req")))
+		strCh <- st
+		errCh <- e
+	}()
+
+	select {
+	case <-tr.openSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the STREAM_OPEN never reached the transport")
+	}
+
+	// When: the peer delivers its whole response and closes while the opener is still
+	// parked in the send, so the completion is what cancels that send.
+	plane := cc.state.Load().streams
+	require.NoError(t, plane.dispatchStreamFrame(transport.Frame{
+		CallID: 1, Kind: transport.FrameStreamMsg, Control: 1, Payload: []byte("first"),
+	}))
+	require.NoError(t, plane.dispatchStreamFrame(transport.Frame{
+		CallID: 1, Kind: transport.FrameStreamMsg, Control: 2, Payload: []byte("second"),
+	}))
+	require.NoError(t, plane.dispatchStreamFrame(transport.Frame{
+		CallID: 1, Kind: transport.FrameStreamClose, Control: 2,
+	}))
+
+	// Then: the open succeeded and the delivered payloads are intact behind it.
+	var st *Stream
+	var err error
+	select {
+	case st = <-strCh:
+		err = <-errCh
+	case <-time.After(3 * time.Second):
+		t.Fatal("OpenStream did not return")
+	}
+
+	require.NoError(t, err, "a canceled send whose stream completed is a delivered exchange, not a failure")
+	require.NotNil(t, st, "the completed stream is handed back so its buffered payloads are not discarded")
+	requireDrains(t, st, "first", "second")
+}
+
 // CAPTURE 2 (uds-poisoned OPEN). A STREAM_OPEN Send that poisons the transport
 // mid-frame is publication-ambiguous AND the transport is now closed, so the poison
 // escalation is the teardown: OpenStream must fail in-flight calls and notify the

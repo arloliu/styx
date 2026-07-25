@@ -1150,15 +1150,22 @@ func TestRunServeLoop_TransportPoison_FailsInstance(t *testing.T) {
 }
 
 // OpenStream must never return (nil, nil): when a fast peer terminal (a rejection or
-// application STREAM_ERR, or a completing STREAM_CLOSE) wins the terminal CAS while
-// the OPEN send is in flight, Publish loses and OpenStream returns a nil stream with
-// the fully-published outcome's non-nil error — never a live stream, never nil.
-func TestOpenStream_PeerTerminalBeforePublish_ReturnsNonNilError(t *testing.T) {
+// application STREAM_ERR, a teardown, a crash, or a completing STREAM_CLOSE) wins the
+// terminal CAS while the OPEN send is in flight, OpenStream resolves the
+// fully-published outcome — a non-nil error with no stream for every terminal that
+// carries no readable result, and the drainable stream for a completion, which is the
+// peer's whole answer rather than a failure.
+func TestOpenStream_PeerTerminalBeforePublish_SurfacesEachOutcome(t *testing.T) {
 	cases := []struct {
 		name          string
 		opts          []StreamOption
 		driveTerminal func(p *streamPlane)
-		assertErr     func(t *testing.T, err error)
+		// wantStream is the universal invariant the loop asserts for every case: a
+		// completion hands back a live stream and no error, everything else hands back
+		// no stream and a non-nil error. assertOpen then checks only what is specific
+		// to this case (which error, which payloads).
+		wantStream bool
+		assertOpen func(t *testing.T, st *Stream, err error)
 	}{
 		{
 			name: "peer application error before publish",
@@ -1168,23 +1175,49 @@ func TestOpenStream_PeerTerminalBeforePublish_ReturnsNonNilError(t *testing.T) {
 					Status: &transport.FrameStatus{Code: uint32(CodeInternal), Message: "boom"},
 				})
 			},
-			assertErr: func(t *testing.T, err error) {
-				var st *Status
-				require.ErrorAs(t, err, &st, "a peer error surfaces as its status error")
-				require.Equal(t, CodeInternal, st.Code)
+			assertOpen: func(t *testing.T, st *Stream, err error) {
+				var status *Status
+				require.ErrorAs(t, err, &status, "a peer error surfaces as its status error")
+				require.Equal(t, CodeInternal, status.Code)
 			},
 		},
 		{
-			name: "completion before publish",
-			opts: []StreamOption{WithServerStreamRequest([]byte("req"))},
+			name:       "completion before publish",
+			opts:       []StreamOption{WithServerStreamRequest([]byte("req"))},
+			wantStream: true,
 			driveTerminal: func(p *streamPlane) {
 				// A server-streaming opener is half-closed-local at establishment, so a
-				// single peer STREAM_CLOSE closes both directions and completes it.
+				// single peer STREAM_CLOSE closes both directions and completes it — after
+				// the peer already delivered its response messages.
+				_ = p.dispatchStreamFrame(transport.Frame{
+					CallID: 1, Kind: transport.FrameStreamMsg, Control: 1, Payload: []byte("first"),
+				})
+				_ = p.dispatchStreamFrame(transport.Frame{
+					CallID: 1, Kind: transport.FrameStreamMsg, Control: 2, Payload: []byte("second"),
+				})
+				_ = p.dispatchStreamFrame(transport.Frame{CallID: 1, Kind: transport.FrameStreamClose, Control: 2})
+			},
+			assertOpen: func(t *testing.T, st *Stream, err error) {
+				// A completed stream whose payloads are buffered is a successful open: the
+				// caller can still receive everything the peer sent, so refusing the open
+				// would silently discard delivered data. RecvMsg returns a buffered message
+				// ahead of the terminal signal, so the caller drains the response and then
+				// reads the clean end of stream.
+				requireDrains(t, st, "first", "second")
+			},
+		},
+		{
+			name:       "completion before publish with no payload sent",
+			opts:       []StreamOption{WithServerStreamRequest([]byte("req"))},
+			wantStream: true,
+			driveTerminal: func(p *streamPlane) {
+				// The peer completes the exchange having sent nothing at all — the case
+				// where handing back a stream instead of an error is least intuitive, and
+				// where a caller most needs an immediate io.EOF to read as success.
 				_ = p.dispatchStreamFrame(transport.Frame{CallID: 1, Kind: transport.FrameStreamClose, Control: 0})
 			},
-			assertErr: func(t *testing.T, err error) {
-				require.ErrorIs(t, err, ErrStreamAlreadyClosed,
-					"a stream that completed before the opener could use it is not a success of OpenStream")
+			assertOpen: func(t *testing.T, st *Stream, err error) {
+				requireDrains(t, st)
 			},
 		},
 		{
@@ -1196,7 +1229,7 @@ func TestOpenStream_PeerTerminalBeforePublish_ReturnsNonNilError(t *testing.T) {
 					Control: uint64(rpcruntime.StatusCodeStreamCanceled),
 				})
 			},
-			assertErr: func(t *testing.T, err error) {
+			assertOpen: func(t *testing.T, st *Stream, err error) {
 				require.ErrorIs(t, err, ErrCanceled, "a peer CANCELED teardown surfaces as ErrCanceled")
 			},
 		},
@@ -1209,7 +1242,7 @@ func TestOpenStream_PeerTerminalBeforePublish_ReturnsNonNilError(t *testing.T) {
 					Control: uint64(rpcruntime.StatusCodeStreamDeadlineExceeded),
 				})
 			},
-			assertErr: func(t *testing.T, err error) {
+			assertOpen: func(t *testing.T, st *Stream, err error) {
 				require.ErrorIs(t, err, ErrDeadlineExceeded,
 					"a peer DEADLINE teardown surfaces as ErrDeadlineExceeded")
 			},
@@ -1221,7 +1254,7 @@ func TestOpenStream_PeerTerminalBeforePublish_ReturnsNonNilError(t *testing.T) {
 				// SUBMITTED behind a gated OPEN (§7.2), with the crash cause.
 				p.streams.OnPeerCrash(ErrPluginUnavailable)
 			},
-			assertErr: func(t *testing.T, err error) {
+			assertOpen: func(t *testing.T, st *Stream, err error) {
 				require.ErrorIs(t, err, ErrPluginUnavailable,
 					"a crash before publish surfaces the crash cause, never a live stream")
 			},
@@ -1274,11 +1307,39 @@ func TestOpenStream_PeerTerminalBeforePublish_ReturnsNonNilError(t *testing.T) {
 				t.Fatal("OpenStream did not return")
 			}
 
-			require.Nil(t, st, "OpenStream must never return a live stream after a peer terminal")
-			require.Error(t, err, "OpenStream must never return (nil, nil)")
-			tc.assertErr(t, err)
+			if tc.wantStream {
+				require.NotNil(t, st, "a completed stream must be handed back to the caller")
+				require.NoError(t, err, "a completion the peer produced is not an open failure")
+			} else {
+				requireFailedOpen(t, st, err)
+			}
+			tc.assertOpen(t, st, err)
 		})
 	}
+}
+
+// requireFailedOpen asserts the disposition of every terminal that carries no
+// readable result: no stream and a non-nil error, so OpenStream never returns
+// (nil, nil) and never hands back a stream the caller could not use.
+func requireFailedOpen(t *testing.T, st *Stream, err error) {
+	t.Helper()
+
+	require.Nil(t, st, "a terminal carrying no readable result must not yield a stream")
+	require.Error(t, err, "OpenStream must never return (nil, nil)")
+}
+
+// requireDrains asserts that st yields exactly want, in order, and then the clean
+// end of stream.
+func requireDrains(t *testing.T, st *Stream, want ...string) {
+	t.Helper()
+
+	for _, w := range want {
+		payload, err := st.RecvMsg(t.Context())
+		require.NoError(t, err, "every payload the peer delivered must still be receivable")
+		require.Equal(t, w, string(payload))
+	}
+	_, err := st.RecvMsg(t.Context())
+	require.ErrorIs(t, err, io.EOF, "a drained completed stream reports the clean end of stream")
 }
 
 // openWireGateTransport gates the STREAM_OPEN send: it parks the OPEN until the
