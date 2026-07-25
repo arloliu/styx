@@ -79,6 +79,10 @@ func (s *Stream) SendMsg(ctx context.Context, payload []byte) error {
 // RecvMsg returns the next delivered STREAM_MSG payload, io.EOF at clean stream
 // end, or an error already in the styx taxonomy (the same sentinels Err() reports).
 // Once the stream has terminated it returns that terminal error.
+//
+// Buffered payloads come first: a stream that has already terminated still delivers
+// every message the peer sent before it reports the end of stream, so a stream that
+// completed before the caller could read it drains in full.
 func (s *Stream) RecvMsg(ctx context.Context) ([]byte, error) {
 	payload, err := s.stream.RecvMsg(ctx)
 
@@ -245,15 +249,23 @@ func WithBidiStream() StreamOption {
 // (service, method) shape. It computes the FNV-1a-64 service/method routing
 // hashes, resolves the caller's deadline to a strictly-positive budget
 // (materializing the connection default when none is set), proposes a credit N
-// bounded by N_max, publishes the STREAM_OPEN, and returns the live narrow
-// *Stream. Generated code wraps the returned Stream with typed Send/Recv for the
-// method's message types.
+// bounded by N_max, publishes the STREAM_OPEN, and returns the narrow *Stream.
+// Generated code wraps the returned Stream with typed Send/Recv for the method's
+// message types.
 //
 // The returned stream's context is rooted in ctx, so canceling ctx cancels the
 // stream — the gRPC-shaped semantics — and terminates it autonomously (its slot
 // frees promptly) even if the caller performs no further operation; a cancel while
 // this call is still publishing the OPEN returns the cancel outcome and no live
 // stream.
+//
+// A peer fast enough to finish the whole exchange before this call returns is a
+// SUCCESS, not a failure: the stream is handed back already complete, its context
+// canceled, and the caller drains it exactly as it drains any other stream —
+// RecvMsg returns every payload the peer delivered, then io.EOF. Nothing the peer
+// sent is lost, so a server-streaming caller must not treat a completed stream as
+// an error case. A failed open, in contrast, always returns a nil stream with a
+// non-nil error (a deadline, a cancel, a peer error, or the plugin going away).
 //
 // Optimistic sends are permitted: the stream is live on the opener's side the
 // moment the transport accepts the STREAM_OPEN (stream-protocol.md §7.4/§4.5), so
@@ -286,7 +298,10 @@ func (c *ClientConn) OpenStreamID(
 // single request rides the OPEN encoded with the SAME codec every other message on
 // the connection uses — never a hardcoded one — and the accepter, decoding with the
 // negotiated codec, reads back exactly what was sent. The opener is half-closed-local
-// at establishment: it sends no STREAM_MSG.
+// at establishment: it sends no STREAM_MSG, so the peer's single STREAM_CLOSE completes
+// the stream on its own. A peer that finishes that fast is a successful open — the
+// returned stream drains the delivered payloads and then reports io.EOF, exactly as
+// OpenStream documents.
 func (c *ClientConn) OpenServerStreamID(
 	ctx context.Context, serviceID, methodID uint64, req proto.Message,
 ) (*Stream, error) {
@@ -425,8 +440,8 @@ func (c *ClientConn) openStreamByID(
 	// in the caller's context, and its cancel on any terminal), NOT context.Background —
 	// so a deadline, a caller cancellation, or a racing terminal that wins while the
 	// writer is gated aborts the send cleanly BEFORE any byte reaches the wire (§7.4:
-	// nothing on the wire is owed nothing); resolveOpenSendErr then surfaces the cancel
-	// or deadline outcome instead of a live stream. A deadline that elapses MID-write
+	// nothing on the wire is owed nothing); resolveOpenSendFailure then surfaces the
+	// cancel or deadline outcome instead of a live stream. A deadline that elapses MID-write
 	// leaves a torn OPEN frame, which the transport correctly poisons — a partial
 	// STREAM_OPEN desynchronizes the peer's framing regardless, so poison is the right
 	// disposition there, not a lingering half-frame. Publication is confirmed AFTER a
@@ -440,11 +455,13 @@ func (c *ClientConn) openStreamByID(
 	// its definitive publish/discard — never releasing the barrier before the enqueued
 	// OPEN is actually published; on the uds transport (definitive) it Leaves inline.
 	if sendErr := c.sendStreamOpen(st.Context(), state.tr, f); sendErr != nil {
-		// resolveOpenSendErr never yields a live stream — it discards or terminates the
-		// published-but-unsent stream and surfaces the outcome, so OpenStream returns no
-		// wrapper. The Leave is already resolved by sendStreamOpen (inline for uds/an
-		// unenqueued shm OPEN; owned by the completion callback for an enqueued one).
-		return nil, resolveOpenSendErr(state, st, sendErr)
+		// resolveOpenSendFailure discards or terminates the published-but-unsent stream
+		// and surfaces the outcome — except when that outcome is a completion, which
+		// proves the peer received the OPEN and answered it in full, so the drainable
+		// stream is handed back instead. The Leave is already resolved by sendStreamOpen
+		// (inline for uds/an unenqueued shm OPEN; owned by the completion callback for an
+		// enqueued one).
+		return resolveOpenSendFailure(state, st, sendErr)
 	}
 	// The OPEN reached the transport; the barrier was released by sendStreamOpen
 	// (inline on success for uds/an unenqueued OPEN, or synchronously by the
@@ -458,13 +475,15 @@ func (c *ClientConn) openStreamByID(
 	// only if the stream is still live; a false return means a terminal won during the
 	// send, and since the send succeeded the peer observed the OPEN and is owed the
 	// terminal pair — drive it strictly after the OPEN, handed off so this return stays
-	// within the deadline.
+	// within the deadline. resolveOpenTerminal then decides what that terminal means for
+	// the caller: a completion is a successful open whose stream is handed back, every
+	// other outcome is an error.
 	if !st.ConfirmOpenSent() {
 		<-st.Done()
 		oc, _ := st.Outcome()
 		st.EmitOwedOpenTeardown()
 
-		return nil, translateStreamOutcomeErr(oc)
+		return resolveOpenTerminal(st, state.codec, oc)
 	}
 
 	return newClientStream(st, state.codec), nil
@@ -505,13 +524,43 @@ func (c *ClientConn) sendStreamOpen(ctx context.Context, tr transport.Transport,
 	return err
 }
 
+// resolveOpenTerminal maps a terminal outcome that won while the STREAM_OPEN was
+// already on its way to the peer to what OpenStream returns: the drainable stream
+// for a completion, the outcome's error for everything else.
+//
+// A completion is reachable only through the peer's own STREAM_CLOSE (both
+// directions closed, stream-protocol.md §7.1), so the outcome is itself proof the
+// peer received the OPEN and answered it in full — including on the
+// acceptance-unknown path, where the send's own error says nothing about whether
+// the frame landed. Every payload the peer delivered is buffered on the stream and
+// RecvMsg drains that queue before it reports io.EOF, so handing the stream back
+// gives the caller exactly the sequence a peer that finished a moment later would
+// have produced. Refusing the open here would discard data the peer already sent.
+//
+// This is not a rare corner. A server-streaming opener is half-closed-local at
+// establishment (§6.3), so the peer's single STREAM_CLOSE completes the stream on
+// its own — and that completion cancels the stream's context, the very context
+// bounding the opener's OPEN send, so on a transport whose send parks the opener
+// (shared memory) a fully-answered exchange routinely surfaces as a canceled send.
+//
+// Every other outcome (deadline, cancel, peer error, crash) carries no readable
+// result and stays an error.
+func resolveOpenTerminal(st *rpcruntime.Stream, cdc codec.Codec, oc rpcruntime.StreamOutcome) (*Stream, error) {
+	if oc.Code == rpcruntime.OutcomeCompleted {
+		return newClientStream(st, cdc), nil
+	}
+
+	return nil, translateStreamOutcomeErr(oc)
+}
+
 // translateStreamOutcomeErr maps a stream that reached a terminal outcome before
-// OpenStream could hand it back (a racing deadline, local cancel, fast peer
-// terminal, or completion won the terminal CAS while the OPEN send was in flight)
-// to the styx error taxonomy, so OpenStream surfaces the real outcome instead of a
-// live stream (stream-protocol.md §7.4). It is called only with a FULLY published
-// outcome (after Done), and NEVER returns nil — a stream that terminated before the
-// opener could use it is not a success of OpenStream.
+// OpenStream could hand it back (a racing deadline, local cancel, or fast peer
+// terminal won the terminal CAS) to the styx error taxonomy, so OpenStream
+// surfaces the real outcome instead of a live stream (stream-protocol.md §7.4). It
+// is called only with a FULLY published outcome (after Done), and NEVER returns
+// nil — a stream that failed before the opener could use it is not a success of
+// OpenStream. A completion reached through resolveOpenTerminal never arrives here:
+// that outcome IS a successful open (see resolveOpenTerminal).
 func translateStreamOutcomeErr(oc rpcruntime.StreamOutcome) error {
 	//exhaustive:ignore -- the two teardown outcomes and completion map to their
 	// sentinels; peer-error and crashed surface through StreamError on the recorded Err.
@@ -521,9 +570,10 @@ func translateStreamOutcomeErr(oc rpcruntime.StreamOutcome) error {
 	case rpcruntime.OutcomeCanceled:
 		return ErrCanceled
 	case rpcruntime.OutcomeCompleted:
-		// The stream completed (both directions closed normally) before OpenStream
-		// could return it — a fast peer completion beat the opener's own publish. A
-		// completed outcome carries no Err, so it must not fall through to
+		// Reached only where the STREAM_OPEN provably never went out (Publish lost the
+		// terminal CAS, or the transport definitively rejected the send), so the peer
+		// could not have closed the stream and a completion is unreachable in practice.
+		// A completed outcome carries no Err, so it must not fall through to
 		// StreamError(nil): surface the dedicated sentinel instead of a nil error.
 		return ErrStreamAlreadyClosed
 	default:
@@ -1155,11 +1205,12 @@ func translateStreamSendErr(err error) error {
 	}
 }
 
-// resolveOpenSendErr classifies a failed STREAM_OPEN Send by transport ACCEPTANCE —
-// not by whether Send returned nil — into one of three dispositions and returns the
-// error OpenStream surfaces (stream-protocol.md §4.5's publication boundary, §7.4). It
-// never yields a live stream, so it returns an error alone and OpenStream returns no
-// wrapper.
+// resolveOpenSendFailure classifies a failed STREAM_OPEN Send by transport
+// ACCEPTANCE — not by whether Send returned nil — into one of three dispositions and
+// returns what OpenStream surfaces (stream-protocol.md §4.5's publication boundary,
+// §7.4). Only the ambiguous-on-a-live-transport disposition can yield a stream, and
+// only for a completion, which proves the peer received the OPEN and answered it in
+// full (see resolveOpenTerminal); the other two dispositions never do.
 //
 //  1. AMBIGUOUS + poisoned (a uds mid-frame poison): the peer MAY hold the OPEN's
 //     prefix and the framing is desynced, so the teardown pair cannot be sent on the
@@ -1174,12 +1225,12 @@ func translateStreamSendErr(err error) error {
 //  3. DEFINITIVELY NOT ACCEPTED (a pre-write / pre-enqueue rejection): nothing on or
 //     headed for the wire, so discard the stream (freeing its S_max slot at once) and
 //     surface the retryable, not-dispatched send error (§4.5's rollback set, §7.4).
-func resolveOpenSendErr(state *connState, st *rpcruntime.Stream, sendErr error) error {
+func resolveOpenSendFailure(state *connState, st *rpcruntime.Stream, sendErr error) (*Stream, error) {
 	if errors.Is(sendErr, transport.ErrPoisoned) {
 		state.escalatePoison()            // FailAll in-flight + notify the owner: the escalation is the teardown
 		st.DiscardUnaccepted(ErrPoisoned) // terminate the stream; the connection is tearing down
 
-		return ErrPoisoned
+		return nil, ErrPoisoned
 	}
 	if acceptanceUnknown(state.tr, sendErr) {
 		st.TerminateOpenAmbiguous(sendErr) // §4.5: post-acceptance ctx error is terminal (DEADLINE/CANCELED)
@@ -1187,15 +1238,15 @@ func resolveOpenSendErr(state *connState, st *rpcruntime.Stream, sendErr error) 
 		oc, _ := st.Outcome()
 		st.EmitOwedOpenTeardown() // one-shot; emits the pair after the OPEN, or no-ops if nothing is owed
 
-		return translateStreamOutcomeErr(oc)
+		return resolveOpenTerminal(st, state.codec, oc)
 	}
 	if st.DiscardUnaccepted(ErrPluginUnavailable) {
-		return translateStreamSendErr(sendErr)
+		return nil, translateStreamSendErr(sendErr)
 	}
 	<-st.Done()
 	oc, _ := st.Outcome()
 
-	return translateStreamOutcomeErr(oc)
+	return nil, translateStreamOutcomeErr(oc)
 }
 
 // acceptanceUnknown asks the transport to classify a failed STREAM_OPEN Send

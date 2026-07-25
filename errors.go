@@ -178,13 +178,17 @@ var (
 	// on a retried Stop). It is a lifecycle/framework error, not a per-call one,
 	// so IsRetryable does not classify it.
 	ErrPluginStopping = errors.New("styx: plugin still stopping")
-	// ErrStreamAlreadyClosed reports that a stream reached its terminal outcome
-	// before OpenStream could hand it back — a fast peer completion won the race
-	// against the opener's own publish step, so there is no usable stream to return.
+	// ErrStreamAlreadyClosed reports that a stream recorded a completed outcome at a
+	// point where its STREAM_OPEN provably never reached the peer, so there is no
+	// usable stream and no peer result to return. A completion the peer actually
+	// produced is not this error: OpenStream returns that stream to the caller, who
+	// drains the delivered payloads and then reads io.EOF.
 	// It is distinct from the peer-error and teardown outcomes, which carry their own
-	// mapped errors; it names specifically the completed-before-use case, which has no
-	// underlying error of its own. It is not retryable by default: the peer already
-	// processed the stream, so reissuing may repeat a side effect.
+	// mapped errors; it names specifically a completed outcome with no underlying
+	// error of its own, and it also guards the theoretical case of a peer-error or
+	// crashed outcome whose recorded error is nil. It is not retryable by default:
+	// a stream the peer may have processed must not be reissued blindly, since that
+	// could repeat a side effect.
 	ErrStreamAlreadyClosed = errors.New("styx: stream already closed")
 )
 

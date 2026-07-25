@@ -198,10 +198,10 @@ func isCanceled(err error) bool {
 // the complete descriptor before the tail store and consumers read only after
 // observing that store, so a poisoned shm outcome is a conformance defect that must
 // surface as unexpected, never be accepted. ErrStreamAlreadyClosed is not accepted
-// on either transport: it means a stream completed normally before its opener
-// returned, which the block-mode fixture (send once, then wait for context
-// termination) never does — a crash instead records a concrete outcome — so it
-// would mask a stream-lifecycle defect.
+// on either transport: a completion the peer produced is handed back as a live,
+// drainable stream rather than an error, so the sentinel names only a completed
+// outcome recorded where the STREAM_OPEN never reached the peer — a
+// stream-lifecycle defect this workload must never mask.
 //
 // The control-plane and routing sentinels (ErrServiceNotFound, ErrMethodNotFound,
 // ErrIncompatible) are excluded: the workload only ever calls a valid method on a
