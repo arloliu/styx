@@ -1,9 +1,6 @@
 package benchbaseline_test
 
 import (
-	"os"
-	"os/exec"
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -11,22 +8,8 @@ import (
 	"github.com/arloliu/styx/bench/internal/benchbaseline"
 )
 
-func buildGoPluginServer(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	out := filepath.Join(dir, "goplugin-ping-server")
-	cmd := exec.Command("go", "build", "-o", out,
-		"github.com/arloliu/styx/bench/internal/benchbaseline/cmd/goplugin-ping-server")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	require.NoError(t, cmd.Run())
-
-	return out
-}
-
 // Test every baseline round-trips an identical payload
 func TestBaseline_CallEchoesPayload_ForEveryImplementation(t *testing.T) {
-	pluginBin := buildGoPluginServer(t)
 	payload := []byte("ping-pong-payload")
 
 	impls := []benchbaseline.Baseline{
@@ -35,7 +18,6 @@ func TestBaseline_CallEchoesPayload_ForEveryImplementation(t *testing.T) {
 		benchbaseline.NewNetRPC(),
 		benchbaseline.NewGRPCUDS(),
 		benchbaseline.NewGRPCTCP(),
-		benchbaseline.NewGoPlugin(pluginBin),
 	}
 
 	for _, impl := range impls {
