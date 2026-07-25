@@ -32,6 +32,7 @@ func TestMetricNames_AreStableContractStrings(t *testing.T) {
 	require.Equal(t, "styx.timeout.count", observe.MetricTimeout)
 	require.Equal(t, "styx.cancel.count", observe.MetricCancellation)
 	require.Equal(t, "styx.restart.count", observe.MetricRestart)
+	require.Equal(t, "styx.reload.dropped.count", observe.MetricReloadDropped)
 	require.Equal(t, "styx.heartbeat.miss.count", observe.MetricHeartbeatMiss)
 	require.Equal(t, "styx.bytes.moved", observe.MetricBytesMoved)
 	require.Equal(t, "styx.wakeup.syscalls_per_sec", observe.MetricWakeupSyscalls)

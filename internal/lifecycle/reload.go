@@ -56,11 +56,14 @@ const (
 	PhasePromote
 )
 
-// PhaseDeadlines bounds the phases that can wait.
+// PhaseDeadlines bounds the phases that can wait on the plugin.
 // PhaseCutoff has no deadline (it is host-local with no wire round trip),
 // but Transaction.Run still bounds its publication join by the DrainAck deadline
-// so the cutoff cannot wedge the supervisor loop. PhasePromote has no deadline
-// because both instances have already answered and only local work remains.
+// so the cutoff cannot wedge the supervisor loop. PhasePromote has none because
+// both instances have already answered and no wire round trip remains — but it
+// is not instant: its teardown first joins the answers the retiring instance's
+// peer already produced, on a separate bound owned by the caller that supplies
+// the ReloadTarget (see ReloadTarget.Teardown), which no field here governs.
 // DefaultPhaseDeadlines is a conservative fallback for a caller that supplies
 // no per-plugin values.
 type PhaseDeadlines struct {

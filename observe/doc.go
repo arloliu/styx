@@ -36,7 +36,8 @@
 //
 // Which metrics carry real values depends on the active transport. Over the uds
 // transport the RPC latency, bytes-moved, timeout, cancellation, restart,
-// reload-dropped, and heartbeat-miss signals are live. The shared-memory-only signals are sourced from
+// reload-dropped, and heartbeat-miss signals are live. The shared-memory-only
+// signals are sourced from
 // optional transport capabilities the periodic reporter samples, and the uds
 // transport omits those capabilities (it blocks rather than rejecting, and has no
 // ring, arena, or eventfd), so no value is reported over it and none is ever

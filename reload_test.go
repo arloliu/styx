@@ -304,15 +304,23 @@ func (t *gatedReadTransport) ReadableNow() bool {
 	return false
 }
 
-// Test a retiring generation's teardown delivering a response its peer had already
-// produced but this host had not yet read. The reader is held out of Recv for the
-// whole teardown, so the answer is provably sitting unclaimed in the inbound queue
-// at the instant the teardown steps run — the state a starved reader reaches under
-// load. Without the join, fail-in-flight destroys the call while its answer sits
-// there and the caller is told the outcome is unknown, which is both false and
-// non-retryable.
-func TestWireConnState_JoinResponses_DeliverUnreadAnswerBeforeTeardownFailsTheCall(t *testing.T) {
-	// Given: one wired generation whose reader cannot consume anything yet.
+// gatedGeneration is one wired connection generation in the state a starved reader
+// reaches under load: its reader is held out of Recv, one call is published to it,
+// and the peer has answered that call in full — so the answer is physically present
+// and unclaimed while the caller is still waiting for it.
+type gatedGeneration struct {
+	hooks    supervisor.ReadyHooks
+	state    *connState
+	gated    *gatedReadTransport
+	answered <-chan error
+	resp     *wrapperspb.StringValue
+}
+
+// newGatedGeneration builds that state and proves it holds before returning, so a
+// test over it starts from a pinned position rather than a hoped-for one.
+func newGatedGeneration(t *testing.T) *gatedGeneration {
+	t.Helper()
+
 	cdc := codec.Proto{}
 	clientTr, pluginTr := newInProcessTransportPairForTest(t)
 	gated := newGatedReadTransport(clientTr)
@@ -320,7 +328,6 @@ func TestWireConnState_JoinResponses_DeliverUnreadAnswerBeforeTeardownFailsTheCa
 	cc := &ClientConn{name: "echo"}
 	hooks := wireConnState(cc, supervisor.Instance{Transport: gated, Generation: 1})
 
-	// And: one call published to it, which the peer answers in full.
 	resp := &wrapperspb.StringValue{}
 	answered := make(chan error, 1)
 	go func() {
@@ -343,24 +350,65 @@ func TestWireConnState_JoinResponses_DeliverUnreadAnswerBeforeTeardownFailsTheCa
 	require.Zero(t, gated.probes.Load(),
 		"nothing has probed the queue yet, so the reader is provably still held")
 
-	// When: the reload retires this generation — the response join, then the
-	// teardown steps in the order internal/lifecycle.Teardown runs them.
-	stragglers := hooks.JoinResponses(context.Background())
-	hooks.StopAdmission()
-	hooks.FailInFlight(lifecycle.ErrTornDown)
-	hooks.JoinGoroutines()
+	return &gatedGeneration{hooks: hooks, state: state, gated: gated, answered: answered, resp: resp}
+}
+
+// retire runs the response join with the given caller context, then the teardown
+// steps in the order internal/lifecycle.Teardown runs them, and reports what the
+// join could not deliver.
+func (g *gatedGeneration) retire(ctx context.Context) int {
+	stragglers := g.hooks.JoinResponses(ctx)
+	g.hooks.StopAdmission()
+	g.hooks.FailInFlight(lifecycle.ErrTornDown)
+	g.hooks.JoinGoroutines()
+
+	return stragglers
+}
+
+// Test a retiring generation's teardown delivering a response its peer had already
+// produced but this host had not yet read. Without the join, fail-in-flight destroys
+// the call while its answer sits unclaimed in the inbound queue and the caller is
+// told the outcome is unknown, which is both false and non-retryable.
+func TestWireConnState_JoinResponses_DeliverTheAnswer_WhenTheReaderHasNotClaimedIt(t *testing.T) {
+	// Given
+	gen := newGatedGeneration(t)
+
+	// When
+	stragglers := gen.retire(t.Context())
 
 	// Then: the caller gets the answer the plugin actually produced.
 	require.Zero(t, stragglers, "the join must not give up on an answer that was already queued")
-	require.NoError(t, <-answered, "a call the plugin answered must not be reported as an unknown outcome")
-	require.Equal(t, "old:hello", resp.GetValue())
+	require.NoError(t, <-gen.answered, "a call the plugin answered must not be reported as an unknown outcome")
+	require.Equal(t, "old:hello", gen.resp.GetValue())
+}
+
+// Test the guarantee surviving a reload caller that gives up after the promote.
+// By then the reload is committed — the successor is routing and admission has
+// reopened — so cancelling can no longer un-promote anything, and letting it cut
+// the join short would convert answers this host already holds into unknown
+// outcomes. A caller with a deadline shorter than its own reload would otherwise
+// hit that on every run, which is why the wait runs detached from ctx.
+func TestWireConnState_JoinResponses_DeliverTheAnswer_WhenTheReloadCallerCanceled(t *testing.T) {
+	// Given: the same unclaimed answer, and a caller context already canceled.
+	gen := newGatedGeneration(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	// When
+	stragglers := gen.retire(ctx)
+
+	// Then: cancellation costs the caller nothing it had already earned.
+	require.Zero(t, stragglers, "a canceled caller must not turn a delivered answer into a straggler")
+	require.NoError(t, <-gen.answered, "a call the plugin answered must survive its caller giving up")
+	require.Equal(t, "old:hello", gen.resp.GetValue())
+	require.Positive(t, gen.gated.probes.Load(), "the join must still have looked before reaping")
 }
 
 // Test the response join giving up rather than waiting forever on a reader that
 // never comes back. A wedged reader must not be able to hold a reload open: the
 // join reports what it could not deliver and lets the teardown proceed, which is
 // what turns those calls into unknown outcomes.
-func TestJoinPublishedResponses_ReportStragglers_WhenReaderNeverDrainsTheQueue(t *testing.T) {
+func TestJoinPublishedResponses_ReportStragglers_WhenTheReaderNeverClaimsTheAnswer(t *testing.T) {
 	// Given: a generation with a call published and its answer queued, and no read
 	// loop at all — the reader will never claim it.
 	cdc := codec.Proto{}
@@ -387,14 +435,17 @@ func TestJoinPublishedResponses_ReportStragglers_WhenReaderNeverDrainsTheQueue(t
 	require.Len(t, envs, 1)
 	require.NoError(t, sendUnaryResponse(t.Context(), pluginTr, cdc, envs[0]))
 
-	// When: the join runs against a context that expires immediately, standing in
-	// for the bound elapsing with the queue still unread.
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
+	// When: the join runs on a budget short enough not to slow the suite. The
+	// production budget is responseJoinBound; only its length differs here.
+	start := time.Now()
+	stragglers := state.joinPublishedResponses(t.Context(), 20*time.Millisecond)
 
-	// Then: it reports the call it could not resolve rather than blocking.
-	require.Equal(t, 1, state.joinPublishedResponses(ctx),
+	// Then: it spent its whole budget and then reported the call it could not
+	// resolve, rather than either blocking forever or giving up early.
+	require.Equal(t, 1, stragglers,
 		"an answer the reader never claimed must be reported, not waited on forever")
+	require.GreaterOrEqual(t, time.Since(start), 20*time.Millisecond,
+		"the join must spend its budget before declaring a call unanswerable")
 }
 
 // mustMarshal encodes msg with cdc, failing the test on error.

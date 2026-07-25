@@ -290,6 +290,71 @@ func TestHost_HeartbeatMissHook_SubmitsWhenEnabled(t *testing.T) {
 		time.Second, 5*time.Millisecond)
 }
 
+// counterLabelSink records both the magnitude and the labels of each counter
+// increment, so a test can assert the dimension a metric carries and not only that
+// it fired. countingSink discards labels, which is right for the tests that only
+// count.
+type counterLabelSink struct {
+	mu     sync.Mutex
+	deltas map[string]int64
+	labels map[string][]observe.Label
+}
+
+func newCounterLabelSink() *counterLabelSink {
+	return &counterLabelSink{deltas: map[string]int64{}, labels: map[string][]observe.Label{}}
+}
+
+func (s *counterLabelSink) ObserveLatency(string, time.Duration, ...observe.Label) {}
+func (s *counterLabelSink) SetGauge(string, float64, ...observe.Label)             {}
+
+func (s *counterLabelSink) IncrCounter(metric string, delta int64, labels ...observe.Label) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deltas[metric] += delta
+	s.labels[metric] = labels
+}
+
+func (s *counterLabelSink) delta(metric string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.deltas[metric]
+}
+
+func (s *counterLabelSink) labelsFor(metric string) []observe.Label {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.labels[metric]
+}
+
+// Test the reload-dropped hook submitting the count of calls a hot-reload could
+// not deliver an outcome for, attributed to the plugin that lost them, and being
+// nil (so the supervisor skips it) when no sink is set.
+func TestHost_ReloadDroppedHook_SubmitsWhenEnabled(t *testing.T) {
+	// Given a host with a sink and one without.
+	sink := newCounterLabelSink()
+	withSink := NewHost(HostConfig{Metrics: sink})
+	t.Cleanup(func() { _ = withSink.Stop(context.Background()) })
+	without := NewHost(HostConfig{})
+	t.Cleanup(func() { _ = without.Stop(context.Background()) })
+
+	// When / Then
+	require.Nil(t, without.reloadDroppedHook("echo"), "no sink means no hook, so the supervisor skips it")
+
+	hook := withSink.reloadDroppedHook("echo")
+	require.NotNil(t, hook)
+	hook(3)
+	hook(2)
+
+	// The counter carries how many calls were lost, not how many reloads lost some.
+	require.Eventually(t, func() bool { return sink.delta(observe.MetricReloadDropped) == 5 },
+		time.Second, 5*time.Millisecond)
+	require.Equal(t, []observe.Label{{Key: labelPlugin, Value: "echo"}},
+		sink.labelsFor(observe.MetricReloadDropped),
+		"a dropped-call count must be attributable to the plugin that lost them")
+}
+
 // panickingLogger is a Logger whose every method panics, proving lifecycle
 // logging routes through the panic-isolated dispatcher rather than running the
 // user Logger synchronously on the event relay.

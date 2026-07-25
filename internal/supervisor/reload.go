@@ -159,8 +159,10 @@ func (s *Supervisor) runReload(lifeCtx, reqCtx context.Context, current **liveIn
 
 	// Calls the retired instance had already answered but whose answers this host
 	// never read are the one way a reload loses work a caller cannot retry. The
-	// normal path loses none, so reporting is conditional: the counter records
-	// anomalies rather than being pinned at zero by every healthy reload.
+	// count is the set that was still at risk when the join gave up, an upper bound
+	// on what was actually lost. The normal path risks none, so reporting is
+	// conditional: the counter records anomalies rather than being pinned at zero by
+	// every healthy reload.
 	if tx.Stragglers > 0 && s.cfg.OnReloadDropped != nil {
 		s.cfg.OnReloadDropped(tx.Stragglers)
 	}

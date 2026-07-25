@@ -18,6 +18,8 @@ import (
 // for this host's own reader to be scheduled. A wait longer than a scheduling
 // hiccup would only be waiting on a reader that is never coming back, and a
 // wedged reader must not be able to stall a reload.
+// It is the budget every production join runs on; joinPublishedResponses takes it
+// as an argument so a test can drive the give-up path without waiting a real second.
 const responseJoinBound = 1 * time.Second
 
 // responseJoinPoll is how often the response join re-evaluates its predicate.
@@ -30,48 +32,60 @@ const responseJoinPoll = 50 * time.Microsecond
 
 // joinPublishedResponses blocks until this generation has no answer outstanding —
 // its transport confirms nothing further is readable AND no call it dispatched is
-// still awaiting an outcome — or until ctx or the response-join bound expires.
-// It reports how many calls were still awaiting an outcome when the wait ended.
+// still awaiting an outcome — or until bound elapses. It reports how many calls
+// were still awaiting an outcome when the wait ended.
 //
 // It exists because the two halves of a hot-reload's completion guarantee are
 // proven on different sides of the connection. The plugin proves at drain-ack that
 // every call it accepted before the cutoff has had its response written to the
 // transport; nothing proves this host has read those responses. Tearing the
 // predecessor down destroys the calls still waiting for them, reporting calls that
-// really did complete as an unknown, non-retryable outcome. Waiting for both halves
-// here is what makes the predecessor's teardown safe.
+// really did complete as an unknown, non-retryable outcome. Waiting here is what
+// makes the predecessor's teardown safe.
 //
-// Both conditions are required and neither implies the other. A drained queue
-// alone does not mean the responses were matched to their calls, because the
-// reader's dispatch of a frame it has already consumed lags the queue going empty.
-// An empty call table alone does not mean the queue is drained, because a response
-// may still be queued for a call that a deadline or cancel has already resolved.
+// The wait deliberately outlives ctx's cancellation. By the time it runs the reload
+// is already committed — the successor is routing and admission has reopened — so a
+// caller giving up cannot un-promote anything, and honoring the cancellation would
+// only convert answers this host already holds into unknown outcomes. That is the
+// same reasoning rollback runs on a detached context. ctx is still taken so the
+// wait inherits the caller's values, and bound alone decides when it stops.
+//
+// Of the two conditions, the call table carries the guarantee: a response that
+// matters belongs to a call that stays published until the reader's dispatch of it
+// CASes the call terminal, so a frame consumed from the queue but not yet
+// dispatched is already covered by the table half. The queue probe is a
+// conservative extra, and it fails open — a transport without the prober capability
+// reports "drained" (see inboundReadable) — so no part of the guarantee may be
+// moved onto it.
 //
 // A non-zero return is an anomaly, not the normal path: it means the bound expired
 // with answers still unclaimed, and the teardown that follows will report those
-// calls as outcome-unknown.
-func (state *connState) joinPublishedResponses(ctx context.Context) int {
-	jctx, cancel := context.WithTimeout(ctx, responseJoinBound)
+// calls as outcome-unknown. It is an upper bound on the loss rather than the exact
+// lost set, because the read loop keeps running and can still resolve some of those
+// calls before teardown stops it.
+func (state *connState) joinPublishedResponses(ctx context.Context, bound time.Duration) int {
+	jctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bound)
 	defer cancel()
 
 	ticker := time.NewTicker(responseJoinPoll)
 	defer ticker.Stop()
 
-	for {
-		// Queue first, then table, matching the plugin-side drain predicate: a frame
-		// the reader has already consumed but not yet dispatched is covered either
-		// way, because the call it resolves is still counted until that dispatch CASes
-		// it terminal.
+	// The budget is checked before each evaluation rather than raced against the
+	// tick inside the select, where an expired budget and a ready tick would be
+	// chosen between at random and could buy one more evaluation.
+	for jctx.Err() == nil {
+		// Queue first, then table, matching the plugin-side drain predicate.
 		if !inboundReadable(state.tr) && state.table.PublishedCount() == 0 {
 			return 0
 		}
 
 		select {
 		case <-jctx.Done():
-			return state.table.PublishedCount()
 		case <-ticker.C:
 		}
 	}
+
+	return state.table.PublishedCount()
 }
 
 // Compile-time proof that each public reload-hook interface is method-set
@@ -116,6 +130,13 @@ var (
 // returns the reason it aborted with that same instance still serving. It
 // returns ErrPluginUnavailable if no plugin of that name is running, and ctx's
 // error (as a styx error) if ctx is done.
+//
+// Cancelling ctx aborts a reload that has not yet promoted. Past that point the
+// reload is committed and cancellation no longer shortens it: the successor is
+// already routing, so there is nothing left to abandon, and cutting the wait for
+// the predecessor's outstanding answers short would discard outcomes this host is
+// already holding. A caller whose ctx expires after the promote still gets nil and
+// a completed reload.
 //
 // The five-phase transaction lives in internal/lifecycle and the atomic
 // routing swap is (*ClientConn).promote; the heartbeat loop that owns the

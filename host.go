@@ -722,7 +722,9 @@ func wireConnState(cc *ClientConn, inst supervisor.Instance) supervisor.ReadyHoo
 		// this generation's peer has already answered every call it accepted, so
 		// give this generation's reader the chance to deliver those answers before
 		// FailInFlight destroys the calls waiting for them.
-		JoinResponses: state.joinPublishedResponses,
+		JoinResponses: func(ctx context.Context) int {
+			return state.joinPublishedResponses(ctx, responseJoinBound)
+		},
 		// CompareAndSwap only tears down routing this exact instance still
 		// owns: on a plain crash-restart cc.state still holds state, so the
 		// swap succeeds and this behaves as an unconditional close always

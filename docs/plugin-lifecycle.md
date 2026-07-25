@@ -183,15 +183,40 @@ serving (old instance)
 4. **Restore and validate** — a fresh successor process is spawned and
    handed the verified snapshot; its registered `StateRestorer.RestoreState`
    applies it before the successor reports itself ready.
-5. **Promote** — routing atomically swaps to the successor, admission
-   reopens immediately, and only then is the retired predecessor torn down
-   (through the same six-step teardown described above, which is why the
-   predecessor's control loop sees a real `Shutdown` rather than a bare
+5. **Promote** — routing atomically swaps to the successor and admission
+   reopens immediately. The host then waits until it has read every answer
+   the predecessor already produced, and only then tears the predecessor
+   down (through the same six-step teardown described above, which is why
+   the predecessor's control loop sees a real `Shutdown` rather than a bare
    disconnect).
+
+That wait in step 5 is what makes the reload's completion guarantee whole.
+Step 2 gets the plugin's promise that every accepted call has been answered
+onto the transport; step 5 makes the host collect those answers before it
+destroys the calls waiting for them. Skipping it would report calls that
+completed successfully as `ErrOutcomeUnknown` — the one error class
+`IsRetryable` refuses to retry — precisely when the host is busiest, since a
+loaded reader trails the plugin by the whole in-flight set.
+
+**What this means for you as a caller:** a call the plugin accepted before
+the cutoff runs to completion and you get its real outcome. A call refused
+at the cutoff fails with `ErrDrained` and is safe to retry. `Reload` can
+therefore take up to a second longer than the wire phases alone, and the
+wait is not cancellable — cancelling your `Reload` context after the
+promote cannot un-promote the successor, so honoring it could only throw
+away answers the host is already holding.
+
+The wait is bounded at one second, so a plugin whose responses somehow never
+arrive cannot stall a reload. Calls still unanswered when that bound expires
+do fail with `ErrOutcomeUnknown`, and each one is counted on
+`styx.reload.dropped.count` (labeled with the plugin name). That counter
+should sit at zero; a non-zero value means a reload genuinely lost work a
+caller cannot safely retry, and is worth an alert.
 
 The three per-phase deadlines are fixed defaults today, not `PluginSpec`
 fields: 30 seconds for drain, 10 seconds for the snapshot exchange, and 30
-seconds for restore-and-validate.
+seconds for restore-and-validate. The step-5 response join has its own fixed
+one-second bound, separate from all three.
 
 ### Registering a plugin's reload participation
 

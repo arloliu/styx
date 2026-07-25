@@ -39,11 +39,14 @@ const (
 	MetricCancellation = "styx.cancel.count"
 	// MetricRestart counts supervisor restarts of a plugin.
 	MetricRestart = "styx.restart.count"
-	// MetricReloadDropped counts calls a hot-reload reaped without their real
-	// outcome: the plugin had already answered them, but the host could not read
-	// the answers before it gave up waiting and tore the predecessor down.
-	// A correct reload delivers every accepted call's outcome, so any non-zero
-	// value is an anomaly worth alerting on, not a routine cost of reloading.
+	// MetricReloadDropped counts calls a hot-reload risked reaping without their
+	// real outcome: the plugin had already answered them, but the host had not read
+	// the answers by the time it gave up waiting and tore the predecessor down.
+	// It is an upper bound on the loss, not an exact count — the connection's reader
+	// keeps running for the first steps of that teardown and may still resolve some
+	// of them — and it can never under-count.
+	// A correct reload delivers every accepted call's outcome, so any non-zero value
+	// is an anomaly worth alerting on, not a routine cost of reloading.
 	MetricReloadDropped = "styx.reload.dropped.count"
 	// MetricHeartbeatMiss counts individual missed plugin heartbeats.
 	MetricHeartbeatMiss = "styx.heartbeat.miss.count"
