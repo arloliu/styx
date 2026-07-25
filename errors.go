@@ -186,9 +186,9 @@ var (
 	// It is distinct from the peer-error and teardown outcomes, which carry their own
 	// mapped errors; it names specifically a completed outcome with no underlying
 	// error of its own, and it also guards the theoretical case of a peer-error or
-	// crashed outcome whose recorded error is nil. It is not retryable by default:
-	// a stream the peer may have processed must not be reissued blindly, since that
-	// could repeat a side effect.
+	// crashed outcome whose recorded error is nil. It is not retryable by default: the
+	// guard case cannot rule out a peer that already processed the stream, and
+	// reissuing blindly in that case could repeat a side effect.
 	ErrStreamAlreadyClosed = errors.New("styx: stream already closed")
 )
 

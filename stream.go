@@ -267,6 +267,12 @@ func WithBidiStream() StreamOption {
 // an error case. A failed open, in contrast, always returns a nil stream with a
 // non-nil error (a deadline, a cancel, a peer error, or the plugin going away).
 //
+// Drain the returned stream with the ctx passed to this call, not the stream's own
+// Context(): on a completed stream that context is already canceled, and RecvMsg
+// selects across it alongside the terminal and remote-close signals, so passing it
+// back in makes the read return ErrCanceled instead of io.EOF at random. Generated
+// client code drains with the caller's ctx for exactly this reason.
+//
 // Optimistic sends are permitted: the stream is live on the opener's side the
 // moment the transport accepts the STREAM_OPEN (stream-protocol.md §7.4/§4.5), so
 // the caller MAY Send and CloseSend immediately without waiting for any inbound

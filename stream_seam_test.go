@@ -1160,7 +1160,12 @@ func TestOpenStream_PeerTerminalBeforePublish_SurfacesEachOutcome(t *testing.T) 
 		name          string
 		opts          []StreamOption
 		driveTerminal func(p *streamPlane)
-		assertOpen    func(t *testing.T, st *Stream, err error)
+		// wantStream is the universal invariant the loop asserts for every case: a
+		// completion hands back a live stream and no error, everything else hands back
+		// no stream and a non-nil error. assertOpen then checks only what is specific
+		// to this case (which error, which payloads).
+		wantStream bool
+		assertOpen func(t *testing.T, st *Stream, err error)
 	}{
 		{
 			name: "peer application error before publish",
@@ -1171,15 +1176,15 @@ func TestOpenStream_PeerTerminalBeforePublish_SurfacesEachOutcome(t *testing.T) 
 				})
 			},
 			assertOpen: func(t *testing.T, st *Stream, err error) {
-				requireFailedOpen(t, st, err)
 				var status *Status
 				require.ErrorAs(t, err, &status, "a peer error surfaces as its status error")
 				require.Equal(t, CodeInternal, status.Code)
 			},
 		},
 		{
-			name: "completion before publish",
-			opts: []StreamOption{WithServerStreamRequest([]byte("req"))},
+			name:       "completion before publish",
+			opts:       []StreamOption{WithServerStreamRequest([]byte("req"))},
+			wantStream: true,
 			driveTerminal: func(p *streamPlane) {
 				// A server-streaming opener is half-closed-local at establishment, so a
 				// single peer STREAM_CLOSE closes both directions and completes it — after
@@ -1198,9 +1203,21 @@ func TestOpenStream_PeerTerminalBeforePublish_SurfacesEachOutcome(t *testing.T) 
 				// would silently discard delivered data. RecvMsg returns a buffered message
 				// ahead of the terminal signal, so the caller drains the response and then
 				// reads the clean end of stream.
-				require.NoError(t, err, "a completion the peer produced is not an open failure")
-				require.NotNil(t, st, "the completed stream is handed back for the caller to drain")
 				requireDrains(t, st, "first", "second")
+			},
+		},
+		{
+			name:       "completion before publish with no payload sent",
+			opts:       []StreamOption{WithServerStreamRequest([]byte("req"))},
+			wantStream: true,
+			driveTerminal: func(p *streamPlane) {
+				// The peer completes the exchange having sent nothing at all — the case
+				// where handing back a stream instead of an error is least intuitive, and
+				// where a caller most needs an immediate io.EOF to read as success.
+				_ = p.dispatchStreamFrame(transport.Frame{CallID: 1, Kind: transport.FrameStreamClose, Control: 0})
+			},
+			assertOpen: func(t *testing.T, st *Stream, err error) {
+				requireDrains(t, st)
 			},
 		},
 		{
@@ -1213,7 +1230,6 @@ func TestOpenStream_PeerTerminalBeforePublish_SurfacesEachOutcome(t *testing.T) 
 				})
 			},
 			assertOpen: func(t *testing.T, st *Stream, err error) {
-				requireFailedOpen(t, st, err)
 				require.ErrorIs(t, err, ErrCanceled, "a peer CANCELED teardown surfaces as ErrCanceled")
 			},
 		},
@@ -1227,7 +1243,6 @@ func TestOpenStream_PeerTerminalBeforePublish_SurfacesEachOutcome(t *testing.T) 
 				})
 			},
 			assertOpen: func(t *testing.T, st *Stream, err error) {
-				requireFailedOpen(t, st, err)
 				require.ErrorIs(t, err, ErrDeadlineExceeded,
 					"a peer DEADLINE teardown surfaces as ErrDeadlineExceeded")
 			},
@@ -1240,7 +1255,6 @@ func TestOpenStream_PeerTerminalBeforePublish_SurfacesEachOutcome(t *testing.T) 
 				p.streams.OnPeerCrash(ErrPluginUnavailable)
 			},
 			assertOpen: func(t *testing.T, st *Stream, err error) {
-				requireFailedOpen(t, st, err)
 				require.ErrorIs(t, err, ErrPluginUnavailable,
 					"a crash before publish surfaces the crash cause, never a live stream")
 			},
@@ -1293,6 +1307,12 @@ func TestOpenStream_PeerTerminalBeforePublish_SurfacesEachOutcome(t *testing.T) 
 				t.Fatal("OpenStream did not return")
 			}
 
+			if tc.wantStream {
+				require.NotNil(t, st, "a completed stream must be handed back to the caller")
+				require.NoError(t, err, "a completion the peer produced is not an open failure")
+			} else {
+				requireFailedOpen(t, st, err)
+			}
 			tc.assertOpen(t, st, err)
 		})
 	}
