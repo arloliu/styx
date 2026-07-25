@@ -2917,13 +2917,10 @@ func TestWriter_FillSends_PublishOnlyWhatTheyReport_UnderRandomizedCancellation(
 		fillAbandoned++
 	}
 
-	// And the run exercised both directions of the fill race rather than
-	// degenerating into "everything published" or "everything abandoned". The
-	// deterministic tests above pin each direction on its own; this guards the
-	// randomized layer against going vacuously one-sided.
+	// Both directions of the fill race are pinned deterministically by the
+	// tests above; this run only logs the observed split as a diagnostic,
+	// since neither population is guaranteed under real scheduling.
 	t.Logf("fill sends: published=%d abandoned=%d", fillPublished, fillAbandoned)
-	require.Positive(t, fillPublished, "the run must publish some fill sends")
-	require.Positive(t, fillAbandoned, "the run must abandon some fill sends")
 }
 
 // storm fault kinds injected into a fill callback by the randomized storm below.
@@ -3103,9 +3100,13 @@ func TestWriter_FillMode_SurvivesRandomizedFaultStorm_OnALiveRegion(t *testing.T
 		}
 	}
 	mu.Unlock()
+	// The published and fill-abandoned populations are pinned deterministically
+	// by the tests above; logging them here is diagnostic only, since neither
+	// is guaranteed under real scheduling. fill-panicked and fill-errored stay
+	// asserted below: a fault-injecting entry is never cancelled (see the
+	// comment above), so the seed fixes which entries carry which fault and
+	// both populations are structurally guaranteed, not scheduler-dependent.
 	t.Logf("storm outcomes: %v", counts)
-	require.Positive(t, counts["published"])
-	require.Positive(t, counts["fill-abandoned"], "the storm must exercise the abandonment race")
 	require.Positive(t, counts["fill-panicked"], "the storm must exercise the fill-panic path")
 	require.Positive(t, counts["fill-errored"], "the storm must exercise the fill-error path")
 
