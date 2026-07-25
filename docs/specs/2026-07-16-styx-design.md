@@ -430,7 +430,14 @@ cross-references it.
   by call ID (monotonic within a generation, never reused within it). States:
   `SUBMITTED → {REJECTED | CANCELED | DEADLINE}` (terminal before publication: admission
   failure, queue failure, cancel/deadline while still local) and
-  `SUBMITTED → PUBLISHED → {COMPLETED | FAILED | CANCELED | DEADLINE | OUTCOME_UNKNOWN}`.
+  `SUBMITTED → PUBLISHED → {COMPLETED | FAILED | CANCELED | DEADLINE | OUTCOME_UNKNOWN |
+  REJECTED}`. The post-publication `REJECTED` terminal belongs to a send that encodes
+  its payload directly into the transport's own buffer (a fill send) rather than into a
+  wire buffer first: when that encode runs, after the publication CAS, and fails, the
+  transport discards the frame and releases its buffer without ever emitting a
+  descriptor. That is a provable non-dispatch — the same guarantee a pre-publication
+  `REJECTED` carries — so the call terminates the same way even though publication
+  already happened locally.
   Transitions are arbitrated by CAS on the call state, which resolves the
   publication/cancellation race atomically: a cancel that wins before `PUBLISHED` means
   the descriptor is never written and nothing crosses the ring; after `PUBLISHED`, a
@@ -642,9 +649,18 @@ slab, or ring descriptor, and the capacity invariant `max_inflight ≤ f(ring ca
 arena capacity / max payload)` is validated at startup — configurations that can admit
 more calls than the region can represent refuse to load. Waiting callers block on
 their own call context — never holding the writer's lock — so cancellation and
-short-deadline calls are never head-of-line blocked by a stalled sender; lifecycle
-frames (`CANCEL`, `STREAM_ACK` — the lifecycle lane) have a reserved descriptor budget so
-data traffic can't starve them. Fairness in v1 is FIFO admission with per-stream
+short-deadline calls are never head-of-line blocked by a stalled sender, for a call that
+marshals into a wire buffer first; lifecycle frames (`CANCEL`, `STREAM_ACK` — the
+lifecycle lane) have a reserved descriptor budget so data traffic can't starve them.
+A call that instead fills the transport's own send buffer directly (a fill send) is
+cancellable only up to the point the writer goroutine claims it: arena backpressure is
+still checked, and still abandonable, before that claim. Once claimed, the frame is
+committed to publication, and a caller then waiting on a full ring window blocks until
+the window opens or the transport shuts down, no longer honoring its own context — a
+genuine head-of-line stall this one send mode accepts. The trade is deliberate: it is
+what lets a fill-send caller always learn the frame's true fate, published or provably
+not, where an abandoning wire-buffer sender can only ever be told `ErrOutcomeUnknown`.
+Fairness in v1 is FIFO admission with per-stream
 credits; per-service quotas are an explicit extension point. Large messages: payloads
 above a negotiated threshold are rejected with a typed error in v1 (chunking/bulk
 transfer is roadmap).

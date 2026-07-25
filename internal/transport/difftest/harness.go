@@ -357,6 +357,14 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 
 		recvAt := time.Now()
 		for _, env := range d.Dispatch(ctx, f, recvAt) {
+			if env.Msg != nil {
+				// scenarioHandler only ever returns Response{Payload: ...}, so this
+				// path is unreached today. It stays a hard failure rather than a
+				// silent Send of an empty-payload frame, because that would report
+				// a successful call with no error and no payload instead of
+				// surfacing the harness gap.
+				panic("difftest: scenarioHandler returned Msg, which this harness cannot encode")
+			}
 			if sendErr := tr.Send(ctx, env.Frame); sendErr != nil {
 				return
 			}

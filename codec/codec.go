@@ -48,9 +48,21 @@ type SizedMarshaler interface {
 	Size(m proto.Message) (int, bool)
 	// MarshalTo encodes m into dst, which must have length exactly equal to
 	// the size Size reported for m, and returns the number of bytes
-	// written. Calling MarshalTo with any other length, or on a message
-	// Size reported false for, is a caller error: it returns a non-nil
+	// written. That count is not just informational: dst is transport
+	// memory handed back reused rather than zeroed, and any checksum the
+	// transport computes over it runs AFTER this call returns, over dst's
+	// declared length rather than however many bytes were actually written.
+	// An implementation that reports writing more than it truly did
+	// therefore ships the previous payload's leftover bytes to the peer
+	// under a valid checksum, with nothing downstream able to tell.
+	// Calling MarshalTo with any other dst length, or on a message Size
+	// reported false for, is a caller error: it must return a non-nil
 	// error rather than partially written or garbage bytes in dst.
+	// ErrSizedMarshalUnsupported and ErrMarshalToSizeMismatch are the two
+	// sentinels Proto itself returns for those cases; naming them here is
+	// informational, not a requirement — any non-nil error satisfies the
+	// contract, a caller-supplied SizedMarshaler is not obligated to return
+	// these particular sentinels.
 	MarshalTo(m proto.Message, dst []byte) (int, error)
 }
 
@@ -145,6 +157,9 @@ func (Proto) Unmarshal(data []byte, m proto.Message) error {
 	return proto.Unmarshal(data, m)
 }
 
+// Size reports m's encoded size via its vtproto SizeVT, or (0, false) if m
+// has no vtproto sized-marshal support (or SizeVT reports a negative size,
+// which only a broken implementation would).
 func (Proto) Size(m proto.Message) (int, bool) {
 	vt, ok := m.(vtprotoSizedMarshaler)
 	if ok && !isTypedNil(m) && m.ProtoReflect().IsValid() {
@@ -159,6 +174,12 @@ func (Proto) Size(m proto.Message) (int, bool) {
 	return 0, false
 }
 
+// MarshalTo marshals m into dst via its vtproto MarshalToSizedBufferVT, which
+// fills dst back to front. MarshalTo returns ErrSizedMarshalUnsupported if m
+// has no vtproto sized-marshal support, and ErrMarshalToSizeMismatch if
+// len(dst) does not exactly equal m's encoded size — the length check is what
+// keeps the back-to-front fill from ever leaving dst's leading bytes
+// unwritten in a caller-visible way.
 func (Proto) MarshalTo(m proto.Message, dst []byte) (int, error) {
 	vt, ok := m.(vtprotoSizedMarshaler)
 	if !ok || isTypedNil(m) || !m.ProtoReflect().IsValid() {

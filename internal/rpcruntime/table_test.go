@@ -195,6 +195,24 @@ func TestTable_Reject_DeliversErr_BeforePublish(t *testing.T) {
 	require.ErrorIs(t, res.Err, rejErr)
 }
 
+// Test Table rejecting a published call whose send provably never reached the peer
+func TestTable_Reject_DeliversErr_AfterPublish(t *testing.T) {
+	// Given
+	table := rpcruntime.NewTable(1)
+	id, wait := table.Submit(t.Context(), time.Second)
+	require.True(t, table.Publish(id))
+	rejErr := errors.New("payload fill failed")
+
+	// When
+	require.True(t, table.Reject(id, rejErr))
+
+	// Then: first-terminal-wins — a later terminal attempt on the same call is a no-op.
+	require.False(t, table.Complete(id, []byte("ok")))
+	res, err := wait(t.Context())
+	require.NoError(t, err)
+	require.ErrorIs(t, res.Err, rejErr)
+}
+
 // Test Table suppressing the request frame when Cancel wins before publication
 func TestTable_Publish_ReturnsFalse_AfterPrePublicationCancel(t *testing.T) {
 	// Given
