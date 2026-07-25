@@ -1,10 +1,26 @@
 package codec
 
 import (
+	"errors"
+	"fmt"
 	"reflect"
 
 	"google.golang.org/protobuf/proto"
 )
+
+// ErrSizedMarshalUnsupported is returned by MarshalTo when the message has no
+// vtproto sized-marshal support (Size would report false for it). Calling
+// MarshalTo without first checking Size is a caller error; this makes it
+// visible instead of writing wrong bytes into dst.
+var ErrSizedMarshalUnsupported = errors.New("codec: message has no sized-marshal support")
+
+// ErrMarshalToSizeMismatch is returned by MarshalTo when len(dst) does not
+// exactly equal the size Size reported for the message. The vtproto fast
+// path fills dst back to front, so an oversized dst would leave its
+// unwritten leading bytes — the part a caller reading dst[:n] treats as the
+// encoding — holding whatever dst already contained rather than the
+// message; MarshalTo refuses that instead of returning wrong bytes.
+var ErrMarshalToSizeMismatch = errors.New("codec: MarshalTo dst length does not match encoded size")
 
 // Codec encodes and decodes RPC payloads.
 // It is a seam for the codec negotiated during the connection handshake,
@@ -19,17 +35,37 @@ type Codec interface {
 	Unmarshal(data []byte, m proto.Message) error
 }
 
+// SizedMarshaler is implemented by codecs that can report a message's exact
+// encoded size and marshal directly into a caller-provided buffer, so a
+// writer can allocate the destination once instead of marshaling into a
+// throwaway buffer and copying it into place afterward.
+// Not every Codec implements this: a codec may lack the capability entirely,
+// or a specific message may lack it while the codec supports others. Either
+// way Size reports false and the caller falls back to Marshal.
+type SizedMarshaler interface {
+	// Size returns m's exact encoded size and true, or (0, false) if m
+	// cannot take the sized path — the caller falls back to Marshal.
+	Size(m proto.Message) (int, bool)
+	// MarshalTo encodes m into dst, which must have length exactly equal to
+	// the size Size reported for m, and returns the number of bytes
+	// written. Calling MarshalTo with any other length, or on a message
+	// Size reported false for, is a caller error: it returns a non-nil
+	// error rather than partially written or garbage bytes in dst.
+	MarshalTo(m proto.Message, dst []byte) (int, error)
+}
+
 // Proto is the default Codec implementation, backed by google.golang.org/protobuf.
 // It is currently the only implementation; codec negotiation exists in the handshake
 // to allow future codecs without a protocol version bump.
 type Proto struct{}
 
 var _ Codec = Proto{}
+var _ SizedMarshaler = Proto{}
 
 func (Proto) Name() string { return "proto" }
 
-// vtprotoMarshaler and vtprotoUnmarshaler are the fast-path methods
-// protoc-gen-go-vtproto generates.
+// vtprotoMarshaler, vtprotoUnmarshaler, and vtprotoSizedMarshaler are the
+// fast-path methods protoc-gen-go-vtproto generates.
 // They are defined locally so this package takes no dependency on the
 // vtprotobuf module.
 // Providing these methods is an opt-in contract: they MUST describe the same
@@ -43,6 +79,17 @@ type vtprotoMarshaler interface {
 
 type vtprotoUnmarshaler interface {
 	UnmarshalVT([]byte) error
+}
+
+// vtprotoSizedMarshaler additionally reports the exact encoded size and
+// fills a caller-provided buffer of that size, back to front: with
+// len(dst) == SizeVT(), MarshalToSizedBufferVT occupies the whole buffer,
+// but with an oversized dst the message lands at the end and dst's leading
+// bytes are left as whatever it already held. Proto.MarshalTo is the guard
+// that keeps that back-to-front fill from ever reaching a caller.
+type vtprotoSizedMarshaler interface {
+	SizeVT() int
+	MarshalToSizedBufferVT(dst []byte) (int, error)
 }
 
 // isTypedNil reports whether the proto.Message interface holds a typed-nil
@@ -96,4 +143,36 @@ func (Proto) Unmarshal(data []byte, m proto.Message) error {
 	}
 
 	return proto.Unmarshal(data, m)
+}
+
+func (Proto) Size(m proto.Message) (int, bool) {
+	vt, ok := m.(vtprotoSizedMarshaler)
+	if ok && !isTypedNil(m) && m.ProtoReflect().IsValid() {
+		// A negative size can only mean a broken SizeVT implementation (the
+		// wire format has no negative-length concept); propagating it would
+		// hand the caller an unsliceable allocation size downstream.
+		if size := vt.SizeVT(); size >= 0 {
+			return size, true
+		}
+	}
+
+	return 0, false
+}
+
+func (Proto) MarshalTo(m proto.Message, dst []byte) (int, error) {
+	vt, ok := m.(vtprotoSizedMarshaler)
+	if !ok || isTypedNil(m) || !m.ProtoReflect().IsValid() {
+		return 0, fmt.Errorf("%w: %T", ErrSizedMarshalUnsupported, m)
+	}
+
+	size := vt.SizeVT()
+	if size < 0 {
+		return 0, fmt.Errorf("%w: %T", ErrSizedMarshalUnsupported, m)
+	}
+
+	if len(dst) != size {
+		return 0, fmt.Errorf("%w: dst has %d bytes, encoded size is %d", ErrMarshalToSizeMismatch, len(dst), size)
+	}
+
+	return vt.MarshalToSizedBufferVT(dst)
 }
