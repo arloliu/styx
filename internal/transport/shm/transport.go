@@ -621,9 +621,13 @@ func (t *Transport) SendReporting(
 // slices a window of exactly that many bytes out of the slab; the writer's own
 // build-time guard is a fail-closed backstop, not this check's equal.
 //
-// It is a data-lane entry only. Fill callbacks belong to payload-bearing kinds; CANCEL
-// and STREAM_ACK store no payload for one to write, and a fill send on either fails on
-// the writer's report rather than publishing.
+// It is a data-lane entry only, for the payload-carrying kinds. CANCEL and STREAM_ACK
+// store no payload for a callback to write, and a fill send on either fails on the
+// writer's report rather than publishing. A status-bearing kind (UNARY_ERR,
+// STREAM_ERR) is the other illegal case and is NOT refused here: fill mode does not
+// read Frame.Status, so such a send publishes the callback's bytes where the peer
+// expects an encoded status. Nothing on a correct path constructs one — the writer
+// produces status bytes itself — so it is left as the caller bug it is.
 //
 // It holds the closing gate's read side for its whole call, like Send, and for one
 // reason more: the admission check reads region-mapped memory on the calling goroutine
@@ -674,14 +678,20 @@ func (t *Transport) SendPayloadFill(
 // case the failed frame cannot later be acted on by a live peer, which is the property
 // the caller relies on.
 //
-// A fill send (SendPayloadFill) is the exception to the context-error reasoning above,
-// and it errs in the safe direction. That path DOES consult the context after the
-// enqueue: it returns a context error only when the caller won the abandonment
-// handshake, which is proof the frame was never filled and never published — a
-// definitively negative result this classifier nonetheless reports as unknown, because
-// it sees the error alone and cannot tell which send produced it. Over-reporting
-// unknown is spec-safe (the caller sends a CANCEL the peer discards as unmatched), and
-// no fill caller needs the classifier: SendPayloadFill hands it the stronger fact
+// A fill send (SendPayloadFill) is the exception to the context-error reasoning
+// above, and it errs in the safe direction. Its context error has exactly two
+// sources, and BOTH are definitively negative:
+//
+//   - the enqueue itself lost to the context, which by the all-or-nothing rule
+//     (enqueue's doc) provably pushed no intent, so none can ever be built; or
+//   - the caller won the abandonment handshake after the enqueue, which is proof
+//     the writer never claimed the intent and so never filled or published it.
+//
+// A fill send therefore never returns a context error for a frame that may still
+// publish. This classifier reports both as unknown anyway, because it sees the
+// error alone and cannot tell which send produced it. Over-reporting unknown is
+// spec-safe (the caller sends a CANCEL the peer discards as unmatched), and no
+// fill caller needs the classifier: SendPayloadFill hands it the stronger fact
 // directly.
 func (t *Transport) AcceptanceUnknown(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)

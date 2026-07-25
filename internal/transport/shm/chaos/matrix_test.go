@@ -89,8 +89,8 @@ func TestChaos_SIGKILLAtEachDeterministicWindow_CompletesWithinBound(t *testing.
 // contract: reached, completed within bound, at least one live call driven, and
 // every one of those calls either delivered its exact payload (drainBatch already
 // verified this and fails hard on any misdelivery) or ended in a caller-context
-// termination. It routes every window — including BeforeUnmap, whose one call is
-// a real outstanding request, not a synthetic success — through the same oracle.
+// termination. It routes every window — including BeforeUnmap, whose calls are
+// real outstanding requests, not synthetic successes — through the same oracle.
 func assertBoundedCompletion(t *testing.T, oc Outcome) {
 	t.Helper()
 

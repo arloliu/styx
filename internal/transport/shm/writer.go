@@ -1303,6 +1303,13 @@ func (w *writer) stampPayload(
 // either still parked on the report or now committed to waiting for it, so the
 // message the closure reads cannot be retired underneath it.
 //
+// A zero-length window is claimed and then skipped: there are no bytes for the
+// callback to produce, and "invoked at most once" allows zero. The skip is
+// unconditional so the rule does not vary with a negotiated feature — a zero-size
+// frame reaches here ONLY when the checksum feature makes its slab non-empty
+// (build publishes an unchecksummed one with no slab at all), and the contract
+// callers code against must not have a checksum-shaped branch in it.
+//
 // The callback is caller-supplied code running on the single writer goroutine,
 // so it is recover-wrapped: a user codec bug must cost this one frame, never
 // poison the region or take the writer down with it. On error or panic the slab
@@ -1316,6 +1323,13 @@ func (w *writer) fillSlab(i intent, h arena.SlabHandle, window []byte) buildStat
 		w.report(i, errSendAbandoned)
 
 		return buildFailed
+	}
+
+	// Claimed and then skipped, never skipped and left pending: this frame goes on
+	// to publish, and publishing with the handshake word still at pending would let
+	// a cancelling caller win the abandonment CAS on a frame already on the wire.
+	if len(window) == 0 {
+		return buildOK
 	}
 
 	if err := runFill(i.fill.fn, window); err != nil {
