@@ -4,10 +4,75 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/supervisor"
 )
+
+// responseJoinBound caps the host-side response join a hot-reload runs before it
+// reaps the predecessor. The budget is small because nothing being waited on is
+// in flight anywhere: the peer proved at drain-ack that every accepted call's
+// response has already reached the transport, so each answer is sitting in local
+// memory — a shared-memory ring or a socket buffer on this machine — waiting only
+// for this host's own reader to be scheduled. A wait longer than a scheduling
+// hiccup would only be waiting on a reader that is never coming back, and a
+// wedged reader must not be able to stall a reload.
+const responseJoinBound = 1 * time.Second
+
+// responseJoinPoll is how often the response join re-evaluates its predicate.
+// Neither half of that predicate has a wake-up signal to park on — the inbound
+// queue's emptiness is a probe and a call's terminal transition is a lock-free
+// CAS — so the join samples instead. The interval is far below the wait it is
+// bounding and far above the cost of one probe, so the normal path (predicate
+// already true on the first evaluation) never sleeps at all.
+const responseJoinPoll = 50 * time.Microsecond
+
+// joinPublishedResponses blocks until this generation has no answer outstanding —
+// its transport confirms nothing further is readable AND no call it dispatched is
+// still awaiting an outcome — or until ctx or the response-join bound expires.
+// It reports how many calls were still awaiting an outcome when the wait ended.
+//
+// It exists because the two halves of a hot-reload's completion guarantee are
+// proven on different sides of the connection. The plugin proves at drain-ack that
+// every call it accepted before the cutoff has had its response written to the
+// transport; nothing proves this host has read those responses. Tearing the
+// predecessor down destroys the calls still waiting for them, reporting calls that
+// really did complete as an unknown, non-retryable outcome. Waiting for both halves
+// here is what makes the predecessor's teardown safe.
+//
+// Both conditions are required and neither implies the other. A drained queue
+// alone does not mean the responses were matched to their calls, because the
+// reader's dispatch of a frame it has already consumed lags the queue going empty.
+// An empty call table alone does not mean the queue is drained, because a response
+// may still be queued for a call that a deadline or cancel has already resolved.
+//
+// A non-zero return is an anomaly, not the normal path: it means the bound expired
+// with answers still unclaimed, and the teardown that follows will report those
+// calls as outcome-unknown.
+func (state *connState) joinPublishedResponses(ctx context.Context) int {
+	jctx, cancel := context.WithTimeout(ctx, responseJoinBound)
+	defer cancel()
+
+	ticker := time.NewTicker(responseJoinPoll)
+	defer ticker.Stop()
+
+	for {
+		// Queue first, then table, matching the plugin-side drain predicate: a frame
+		// the reader has already consumed but not yet dispatched is covered either
+		// way, because the call it resolves is still counted until that dispatch CASes
+		// it terminal.
+		if !inboundReadable(state.tr) && state.table.PublishedCount() == 0 {
+			return 0
+		}
+
+		select {
+		case <-jctx.Done():
+			return state.table.PublishedCount()
+		case <-ticker.C:
+		}
+	}
+}
 
 // Compile-time proof that each public reload-hook interface is method-set
 // identical to the internal one PluginServer stores and its serving loop
@@ -30,13 +95,20 @@ var (
 // supervision. It blocks until the transaction reaches a terminal outcome, and on
 // success until the old instance's teardown-with-reap has completed.
 //
-// The drain certifies mutator quiescence only: new-call admission is closed and
-// every registered Mutator is frozen before the snapshot is taken, but a
-// data-plane call the instance accepted before the admission cutoff may still be
-// in flight when the predecessor is torn down. Such an already-published call is
-// failed with ErrOutcomeUnknown — a non-retryable outcome-unknown error, because
-// the plugin may or may not have executed it before teardown. A new call refused
-// at the cutoff instead fails with ErrDrained and is retryable.
+// A call the instance accepted before the admission cutoff runs to completion and
+// its real outcome reaches the caller. The drain certifies both halves of that:
+// every registered Mutator is frozen before the snapshot is taken, and every call
+// the instance accepted has finished and had its response written to the transport
+// before the drain is acknowledged. The host then reads those responses out before
+// it reaps the predecessor, so a call that completed is answered rather than
+// reported as an unknown outcome. A new call refused at the cutoff instead fails
+// with ErrDrained and is retryable.
+//
+// A call can still end in ErrOutcomeUnknown, but only as a genuine anomaly rather
+// than the ordinary course of a reload: the host bounds how long it waits to read
+// the answers it is owed, so a reader that stops making progress cannot stall a
+// reload indefinitely. Calls left unanswered when that bound expires are reported
+// as outcome-unknown and counted on styx.reload.dropped.count.
 //
 // On success it returns nil and the successor is the instance the named plugin
 // now routes to. On any pre-promote failure the reload has already rolled back

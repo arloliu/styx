@@ -51,7 +51,8 @@ const (
 	// PhaseRestoreValidate spawns the successor and delivers the snapshot to it,
 	// up to its readiness ack.
 	PhaseRestoreValidate
-	// PhasePromote swaps routing to the successor and reaps the predecessor.
+	// PhasePromote swaps routing to the successor, then joins the answers the
+	// predecessor's peer already produced before reaping it.
 	PhasePromote
 )
 
@@ -212,7 +213,16 @@ type ReloadTarget interface {
 	// had been promoted.
 	Promote(ctx context.Context) error
 	// Teardown destroys the instance and does not return until its process has been reaped.
-	Teardown(ctx context.Context, deadline time.Duration) error
+	// An instance being retired after a promote must first join the answers its peer
+	// already produced: DrainAck proved every call it accepted has had its response
+	// written to the transport, and destroying the instance before the host has read
+	// them turns completed calls into unknown, non-retryable outcomes. That join is
+	// bounded, so a host reader that stops making progress cannot stall a reload.
+	// Teardown returns how many calls were still unanswered when it stopped waiting —
+	// zero on every path that had nothing to wait for, and non-zero only as an anomaly
+	// the caller is expected to surface, since those calls are the ones it then fails
+	// with an unknown outcome.
+	Teardown(ctx context.Context, deadline time.Duration) (stragglers int, err error)
 }
 
 // Transaction runs the five-phase hot-reload state machine for one plugin.
@@ -222,6 +232,14 @@ type Transaction struct {
 	spawnNew  func(context.Context) (ReloadTarget, error)
 	deadlines PhaseDeadlines
 	admission *AdmissionGate
+
+	// Stragglers is how many calls the retired instance's teardown was still owed
+	// an answer for when it stopped waiting for them, populated once Run returns.
+	// Those calls are failed with an unknown outcome, so a non-zero value is a
+	// correctness anomaly the caller is expected to report, not a routine cost.
+	// It is zero on every path that never reached the retirement, including every
+	// rollback: only a promoted transaction retires an instance that was serving.
+	Stragglers int
 }
 
 // NewTransaction creates a Transaction that replaces old with the instance
@@ -238,7 +256,9 @@ func NewTransaction(
 
 // Run executes the five phases in order. On success it returns the promoted
 // successor; the old instance's teardown-with-reap has already completed
-// before it returns.
+// before it returns, including the bounded join that delivers the answers its
+// peer had already produced. Stragglers records what that join could not
+// deliver.
 //
 // On any failure Run has already rolled back before returning: any successor it
 // spawned is torn down, the old instance has been sent Resume and has acked it,
@@ -301,8 +321,13 @@ func (tx *Transaction) Run(ctx context.Context) (ReloadTarget, error) {
 	// wire phases rather than extending it across a reap.
 	tx.admission.Open()
 
-	// Teardown completes the transaction by reaping the predecessor.
-	if err := tx.old.Teardown(ctx, control.ReplyDeadlines[control.KindShutdown]); err != nil {
+	// Teardown completes the transaction by joining the answers the predecessor's
+	// peer already produced and then reaping it. Anything still unanswered when
+	// that join gives up is failed with an unknown outcome, so the count is
+	// recorded for the caller to surface rather than left to pass silently.
+	stragglers, err := tx.old.Teardown(ctx, control.ReplyDeadlines[control.KindShutdown])
+	tx.Stragglers = stragglers
+	if err != nil {
 		return successor, fmt.Errorf("lifecycle: reload: teardown old instance: %w", err)
 	}
 

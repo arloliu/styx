@@ -323,6 +323,7 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 		StrictCapacity:  spec.StrictCapacity,
 		OnHeartbeatMiss: h.heartbeatMissHook(spec.Name),
 		OnRestart:       h.restartHook(spec.Name),
+		OnReloadDropped: h.reloadDroppedHook(spec.Name),
 		// The reload transaction drives the SAME admission gate a caller's
 		// Invoke checks, so a cutoff a reload begins is the cutoff Invoke
 		// observes. internal/supervisor never names *ClientConn; it holds only
@@ -717,6 +718,11 @@ func wireConnState(cc *ClientConn, inst supervisor.Instance) supervisor.ReadyHoo
 	}()
 
 	return supervisor.ReadyHooks{
+		// The reload transaction's own step, ahead of the teardown steps below:
+		// this generation's peer has already answered every call it accepted, so
+		// give this generation's reader the chance to deliver those answers before
+		// FailInFlight destroys the calls waiting for them.
+		JoinResponses: state.joinPublishedResponses,
 		// CompareAndSwap only tears down routing this exact instance still
 		// owns: on a plain crash-restart cc.state still holds state, so the
 		// swap succeeds and this behaves as an unconditional close always

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,7 +12,9 @@ import (
 	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
+	"github.com/arloliu/styx/internal/transport"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -243,6 +246,165 @@ func TestWireConnState_StopAdmission_BoundsPublicationJoin_WhenPublisherWedged(t
 		t.Fatal("teardown cutoff did not bound its publication join; it hung on a wedged publisher")
 	}
 	require.False(t, cc.admission.IsOpen(), "teardown leaves admission closed and proceeds")
+}
+
+// gatedReadTransport holds the connection reader out of Recv until the host
+// probes the inbound queue, and reports how many times it was probed. It models
+// the one condition the response join exists to survive: the peer's answers are
+// physically present and unread only because the reader has not been scheduled.
+// Releasing on the probe rather than on a timer is what makes a test over it
+// decide a real question — a host that reaps without ever looking never lets the
+// reader run, and a host that looks first always does.
+type gatedReadTransport struct {
+	transport.Transport
+
+	release     chan struct{}
+	releaseOnce sync.Once
+	closed      chan struct{}
+	closeOnce   sync.Once
+	probes      atomic.Int64
+}
+
+func newGatedReadTransport(tr transport.Transport) *gatedReadTransport {
+	return &gatedReadTransport{Transport: tr, release: make(chan struct{}), closed: make(chan struct{})}
+}
+
+// Recv holds the reader until the gate is released, and reports the connection
+// closed if teardown gets there first — so a host that reaps without probing
+// still lets its read loop exit rather than hanging the join that follows.
+func (t *gatedReadTransport) Recv(ctx context.Context) (transport.Frame, error) {
+	select {
+	case <-t.release:
+	case <-t.closed:
+		return transport.Frame{}, transport.ErrClosed
+	case <-ctx.Done():
+		return transport.Frame{}, ctx.Err()
+	}
+
+	return t.Transport.Recv(ctx)
+}
+
+func (t *gatedReadTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+
+	return t.Transport.Close()
+}
+
+// ReadableNow answers the probe truthfully from the wrapped transport and
+// releases the reader: the probe is the host looking before it reaps, and the
+// release is the reader finally getting its turn.
+func (t *gatedReadTransport) ReadableNow() bool {
+	t.probes.Add(1)
+	t.releaseOnce.Do(func() { close(t.release) })
+
+	if p, ok := t.Transport.(transport.InboundQueueProber); ok {
+		return p.ReadableNow()
+	}
+
+	return false
+}
+
+// Test a retiring generation's teardown delivering a response its peer had already
+// produced but this host had not yet read. The reader is held out of Recv for the
+// whole teardown, so the answer is provably sitting unclaimed in the inbound queue
+// at the instant the teardown steps run — the state a starved reader reaches under
+// load. Without the join, fail-in-flight destroys the call while its answer sits
+// there and the caller is told the outcome is unknown, which is both false and
+// non-retryable.
+func TestWireConnState_JoinResponses_DeliverUnreadAnswerBeforeTeardownFailsTheCall(t *testing.T) {
+	// Given: one wired generation whose reader cannot consume anything yet.
+	cdc := codec.Proto{}
+	clientTr, pluginTr := newInProcessTransportPairForTest(t)
+	gated := newGatedReadTransport(clientTr)
+
+	cc := &ClientConn{name: "echo"}
+	hooks := wireConnState(cc, supervisor.Instance{Transport: gated, Generation: 1})
+
+	// And: one call published to it, which the peer answers in full.
+	resp := &wrapperspb.StringValue{}
+	answered := make(chan error, 1)
+	go func() {
+		answered <- cc.Invoke(context.Background(), "test.Echo", "Say", wrapperspb.String("hello"), resp)
+	}()
+
+	dispatcher := rpcruntime.NewDispatcher()
+	dispatcher.Register(fnv64a("test.Echo"), labelHandler{codec: cdc, label: "old"})
+	// The request arriving proves the call is published: Invoke takes the
+	// publication CAS before it hands the frame to the transport.
+	reqFrame, err := pluginTr.Recv(t.Context())
+	require.NoError(t, err)
+	envs := dispatcher.Dispatch(t.Context(), reqFrame, time.Now())
+	require.Len(t, envs, 1)
+	require.NoError(t, sendUnaryResponse(t.Context(), pluginTr, cdc, envs[0]))
+
+	state := cc.state.Load()
+	require.Equal(t, 1, state.table.PublishedCount(),
+		"the call must still be awaiting its outcome when the teardown begins")
+	require.Zero(t, gated.probes.Load(),
+		"nothing has probed the queue yet, so the reader is provably still held")
+
+	// When: the reload retires this generation — the response join, then the
+	// teardown steps in the order internal/lifecycle.Teardown runs them.
+	stragglers := hooks.JoinResponses(context.Background())
+	hooks.StopAdmission()
+	hooks.FailInFlight(lifecycle.ErrTornDown)
+	hooks.JoinGoroutines()
+
+	// Then: the caller gets the answer the plugin actually produced.
+	require.Zero(t, stragglers, "the join must not give up on an answer that was already queued")
+	require.NoError(t, <-answered, "a call the plugin answered must not be reported as an unknown outcome")
+	require.Equal(t, "old:hello", resp.GetValue())
+}
+
+// Test the response join giving up rather than waiting forever on a reader that
+// never comes back. A wedged reader must not be able to hold a reload open: the
+// join reports what it could not deliver and lets the teardown proceed, which is
+// what turns those calls into unknown outcomes.
+func TestJoinPublishedResponses_ReportStragglers_WhenReaderNeverDrainsTheQueue(t *testing.T) {
+	// Given: a generation with a call published and its answer queued, and no read
+	// loop at all — the reader will never claim it.
+	cdc := codec.Proto{}
+	clientTr, pluginTr := newInProcessTransportPairForTest(t)
+
+	state := &connState{
+		table:        rpcruntime.NewTable(1),
+		tr:           clientTr,
+		codec:        cdc,
+		readLoopDone: make(chan struct{}),
+	}
+	callID, _ := state.table.Submit(t.Context(), time.Minute)
+	require.True(t, state.table.Publish(callID))
+
+	dispatcher := rpcruntime.NewDispatcher()
+	dispatcher.Register(fnv64a("test.Echo"), labelHandler{codec: cdc, label: "old"})
+	envs := dispatcher.Dispatch(t.Context(), transport.Frame{
+		CallID:  callID,
+		Kind:    transport.FrameUnaryReq,
+		Service: fnv64a("test.Echo"),
+		Method:  fnv64a("Say"),
+		Payload: mustMarshal(t, cdc, wrapperspb.String("hello")),
+	}, time.Now())
+	require.Len(t, envs, 1)
+	require.NoError(t, sendUnaryResponse(t.Context(), pluginTr, cdc, envs[0]))
+
+	// When: the join runs against a context that expires immediately, standing in
+	// for the bound elapsing with the queue still unread.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	// Then: it reports the call it could not resolve rather than blocking.
+	require.Equal(t, 1, state.joinPublishedResponses(ctx),
+		"an answer the reader never claimed must be reported, not waited on forever")
+}
+
+// mustMarshal encodes msg with cdc, failing the test on error.
+func mustMarshal(t *testing.T, cdc codec.Codec, msg proto.Message) []byte {
+	t.Helper()
+
+	payload, err := cdc.Marshal(msg)
+	require.NoError(t, err)
+
+	return payload
 }
 
 // Test Reload reporting a typed error for a plugin this Host does not manage

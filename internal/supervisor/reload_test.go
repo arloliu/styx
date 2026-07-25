@@ -50,6 +50,17 @@ type fakeRouter struct {
 	// before routing is installed. A test uses it to observe which goroutine
 	// drives a reload, or to fire a cancellation at the commit point.
 	onPromote func()
+
+	// joinResponses, if set, becomes every generation's response-join hook,
+	// standing in for the styx layer's wait on answers its reader has not
+	// claimed. It is passed the generation it was called for so a test can prove
+	// only the retiring instance is ever joined.
+	joinResponses func(generation uint64) int
+
+	// onStopAdmission, if set, is called with the generation whose routing
+	// teardown is starting — the first step that destroys anything, so a test can
+	// pin what must have happened before it.
+	onStopAdmission func(generation uint64)
 }
 
 // routingState stands in for one generation of styx's connState.
@@ -65,16 +76,24 @@ func (r *fakeRouter) onReady(inst supervisor.Instance) supervisor.ReadyHooks {
 	r.state.Store(st)
 	r.admission.Open()
 
-	return supervisor.ReadyHooks{
+	hooks := supervisor.ReadyHooks{
 		// Only closes admission / nils routing this exact generation still owns;
 		// after a later generation is promoted, this becomes a no-op — the
 		// ownership CAS from host.go's wireConnState, replicated.
 		StopAdmission: func() {
+			if r.onStopAdmission != nil {
+				r.onStopAdmission(inst.Generation)
+			}
 			if r.state.CompareAndSwap(st, nil) {
 				_ = r.admission.Close(context.Background())
 			}
 		},
 	}
+	if r.joinResponses != nil {
+		hooks.JoinResponses = func(context.Context) int { return r.joinResponses(inst.Generation) }
+	}
+
+	return hooks
 }
 
 // spawner is the test's replacement for the instance-spawn seam. Each call
@@ -936,4 +955,75 @@ func TestSupervisor_Reload_AdoptsSuccessorAndSurfacesError_OnPostPromoteTeardown
 	sp.teardownErr = nil
 	require.NoError(t, sup.Reload(t.Context()))
 	require.Equal(t, uint64(3), router.state.Load().generation)
+}
+
+// Test a reload joining the retiring instance's outstanding answers before it
+// destroys them, and only that instance's. The join is the host's half of the
+// completion guarantee: the peer proved at drain-ack that it answered every call
+// it accepted, so tearing the instance down before the routing layer has read
+// those answers reports completed calls as an unknown outcome. A never-promoted
+// successor has no such answer, so it must never be joined.
+func TestSupervisor_Reload_JoinsRetiringInstanceResponses_BeforeTearingItDown(t *testing.T) {
+	// Given: a routing layer that records every join and every routing teardown,
+	// in the order they happen.
+	admission := &lifecycle.AdmissionGate{}
+	var mu sync.Mutex
+	var order []string
+	router := &fakeRouter{admission: admission}
+	router.joinResponses = func(generation uint64) int {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, "join-"+strconv.FormatUint(generation, 10))
+
+		return 0
+	}
+	router.onStopAdmission = func(generation uint64) {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, "teardown-"+strconv.FormatUint(generation, 10))
+	}
+	sp := newSpawner(t, router)
+	sup, cleanup := startReloadSupervisor(t, sp)
+	defer cleanup()
+
+	// When
+	require.NoError(t, sup.Reload(t.Context()))
+
+	// Then: the retiring instance was joined, and joined before anything about it
+	// was destroyed. The successor, which never routed a call, was not joined.
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"join-1", "teardown-1"}, order,
+		"the retiring instance must be joined before its teardown, and the successor never joined")
+}
+
+// Test the count of calls a reload could not deliver reaching the observability
+// seam, and only when there is something to report. The routing layer emits the
+// metric, so the count has to survive the trip out of the transaction; a reload
+// that loses nothing must stay silent rather than pin the counter at zero.
+func TestSupervisor_Reload_ReportsDroppedCalls_OnlyWhenTheJoinLeftAnswersUnread(t *testing.T) {
+	// Given: a join that gives up with answers still unread.
+	admission := &lifecycle.AdmissionGate{}
+	router := &fakeRouter{admission: admission}
+	stragglers := 3
+	router.joinResponses = func(uint64) int { return stragglers }
+	sp := newSpawner(t, router)
+
+	var dropped []int
+	cfg := reloadConfig(router)
+	cfg.OnReloadDropped = func(n int) { dropped = append(dropped, n) }
+	sup, _, cleanup := runReloadSupervisor(t, sp, cfg)
+	defer cleanup()
+
+	// When
+	require.NoError(t, sup.Reload(t.Context()))
+
+	// Then: exactly what the join could not deliver is reported.
+	require.Equal(t, []int{3}, dropped)
+
+	// And when a later reload delivers everything, nothing is reported: the
+	// counter records anomalies, not reloads.
+	stragglers = 0
+	require.NoError(t, sup.Reload(t.Context()))
+	require.Equal(t, []int{3}, dropped, "a reload that delivered every outcome must report nothing")
 }

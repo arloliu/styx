@@ -38,8 +38,12 @@ func (tx *Transaction) rollback(ctx context.Context, fromPhase Phase, successor 
 		// The successor never routed anything, so tearing it down cannot affect
 		// a caller. Its error is deliberately not propagated; the reason the
 		// reload failed is more useful than the reason its cleanup did, and the
-		// reap happens either way.
-		_ = successor.Teardown(rctx, control.ReplyDeadlines[control.KindShutdown])
+		// reap happens either way. Its straggler count is discarded for a stronger
+		// reason: rollback runs strictly before promote, so nothing was ever routed
+		// to this instance and there is no answer it could be owed. Recording a
+		// zero that can only ever be zero would claim the transaction retired a
+		// serving instance, which it did not.
+		_, _ = successor.Teardown(rctx, control.ReplyDeadlines[control.KindShutdown])
 	}
 
 	if err := tx.resumeOld(rctx); err != nil {

@@ -310,6 +310,30 @@ func (t *Table) Reject(id uint64, err error) bool {
 	return t.terminate(id, StateRejected, Result{Err: err}, StateSubmitted, StatePublished)
 }
 
+// PublishedCount reports how many live calls are currently StatePublished:
+// their request frame has been handed to the transport, so the peer may have
+// executed them and only its response can resolve them.
+// It is the host's half of the hot-reload response join: a predecessor that
+// still holds a published call is still owed an answer the peer may already
+// have sent, so reaping it would turn a completed call into an unknown outcome.
+// The value is a snapshot taken under the table lock; a call may terminate the
+// instant after it is read. That is sound for the join, whose predecessor table
+// can only shrink — routing has already moved to the successor, so no new call
+// is ever registered here.
+func (t *Table) PublishedCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	n := 0
+	for _, c := range t.calls {
+		if CallState(c.state.Load()) == StatePublished {
+			n++
+		}
+	}
+
+	return n
+}
+
 // FailAll terminates every in-flight call and wakes all waiters — the
 // mechanism teardown uses to fail every outstanding call.
 // A zero-budget abandoned call has no deadline timer to reap it, so FailAll is
