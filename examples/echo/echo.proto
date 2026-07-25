@@ -4,6 +4,8 @@ option go_package = "github.com/arloliu/styx/examples/echo/echopb";
 
 service Echo {
   rpc Say (SayRequest) returns (SayResponse);
+  // Blob carries a bytes payload, so bulk binary data crosses without a
+  // []byte<->string conversion at either end, unlike Say's string field.
   rpc Blob (BlobRequest) returns (BlobResponse);
 }
 

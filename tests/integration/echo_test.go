@@ -15,13 +15,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// This suite is the differential-testing oracle a future shared-memory
-// transport implementation will be diffed against: every case here
-// exercises Styx's public API
+// This file exercises Styx's public API
 // (styx.NewHost/NewPluginServer, examples/echo/echopb's generated
-// NewEchoClient/RegisterEchoServer) as an external consumer would, over the
-// uds transport, so the identical scenario can be re-run over shm later and
-// the two results compared.
+// NewEchoClient/RegisterEchoServer) as an external consumer would. Most
+// cases here don't pin a transport, so they run over whatever TransportAuto
+// negotiates; the Blob round-trip test below is the exception,
+// parametrizing directly over both uds and shm. differential_shm_test.go is
+// what re-runs a scenario over both transports and diffs the results.
 //
 // Much of this behavior is already covered one layer down: host_test.go
 // (handshake success/version-mismatch/binary-pin/GaveUp-under-burst) and
@@ -515,7 +515,7 @@ func TestEcho_UnregisteredService_ReturnsErrServiceNotFound(t *testing.T) {
 // ErrMethodNotFound, reconstructed via errors.Is — again against
 // the real echo plugin (echo.Echo is registered; "Nonexistent" is not).
 func TestEcho_UnknownMethod_ReturnsErrMethodNotFound(t *testing.T) {
-	// Given: the real echo plugin, whose echo.Echo has only a Say method.
+	// Given: the real echo plugin, whose echo.Echo has no method named Nonexistent.
 	h := styx.NewHost(styx.HostConfig{
 		Plugins: []styx.PluginSpec{{Name: "echo", Path: echoPluginBin}},
 	})

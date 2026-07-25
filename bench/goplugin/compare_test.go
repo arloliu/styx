@@ -17,7 +17,7 @@ import (
 )
 
 // The largest tier is short of the canonical 1048576 (1 MiB) by 64 bytes:
-// styx-shm/styx-uds send this payload wrapped in an echopb.SayRequest, whose
+// styx-shm/styx-uds send this payload wrapped in an echopb.BlobRequest, whose
 // protobuf envelope (field tag + varint length prefix) adds a few bytes of
 // overhead on top of the raw payload -- a full 1048576-byte payload would
 // exceed transport.MaxFrameSize (also 1048576, hard-coded and not
