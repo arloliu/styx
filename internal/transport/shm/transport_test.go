@@ -2307,25 +2307,37 @@ func TestTransport_SendPayloadFill_RoundTripsUnaryFrame_FilledIntoTheSlab(t *tes
 // Test that size 0 is the admitted low end of the range, not a rejection: the
 // frame publishes carrying an empty payload and the callback is skipped, since a
 // zero-byte window has nothing for it to write ("at most once" allows zero).
+//
+// Both checksum settings are covered because they reach the skip by different
+// routes and only one of them is the obvious one. Without the feature a
+// zero-payload frame stores nothing at all and never allocates a slab; with it
+// the frame still stores a CRC32C(empty) trailer, so it DOES allocate and reach
+// the fill path — with a zero-length window. The contract is one rule either way:
+// no bytes to write means no callback. A skip that held only for the unnegotiated
+// case would make the interface's contract depend on a negotiated feature.
 func TestTransport_SendPayloadFill_CarriesEmptyPayload_WhenSizeIsZero(t *testing.T) {
-	// Given a host and plugin attached to one region.
-	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	for _, checksum := range []bool{false, true} {
+		t.Run(fmt.Sprintf("checksum=%v", checksum), func(t *testing.T) {
+			// Given a host and plugin attached to one region.
+			ep := newEndpoints(t, roundTripLayout(), validConfig(checksum))
 
-	// When the host sends a fill frame declaring no payload bytes.
-	var ran atomic.Bool
-	err := ep.host.SendPayloadFill(t.Context(), dataReqFrame(9), 0, func([]byte) error {
-		ran.Store(true)
+			// When the host sends a fill frame declaring no payload bytes.
+			var ran atomic.Bool
+			err := ep.host.SendPayloadFill(t.Context(), dataReqFrame(9), 0, func([]byte) error {
+				ran.Store(true)
 
-		return nil
-	})
+				return nil
+			})
 
-	// Then it publishes with an empty payload and the callback never ran.
-	require.NoError(t, err)
-	require.False(t, ran.Load(), "a zero-size fill has nothing to write, so its callback must be skipped")
+			// Then it publishes with an empty payload and the callback never ran.
+			require.NoError(t, err)
+			require.False(t, ran.Load(), "a zero-size fill has nothing to write, so its callback must be skipped")
 
-	got := recvOne(t, ep.plugin)
-	require.Equal(t, uint64(9), got.CallID)
-	require.Empty(t, got.Payload)
+			got := recvOne(t, ep.plugin)
+			require.Equal(t, uint64(9), got.CallID)
+			require.Empty(t, got.Payload)
+		})
+	}
 }
 
 // Test that a size outside 0..max_payload is refused on the calling goroutine,

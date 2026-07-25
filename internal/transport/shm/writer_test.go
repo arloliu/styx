@@ -2405,6 +2405,42 @@ func TestWriter_StampsZeroSizeFillDescriptor_WithoutSlabOrCallback(t *testing.T)
 	require.False(t, i.fill.abandon(), "a published fill intent must no longer be abandonable")
 }
 
+// Test the other route a zero-size fill frame can take: with the checksum feature
+// negotiated it stores a CRC32C(empty) trailer, so it DOES allocate a slab and
+// reach the fill path — with a zero-length window. The callback must still be
+// skipped, so the "no bytes to write means no callback" rule is one rule and not
+// one that varies with a negotiated feature. The claim must still happen: this
+// frame publishes, and a publish with the handshake word left pending would let a
+// late abandon report a delivered frame as a context error.
+func TestWriter_SkipsZeroSizeFillCallback_WhenChecksumForcesASlab(t *testing.T) {
+	// Given a checksum-negotiated writer and a zero-size fill intent.
+	sa := &stubArena{offset: 4096, generation: 7, sequence: 9}
+	w := newWriterFromParts(&recordRing{}, sa, 1, 1, admitBlock)
+	w.checksum = true
+
+	var ran atomic.Bool
+	i := intent{
+		frame: transport.Frame{CallID: 5, Kind: transport.FrameUnaryResp},
+		lane:  laneData,
+		fill:  &payloadFill{size: 0, fn: func([]byte) error { ran.Store(true); return nil }},
+		done:  make(chan error, 1),
+	}
+
+	// When building it.
+	d, st := w.build(i)
+
+	// Then the slab exists for the trailer alone, the callback never ran, and the
+	// descriptor reports an empty payload carrying a checksum.
+	require.Equal(t, buildOK, st)
+	require.False(t, ran.Load(), "a zero-length window has nothing for the callback to write")
+	require.Equal(t, uint32(0), d.PayloadLength())
+	require.NotZero(t, d.Flags()&flagCRC32CPresent)
+	require.Equal(t, crc32.Checksum(nil, castagnoliTable), binary.LittleEndian.Uint32(sa.slab[:crc32TrailerLen]))
+
+	// And it was claimed despite the skip, so the publish cannot be contradicted.
+	require.False(t, i.fill.abandon(), "a published fill intent must no longer be abandonable")
+}
+
 // Test that a fill callback returning an error fails the frame terminally and
 // gives the slab back: the caller's error is reported, nothing is published, and
 // the arena is exactly where it started.

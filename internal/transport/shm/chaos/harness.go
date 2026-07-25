@@ -141,6 +141,10 @@ type WindowSpec struct {
 	// before the triggering event. AfterSlabRelease needs one: the host must
 	// consume a response so a later plugin send drives head-gated reclaim to
 	// arena.Free (shm-abi.md §6).
+	//
+	// It applies to the send-path windows only. A closePath window reaches its
+	// window from the shutdown command rather than from prior traffic, so
+	// driveClosePath runs no warm-ups and does not read this field.
 	warmupCalls int
 
 	// closePath marks a window reached inside the peer's Transport.Close
@@ -774,24 +778,39 @@ func (s *session) driveSendPath(ctx context.Context, oc Outcome, spec WindowSpec
 	return s.completeDrain(ctx, oc, issued, batch)
 }
 
-// driveClosePath issues a REAL outstanding host call, then commands the peer to
+// driveClosePath issues REAL outstanding host calls, then commands the peer to
 // cancel+join its serve loop and call Transport.Close, whose BeforeUnmap hook
-// parks it; the harness SIGKILLs, reaps, and drains that call through the same
-// oracle as every other window. The call is either delivered with its exact
+// parks it; the harness SIGKILLs, reaps, and drains those calls through the same
+// oracle as every other window. Each call is either delivered with its exact
 // payload (the peer answered before shutting down) or ends in a caller-context
 // termination — never a synthetic success.
+//
+// It drives two calls with consecutive CallIDs so hostSendFor's parity split puts
+// one of each payload mode across the teardown. This is the window a fill send
+// most needs covered: it is the one where the peer runs real shutdown code under
+// an outstanding call, and where a fill caller that lost the abandonment CAS can
+// leave only on publication or shutdown.
+//
+// It runs no warm-up round trips, and ignores the warmupCalls its WindowSpec
+// declares: a warm-up would have to complete BEFORE the shutdown command, and the
+// peer's Close is driven by that command rather than by prior traffic, so a
+// completed round trip changes nothing about reaching BeforeUnmap. The two
+// outstanding calls are what the window is about.
 func (s *session) driveClosePath(ctx context.Context, oc Outcome) (Outcome, error) {
-	id := uint64(1)
-	want := payloadFor(id)
-	issued := map[uint64][]byte{id: want}
+	batch := []uint64{1, 2}
+	issued := make(map[uint64][]byte, len(batch))
 
-	// Issue but do not await: the call is outstanding on the host when the peer is
-	// commanded to tear down and park at BeforeUnmap.
-	sctx, cancelSend := context.WithTimeout(ctx, callTimeout)
-	err := s.hostSendFor(sctx, id, want)
-	cancelSend()
-	if err != nil {
-		return oc, fmt.Errorf("chaos: close-path trigger send: %w", err)
+	// Issue but do not await: the calls are outstanding on the host when the peer
+	// is commanded to tear down and park at BeforeUnmap.
+	for _, id := range batch {
+		want := payloadFor(id)
+		issued[id] = want
+		sctx, cancelSend := context.WithTimeout(ctx, callTimeout)
+		err := s.hostSendFor(sctx, id, want)
+		cancelSend()
+		if err != nil {
+			return oc, fmt.Errorf("chaos: close-path trigger send %d: %w", id, err)
+		}
 	}
 
 	if err := s.writeCtrl(ctx, ctrlShutdown); err != nil {
@@ -805,7 +824,7 @@ func (s *session) driveClosePath(ctx context.Context, oc Outcome) (Outcome, erro
 		return oc, err
 	}
 
-	return s.completeDrain(ctx, oc, issued, []uint64{id})
+	return s.completeDrain(ctx, oc, issued, batch)
 }
 
 // completeDrain runs the post-kill batch drain under a hard backstop and folds

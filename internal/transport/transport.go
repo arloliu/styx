@@ -24,10 +24,16 @@ const MaxFrameSize = 1 << 20 // 1 MiB
 // unassigned value, not streaming.
 var ErrUnimplementedFrameKind = errors.New("transport: unimplemented frame kind")
 
-// ErrPayloadTooLarge is returned by Send (before any write) when a
-// Frame's Payload exceeds MaxFrameSize, and by Recv when a peer's
-// declared payload length exceeds MaxFrameSize (checked before any
-// allocation for that payload).
+// ErrPayloadTooLarge is returned when a payload exceeds the limit the transport
+// bounds it by, always before any write or allocation for that payload:
+//
+//   - Send, when a Frame's Payload exceeds MaxFrameSize;
+//   - Recv, when a peer's declared payload length exceeds MaxFrameSize;
+//   - PayloadFillSender.SendPayloadFill, when the declared size exceeds the
+//     transport's per-direction max payload — which is derived from the
+//     transport's own geometry and may be ABOVE MaxFrameSize, so the sentinel
+//     names the condition (too large for this transport) rather than the
+//     constant.
 var ErrPayloadTooLarge = errors.New("transport: payload exceeds MaxFrameSize")
 
 // ErrInvalidPayloadSize is returned by PayloadFillSender.SendPayloadFill,
@@ -239,6 +245,18 @@ type ReportingSender interface {
 // back to Send.
 //
 // The frame's Payload and Status fields are not read: size and fill are the payload.
+// That makes two groups of kinds illegal in fill mode, both of them caller bugs a
+// transport may reject however it likes — including after the send is accepted,
+// since neither is on any correct path:
+//
+//   - the descriptor-only kinds (FrameCancel, FrameStreamAck) store no payload at
+//     all, so there is nothing for fill to write;
+//   - the status-bearing kinds (see CarriesStatusBody) encode their FrameStatus as
+//     the payload, and fill mode does not read Status — a fill send on one would
+//     drop the caller's Status and publish the callback's bytes in its place, to be
+//     decoded by the peer as a status body.
+//
+// Fill mode is for the payload-carrying kinds, whose bytes the caller produces.
 //
 // size is the exact payload length, validated synchronously at admission —
 // 0 <= size <= the transport's per-direction max payload — before any intent is
