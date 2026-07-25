@@ -123,6 +123,9 @@ state-preserving hot-reload ([`examples/hot-reload/`](examples/hot-reload/)).
 Coming from `hashicorp/go-plugin`? See
 [docs/migration-from-go-plugin.md](docs/migration-from-go-plugin.md).
 
+For what graceful shutdown, crash/restart, and hot-reload actually do to a running
+plugin — and what it means when a reload fails — see [docs/plugin-lifecycle.md](docs/plugin-lifecycle.md).
+
 ## Configuration
 
 The Quickstart above leaves every `PluginSpec` and `PluginServerConfig` field at
@@ -137,38 +140,28 @@ guide, including a plain-language walkthrough of shared-memory geometry (ring
 capacity, lifecycle reserve, size classes) for readers who don't already know
 those terms.
 
+## Observability
+
+`host.Events()` (shown in the Quickstart above) is a subscription to every
+plugin's lifecycle transitions — spawned, ready, unhealthy, crashed,
+restarting, or given up for good. `HostConfig.Logger` and `HostConfig.Metrics`
+cover structured diagnostics and counters for the same transitions, so a real
+host usually configures all three rather than reimplementing logging inside
+an `Events()` consumer.
+See [docs/supervisor-events.md](docs/supervisor-events.md) for what each event
+means and what's worth reacting to versus just logging.
+
 ## Status
 
-The framework is complete on both data-plane transports:
+Styx is feature-complete on both data-plane transports — shared memory and
+Unix domain sockets, unary and streaming RPC, supervised plugin lifecycle
+with hot-reload — and validated by a differential test suite against the
+UDS oracle, a fault-injection (chaos) suite, and a long-running leak soak.
 
-- **Transports.** Shared memory (memfd rings + payload arena + eventfd wakeups)
-  and Unix domain sockets. Each plugin selects its transport via
-  `PluginSpec.Transport`: `TransportAuto` (the default) offers shared memory,
-  preferred, and falls back to UDS only when a plugin does not offer shared
-  memory; `TransportSHM` pins shared memory with never a silent downgrade.
-  At a 64-byte payload with one in-flight call, the measured round-trip p50 is
-  2.11 µs on shared memory versus 8.15 µs on UDS
-  ([bench/shm/REPORT.md](bench/shm/REPORT.md)). See
-  [docs/configuration.md](docs/configuration.md) for the full set of values.
-- **RPC.** Unary and streaming (server-, client-, and bidirectional streaming),
-  with version-negotiated handshake, deadline and cancellation propagation, and
-  a comprehensive, retryability-classified error taxonomy. Under load, a
-  shared-memory send whose ring or arena is full applies typed backpressure —
-  deadline-bounded for streaming sends, while a starved unary send can outlive
-  its call deadline (see the migration guide's provisioning section);
-  provisioning the geometry for peak concurrency (or opting into
-  `StrictCapacity`) avoids it — see
-  [docs/configuration.md](docs/configuration.md#shared-memory-geometry) for how
-  to size a geometry.
-- **Lifecycle.** Supervised plugins with a restart policy, crash detection, a
-  progress-based heartbeat, and hot-reload that hands a plugin's sealed,
-  verified state to a freshly spawned successor without dropping accepted calls
-  or restarting supervision.
-
-The shared-memory data plane is validated by a differential test suite against
-the UDS oracle, a fault-injection (chaos) suite, and a long-running leak soak.
-Its full performance profile is in [bench/shm/REPORT.md](bench/shm/REPORT.md);
-the earlier prototype that first validated the premise is in
+At a 64-byte payload with one in-flight call, the measured round-trip p50 is
+2.11 µs on shared memory versus 8.15 µs on UDS
+([bench/shm/REPORT.md](bench/shm/REPORT.md)); the earlier prototype that
+first validated the premise is in
 [docs/plans/2026-07-16-m0-gate-report.md](docs/plans/2026-07-16-m0-gate-report.md).
 
 For the full design, see [docs/specs/2026-07-16-styx-design.md](docs/specs/2026-07-16-styx-design.md).

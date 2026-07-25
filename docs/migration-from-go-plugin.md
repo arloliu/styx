@@ -128,7 +128,9 @@ per-plugin knobs: `Restart` (a `RestartPolicy` of `Max` attempts and a `Backoff`
 function), `Services` (declared acceptable version ranges), `RequireStreaming`,
 `Transport`, and the shared-memory geometry knobs (`Geometry`, `MaxDataInflight`,
 `StrictCapacity`). Lifecycle events are observed by ranging over `host.Events()`,
-a subscription rather than a callback invoked under a lock.
+a subscription rather than a callback invoked under a lock — see
+[docs/supervisor-events.md](supervisor-events.md) for what each event means and
+how to consume the channel.
 
 ## Lifecycle: liveness, shutdown, and kill
 
@@ -138,7 +140,8 @@ a subscription rather than a callback invoked under a lock.
   automatic, progress-based heartbeat that classifies a plugin as healthy,
   transport-wedged, dispatch-wedged, or overloaded from advancing counters. A
   plugin that stays wedged past the wedge window is restarted, and restarts and
-  heartbeat misses surface on `host.Events()`. Overload (advancing but arena
+  heartbeat misses surface on `host.Events()` (see
+  [docs/supervisor-events.md](supervisor-events.md)). Overload (advancing but arena
   occupancy over a high-water mark) is deliberately **not** a restart trigger and
   emits no event — it only clears wedge tracking so a load spike cannot cause a
   restart storm.
@@ -151,7 +154,11 @@ a subscription rather than a callback invoked under a lock.
   bounds `Stop`'s wait for the teardown goroutines to join, not the graceful
   window itself. Process termination is owned by the supervisor and `Host.Stop`;
   you tear a whole host down rather than killing one plugin from arbitrary call
-  sites, which keeps a freely callable concurrent kill off the API.
+  sites, which keeps a freely callable concurrent kill off the API. Unlike a
+  drain-in-flight-requests shutdown you may be used to, `Stop` fails every
+  in-flight call immediately rather than waiting for it to finish — see
+  [docs/plugin-lifecycle.md](plugin-lifecycle.md#graceful-shutdown--hoststop)
+  for the exact six-step teardown sequence.
 - **`plugin.CleanupClients()` / a global managed-client registry** → none. Each
   `Host` owns its own plugins' state; there is no package-level registry to leak.
 - **`ReattachConfig` (reattach to an already-running plugin)** → not supported.
@@ -231,7 +238,10 @@ into the snapshot) and `RegisterStateRestorer` (`RestoreState` seeds the
 successor). Accepted calls are not dropped by a successful reload; a call refused
 at the cutoff fails with the retryable `ErrDrained`. A runnable example that
 preserves state across a reload is in
-[`examples/hot-reload/`](../examples/hot-reload/).
+[`examples/hot-reload/`](../examples/hot-reload/). See
+[docs/plugin-lifecycle.md](plugin-lifecycle.md#hot-reload--hostreload) for the
+five-phase transaction in detail, including the three different things a
+non-nil `Reload` error can mean.
 
 ## What Styx does not do
 

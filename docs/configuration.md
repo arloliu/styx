@@ -169,3 +169,14 @@ For the exact wire-level rules these numbers satisfy — the bounds on
 `RingCapacity`, the layout of a size class, and how `MaxDataInflight` is
 carried between host and plugin — see
 [`docs/specs/shm-abi.md`](specs/shm-abi.md) §1, §2, §6, and §18.
+
+## Observing what a Host is doing
+
+`HostConfig` (the struct `Plugins` lives on, alongside every `PluginSpec` above)
+also has `Logger`, `Metrics`, and `MetricsInterval` for structured diagnostics
+and counters, plus `Host.Events()` for a subscription to each plugin's
+lifecycle transitions. See
+[docs/supervisor-events.md](supervisor-events.md) for what to configure and how
+to react to what it reports, and
+[docs/plugin-lifecycle.md](plugin-lifecycle.md) for what graceful shutdown,
+crash/restart, and hot-reload actually do underneath those signals.

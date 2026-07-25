@@ -613,9 +613,9 @@ distinguishes queued transport work from executing handlers:
 - **draining** — expected stall during hot-reload/shutdown phases; progress checks
   suspended for the phase's own deadline.
 
-Defaults (configurable): 1 s interval, 3 missed heartbeats, or 5 s of
-no-transport-progress-with-queued-work → unhealthy. Restart storms are damped by the
-existing backoff policy.
+Defaults (fixed today, not exposed on `PluginSpec`): 1 s interval, 3 missed
+heartbeats, or 5 s of no-transport-progress-with-queued-work → unhealthy. Restart
+storms are damped by the existing backoff policy.
 
 **Sinks and subscribers can be slow; supervision must not care.** Child stdout/stderr
 pipes are always drained by dedicated goroutines into bounded buffers with per-line
