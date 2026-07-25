@@ -55,6 +55,18 @@
 // context cancel — an abandoned intent may still be emitted, which is harmless
 // because nobody waits on it and the writer never blocks reporting it.
 //
+// A data intent carries its payload one of two ways, and that changes what
+// abandoning it means. A wire intent snapshots immutable bytes at submit, which
+// is why it may still be emitted after its caller gave up. A fill intent carries
+// a size and a callback that marshals into the slab on the writer goroutine;
+// that callback reads a message its caller still owns, so it must never run
+// after the caller has resumed. An atomic handshake on the intent decides which
+// side gets it: the writer claims it right before it fills, and a cancelling
+// caller either wins the claim first — which is proof the frame was never
+// published, so it returns its context error — or loses and waits out the
+// writer's report, returning that report rather than a context error. See
+// intent.go's fill-state constants.
+//
 // # The assembled transport
 //
 // Attach wires this writer, plus a SpinWaiter-driven inbound reader, onto a real
