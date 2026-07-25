@@ -3,7 +3,6 @@ package styx
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -217,40 +216,16 @@ func TestClientConn_Invoke_ReturnsErrCanceled_ForCanceledContext(t *testing.T) {
 }
 
 // heldFillTransport holds every payload-fill send until the caller's context
-// ends, then reports the context error without ever running the callback — the
+// ends, then reports the context error without ever invoking the callback — the
 // disposition a real writer produces when a cancelling caller wins the
 // abandonment handshake against a writer queue that has not reached the intent.
-// It counts callback runs, so a test can assert the request was never encoded,
-// not merely never delivered.
+// It counts frames handed to Send, so a test can assert nothing was put on the
+// wire for an abandoned call.
 type heldFillTransport struct {
-	entered  chan struct{}
-	fillRuns atomic.Int64
-	sends    atomic.Int64
-	closed   chan struct{}
-	clOnce   sync.Once
-}
-
-// runFill counts and invokes the callback under the recover boundary the
-// shared-memory writer draws around caller-supplied code, and wraps whichever
-// failure form comes back in the class transport.PayloadFillSender specifies. The
-// doubles share it so a test can never pass against a double that reports a
-// callback fault as a bare transport error.
-func (t *heldFillTransport) runFill(fill func(dst []byte) error, dst []byte) error {
-	t.fillRuns.Add(1)
-	err := func() (err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				err = fmt.Errorf("payload fill panicked: %v", r)
-			}
-		}()
-
-		return fill(dst)
-	}()
-	if err != nil {
-		return fmt.Errorf("%w: %w", transport.ErrPayloadFillFailed, err)
-	}
-
-	return nil
+	entered chan struct{}
+	sends   atomic.Int64
+	closed  chan struct{}
+	clOnce  sync.Once
 }
 
 func newHeldFillTransport() *heldFillTransport {
@@ -278,34 +253,37 @@ func (t *heldFillTransport) Close() error {
 	return nil
 }
 
+// SendPayloadFill parks until the caller's context ends and never claims the
+// callback, which is the whole behavior being modeled: a caller that wins the
+// abandonment handshake is one whose message the writer never read.
 func (t *heldFillTransport) SendPayloadFill(
-	ctx context.Context, _ transport.Frame, _ int, fill func(dst []byte) error,
+	ctx context.Context, _ transport.Frame, _ int, _ func(dst []byte) error,
 ) error {
 	select {
 	case t.entered <- struct{}{}:
 	default:
 	}
 	<-ctx.Done()
-	_ = fill // never invoked: an abandoned fill send is one the writer never claimed.
 
 	return ctx.Err()
 }
 
-// failingFillTransport runs the fill callback and reports its failure the way the
-// shared-memory writer does — wrapped in transport.ErrPayloadFillFailed, with the
-// slab freed and the frame discarded unpublished.
+// failingFillTransport claims the callback immediately and reports its failure
+// the way the shared-memory writer does — wrapped in
+// transport.ErrPayloadFillFailed, with the buffer released and the frame
+// discarded unpublished. It counts callback runs, so a test asserting a fault
+// reached the caller can also pin how many times the codec was asked to encode.
 type failingFillTransport struct {
 	heldFillTransport
-	fillErr atomic.Pointer[error]
+	fillRuns atomic.Int64
 }
 
 func (t *failingFillTransport) SendPayloadFill(
 	_ context.Context, _ transport.Frame, size int, fill func(dst []byte) error,
 ) error {
-	err := t.runFill(fill, make([]byte, size))
-	t.fillErr.Store(&err)
+	t.fillRuns.Add(1)
 
-	return err
+	return runFillAsTransport(fill, make([]byte, size))
 }
 
 // Test the invoke path producing its request straight into the transport's send
@@ -402,8 +380,9 @@ func TestClientConn_Invoke_CancelsLocally_WhenTheFillSendIsAbandoned(t *testing.
 	require.ErrorIs(t, err, ErrCanceled)
 	require.NotErrorIs(t, err, ErrOutcomeUnknown, "a won abandonment is proof of non-publication")
 
-	// ...the request was never encoded, and no CANCEL frame was owed.
-	require.Equal(t, int64(0), tr.fillRuns.Load())
+	// ...and no frame reached the wire, so no CANCEL was owed for a request the
+	// peer never saw. (That the callback itself never ran is the transport's
+	// guarantee, asserted where it lives: the shm writer's abandonment tests.)
 	require.Equal(t, int64(0), tr.sends.Load())
 
 	// ...and the call left no entry behind: Table.Cancel finds nothing to

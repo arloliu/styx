@@ -73,6 +73,30 @@ func (c plainTestCodec) Unmarshal(data []byte, m proto.Message) error {
 	return c.inner.Unmarshal(data, m)
 }
 
+// runFillAsTransport invokes a payload-fill callback the way a transport that
+// implements transport.PayloadFillSender must: under a recover boundary, so a
+// caller's bug costs one frame instead of the transport, and reporting BOTH
+// failure forms — a returned error and a recovered panic — wrapped in
+// transport.ErrPayloadFillFailed. Every fill-capable double in this package runs
+// its callback through this one function, so none of them can pass a caller
+// branch that the real shared-memory transport would fail.
+func runFillAsTransport(fill func(dst []byte) error, dst []byte) error {
+	err := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("payload fill panicked: %v", r)
+			}
+		}()
+
+		return fill(dst)
+	}()
+	if err != nil {
+		return fmt.Errorf("%w: %w", transport.ErrPayloadFillFailed, err)
+	}
+
+	return nil
+}
+
 // fillCountingTransport gives a transport that has no send buffer of its own a
 // payload-fill capability, and counts how many sends took each path plus how many
 // times the callback actually ran. The real shared-memory transport fills a slab
@@ -108,26 +132,14 @@ func (t *fillCountingTransport) SendPayloadFill(
 ) error {
 	t.fillSends.Add(1)
 	buf := make([]byte, size)
-	if err := t.runFill(fill, buf); err != nil {
-		return fmt.Errorf("%w: %w", transport.ErrPayloadFillFailed, err)
+	t.fillRuns.Add(1)
+	if err := runFillAsTransport(fill, buf); err != nil {
+		return err
 	}
 	t.lastFill.Store(&buf)
 	f.Payload = buf
 
 	return t.Transport.Send(ctx, f)
-}
-
-// runFill counts and invokes the callback, converting a panic into an error the
-// way the shared-memory writer's own recover boundary does.
-func (t *fillCountingTransport) runFill(fill func(dst []byte) error, dst []byte) (err error) {
-	t.fillRuns.Add(1)
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("payload fill panicked: %v", r)
-		}
-	}()
-
-	return fill(dst)
 }
 
 // Test the fill path being declined when the transport has no send buffer to

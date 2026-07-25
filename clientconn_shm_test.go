@@ -238,15 +238,20 @@ func TestPluginServe_SurvivesAPanickingResponseCodec_OverSharedMemory(t *testing
 	require.Equal(t, styx.CodeInternal, status.Code)
 	require.Contains(t, status.Message, "panicked")
 
-	// ...the plugin is still serving, with no obligation left owed...
+	// ...the plugin is still serving, and the faulted call's response obligation
+	// is closed. The close happens on the plugin's serve goroutine AFTER the
+	// status frame is handed to the transport, and the transport signals the
+	// consumer before it unblocks the sender, so the caller above can return
+	// while that goroutine is still runnable: the obligation must reach zero, and
+	// need not be there the instant the call returns.
 	require.False(t, pair.ServeLoopExited(), "one bad message must not stop the serve loop")
-	require.Zero(t, pair.OpenObligations(), "the faulted call's response obligation must be closed")
+	requireNoOwedObligations(t, pair)
 
 	// ...and the next call on the same connection completes normally.
 	ok, err := client.Blob(ctx, &echopb.BlobRequest{Payload: []byte("healthy")})
 	require.NoError(t, err)
 	require.Equal(t, []byte("healthy"), ok.GetPayload())
-	require.Zero(t, pair.OpenObligations())
+	requireNoOwedObligations(t, pair)
 }
 
 // Test a codec that under-reports what it wrote into the shared-memory
@@ -281,5 +286,20 @@ func TestClientConn_Invoke_FailsOneCall_WhenTheRequestCodecUnderReports_OverShar
 	ok, err := client.Blob(ctx, &echopb.BlobRequest{Payload: []byte("healthy")})
 	require.NoError(t, err)
 	require.Equal(t, []byte("healthy"), ok.GetPayload())
-	require.Zero(t, pair.OpenObligations())
+	requireNoOwedObligations(t, pair)
+}
+
+// requireNoOwedObligations asserts the plugin serve loop owes no unary response.
+// It waits rather than sampling once because the obligation closes on the serve
+// goroutine after the response reaches the transport, and the shared-memory
+// transport signals the consumer before it unblocks that sender — so a caller
+// that has already received its response says nothing about whether the plugin
+// has run its next statement yet. The assertion is unchanged in what it proves:
+// the count must reach zero, and a leaked obligation never does.
+func requireNoOwedObligations(t *testing.T, pair styx.SHMPairForTest) {
+	t.Helper()
+
+	require.Eventually(t, func() bool { return pair.OpenObligations() == 0 },
+		5*time.Second, time.Millisecond,
+		"the plugin must close every unary response obligation it opened")
 }
