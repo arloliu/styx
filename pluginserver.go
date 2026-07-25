@@ -306,7 +306,7 @@ func (s *PluginServer) runServing(
 	var readPoisoned atomic.Bool
 	go func() {
 		defer close(readDone)
-		if runServeLoop(ctx, tr, dispatcher, srv, panicPolicy, coord) != nil {
+		if runServeLoop(ctx, tr, codec.Proto{}, dispatcher, srv, panicPolicy, coord) != nil {
 			readPoisoned.Store(true)
 		}
 	}()
@@ -938,7 +938,7 @@ var errServeLoopHandlerPanicked = errors.New("styx: serve loop terminated after 
 // the cases runServing must distinguish (see each sentinel). panicPolicy carries
 // that policy and may be nil for a caller that does not exercise panic recovery.
 func runServeLoop(
-	ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher, srv *streamServer,
+	ctx context.Context, tr transport.Transport, cdc codec.Codec, d *rpcruntime.Dispatcher, srv *streamServer,
 	panicPolicy *panicController, coord *drainCoordinator,
 ) error {
 	// One releaser for the whole loop: dispatch is inline on this single goroutine, so
@@ -953,7 +953,7 @@ func runServeLoop(
 			srv.plane.probeDrain()
 		}
 
-		done, loopErr := serveOneFrame(ctx, tr, d, srv, panicPolicy, releaser, coord)
+		done, loopErr := serveOneFrame(ctx, tr, cdc, d, srv, panicPolicy, releaser, coord)
 		if done {
 			return loopErr
 		}
@@ -1006,7 +1006,7 @@ func disposeRecvErr(err error) (done bool, loopErr error) {
 }
 
 func serveOneFrame(
-	ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher, srv *streamServer,
+	ctx context.Context, tr transport.Transport, cdc codec.Codec, d *rpcruntime.Dispatcher, srv *streamServer,
 	panicPolicy *panicController, releaser *admitReleaser, coord *drainCoordinator,
 ) (done bool, loopErr error) {
 	reserved := false
@@ -1094,7 +1094,7 @@ func serveOneFrame(
 
 		return true, errServeLoopPoisoned
 	default:
-		stop, derr := dispatchNonStreamFrame(ctx, tr, d, f, panicPolicy, releaser)
+		stop, derr := dispatchNonStreamFrame(ctx, tr, cdc, d, f, panicPolicy, releaser)
 		if derr != nil {
 			return true, derr
 		}
@@ -1160,7 +1160,7 @@ func (r *admitReleaser) release() {
 // per-request heap allocation. A non-unary frame takes no read side and never arms
 // or fires it.
 func dispatchNonStreamFrame(
-	ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher, f transport.Frame,
+	ctx context.Context, tr transport.Transport, cdc codec.Codec, d *rpcruntime.Dispatcher, f transport.Frame,
 	panicPolicy *panicController, releaser *admitReleaser,
 ) (stop bool, err error) {
 	recvAt := time.Now()
@@ -1194,15 +1194,15 @@ func dispatchNonStreamFrame(
 		onHandlerEntry = releaser.entry
 		defer releaser.entry()
 	}
-	frames := d.Dispatch(ctx, f, recvAt, onHandlerEntry)
+	envelopes := d.Dispatch(ctx, f, recvAt, onHandlerEntry)
 	if isUnaryReq {
 		// Release the read side for every path that reached no handler entry — a call refused
 		// before any handler (unknown service/method, elapsed budget) opens no handler, so its
 		// read side is freed here, before any reply send, and never held across the transport.
 		releaser.entry()
 	}
-	for _, resp := range frames {
-		if serr := tr.Send(ctx, resp); serr != nil {
+	for _, env := range envelopes {
+		if serr := sendUnaryResponse(ctx, tr, cdc, env); serr != nil {
 			if errors.Is(serr, transport.ErrPoisoned) {
 				// A partially-written response frame desynced the data plane: fail the
 				// instance so the supervisor restarts it, rather than treating the poison
@@ -1231,6 +1231,49 @@ func dispatchNonStreamFrame(
 	}
 
 	return false, nil
+}
+
+// sendUnaryResponse sends one dispatched response under the serve loop's own
+// context — an abandoned response means the plugin is shutting down, which is a
+// dropped response, the failure mode a dying plugin already presents.
+//
+// A response still carrying its message is encoded straight into the transport's
+// send buffer when the transport and codec both support it, so the payload is
+// copied once (from the message's fields into the transport's buffer) instead of
+// into a wire buffer the transport then copies. Everything else — a status reply,
+// or a message no codec can size — marshals into the frame's payload and takes
+// the ordinary send.
+//
+// A failure to ENCODE the message is the one send failure that is not the
+// connection's fault, and it must not be reported as one: it costs this call, not
+// the session. Both encoding paths answer it with the framework-internal status
+// reply the client would otherwise wait out its whole deadline for — the same
+// reply the marshal produced back when it ran inside the handler adapter.
+func sendUnaryResponse(
+	ctx context.Context, tr transport.Transport, cdc codec.Codec, env rpcruntime.ResponseEnvelope,
+) error {
+	if env.Msg == nil {
+		return tr.Send(ctx, env.Frame)
+	}
+
+	if pf, ok := resolvePayloadFiller(tr, cdc, env.Msg); ok {
+		serr := pf.sender.SendPayloadFill(ctx, env.Frame, pf.size, pf.fill)
+		if serr != nil && errors.Is(serr, errPayloadFill) {
+			return tr.Send(ctx, rpcruntime.InternalStatusFrame(env.Frame, serr.Error()))
+		}
+
+		return serr
+	}
+
+	payload, merr := cdc.Marshal(env.Msg)
+	if merr != nil {
+		return tr.Send(ctx, rpcruntime.InternalStatusFrame(env.Frame, merr.Error()))
+	}
+
+	out := env.Frame
+	out.Payload = payload
+
+	return tr.Send(ctx, out)
 }
 
 // routeStreamFrame routes one inbound STREAM_* frame on the plugin accept side: a
@@ -1538,7 +1581,8 @@ func (h *heartbeatSender) awaitResume(ctx context.Context) bool {
 // serviceHandler adapts a registered styx service (ServiceDesc + impl) to the
 // internal/rpcruntime.ServiceHandler interface the Dispatcher calls: it maps
 // a method ID to its MethodDesc, decodes the request via the negotiated
-// codec, invokes the generated handler, and marshals the response.
+// codec, and invokes the generated handler. The response message is handed back
+// unencoded for the send path to marshal.
 type serviceHandler struct {
 	rs      registeredService
 	cdc     codec.Codec
@@ -1569,25 +1613,31 @@ func newServiceHandler(rs registeredService, cdc codec.Codec, panicPolicy *panic
 }
 
 // Handle resolves methodID, decodes payload, invokes the handler, and returns
-// the marshaled response. Every non-success outcome is surfaced as a
-// *rpcruntime.Status so the Dispatcher can frame it back to the client
-// rather than the call hanging:
+// the response message for the send path to encode. Every non-success outcome is
+// surfaced as a *rpcruntime.Status so the Dispatcher can frame it back to the
+// client rather than the call hanging:
 //
 //   - unknown method -> Status{StatusCodeMethodNotFound}, which the client
 //     reconstructs as ErrMethodNotFound.
 //   - a handler that returns a *styx.Status (application error) ->
 //     Status{that code/message/details}, preserved across the wire so the
 //     client's errors.As recovers the same *styx.Status.
-//   - any other handler error, or a codec failure -> Status{CodeInternal}.
+//   - any other handler error, including a request-decode failure the handler
+//     surfaced -> Status{CodeInternal}.
+//
+// Encoding the response is NOT done here: the response travels back as a message
+// so the serve loop can encode it straight into the transport's send buffer (see
+// sendUnaryResponse), which also owns the Status{CodeInternal} reply owed when
+// that encoding fails.
 func (h *serviceHandler) Handle(
 	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
-) ([]byte, *rpcruntime.Status, error) {
+) (rpcruntime.Response, *rpcruntime.Status, error) {
 	m, ok := h.methods[methodID]
 	if !ok {
 		// An unknown method runs no handler, so onHandlerEntry is deliberately not
 		// called here — the serve loop releases its admission read side itself for a
 		// refusal that reaches no handler.
-		return nil, &rpcruntime.Status{
+		return rpcruntime.Response{}, &rpcruntime.Status{
 			Code: rpcruntime.StatusCodeMethodNotFound,
 			Message: fmt.Sprintf("method %d not found in %q",
 				methodID, h.rs.desc.ServiceName),
@@ -1600,25 +1650,20 @@ func (h *serviceHandler) Handle(
 		// The handler panicked and the tight recover boundary caught it. Reply with
 		// the panic outcome so the call terminates as a plugin fault rather than
 		// vanishing, and let the panic policy taint-and-terminate (default) or
-		// continue serving. The panic never unwinds past this point, so the marshal
-		// below and every other runtime frame stay untouched.
+		// continue serving. The panic never unwinds past this point, so every other
+		// runtime frame stays untouched.
 		if h.panicPolicy == nil {
 			panic(recovered) // no serving session policy: preserve crash-on-panic.
 		}
 		h.panicPolicy.recordUnaryPanic()
 
-		return nil, panicStatus(recovered), nil
+		return rpcruntime.Response{}, panicStatus(recovered), nil
 	}
 	if err != nil {
-		return nil, statusFromHandlerErr(err), nil
+		return rpcruntime.Response{}, statusFromHandlerErr(err), nil
 	}
 
-	out, err := h.cdc.Marshal(resp)
-	if err != nil {
-		return nil, &rpcruntime.Status{Code: uint32(CodeInternal), Message: err.Error()}, nil
-	}
-
-	return out, nil, nil
+	return rpcruntime.Response{Msg: resp}, nil, nil
 }
 
 // invokeHandler calls the user handler under a recover boundary drawn tightly

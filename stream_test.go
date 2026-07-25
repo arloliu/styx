@@ -61,7 +61,7 @@ func startStreamPluginWithLeases(
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = runServeLoop(context.Background(), pluginTr, d, srv, nil, nil)
+		_ = runServeLoop(context.Background(), pluginTr, codec.Proto{}, d, srv, nil, nil)
 	}()
 	t.Cleanup(func() {
 		_ = pluginTr.Close()
@@ -1229,4 +1229,51 @@ func TestEmitOwedOpenTeardown_SecondCall_IsNoOpAndCloseCompletes(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close hung: EmitOwedOpenTeardown is not one-shot; a second call stranded a finisher")
 	}
+}
+
+// Test streaming frames never taking the payload-fill send path, on either side.
+// A stream carries bytes the caller already encoded (Stream.SendMsg takes a
+// []byte), so there is no message for a codec to size and no marshal to move into
+// the transport's buffer; the fill path is unary-only by construction, and this
+// pins that down against a transport that would happily accept a fill send.
+func TestStream_NeverTakesTheFillPath_ForStreamingFrames(t *testing.T) {
+	// Given a fill-capable transport on both ends of a streaming round trip.
+	clientInner, pluginInner := newStreamingTransportPairForTest(t)
+	clientTr := newFillCountingTransport(clientInner)
+	pluginTr := newFillCountingTransport(pluginInner)
+
+	const service, method = "echo.Echo", "Collect"
+	handlers := map[streamKey]streamHandlerReg{
+		{service: fnv64a(service), method: fnv64a(method)}: {handler: func(st *Stream) error {
+			got, rerr := st.RecvMsg(context.Background())
+			if rerr != nil {
+				return rerr
+			}
+			if _, eof := st.RecvMsg(context.Background()); !errors.Is(eof, io.EOF) {
+				return eof
+			}
+
+			return st.CloseSend(context.Background(), append([]byte("got:"), got...))
+		}},
+	}
+	startStreamPlugin(t, pluginTr, handlers)
+	cc := newClientConn("p", rpcruntime.NewTable(firstGeneration), clientTr, codec.Proto{})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	// When a full stream round trip runs: open, send, half-close, receive.
+	st, err := cc.OpenStream(ctx, service, method)
+	require.NoError(t, err)
+	require.NoError(t, st.SendMsg(ctx, []byte("hello")))
+	require.NoError(t, st.CloseSend(ctx, nil))
+	resp, err := st.RecvMsg(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []byte("got:hello"), resp)
+
+	// Then every frame either side emitted took the ordinary wire send.
+	require.Equal(t, int64(0), clientTr.fillSends.Load(), "the opener never fills")
+	require.Equal(t, int64(0), pluginTr.fillSends.Load(), "the stream handler never fills")
+	require.Positive(t, clientTr.wireSends.Load(), "the stream did send frames")
+	require.Positive(t, pluginTr.wireSends.Load())
 }

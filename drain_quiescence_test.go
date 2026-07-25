@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/transport"
 	"github.com/arloliu/styx/internal/transport/shm/shmtest"
@@ -218,7 +219,7 @@ func TestServeLoop_RetiresReservationOnEOF(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = runServeLoop(t.Context(), plugin, dispatcher, nil, nil, coord)
+		_ = runServeLoop(t.Context(), plugin, codec.Proto{}, dispatcher, nil, nil, coord)
 	}()
 
 	// Close the host end: the plugin reader's readiness peek commits on EOF (reserve
@@ -259,7 +260,7 @@ func TestServeLoop_WaitQuiescentCertifies_WhileReaderHeldAtBoundary(t *testing.T
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = runServeLoop(t.Context(), plugin, rpcruntime.NewDispatcher(), nil, nil, coord)
+		_ = runServeLoop(t.Context(), plugin, codec.Proto{}, rpcruntime.NewDispatcher(), nil, nil, coord)
 	}()
 	// Free a held reader before joining, or the join would deadlock on a reader parked in
 	// the seam rather than in the (closeable) peek.
@@ -396,7 +397,9 @@ func TestServeOneFrame_RetiresReservation_OnTransportErrorEdges(t *testing.T) {
 			require.NoError(t, err)
 
 			releaser := newAdmitReleaser(nil)
-			done, loopErr := serveOneFrame(t.Context(), plugin, rpcruntime.NewDispatcher(), nil, nil, releaser, coord)
+			done, loopErr := serveOneFrame(
+				t.Context(), plugin, codec.Proto{}, rpcruntime.NewDispatcher(), nil, nil, releaser, coord,
+			)
 
 			require.Equal(t, tc.wantDone, done)
 			require.Equal(t, tc.wantErr, loopErr != nil)

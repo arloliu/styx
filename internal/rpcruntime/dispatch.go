@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/arloliu/styx/internal/transport"
+	"google.golang.org/protobuf/proto"
 )
 
 // ServiceHandler resolves a method ID within one service to a callable handler
@@ -17,7 +18,7 @@ import (
 // the reverse). Status is a package-local sentinel for the same reason.
 type ServiceHandler interface {
 	// Handle dispatches a single method call by ID, returning either a
-	// successful response payload or a Status describing the failure.
+	// successful Response or a Status describing the failure.
 	// onHandlerEntry, when non-nil, is called exactly once at the top of the
 	// handler frame — immediately before the application handler runs, after
 	// method resolution and request-decode setup.
@@ -28,7 +29,37 @@ type ServiceHandler interface {
 	// serve loop releases its read side itself in that case.
 	Handle(
 		ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
-	) (respPayload []byte, status *Status, err error)
+	) (resp Response, status *Status, err error)
+}
+
+// Response is a unary handler's successful reply, in whichever form the handler
+// produced it. At most one field is set: Payload for a handler that encoded the
+// response itself, Msg for one that returns the response message and leaves
+// encoding to the send path. The zero Response is an empty payload.
+//
+// The Msg form exists so the send path can encode into a transport's own send
+// buffer instead of into a wire buffer the transport then copies; a handler that
+// already holds bytes (or has no proto message to hand back) uses Payload and
+// nothing changes for it.
+type Response struct {
+	Payload []byte
+	Msg     proto.Message
+}
+
+// ResponseEnvelope is one frame the dispatcher wants sent, together with the
+// response message when the payload bytes are still to be produced.
+//
+// The frame is embedded so an envelope reads as the frame it is (Kind, CallID,
+// Status), while Frame still names the whole frame for a caller handing it to a
+// Transport. Msg is non-nil only for a successful unary response whose handler
+// returned a message: the send path encodes it — directly into the transport's
+// send buffer where that is supported, otherwise through the codec into
+// Frame.Payload. Every other response (a status reply, whose body the transport
+// encodes from Frame.Status, or a handler that produced bytes itself) carries
+// its bytes in Frame and leaves Msg nil.
+type ResponseEnvelope struct {
+	transport.Frame
+	Msg proto.Message
 }
 
 // Dispatcher is the plugin-side handler dispatcher. It looks up and invokes
@@ -139,7 +170,7 @@ func (d *Dispatcher) CloseObligation(callID uint64) {
 // its admission read side at handler entry.
 func (d *Dispatcher) Dispatch(
 	ctx context.Context, f transport.Frame, recvAt time.Time, onHandlerEntry ...func(),
-) []transport.Frame {
+) []ResponseEnvelope {
 	var atHandlerEntry func()
 	if len(onHandlerEntry) > 0 {
 		atHandlerEntry = onHandlerEntry[0]
@@ -162,7 +193,7 @@ func (d *Dispatcher) Dispatch(
 // check, and response-frame construction.
 func (d *Dispatcher) dispatchUnary(
 	ctx context.Context, f transport.Frame, recvAt time.Time, onHandlerEntry func(),
-) []transport.Frame {
+) []ResponseEnvelope {
 	var deadline time.Time
 	if f.Budget > 0 {
 		deadline = Reanchor(f.Budget, recvAt)
@@ -178,7 +209,7 @@ func (d *Dispatcher) dispatchUnary(
 		// Unknown service: carry the classification back as a status frame so
 		// the client reconstructs ErrServiceNotFound instead of hanging until
 		// its deadline.
-		return []transport.Frame{statusFrame(f, &Status{
+		return []ResponseEnvelope{statusEnvelope(f, &Status{
 			Code: StatusCodeServiceNotFound, Message: "service not found",
 		})}
 	}
@@ -187,7 +218,7 @@ func (d *Dispatcher) dispatchUnary(
 	d.trackCall(f.CallID, cancel, recvAt)
 	defer d.untrackCall(f.CallID, cancel)
 
-	payload, status, err := h.Handle(callCtx, f.Method, f.Payload, onHandlerEntry)
+	resp, status, err := h.Handle(callCtx, f.Method, f.Payload, onHandlerEntry)
 
 	if !deadline.IsZero() && !time.Now().Before(deadline) {
 		return nil // budget elapsed during the handler: the plugin checks the budget again after the handler returns.
@@ -205,23 +236,43 @@ func (d *Dispatcher) dispatchUnary(
 		// framework-internal status so the call terminates at the client rather
 		// than hanging. Application errors and not-found classifications arrive
 		// as status, not err (see ServiceHandler's contract).
-		return []transport.Frame{statusFrame(f, &Status{
+		return []ResponseEnvelope{statusEnvelope(f, &Status{
 			Code: StatusCodeInternal, Message: err.Error(),
 		})}
 	}
 	if status != nil {
 		// Application error (or a not-found classification the ServiceHandler
 		// encoded as a status): carry it back as a status frame.
-		return []transport.Frame{statusFrame(f, status)}
+		return []ResponseEnvelope{statusEnvelope(f, status)}
 	}
 
-	return []transport.Frame{{
-		CallID:  f.CallID,
-		Kind:    transport.FrameUnaryResp,
-		Service: f.Service,
-		Method:  f.Method,
-		Payload: payload,
+	// The response message, when the handler returned one, is left unmarshaled:
+	// the send path owns encoding it, so a transport that can encode into its own
+	// send buffer never copies a finished wire buffer into place.
+	return []ResponseEnvelope{{
+		Frame: transport.Frame{
+			CallID:  f.CallID,
+			Kind:    transport.FrameUnaryResp,
+			Service: f.Service,
+			Method:  f.Method,
+			Payload: resp.Payload,
+		},
+		Msg: resp.Msg,
 	}}
+}
+
+// InternalStatusFrame builds the FrameUnaryErr reply carrying a
+// framework-internal status for the call f names. It is the reply a send path
+// owes when it cannot encode a response message: without it that call would hang
+// at the client until its deadline instead of terminating on the fault.
+func InternalStatusFrame(f transport.Frame, message string) transport.Frame {
+	return statusFrame(f, &Status{Code: StatusCodeInternal, Message: message})
+}
+
+// statusEnvelope wraps statusFrame's result: a status reply carries its body in
+// the frame and never a response message.
+func statusEnvelope(f transport.Frame, s *Status) ResponseEnvelope {
+	return ResponseEnvelope{Frame: statusFrame(f, s)}
 }
 
 // statusFrame builds the FrameUnaryErr response carrying s for request f — an
