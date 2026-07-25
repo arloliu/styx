@@ -57,7 +57,7 @@ func (g *GoPluginBaseline) Start() error {
 		HandshakeConfig: handshakeConfig,
 		Plugins:         goplugin.PluginSet{"ping": &pingGRPCPlugin{}},
 		// pluginBinPath is the benchmark suite's own helper binary (see NewGoPlugin), not
-		// externally supplied input; Start has no ctx param, matching every other baseline in this package.
+		// externally supplied input; Start has no ctx param.
 		//nolint:gosec,noctx // safe: binary is built and controlled by the benchmark suite
 		Cmd:              exec.Command(g.pluginBinPath),
 		AllowedProtocols: []goplugin.Protocol{goplugin.ProtocolGRPC},

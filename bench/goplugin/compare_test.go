@@ -78,6 +78,22 @@ func (s *styxBaseline) Stop() error {
 	return s.host.Stop(ctx)
 }
 
+// Call is not a clean transport-only comparison against the goplugin-fork
+// arm: echopb.SayRequest/SayResponse (the shared example proto every Styx
+// plugin author actually uses) declare Message as a protobuf string field,
+// not bytes, and Go has no zero-copy []byte<->string conversion without
+// unsafe. string(payload) below copies payload into a new string, and
+// []byte(resp.Message) copies it again on the way back -- two full
+// memcpy(payload-size) per call that pingpb.EchoRequest/EchoResponse (raw
+// bytes fields, used by the goplugin-fork arm) never pay. At the top payload
+// tier (~1 MiB) this is a real, non-negligible cost that this benchmark
+// attributes to "styx-shm"/"styx-uds" but that is actually an artifact of
+// which generated Go type each arm happens to call through. Changing
+// echopb's field type or reusing a preallocated request struct would not
+// remove the copies (the payload content varies per call in this harness,
+// unlike bench/rpc where it's fixed per subtest), so read the styx-shm/
+// styx-uds rows at the top payload tier with that in mind rather than as a
+// pure transport measurement.
 func (s *styxBaseline) Call(payload []byte) ([]byte, error) {
 	resp, err := s.client.Say(context.Background(), &echopb.SayRequest{Message: string(payload)})
 	if err != nil {
@@ -101,16 +117,13 @@ func buildEchoPlugin(b *testing.B) string {
 
 func buildGoPluginServer(b *testing.B) string {
 	b.Helper()
-	dir := b.TempDir()
-	out := filepath.Join(dir, "goplugin-ping-server")
-	cmd := exec.Command("go", "build", "-o", out, "github.com/arloliu/styx-bench-goplugin/cmd/goplugin-ping-server")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		b.Fatal(err)
+	bin := filepath.Join(b.TempDir(), "goplugin-ping-server")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/arloliu/styx-bench-goplugin/cmd/goplugin-ping-server")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		b.Fatalf("build goplugin-ping-server: %v\n%s", err, out)
 	}
 
-	return out
+	return bin
 }
 
 // BenchmarkCompare drives the go-plugin fork baseline against Styx's shm and

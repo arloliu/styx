@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package pingpb;
 
-option go_package = "github.com/arloliu/styx/bench/internal/benchbaseline/pingpb";
+option go_package = "github.com/arloliu/styx-bench-goplugin/internal/baseline/pingpb";
 
 service Ping {
   rpc Echo(EchoRequest) returns (EchoResponse);
