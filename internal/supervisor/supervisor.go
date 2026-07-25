@@ -177,8 +177,9 @@ type Instance struct {
 
 // ReadyHooks are the caller-supplied callbacks for tearing an Instance's routing
 // back down, returned from Config.OnReady.
-// They mirror exactly the three caller-specific fields of internal/lifecycle.Teardown
-// (StopAdmission, FailInFlight, JoinGoroutines).
+// Three of them mirror exactly the caller-specific fields of internal/lifecycle.Teardown
+// (StopAdmission, FailInFlight, JoinGoroutines); JoinResponses is not a teardown step
+// at all, but the hot-reload-only wait that must precede them.
 // Supervisor owns and supplies Teardown's other fields (Process, ControlConn,
 // Unmap, CloseFDs) itself.
 // Any nil hook defaults to a no-op.
@@ -186,6 +187,18 @@ type ReadyHooks struct {
 	StopAdmission  func()
 	FailInFlight   func(err error)
 	JoinGoroutines func()
+
+	// JoinResponses blocks until this instance has no answer outstanding — its
+	// transport reports nothing further readable and no call it dispatched is still
+	// awaiting an outcome — or until it gives up, bounded by the routing layer that
+	// supplies it. It returns how many calls were still awaiting an outcome when the
+	// wait ended.
+	// ONLY a hot-reload calls it, and only on the instance it is retiring: that peer
+	// has proven it answered every call it accepted, so the answers are already local
+	// and the wait is short. A crash, poison, or shutdown teardown has no such proof
+	// and no live peer, so it must never wait for answers that are not coming.
+	// nil (the default) reports zero without waiting.
+	JoinResponses func(ctx context.Context) int
 }
 
 // CrashInfo carries the detail behind an EventCrashed/EventGaveUp notification:
@@ -319,6 +332,16 @@ type Config struct {
 	// interval), so it MUST NOT block.
 	// nil (the default) disables it.
 	OnHeartbeatMiss func()
+
+	// OnReloadDropped is called once per hot-reload that reaped calls without their
+	// real outcome, with how many were lost.
+	// It is called only when that count is non-zero: a reload that delivers every
+	// accepted call's outcome — the normal path — reports nothing.
+	// It is an optional observability seam owned by this package (no styx dependency).
+	// Runs on the heartbeat loop goroutine, which drives the reload inline, so it
+	// MUST NOT block.
+	// nil (the default) disables it.
+	OnReloadDropped func(dropped int)
 
 	// OnRestart is called once at the authoritative restart-decision site.
 	// Called after a crash is classified restart-eligible and the restart budget

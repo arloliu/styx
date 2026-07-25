@@ -391,6 +391,24 @@ func (h *Host) heartbeatMissHook(name string) func() {
 	}
 }
 
+// reloadDroppedHook returns the supervisor's callback for calls a hot-reload
+// reaped without their real outcome, or nil when no sink is configured (so the
+// supervisor's own nil check skips it). The supervisor calls it only when a
+// reload actually dropped calls, so the counter records anomalies and stays
+// silent across the reloads that lose nothing. It runs on the heartbeat loop,
+// a cold path, and only submits — it never blocks.
+func (h *Host) reloadDroppedHook(name string) func(int) {
+	if h.metricsDisp == nil {
+		return nil
+	}
+
+	return func(dropped int) {
+		h.metricsDisp.Submit(func(s observe.MetricsSink) {
+			s.IncrCounter(observe.MetricReloadDropped, int64(dropped), observe.Label{Key: labelPlugin, Value: name})
+		})
+	}
+}
+
 // logEvent routes a supervisor lifecycle transition to the host logger — Styx's
 // structured internal-diagnostics seam — through the panic-isolated log
 // dispatcher, so a slow or panicking user Logger can neither stall the event

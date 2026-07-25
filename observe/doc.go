@@ -25,7 +25,8 @@
 //     the oldest event (counted); a panicking sink is recovered (counted); a
 //     slow sink can never stall supervision or the data plane.
 //   - Per-event submits only for low-rate events (restarts, heartbeat misses,
-//     timeouts, cancellations, backpressure transitions). High-rate throughput
+//     timeouts, cancellations, backpressure transitions, calls a hot-reload
+//     could not deliver an outcome for). High-rate throughput
 //     and depth signals (bytes moved, ring depth, arena utilization, wakeup
 //     rate) are counted by the transport itself and read by a cold periodic
 //     reporter goroutine as counter deltas or gauges, never submitted per event
@@ -34,12 +35,12 @@
 // # Live vs seam-only signals
 //
 // Which metrics carry real values depends on the active transport. Over the uds
-// transport the RPC latency, bytes-moved, timeout, cancellation, restart, and
-// heartbeat-miss signals are live. The shared-memory-only signals are sourced from
-// optional transport capabilities the periodic reporter samples, and the uds
-// transport omits those capabilities (it blocks rather than rejecting, and has no
-// ring, arena, or eventfd), so no value is reported over it and none is ever
-// fabricated:
+// transport the RPC latency, bytes-moved, timeout, cancellation, restart,
+// reload-dropped, and heartbeat-miss signals are live. The shared-memory-only
+// signals are sourced from optional transport capabilities the periodic reporter
+// samples, and the uds transport omits those capabilities (it blocks rather than
+// rejecting, and has no ring, arena, or eventfd), so no value is reported over it
+// and none is ever fabricated:
 //
 //   - Backpressure transitions read the shared-memory transport's edge counter.
 //     The transport implements the capability; its value is zero unless the writer

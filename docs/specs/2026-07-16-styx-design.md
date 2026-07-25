@@ -260,8 +260,20 @@ sequence. Phases, each with an explicit acknowledgement and deadline:
    the snapshot; the new plugin acknowledges successful restore and readiness.
 5. **Promote** — host atomically swaps the stable `ClientConn` routing target to the
    new instance (single linearization point; no call ever spans the snapshot boundary),
-   then terminates the old process via the normal teardown machine (including the
-   step-5 reap).
+   then joins the answers the old instance already produced, and only then terminates
+   it via the normal teardown machine (including the step-5 reap). The join is the
+   host's half of the phase-2 guarantee: drain-ack proves the plugin wrote every
+   accepted call's response to the transport, and this waits until the host's own
+   reader has consumed them and no call is still awaiting an outcome. Without it,
+   teardown fails calls that had in fact completed, reporting a non-retryable unknown
+   outcome for answers already sitting unread. The wait is bounded at one second — every
+   answer is already in local memory, so this covers a scheduling hiccup, not a network
+   — and it deliberately ignores the reload caller's cancellation, since by this point
+   the reload is committed and cancelling could only discard answers already in hand.
+   Anything still unanswered when the bound expires is at risk of being failed as
+   outcome-unknown, and that many are counted on `styx.reload.dropped.count` — an
+   upper bound on the loss rather than an exact count, since the reader keeps running
+   through the first teardown steps and may still resolve some of them.
 
 **Rollback is defined from every pre-promotion phase, and it reverses the freeze.**
 An abort during phase 1 (cutoff) is trivial: nothing is frozen and no successor exists,

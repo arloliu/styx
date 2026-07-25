@@ -57,6 +57,10 @@ type fakeReloadTarget struct {
 	// was torn down.
 	successorPromoted *atomic.Bool
 
+	// stragglers is what this instance's Teardown reports as still unanswered,
+	// standing in for a response join that gave up with answers unread.
+	stragglers int
+
 	drainSent            atomic.Bool
 	drainDeadlineNanos   atomic.Int64 // the absolute deadline the host transmitted in Drain
 	resumeReceived       atomic.Bool
@@ -131,13 +135,13 @@ func (f *fakeReloadTarget) Promote(context.Context) error {
 	return nil
 }
 
-func (f *fakeReloadTarget) Teardown(context.Context, time.Duration) error {
+func (f *fakeReloadTarget) Teardown(context.Context, time.Duration) (int, error) {
 	if f.successorPromoted != nil {
 		f.tornDownAfterPromote.Store(f.successorPromoted.Load())
 	}
 	f.tornDown.Store(true)
 
-	return nil
+	return f.stragglers, nil
 }
 
 // script is the plugin half of the exchange: it reads control messages until
@@ -782,6 +786,68 @@ func TestTransaction_PromoteSuccessorAndReapOldInstance_WhenEveryPhaseSucceeds(t
 	got := old.restoredChecksum.Load()
 	require.NotNil(t, got, "the host must acknowledge the snapshot with its own checksum")
 	require.Equal(t, want[:], *got)
+}
+
+// Test the transaction recording what the retired instance's teardown could not
+// deliver. Those calls are failed with an unknown outcome, so the count is the
+// only trace they leave; losing it here would make the loss invisible to the
+// layer that reports it.
+func TestTransaction_RecordStragglers_WhenRetiredInstanceLeavesAnswersUndelivered(t *testing.T) {
+	// Given: a retiring instance whose response join gives up with answers unread.
+	admission := &lifecycle.AdmissionGate{}
+	admission.Open()
+
+	old := newFakeReloadTarget(t, admission)
+	old.snapshotPayload = []byte("state")
+	old.stragglers = 4
+	old.start(t)
+
+	successor := newFakeReloadTarget(t, admission)
+	successor.isSuccessor = true
+	successor.start(t)
+	spawnNew := func(context.Context) (lifecycle.ReloadTarget, error) { return successor, nil }
+
+	tx := lifecycle.NewTransaction(old, spawnNew, shortDeadlines(), admission)
+
+	// When
+	_, err := tx.Run(t.Context())
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, 4, tx.Stragglers)
+}
+
+// Test a rolled-back transaction reporting no stragglers. Rollback runs strictly
+// before promote, so the successor it tears down never routed a call and cannot
+// have left an answer undelivered — a non-zero count here would claim a loss that
+// did not happen.
+func TestTransaction_ReportNoStragglers_WhenRolledBackBeforePromote(t *testing.T) {
+	// Given: a successor that refuses the snapshot, and would report stragglers if
+	// its teardown were ever asked for them.
+	admission := &lifecycle.AdmissionGate{}
+	admission.Open()
+
+	old := newFakeReloadTarget(t, admission)
+	old.snapshotPayload = []byte("state")
+	old.stragglers = 4
+	old.start(t)
+
+	successor := newFakeReloadTarget(t, admission)
+	successor.isSuccessor = true
+	successor.restoreNotReady = true
+	successor.restoreReason = "incompatible snapshot format"
+	successor.stragglers = 7
+	successor.start(t)
+	spawnNew := func(context.Context) (lifecycle.ReloadTarget, error) { return successor, nil }
+
+	tx := lifecycle.NewTransaction(old, spawnNew, shortDeadlines(), admission)
+
+	// When
+	_, err := tx.Run(t.Context())
+
+	// Then
+	require.Error(t, err)
+	require.Zero(t, tx.Stragglers, "a reload that never retired a serving instance lost nothing")
 }
 
 // Test transaction tearing the successor down and unfreezing the old instance when restore reports not ready

@@ -36,7 +36,9 @@ type reloadRequest struct {
 //
 // It returns ErrReloadUnavailable if this Supervisor cannot reload (no admission
 // gate was configured or the serving loop has stopped), and ctx's error if ctx is
-// done before the transaction completes.
+// done before the transaction commits. Cancellation aborts only a reload that has
+// not yet promoted; past that point the successor is already routing, there is
+// nothing left to abandon, and the transaction runs to completion and returns nil.
 func (s *Supervisor) Reload(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -157,6 +159,16 @@ func (s *Supervisor) runReload(lifeCtx, reqCtx context.Context, current **liveIn
 	tx := lifecycle.NewTransaction(reloadOld{li: old}, spawnNew, s.reloadDeadlines(), s.cfg.Admission)
 	promoted, err := tx.Run(reqCtx)
 
+	// Calls the retired instance had already answered but whose answers this host
+	// never read are the one way a reload loses work a caller cannot retry. The
+	// count is the set that was still at risk when the join gave up, an upper bound
+	// on what was actually lost. The normal path risks none, so reporting is
+	// conditional: the counter records anomalies rather than being pinned at zero by
+	// every healthy reload.
+	if tx.Stragglers > 0 && s.cfg.OnReloadDropped != nil {
+		s.cfg.OnReloadDropped(tx.Stragglers)
+	}
+
 	// A non-nil promoted means the successor is already routing (its promote
 	// ran), regardless of err: the transaction only returns a non-nil
 	// successor once it has been made the routing target. Adopt it as current
@@ -201,10 +213,21 @@ func (o reloadOld) Promote(context.Context) error {
 	panic("supervisor: reload transaction must not promote the outgoing instance")
 }
 
-func (o reloadOld) Teardown(ctx context.Context, deadline time.Duration) error {
+// Teardown joins this instance's outstanding answers before destroying it.
+// The routing layer's join is what turns the peer's drain-ack promise ("every
+// accepted call has been answered onto the transport") into a delivered outcome:
+// without it, teardown's fail-in-flight step destroys calls whose responses are
+// already sitting unread in this host's own inbound queue and reports them as
+// outcome-unknown. A nil hook (a caller with no data plane to join) reports zero.
+func (o reloadOld) Teardown(ctx context.Context, deadline time.Duration) (int, error) {
+	stragglers := 0
+	if o.li.hooks.JoinResponses != nil {
+		stragglers = o.li.hooks.JoinResponses(ctx)
+	}
+
 	_, err := o.li.teardown(ctx, deadline)
 
-	return err
+	return stragglers, err
 }
 
 // reloadSuccessor adapts a freshly spawned, not-yet-promoted instance as the
@@ -223,8 +246,13 @@ func (n *reloadSuccessor) Promote(context.Context) error {
 	return nil
 }
 
-func (n *reloadSuccessor) Teardown(ctx context.Context, deadline time.Duration) error {
+// Teardown destroys a successor the transaction is abandoning, and always reports
+// zero calls left unanswered.
+// That zero is a fact about this instance, not a placeholder: a successor is torn
+// down only from rollback, which runs strictly before promote, so nothing was ever
+// routed to it and it has no answer to wait for.
+func (n *reloadSuccessor) Teardown(ctx context.Context, deadline time.Duration) (int, error) {
 	_, err := n.li.teardown(ctx, deadline)
 
-	return err
+	return 0, err
 }

@@ -198,9 +198,15 @@ type InboundQueueProber interface {
 	// The snapshot is taken at the instant of the call. Transient errors are retried
 	// internally; persistent errors report true so the next Recv surfaces the real
 	// condition.
-	// ReadableNow is non-consuming and safe to call concurrently with a single reader's Recv.
-	// It may run on a different goroutine (e.g., the plugin's heartbeat) but must not
-	// run concurrently with a second ReadableNow or second reader.
+	// ReadableNow is non-consuming and safe to call concurrently with a single reader's
+	// Recv and with any number of other ReadableNow calls, from any goroutine — an
+	// implementation observes emptiness without taking anything out of the queue, so
+	// probes never contend for what only the reader may consume. A second concurrent
+	// READER is still forbidden; that is the transport's own single-consumer rule, not
+	// a restriction this probe adds.
+	// Several unrelated callers rely on this: the plugin's heartbeat assembly, the
+	// connection reader arming an owed stream-credit drain boundary, and a hot-reload
+	// confirming its retiring instance has no answer left unread.
 	ReadableNow() bool
 }
 
