@@ -182,6 +182,13 @@ func (crashyStreamServer) Chat(stream echopb.EchoStream_ChatServer) error {
 	}
 }
 
+// Blob echoes the payload back unchanged. None of the misbehavior modes above
+// apply here — they exist to exercise Say's crash-timing and status-framing
+// paths, which Blob does not need its own copy of.
+func (crashyServer) Blob(_ context.Context, req *echopb.BlobRequest) (*echopb.BlobResponse, error) {
+	return &echopb.BlobResponse{Payload: req.GetPayload()}, nil
+}
+
 func (failingRestorer) RestoreState(_ context.Context, _ uint32, _ []byte) error {
 	return errors.New("styx echo test: deliberate restore failure")
 }

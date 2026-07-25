@@ -4,6 +4,7 @@ option go_package = "github.com/arloliu/styx/examples/echo/echopb";
 
 service Echo {
   rpc Say (SayRequest) returns (SayResponse);
+  rpc Blob (BlobRequest) returns (BlobResponse);
 }
 
 // EchoStream exercises the three streaming shapes over the same messages, so the
@@ -17,3 +18,6 @@ service EchoStream {
 
 message SayRequest { string message = 1; }
 message SayResponse { string message = 1; }
+
+message BlobRequest { bytes payload = 1; }
+message BlobResponse { bytes payload = 1; }

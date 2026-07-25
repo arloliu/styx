@@ -140,6 +140,52 @@ func TestEcho_HandshakeAndUnaryRoundTrip_Succeeds(t *testing.T) {
 	require.Equal(t, "hello\n", string(stdout))
 }
 
+// blobTestPayload returns every byte value 0-255 followed by a run of bytes
+// that never form valid UTF-8 on their own. A []byte field surviving this
+// unchanged proves the payload traveled as bytes end to end; a field that
+// had been accidentally routed through a string conversion (the asymmetry
+// Blob exists to remove) would corrupt or reject it.
+func blobTestPayload() []byte {
+	extra := []byte{0x80, 0x81, 0xfe, 0xff, 0x80, 0x81}
+	payload := make([]byte, 0, 256+len(extra))
+	for i := range 256 {
+		payload = append(payload, byte(i))
+	}
+
+	return append(payload, extra...)
+}
+
+// Test the Blob RPC round-tripping a binary payload unchanged over both the
+// uds and shm transports, spawning the real echo plugin each time — the same
+// transport-parameterization the differential suite (differential_shm_test.go)
+// uses for Say, applied here to prove Blob's bytes field works end to end on
+// each transport individually.
+func TestEcho_Blob_RoundTripsBinaryPayload_OverBothTransports(t *testing.T) {
+	payload := blobTestPayload()
+
+	for _, transport := range []styx.Transport{styx.TransportUDS, styx.TransportSHM} {
+		t.Run(string(transport), func(t *testing.T) {
+			// Given
+			h := styx.NewHost(styx.HostConfig{
+				Plugins: []styx.PluginSpec{{Name: "echo", Path: echoPluginBin, Transport: transport}},
+			})
+			require.NoError(t, h.Start(t.Context()))
+			stopHostInCleanup(t, h)
+
+			client := echopb.NewEchoClient(h.Plugin("echo"))
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+
+			// When
+			resp, err := client.Blob(ctx, &echopb.BlobRequest{Payload: payload})
+
+			// Then
+			require.NoError(t, err)
+			require.Equal(t, payload, resp.GetPayload())
+		})
+	}
+}
+
 // Test host reporting a typed ErrIncompatible when the plugin's advertised
 // service version excludes the host's declared requirement. Uses the REAL
 // echo plugin (which always advertises echopb.EchoServiceVersion) against a
