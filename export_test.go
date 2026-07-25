@@ -69,26 +69,47 @@ func InProcessStreamPairForTest(s *PluginServer) (*ClientConn, func(), error) {
 	return cc, stop, nil
 }
 
+// SHMPairForTest is one in-process shared-memory host/plugin pair built by
+// InProcessSHMPairForTest: the client end, the plugin-side accounting a test
+// needs to assert against it, and the teardown. The three travel together so the
+// constructor stays inside revive's function-result limit and so a caller cannot
+// hold the conn without the stop that releases the region behind it.
+type SHMPairForTest struct {
+	Conn *ClientConn
+	// OpenObligations reports how many unary responses the plugin serve loop
+	// still owes. It is the accounting that goes wrong when a response send is
+	// misclassified as a dead connection: the serve loop skips the obligation
+	// close and the instance is dispatch-wedged by its own bookkeeping while
+	// still heartbeating.
+	OpenObligations func() int
+	// ServeLoopExited reports whether the plugin serve loop has stopped, so a
+	// test can assert that a per-call fault did NOT take the session down.
+	ServeLoopExited func() bool
+	Stop            func()
+}
+
 // InProcessSHMPairForTest wires a *ClientConn (client end) to s's registered
 // unary services (plugin end) over an in-process shared-memory transport pair,
-// both ends using cdc, and returns the client conn plus a stop func. It is the
-// shared-memory counterpart of InProcessStreamPairForTest, and exists because
-// the payload-fill send path only engages on a transport with a send buffer of
-// its own — which uds does not have — so a test proving the round trip and its
-// allocation profile has to run over the real shm transport, driving GENERATED
-// client stubs against a GENERATED server registration. cdc is a parameter so a
-// test can also run the identical round trip through a codec with no
-// sized-marshal support and compare the two.
+// both ends using cdc. It is the shared-memory counterpart of
+// InProcessStreamPairForTest, and exists because the payload-fill send path only
+// engages on a transport with a send buffer of its own — which uds does not
+// have — so a test of that path's round trip, allocation profile, or failure
+// handling has to run over the real shm transport, driving GENERATED client stubs
+// against a GENERATED server registration. cdc is a parameter so a test can run
+// the identical round trip through a codec with no sized-marshal support, or
+// through a deliberately faulty one, and compare.
 //
-// stop closes both ends and the region, and joins the serve loop, in the order
+// Stop closes both ends and the region, and joins the serve loop, in the order
 // runServing's own teardown uses.
-func InProcessSHMPairForTest(s *PluginServer, cdc codec.Codec) (*ClientConn, func(), error) {
+func InProcessSHMPairForTest(s *PluginServer, cdc codec.Codec) (SHMPairForTest, error) {
 	pair, err := shmtest.NewInProcessPair(firstGeneration, shmtest.DefaultConfig())
 	if err != nil {
-		return nil, nil, err
+		return SHMPairForTest{}, err
 	}
 
+	leases := rpcruntime.NewLeaseTable()
 	dispatcher := rpcruntime.NewDispatcher()
+	dispatcher.SetLeaseTable(leases)
 	s.mu.Lock()
 	for _, rs := range s.services {
 		dispatcher.Register(rs.desc.ServiceID, newServiceHandler(rs, cdc, nil))
@@ -101,15 +122,25 @@ func InProcessSHMPairForTest(s *PluginServer, cdc codec.Codec) (*ClientConn, fun
 		_ = runServeLoop(context.Background(), pair.Plugin, cdc, dispatcher, nil, nil, nil)
 	}()
 
-	cc := newClientConn("p", rpcruntime.NewTable(firstGeneration), pair.Host, cdc)
-
-	stop := func() {
-		_ = pair.Plugin.Close()
-		<-done
-		_ = pair.Close()
+	exited := func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
 	}
 
-	return cc, stop, nil
+	return SHMPairForTest{
+		Conn:            newClientConn("p", rpcruntime.NewTable(firstGeneration), pair.Host, cdc),
+		OpenObligations: leases.OpenObligationCount,
+		ServeLoopExited: exited,
+		Stop: func() {
+			_ = pair.Plugin.Close()
+			<-done
+			_ = pair.Close()
+		},
+	}, nil
 }
 
 // HeartbeatIntervalEnv re-exports heartbeatIntervalEnv so pluginserver_test

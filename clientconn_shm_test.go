@@ -9,6 +9,7 @@ import (
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/examples/echo/echopb"
+	"github.com/arloliu/styx/internal/transport"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -42,18 +43,25 @@ func (c unsizedCodec) Unmarshal(data []byte, m proto.Message) error {
 	return c.inner.Unmarshal(data, m)
 }
 
-// newBlobClient wires a generated Echo client to a generated Echo server over an
+// newBlobPair wires a generated Echo client to a generated Echo server over an
 // in-process shared-memory pair using cdc on both ends.
-func newBlobClient(t *testing.T, cdc codec.Codec) echopb.EchoClient {
+func newBlobPair(t *testing.T, cdc codec.Codec) styx.SHMPairForTest {
 	t.Helper()
 
 	srv := styx.NewPluginServer(styx.PluginServerConfig{})
 	echopb.RegisterEchoServer(srv, blobEcho{})
-	cc, stop, err := styx.InProcessSHMPairForTest(srv, cdc)
+	pair, err := styx.InProcessSHMPairForTest(srv, cdc)
 	require.NoError(t, err)
-	t.Cleanup(stop)
+	t.Cleanup(pair.Stop)
 
-	return echopb.NewEchoClient(cc)
+	return pair
+}
+
+// newBlobClient is newBlobPair for a test that needs only the client end.
+func newBlobClient(t *testing.T, cdc codec.Codec) echopb.EchoClient {
+	t.Helper()
+
+	return echopb.NewEchoClient(newBlobPair(t, cdc).Conn)
 }
 
 // blobRoundTripBytes reports the bytes the whole process allocated per Blob round
@@ -151,4 +159,127 @@ func TestClientConn_Invoke_RoundTripsBlob_OverSharedMemory(t *testing.T) {
 			require.Equal(t, payload, resp.GetPayload())
 		}
 	}
+}
+
+// faultMarker is the first payload byte that makes the faulty codecs below fault
+// on that one message. Marking by content rather than by construction lets a
+// single connection carry both a faulting call and healthy ones, which is what
+// makes "the session survived" assertable rather than assumed.
+const faultMarker = 0xFE
+
+func faulted(payload []byte) bool { return len(payload) > 0 && payload[0] == faultMarker }
+
+// markedPayload returns a payload the faulty codecs fault on.
+func markedPayload(n int) []byte {
+	p := make([]byte, n)
+	p[0] = faultMarker
+
+	return p
+}
+
+// panicOnResponseCodec panics inside the sized marshal of a marked BlobResponse —
+// a codec bug on the PLUGIN's response encode, which on the shared-memory path
+// runs on the transport's writer goroutine. Requests and unmarked messages take
+// the ordinary path.
+type panicOnResponseCodec struct{ codec.Proto }
+
+func (c panicOnResponseCodec) MarshalTo(m proto.Message, dst []byte) (int, error) {
+	if resp, ok := m.(*echopb.BlobResponse); ok && faulted(resp.GetPayload()) {
+		panic("codec boom: response marshal panicked")
+	}
+
+	return c.Proto.MarshalTo(m, dst)
+}
+
+// shortOnRequestCodec reports one byte fewer than it wrote for a marked
+// BlobRequest — a codec bug on the HOST's request encode, and the disagreement
+// between the declared size and the reported count that the fill callback's own
+// check exists to catch.
+type shortOnRequestCodec struct{ codec.Proto }
+
+func (c shortOnRequestCodec) MarshalTo(m proto.Message, dst []byte) (int, error) {
+	n, err := c.Proto.MarshalTo(m, dst)
+	if err != nil {
+		return 0, err
+	}
+	if req, ok := m.(*echopb.BlobRequest); ok && faulted(req.GetPayload()) {
+		return n - 1, nil
+	}
+
+	return n, nil
+}
+
+// Test a codec that panics while encoding a response into the shared-memory
+// transport's send buffer costing exactly one call.
+//
+// The panic runs on the transport's writer goroutine, which recovers it and
+// reports it as a fill-callback failure. If the serve loop read that as an
+// ordinary send failure it would take the peer-close branch: no status frame, so
+// this caller would wait out its whole deadline (and forever without one); the
+// response obligation never closed, so the instance would be dispatch-wedged by
+// its own accounting; and the serve loop would exit while the control plane kept
+// heartbeating over a dead data plane.
+func TestPluginServe_SurvivesAPanickingResponseCodec_OverSharedMemory(t *testing.T) {
+	// Given a plugin whose codec panics on one marked message.
+	pair := newBlobPair(t, panicOnResponseCodec{})
+	client := echopb.NewEchoClient(pair.Conn)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	// When the marked call runs.
+	resp, err := client.Blob(ctx, &echopb.BlobRequest{Payload: markedPayload(1024)})
+
+	// Then the caller terminates on a framework-internal status instead of waiting
+	// out its deadline...
+	require.Error(t, err)
+	require.Nil(t, resp)
+	var status *styx.Status
+	require.ErrorAs(t, err, &status)
+	require.Equal(t, styx.CodeInternal, status.Code)
+	require.Contains(t, status.Message, "panicked")
+
+	// ...the plugin is still serving, with no obligation left owed...
+	require.False(t, pair.ServeLoopExited(), "one bad message must not stop the serve loop")
+	require.Zero(t, pair.OpenObligations(), "the faulted call's response obligation must be closed")
+
+	// ...and the next call on the same connection completes normally.
+	ok, err := client.Blob(ctx, &echopb.BlobRequest{Payload: []byte("healthy")})
+	require.NoError(t, err)
+	require.Equal(t, []byte("healthy"), ok.GetPayload())
+	require.Zero(t, pair.OpenObligations())
+}
+
+// Test a codec that under-reports what it wrote into the shared-memory
+// transport's send buffer failing that one request, over the real transport.
+//
+// This is the end-to-end check that the fill-failure class survives every hop
+// between the writer's recover boundary and the invoke path — the writer's
+// report, the intent's completion channel, and SendPayloadFill's return. The
+// per-call-versus-per-session branch on both sides rests entirely on that chain,
+// and a test double cannot exercise it.
+func TestClientConn_Invoke_FailsOneCall_WhenTheRequestCodecUnderReports_OverSharedMemory(t *testing.T) {
+	// Given a host whose codec under-reports on one marked message.
+	pair := newBlobPair(t, shortOnRequestCodec{})
+	client := echopb.NewEchoClient(pair.Conn)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	// When the marked call runs.
+	resp, err := client.Blob(ctx, &echopb.BlobRequest{Payload: markedPayload(1024)})
+
+	// Then the caller sees the encode failure — not an unknown outcome, because
+	// the transport demonstrably discarded the frame — and no residue was
+	// published under a valid checksum.
+	require.Error(t, err)
+	require.Nil(t, resp)
+	require.ErrorIs(t, err, transport.ErrPayloadFillFailed)
+	require.NotErrorIs(t, err, styx.ErrOutcomeUnknown)
+	require.ErrorContains(t, err, "styx: invoke: marshal request")
+
+	// ...and the connection is unharmed: the next call completes normally.
+	require.False(t, pair.ServeLoopExited())
+	ok, err := client.Blob(ctx, &echopb.BlobRequest{Payload: []byte("healthy")})
+	require.NoError(t, err)
+	require.Equal(t, []byte("healthy"), ok.GetPayload())
+	require.Zero(t, pair.OpenObligations())
 }

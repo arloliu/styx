@@ -28,7 +28,14 @@ import (
 // explicit opt-in, safe only if every handler guarantees its own isolation,
 // since process state after a panic is whatever the handler left behind.
 // A panic in the Styx runtime itself (outside handler frames) is never recovered
-// under either setting.
+// under either setting, with one documented exception: a codec that panics while
+// encoding a response into the transport's own send buffer runs on the
+// transport's writer goroutine, which recovers it so a caller's bug cannot take
+// the transport down. That panic terminates its own call with an internal status
+// and the plugin keeps serving; it does not taint the session or reach this
+// policy at all. Encoding the same response into a wire buffer first — every uds
+// connection, and any message the codec cannot size — runs the codec on the serve
+// goroutine, where a panic crashes the process as the rule says.
 
 // panicController carries one serving session's handler-panic policy and the
 // termination signal its two dispatch paths raise. The unary and streaming paths

@@ -9,16 +9,15 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// errPayloadFill marks an error raised by the marshal callback a transport runs
-// to produce a frame's payload, as opposed to a failure of the transport around
-// it. A send path uses the distinction to tell "this one message could not be
-// encoded" — which costs one call — from "the connection is gone", which costs
-// the session.
-var errPayloadFill = errors.New("styx: payload fill failed")
-
 // errShortSizedMarshal is returned by the payload-fill callback when the codec
 // reports writing a different number of bytes than the size it was asked for.
 // See newPayloadFillFunc for why that has to be caught here and nowhere else.
+//
+// Classifying a fill failure is NOT this sentinel's job and never should be: the
+// transport wraps everything a callback raises — a returned error and a recovered
+// panic alike — in transport.ErrPayloadFillFailed, and that is the class a send
+// path branches on. A sentinel only the returned-error form carries would silently
+// miss the panic form.
 var errShortSizedMarshal = errors.New("styx: sized marshal wrote a different byte count than its declared size")
 
 // payloadFiller is a resolved fill-mode send: the transport that will run the
@@ -75,10 +74,10 @@ func newPayloadFillFunc(sm codec.SizedMarshaler, m proto.Message, size int) func
 	return func(dst []byte) error {
 		n, err := sm.MarshalTo(m, dst)
 		if err != nil {
-			return fmt.Errorf("%w: %w", errPayloadFill, err)
+			return fmt.Errorf("styx: marshal into the transport send buffer: %w", err)
 		}
 		if n != size {
-			return fmt.Errorf("%w: %w: wrote %d of %d bytes", errPayloadFill, errShortSizedMarshal, n, size)
+			return fmt.Errorf("%w: wrote %d of %d bytes", errShortSizedMarshal, n, size)
 		}
 
 		return nil
