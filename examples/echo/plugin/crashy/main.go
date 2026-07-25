@@ -126,6 +126,13 @@ func (s crashyServer) Say(_ context.Context, req *echopb.SayRequest) (*echopb.Sa
 	return &echopb.SayResponse{Message: msg}, nil
 }
 
+// Blob echoes the payload back unchanged. None of the misbehavior modes above
+// apply here — they exist to exercise Say's crash-timing and status-framing
+// paths, which Blob does not need its own copy of.
+func (crashyServer) Blob(_ context.Context, req *echopb.BlobRequest) (*echopb.BlobResponse, error) {
+	return &echopb.BlobResponse{Payload: req.GetPayload()}, nil
+}
+
 func (crashyStreamServer) Collect(stream echopb.EchoStream_CollectServer) error {
 	var all string
 	for {
@@ -180,13 +187,6 @@ func (crashyStreamServer) Chat(stream echopb.EchoStream_ChatServer) error {
 			return err
 		}
 	}
-}
-
-// Blob echoes the payload back unchanged. None of the misbehavior modes above
-// apply here — they exist to exercise Say's crash-timing and status-framing
-// paths, which Blob does not need its own copy of.
-func (crashyServer) Blob(_ context.Context, req *echopb.BlobRequest) (*echopb.BlobResponse, error) {
-	return &echopb.BlobResponse{Payload: req.GetPayload()}, nil
 }
 
 func (failingRestorer) RestoreState(_ context.Context, _ uint32, _ []byte) error {

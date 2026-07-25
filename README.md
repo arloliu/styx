@@ -18,10 +18,14 @@ package echo;
 
 service Echo {
   rpc Say(SayRequest) returns (SayResponse);
+  rpc Blob(BlobRequest) returns (BlobResponse);
 }
 
 message SayRequest { string message = 1; }
 message SayResponse { string message = 1; }
+
+message BlobRequest { bytes payload = 1; }
+message BlobResponse { bytes payload = 1; }
 ```
 
 Generate client and server stubs:
@@ -47,6 +51,13 @@ type echoServer struct{}
 
 func (echoServer) Say(ctx context.Context, req *echopb.SayRequest) (*echopb.SayResponse, error) {
 	return &echopb.SayResponse{Message: req.GetMessage()}, nil
+}
+
+// Blob echoes the payload back unchanged. Unlike Say's string field, bytes
+// avoids the extra []byte<->string conversion on both sides of the call, so
+// this is the representative shape for bulk binary payloads.
+func (echoServer) Blob(ctx context.Context, req *echopb.BlobRequest) (*echopb.BlobResponse, error) {
+	return &echopb.BlobResponse{Payload: req.GetPayload()}, nil
 }
 
 func main() {
