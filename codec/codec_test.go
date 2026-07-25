@@ -564,6 +564,184 @@ type reflectionOnly struct{ m *testpb.Everything }
 
 func (r reflectionOnly) ProtoReflect() protoreflect.Message { return r.m.ProtoReflect() }
 
+// Test Size returning the same numeric value as len(MarshalVT()) across an
+// empty-payload message, a populated message, and a nil message — the nil
+// case is expected to also report false, per the typed-nil guard below.
+func TestProtoCodec_Size_MatchesMarshalVTLength(t *testing.T) {
+	tests := []struct {
+		name   string
+		msg    *echopb.SayRequest
+		wantOK bool
+	}{
+		{name: "empty_payload", msg: &echopb.SayRequest{}, wantOK: true},
+		{name: "populated", msg: &echopb.SayRequest{Message: "hello world"}, wantOK: true},
+		{name: "nil_message", msg: nil, wantOK: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			want, err := tc.msg.MarshalVT()
+			require.NoError(t, err)
+
+			// When
+			size, ok := codec.Proto{}.Size(tc.msg)
+
+			// Then
+			require.Equal(t, tc.wantOK, ok)
+			require.Equal(t, len(want), size)
+		})
+	}
+}
+
+// Test Size reporting false for a message with no vtproto sized-marshal
+// support, so the caller falls back to Marshal instead of trusting a bogus size.
+func TestProtoCodec_Size_ReturnsFalse_WhenUnsupported(t *testing.T) {
+	// Given: a well-known-types message, generated without vtproto support.
+	msg := wrapperspb.String("no vtproto support")
+
+	// When
+	size, ok := codec.Proto{}.Size(msg)
+
+	// Then
+	require.False(t, ok)
+	require.Zero(t, size)
+}
+
+// Test MarshalTo producing bytes identical to MarshalVT for the same
+// message, across an empty-payload message and a populated one.
+func TestProtoCodec_MarshalTo_MatchesMarshalVTBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  *echopb.SayRequest
+	}{
+		{name: "empty_payload", msg: &echopb.SayRequest{}},
+		{name: "populated", msg: &echopb.SayRequest{Message: "hello world"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			want, err := tc.msg.MarshalVT()
+			require.NoError(t, err)
+			size, ok := codec.Proto{}.Size(tc.msg)
+			require.True(t, ok)
+			require.Equal(t, len(want), size)
+			dst := make([]byte, size)
+
+			// When
+			n, err := codec.Proto{}.MarshalTo(tc.msg, dst)
+
+			// Then
+			require.NoError(t, err)
+			require.Equal(t, size, n)
+			require.True(t, bytes.Equal(want, dst), "MarshalTo bytes must match MarshalVT bytes")
+		})
+	}
+}
+
+// Test MarshalTo rejecting a dst one byte larger than the reported size,
+// rather than filling it back-to-front and leaving the leading byte as
+// whatever dst already held.
+func TestProtoCodec_MarshalTo_ReturnsError_WhenDstOversized(t *testing.T) {
+	// Given
+	msg := &echopb.SayRequest{Message: "hello world"}
+	size, ok := codec.Proto{}.Size(msg)
+	require.True(t, ok)
+	dst := make([]byte, size+1)
+
+	// When
+	n, err := codec.Proto{}.MarshalTo(msg, dst)
+
+	// Then
+	require.ErrorIs(t, err, codec.ErrMarshalToSizeMismatch)
+	require.Zero(t, n)
+}
+
+// Test MarshalTo rejecting a dst one byte smaller than the reported size.
+func TestProtoCodec_MarshalTo_ReturnsError_WhenDstUndersized(t *testing.T) {
+	// Given
+	msg := &echopb.SayRequest{Message: "hello world"}
+	size, ok := codec.Proto{}.Size(msg)
+	require.True(t, ok)
+	require.Positive(t, size)
+	dst := make([]byte, size-1)
+
+	// When
+	n, err := codec.Proto{}.MarshalTo(msg, dst)
+
+	// Then
+	require.ErrorIs(t, err, codec.ErrMarshalToSizeMismatch)
+	require.Zero(t, n)
+}
+
+// Test MarshalTo returning ErrSizedMarshalUnsupported for a message with no
+// vtproto sized-marshal support, instead of silently writing wrong bytes.
+// Reaching MarshalTo on such a message means the caller skipped the
+// documented Size check; the error makes that caller bug loud.
+func TestProtoCodec_MarshalTo_ReturnsError_WhenUnsupported(t *testing.T) {
+	// Given
+	msg := wrapperspb.String("no vtproto support")
+	dst := make([]byte, 0)
+
+	// When
+	n, err := codec.Proto{}.MarshalTo(msg, dst)
+
+	// Then
+	require.ErrorIs(t, err, codec.ErrSizedMarshalUnsupported)
+	require.Zero(t, n)
+}
+
+// Test MarshalTo returning ErrSizedMarshalUnsupported for a nil message,
+// applying the same typed-nil guard Size uses rather than dereferencing a
+// nil receiver through the vtproto fast path.
+func TestProtoCodec_MarshalTo_ReturnsError_WhenMessageNil(t *testing.T) {
+	// Given
+	var msg *echopb.SayRequest
+
+	// When
+	n, err := codec.Proto{}.MarshalTo(msg, nil)
+
+	// Then
+	require.ErrorIs(t, err, codec.ErrSizedMarshalUnsupported)
+	require.Zero(t, n)
+}
+
+// negativeSizeVT wraps a valid message but reports a negative SizeVT, standing
+// in for a broken vtproto implementation. The wire format has no
+// negative-length concept, so a negative SizeVT must never reach a caller as
+// an allocation size.
+type negativeSizeVT struct {
+	*echopb.SayRequest
+}
+
+func (negativeSizeVT) SizeVT() int { return -1 }
+
+// Test Size returning false when SizeVT reports a negative size.
+func TestProtoCodec_Size_ReturnsFalse_WhenSizeVTNegative(t *testing.T) {
+	// Given
+	spy := negativeSizeVT{SayRequest: &echopb.SayRequest{Message: "x"}}
+
+	// When
+	size, ok := codec.Proto{}.Size(spy)
+
+	// Then
+	require.False(t, ok)
+	require.Zero(t, size)
+}
+
+// Test MarshalTo returning ErrSizedMarshalUnsupported, matching Size's
+// guard, when SizeVT reports a negative size.
+func TestProtoCodec_MarshalTo_ReturnsError_WhenSizeVTNegative(t *testing.T) {
+	// Given
+	spy := negativeSizeVT{SayRequest: &echopb.SayRequest{Message: "x"}}
+
+	// When
+	n, err := codec.Proto{}.MarshalTo(spy, nil)
+
+	// Then
+	require.ErrorIs(t, err, codec.ErrSizedMarshalUnsupported)
+	require.Zero(t, n)
+}
+
 // BenchmarkProtoCodec is the causal A/B: only codec dispatch differs between the
 // vt and reflect cells at each payload size.
 func BenchmarkProtoCodec(b *testing.B) {
