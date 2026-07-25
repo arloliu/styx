@@ -14,7 +14,7 @@
 - `github.com/arloliu/go-plugin` is pinned at `v1.9.0` (latest on the module proxy at plan time; API-identical to `hashicorp/go-plugin` at the symbols this code uses: `Client`, `ClientConfig`, `HandshakeConfig`, `Plugin`, `PluginSet`, `Protocol`, `ProtocolGRPC`, `ServeConfig`, `Serve`, `DefaultGRPCServer`, `GRPCBroker`).
 - After this plan, `hashicorp/go-plugin` must not appear anywhere in root `go.mod`/`go.sum`.
 - The new module never imports anything under `github.com/arloliu/styx/internal/...` — only `github.com/arloliu/styx` (public) and `github.com/arloliu/styx/examples/echo/echopb` (public example package).
-- Payload matrix: `{64, 4096, 1048576}` bytes. Concurrency levels: `{1, 8, 64, 512}`. Both match the existing full-matrix convention in `bench/spike/spike_bench_test.go` and `bench/shm/bench_test.go`.
+- Payload matrix: `{64, 4096, 1048512}` bytes — the top tier is 64 bytes short of the canonical `1048576` (1 MiB) so the echopb-wrapped styx-shm/styx-uds arms stay under `transport.MaxFrameSize` (hard-coded at exactly `1048576`, not configurable); see Task 3's `payloadSizes` doc comment. Concurrency levels: `{1, 8, 64, 512}`. Both otherwise match the existing full-matrix convention in `bench/spike/spike_bench_test.go` and `bench/shm/bench_test.go`.
 - `bench/internal/benchbaseline/pingpb` stays in the root module — `grpc_uds.go` and `grpc_tcp.go` still depend on it. Only `goplugin.go` and `cmd/goplugin-ping-server/` move out; `pingpb` is copied (not moved) into the new module since the new module can't import the root module's `internal/` package.
 - No change to `bench/baselines/shm-baseline.json` or the `bench-compare` regression gate — this comparison is descriptive, not gating.
 
@@ -577,7 +577,15 @@ import (
 	"github.com/arloliu/styx-bench-goplugin/internal/latency"
 )
 
-var payloadSizes = []int{64, 4096, 1048576}
+// The largest tier is short of the canonical 1048576 (1 MiB) by 64 bytes:
+// styx-shm/styx-uds send this payload wrapped in an echopb.SayRequest, whose
+// protobuf envelope (field tag + varint length prefix) adds a few bytes of
+// overhead on top of the raw payload -- a full 1048576-byte payload would
+// exceed transport.MaxFrameSize (also 1048576, hard-coded and not
+// configurable via the public API). 64 bytes of headroom keeps all three
+// arms on the same payload tier without cutting the margin to the exact
+// observed 4-byte overhead.
+var payloadSizes = []int{64, 4096, 1048512}
 var concurrencyLevels = []int{1, 8, 64, 512}
 
 // compareBaseline is the uniform shape BenchmarkCompare drives every
