@@ -3,6 +3,7 @@ package styx
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -219,14 +220,37 @@ func TestClientConn_Invoke_ReturnsErrCanceled_ForCanceledContext(t *testing.T) {
 // ends, then reports the context error without ever running the callback — the
 // disposition a real writer produces when a cancelling caller wins the
 // abandonment handshake against a writer queue that has not reached the intent.
-// It records whether a callback ever ran, so a test can assert the request was
-// never encoded, not merely never delivered.
+// It counts callback runs, so a test can assert the request was never encoded,
+// not merely never delivered.
 type heldFillTransport struct {
 	entered  chan struct{}
 	fillRuns atomic.Int64
 	sends    atomic.Int64
 	closed   chan struct{}
 	clOnce   sync.Once
+}
+
+// runFill counts and invokes the callback under the recover boundary the
+// shared-memory writer draws around caller-supplied code, and wraps whichever
+// failure form comes back in the class transport.PayloadFillSender specifies. The
+// doubles share it so a test can never pass against a double that reports a
+// callback fault as a bare transport error.
+func (t *heldFillTransport) runFill(fill func(dst []byte) error, dst []byte) error {
+	t.fillRuns.Add(1)
+	err := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("payload fill panicked: %v", r)
+			}
+		}()
+
+		return fill(dst)
+	}()
+	if err != nil {
+		return fmt.Errorf("%w: %w", transport.ErrPayloadFillFailed, err)
+	}
+
+	return nil
 }
 
 func newHeldFillTransport() *heldFillTransport {
@@ -267,9 +291,9 @@ func (t *heldFillTransport) SendPayloadFill(
 	return ctx.Err()
 }
 
-// failingFillTransport runs the fill callback and reports its error verbatim,
-// modeling the shared-memory writer's own disposition for a callback that fails:
-// the slab is freed and the frame is discarded unpublished.
+// failingFillTransport runs the fill callback and reports its failure the way the
+// shared-memory writer does — wrapped in transport.ErrPayloadFillFailed, with the
+// slab freed and the frame discarded unpublished.
 type failingFillTransport struct {
 	heldFillTransport
 	fillErr atomic.Pointer[error]
@@ -278,7 +302,7 @@ type failingFillTransport struct {
 func (t *failingFillTransport) SendPayloadFill(
 	_ context.Context, _ transport.Frame, size int, fill func(dst []byte) error,
 ) error {
-	err := fill(make([]byte, size))
+	err := t.runFill(fill, make([]byte, size))
 	t.fillErr.Store(&err)
 
 	return err
@@ -408,8 +432,9 @@ func TestClientConn_Invoke_ReportsDeadline_WhenTheFillSendIsAbandonedByDeadline(
 }
 
 // Test a fill callback that under-writes its window failing the send rather than
-// publishing residue: the request never reaches the peer, and the caller learns
-// the outcome is unknown instead of receiving a silently corrupt reply.
+// publishing residue, and the caller learning it as the encode failure it is. The
+// frame is provably discarded, so reporting it as an unknown outcome would tell
+// the caller the handler may have run when it demonstrably did not.
 func TestClientConn_Invoke_FailsTheSend_WhenTheFillCallbackWritesShort(t *testing.T) {
 	// Given a codec that leaves the last byte of the fill window unwritten.
 	tr := &failingFillTransport{heldFillTransport: *newHeldFillTransport()}
@@ -421,8 +446,14 @@ func TestClientConn_Invoke_FailsTheSend_WhenTheFillCallbackWritesShort(t *testin
 	// When
 	err := cc.Invoke(ctx, "test.Echo", "Say", wrapperspb.String("hello"), &wrapperspb.StringValue{})
 
-	// Then the send failed on the byte-count check and nothing was published.
-	require.ErrorIs(t, err, ErrOutcomeUnknown)
-	require.ErrorIs(t, *tr.fillErr.Load(), errShortSizedMarshal)
+	// Then the send failed on the byte-count check, nothing was published, and the
+	// caller sees the encode failure the marshal-then-send path would have reported
+	// for the same fault — not an unknown outcome.
+	require.ErrorIs(t, err, errShortSizedMarshal)
+	require.ErrorIs(t, err, transport.ErrPayloadFillFailed)
+	require.NotErrorIs(t, err, ErrOutcomeUnknown)
+	require.ErrorContains(t, err, "styx: invoke: marshal request")
+	require.Equal(t, int64(1), tr.fillRuns.Load(), "the callback ran exactly once")
 	require.Equal(t, int64(0), tr.sends.Load())
+	require.False(t, table.Cancel(1), "the call table entry must be cleaned up")
 }

@@ -2,6 +2,7 @@ package styx
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 
@@ -73,15 +74,21 @@ func (c plainTestCodec) Unmarshal(data []byte, m proto.Message) error {
 }
 
 // fillCountingTransport gives a transport that has no send buffer of its own a
-// payload-fill capability, and counts how many sends took each path. The real
-// shared-memory transport fills a slab no test can observe from here and exposes
-// no per-path counter, so this is what makes "which path did this send take"
-// directly assertable at the RPC layer: SendPayloadFill runs the callback over a
-// window of exactly the declared size — the same contract the shm writer
-// honors — and hands the result to the wrapped transport as an ordinary frame.
+// payload-fill capability, and counts how many sends took each path plus how many
+// times the callback actually ran. The real shared-memory transport fills a slab
+// no test can observe from here and exposes no per-path counter, so this is what
+// makes "which path did this send take" directly assertable at the RPC layer.
+//
+// It honors the parts of transport.PayloadFillSender's contract a caller depends
+// on: the callback gets a window of exactly the declared size, runs at most once,
+// and BOTH of its failure forms — a returned error and a panic — come back
+// wrapped in transport.ErrPayloadFillFailed with the frame unpublished. That last
+// part is the contract the RPC layer's per-call-versus-per-session branch reads,
+// so a double that returned the raw error would let a broken branch pass.
 type fillCountingTransport struct {
 	transport.Transport
 	fillSends atomic.Int64
+	fillRuns  atomic.Int64
 	wireSends atomic.Int64
 	lastFill  atomic.Pointer[[]byte]
 }
@@ -101,13 +108,26 @@ func (t *fillCountingTransport) SendPayloadFill(
 ) error {
 	t.fillSends.Add(1)
 	buf := make([]byte, size)
-	if err := fill(buf); err != nil {
-		return err
+	if err := t.runFill(fill, buf); err != nil {
+		return fmt.Errorf("%w: %w", transport.ErrPayloadFillFailed, err)
 	}
 	t.lastFill.Store(&buf)
 	f.Payload = buf
 
 	return t.Transport.Send(ctx, f)
+}
+
+// runFill counts and invokes the callback, converting a panic into an error the
+// way the shared-memory writer's own recover boundary does.
+func (t *fillCountingTransport) runFill(fill func(dst []byte) error, dst []byte) (err error) {
+	t.fillRuns.Add(1)
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("payload fill panicked: %v", r)
+		}
+	}()
+
+	return fill(dst)
 }
 
 // Test the fill path being declined when the transport has no send buffer to
@@ -195,7 +215,6 @@ func TestPayloadFill_FailsTheFill_WhenTheCodecWritesFewerBytesThanDeclared(t *te
 
 	// Then
 	require.Error(t, err)
-	require.ErrorIs(t, err, errPayloadFill)
 	require.ErrorIs(t, err, errShortSizedMarshal)
 	require.Equal(t, byte(0xAB), dst[len(dst)-1], "the residue byte the codec never wrote")
 }
@@ -310,4 +329,46 @@ func TestSendUnaryResponse_NeverFills_ForAStatusReply(t *testing.T) {
 	got, err := hostTr.Recv(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, transport.FrameUnaryErr, got.Kind)
+}
+
+// panicOnMarshalToCodec is sizedTestCodec with a sized marshal that panics — a
+// codec bug reached on the fill path, where the callback runs on the transport's
+// writer goroutine rather than on the goroutine that asked for the send.
+type panicOnMarshalToCodec struct{ sizedTestCodec }
+
+func (c panicOnMarshalToCodec) MarshalTo(proto.Message, []byte) (int, error) {
+	panic("marshal boom: this runs on the transport's writer goroutine")
+}
+
+// Test the fill half of the runtime-panic rule: a codec that panics while
+// encoding into the transport's send buffer is recovered BY THE TRANSPORT — a
+// caller's bug must not take the transport down — so the panic never reaches this
+// goroutine and the call terminates with a framework-internal status instead. Its
+// wire-path counterpart is
+// TestSendUnaryResponse_PropagatesMarshalPanic_OutsideHandlerBoundary, where the
+// same codec bug runs on this goroutine and does crash the process. The two
+// together are the whole rule as it now stands.
+func TestSendUnaryResponse_RepliesInternalStatus_WhenTheFillCallbackPanics(t *testing.T) {
+	// Given
+	pluginTr, hostTr := newInProcessTransportPairForTest(t)
+	tr := newFillCountingTransport(pluginTr)
+	env := rpcruntime.ResponseEnvelope{
+		Frame: transport.Frame{CallID: 7, Kind: transport.FrameUnaryResp},
+		Msg:   wrapperspb.String("response"),
+	}
+
+	// When
+	require.NotPanics(t, func() {
+		require.NoError(t, sendUnaryResponse(t.Context(), tr, panicOnMarshalToCodec{}, env))
+	})
+
+	// Then the call — and only the call — failed.
+	require.Equal(t, int64(1), tr.fillRuns.Load())
+	got, err := hostTr.Recv(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, transport.FrameUnaryErr, got.Kind)
+	require.Equal(t, uint64(7), got.CallID)
+	require.NotNil(t, got.Status)
+	require.Equal(t, rpcruntime.StatusCodeInternal, got.Status.Code)
+	require.Contains(t, got.Status.Message, "panicked")
 }

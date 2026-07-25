@@ -1246,19 +1246,31 @@ func dispatchNonStreamFrame(
 //
 // A failure to ENCODE the message is the one send failure that is not the
 // connection's fault, and it must not be reported as one: it costs this call, not
-// the session. Both encoding paths answer it with the framework-internal status
-// reply the client would otherwise wait out its whole deadline for — the same
-// reply the marshal produced back when it ran inside the handler adapter.
+// the session. Reported as a send failure it would take the peer-close branch,
+// which skips the obligation close and leaves the instance dispatch-wedged by its
+// own accounting while a caller with no deadline waits forever. Both encoding
+// paths therefore answer it with the framework-internal status reply the client
+// would otherwise wait out its whole deadline for — the same reply the marshal
+// produced back when it ran inside the handler adapter — and return nil so the
+// serve loop closes the obligation and keeps serving. On the fill path that
+// covers a panicking codec too: transport.ErrPayloadFillFailed wraps a recovered
+// callback panic exactly as it wraps a returned error.
 func sendUnaryResponse(
 	ctx context.Context, tr transport.Transport, cdc codec.Codec, env rpcruntime.ResponseEnvelope,
 ) error {
-	if env.Msg == nil {
+	// Only a UNARY_RESP's payload is the caller's to produce. Fill mode does not
+	// read Frame.Status, so a status-bearing kind sent through it would publish
+	// callback bytes where the peer expects an encoded status — and the transport
+	// documents that it does not refuse such a send. Gating on the kind keeps that
+	// invariant readable here rather than resting on which envelopes happen to
+	// carry a message.
+	if env.Msg == nil || env.Kind != transport.FrameUnaryResp {
 		return tr.Send(ctx, env.Frame)
 	}
 
 	if pf, ok := resolvePayloadFiller(tr, cdc, env.Msg); ok {
 		serr := pf.sender.SendPayloadFill(ctx, env.Frame, pf.size, pf.fill)
-		if serr != nil && errors.Is(serr, errPayloadFill) {
+		if serr != nil && errors.Is(serr, transport.ErrPayloadFillFailed) {
 			return tr.Send(ctx, rpcruntime.InternalStatusFrame(env.Frame, serr.Error()))
 		}
 
@@ -1672,8 +1684,17 @@ func (h *serviceHandler) Handle(
 // the panic outcome and apply the panic policy instead of crashing mid-call. The
 // boundary wraps ONLY the handler call — a panic in the request decode the
 // handler triggers unwinds through the handler and is caught here, but a panic in
-// the response marshal or any other framework frame runs outside this function
-// and still crashes the process, per the runtime-panic rule.
+// any other framework frame runs outside this function and still crashes the
+// process, per the runtime-panic rule.
+//
+// The response marshal is the documented exception, and it is the transport that
+// makes it one: where the response is encoded into the transport's own send
+// buffer, the codec runs on the transport's writer goroutine, which recovers a
+// panicking callback rather than letting a caller's bug take the transport down
+// (transport.ErrPayloadFillFailed). That panic terminates its own call with an
+// internal status and the plugin keeps serving. Where the response is marshaled
+// into a wire buffer first, the codec runs on this goroutine and a panic in it
+// still crashes the process.
 func (h *serviceHandler) invokeHandler(
 	ctx context.Context, m MethodDesc, dec func(proto.Message) error, onHandlerEntry func(),
 ) (resp proto.Message, recovered any, err error) {

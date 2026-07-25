@@ -27,7 +27,9 @@ var ErrDeadlineExceeded = errors.New("rpcruntime: call deadline exceeded")
 // From SUBMITTED, a call can reach REJECTED, CANCELED, or DEADLINE
 // (terminal pre-publication).
 // From SUBMITTED, a call transitions to PUBLISHED, then from PUBLISHED can
-// reach COMPLETED, FAILED, CANCELED, DEADLINE, or OUTCOME_UNKNOWN.
+// reach COMPLETED, FAILED, CANCELED, DEADLINE, OUTCOME_UNKNOWN, or REJECTED
+// (the last only when the send after the publication CAS proves the frame was
+// never emitted — see Reject).
 // Every transition is a single CompareAndSwap on call.state; the first CAS to
 // land from a live source state wins.
 // Whichever transition wins is the terminal one — there is no "undo".
@@ -286,11 +288,26 @@ func (t *Table) OutcomeUnknown(id uint64, cause error) bool {
 	return t.terminate(id, StateOutcomeUnknown, Result{Err: cause}, StatePublished)
 }
 
-// Reject CASes id from StateSubmitted to StateRejected (admission failure or
-// local queue failure, before any Publish was attempted) and delivers err as the
-// Result's Err. It returns false if id is not currently StateSubmitted.
+// Reject CASes id to StateRejected and delivers err as the Result's Err: the
+// call failed locally and provably never reached the peer, so it belongs to the
+// not-dispatched class rather than the unknown-outcome one.
+// It accepts two source states, because a request is provably undispatched in
+// two different places:
+//
+//   - StateSubmitted: an admission failure or local queue failure, before any
+//     Publish was attempted.
+//   - StatePublished: a send that failed definitively-unpublished after the
+//     publication CAS — the caller's payload-fill callback faulted, so the
+//     transport discarded the frame and released its buffer without ever
+//     emitting a descriptor (transport.ErrPayloadFillFailed). The publication
+//     CAS is taken before the send precisely so a racing cancel is ordered
+//     against it, so reaching this terminal from PUBLISHED is the normal shape
+//     of that failure, not an anomaly.
+//
+// It returns false if id is already in any other terminal state
+// (first-terminal-wins) or absent.
 func (t *Table) Reject(id uint64, err error) bool {
-	return t.terminate(id, StateRejected, Result{Err: err}, StateSubmitted)
+	return t.terminate(id, StateRejected, Result{Err: err}, StateSubmitted, StatePublished)
 }
 
 // FailAll terminates every in-flight call and wakes all waiters — the

@@ -49,7 +49,11 @@ type PluginServerConfig struct {
 	// if every handler guarantees its own isolation, since process state after a
 	// panic is whatever the handler left behind.
 	// A panic in the Styx runtime itself (outside handler frames) is never
-	// recovered under either setting.
+	// recovered under either setting, with one exception: a codec that panics
+	// while encoding a response directly into the shared-memory transport's send
+	// buffer is recovered by that transport, because a caller's bug must not take
+	// the transport down. That call terminates with an internal-error status and
+	// the plugin keeps serving, without tainting the session.
 	ContinueAfterPanic bool
 
 	// Transports is the data-plane transport allowlist advertised during handshake.

@@ -118,10 +118,13 @@ func TestServiceHandler_ContinueAfterPanic_RepliesPanicStatus_WithoutTaint(t *te
 	require.NotNil(t, echoResp.Msg)
 }
 
-// Test the response marshal panicking outside the handler frame still crashing
-// rather than being recovered. The marshal runs on the send path now, after the
-// handler returned and outside its recover boundary, so the panic must propagate
-// out of the serve goroutine exactly as any other runtime panic does.
+// Test the wire half of the runtime-panic rule: where the response is marshaled
+// into a wire buffer first, the codec runs on the serve goroutine, after the
+// handler returned and outside its recover boundary, so a panic in it propagates
+// exactly as any other runtime panic does. Its fill-path counterpart is
+// TestSendUnaryResponse_RepliesInternalStatus_WhenTheFillCallbackPanics, where
+// the codec runs on the transport's writer goroutine and the transport recovers
+// it. The two together are the whole rule as it now stands.
 func TestSendUnaryResponse_PropagatesMarshalPanic_OutsideHandlerBoundary(t *testing.T) {
 	// Given a dispatched response and a codec whose Marshal panics, over a
 	// transport with no payload-fill support so the marshal runs inline here

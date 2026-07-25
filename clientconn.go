@@ -540,13 +540,15 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 		if unpublished := sendRequest(ctx, state, callID, f, pf, useFill); unpublished != nil {
 			// The request provably never reached the peer and the call is already
 			// terminal, so there is no response to wait for: release the publication
-			// barrier and return the caller's own context error.
+			// barrier and report the failure. Only a context end is an abandoned
+			// call; an encode failure is neither a cancellation nor a timeout, and
+			// the marshal-then-send path records no metric for its own equivalent.
 			c.admission.Leave()
-			if m != nil {
+			if m != nil && isContextErr(unpublished) {
 				c.recordAbandoned(m, start, unpublished)
 			}
 
-			return translateCtxErr(unpublished)
+			return translateSendFailure(unpublished)
 		}
 	}
 	// The request has been published (or Publish lost to a racing terminal, so
@@ -583,14 +585,24 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 // because transport.PayloadFillSender's abandonment handshake makes a context
 // error proof that the frame was never published.
 //
-// It returns non-nil ONLY for that proven-unpublished case, carrying the context
-// error the caller must return: the call is terminated locally — Table.Cancel
-// touches no transport, and no CANCEL frame is owed for a request the peer never
-// saw — and no response can arrive. Every other send failure is classified into
-// the table as an unknown outcome and surfaces through the response wait,
-// exactly as before.
+// It returns the raw send error ONLY for the two failure classes a fill send can
+// prove were never published, having already terminated the call locally with the
+// terminal that fits each; the caller returns translateSendFailure of it and never
+// waits for a response, since none can arrive:
 //
-// The split reads the error class directly rather than asking
+//   - a context error — the caller's own cancel or deadline won the abandonment
+//     handshake. The call terminates CANCELED or DEADLINE to match what the
+//     caller sees, and no CANCEL frame is owed for a request the peer never saw
+//     (Table's terminals touch no transport).
+//   - transport.ErrPayloadFillFailed — this message could not be encoded. The
+//     transport discarded the frame and released its buffer, so the call is
+//     provably not dispatched and terminates REJECTED, the retryable
+//     not-dispatched class, rather than being reported as an unknown outcome.
+//
+// Every other send failure keeps the unknown-outcome classification and surfaces
+// through the response wait, exactly as before.
+//
+// The split reads the error classes directly rather than asking
 // transport.AcceptanceClassifier: that classifier sees only the error and must
 // answer conservatively for both send shapes at once, while this call site knows
 // which send produced it — and only the fill send is issued under a cancellable
@@ -608,10 +620,21 @@ func sendRequest(
 		return nil
 	}
 
-	if useFill && isContextErr(sendErr) {
-		state.table.Cancel(callID)
+	if useFill {
+		switch {
+		case errors.Is(sendErr, context.DeadlineExceeded):
+			state.table.DeadlineExceeded(callID)
 
-		return sendErr
+			return sendErr
+		case errors.Is(sendErr, context.Canceled):
+			state.table.Cancel(callID)
+
+			return sendErr
+		case errors.Is(sendErr, transport.ErrPayloadFillFailed):
+			state.table.Reject(callID, fmt.Errorf("styx: invoke: marshal request: %w", sendErr))
+
+			return sendErr
+		}
 	}
 
 	// Backpressure transitions are counted inside the transport, at the
@@ -623,6 +646,20 @@ func sendRequest(
 	state.table.OutcomeUnknown(callID, cause)
 
 	return nil
+}
+
+// translateSendFailure maps a request send that sendRequest proved was never
+// published to the error the caller sees. A context error is the caller's own
+// cancel or deadline; anything else reaching here is a payload-fill failure,
+// reported with the same wording the marshal-then-send path uses for its own
+// marshal failure, because it is the same fault in the same place — encoding this
+// request — differing only in which buffer it was encoding into.
+func translateSendFailure(err error) error {
+	if isContextErr(err) {
+		return translateCtxErr(err)
+	}
+
+	return fmt.Errorf("styx: invoke: marshal request: %w", err)
 }
 
 // isContextErr reports whether err is (or wraps) one of the two context

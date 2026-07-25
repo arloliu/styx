@@ -44,6 +44,21 @@ var ErrPayloadTooLarge = errors.New("transport: payload exceeds MaxFrameSize")
 // a length at all — the caller computed it wrong.
 var ErrInvalidPayloadSize = errors.New("transport: negative payload size")
 
+// ErrPayloadFillFailed wraps every failure that originates INSIDE a
+// PayloadFillSender.SendPayloadFill callback — an error the callback returned, or
+// a panic the transport recovered out of it. It is the seam that lets a caller
+// tell a fault in its own encoding of one frame from a fault of the transport
+// carrying it, which is a different decision with a different blast radius: a
+// callback fault costs exactly that frame and leaves the connection healthy, so a
+// caller answers it per call (report the encode failure to that call, keep
+// serving), while a transport fault is the connection's and is handled as such.
+//
+// A transport implementing PayloadFillSender MUST wrap both callback-failure
+// forms in it, and MUST NOT wrap anything else in it. The frame is never
+// published when it is returned: the transport has discarded it and released
+// whatever buffer it had reserved.
+var ErrPayloadFillFailed = errors.New("transport: payload fill callback failed")
+
 // ErrMalformedStatusFrame is returned by Recv when a FrameUnaryErr frame's
 // body cannot be decoded into a Status — a length prefix inside the status
 // body overruns the (already MaxFrameSize-bounded) body, or the body is
@@ -269,6 +284,13 @@ type ReportingSender interface {
 // other outbound frame for its whole duration, and dst is buffer space the peer may
 // read the instant the frame publishes. A size of 0 carries an empty payload and skips
 // fill entirely — "at most once" allows zero.
+//
+// A callback that returns an error, or panics, costs that one frame and nothing more:
+// the transport recovers the panic, discards the frame unpublished, releases the buffer
+// it reserved, and stays usable — a bug in caller-supplied encoding must never take the
+// transport down with it. Both forms are reported to the caller wrapped in
+// ErrPayloadFillFailed, so the caller can tell its own encoding fault from a transport
+// fault without inspecting transport-internal error values.
 //
 // fill MUST write all size bytes. Writing fewer is a caller bug no transport can
 // detect: fill reports no byte count, the buffer it is handed is reused rather than

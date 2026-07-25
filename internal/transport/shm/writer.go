@@ -1334,7 +1334,13 @@ func (w *writer) fillSlab(i intent, h arena.SlabHandle, window []byte) buildStat
 
 	if err := runFill(i.fill.fn, window); err != nil {
 		_ = w.arena.Free(h)
-		w.report(i, err)
+		// transport.ErrPayloadFillFailed is the caller-visible class for BOTH
+		// failure forms — a returned error and a recovered panic alike. Wrapping
+		// it here, at the one place either can arise, is what lets the RPC layer
+		// tell "this one message could not be encoded" from "the connection is
+		// gone" without depending on the identity of an error private to this
+		// package.
+		w.report(i, fmt.Errorf("%w: %w", transport.ErrPayloadFillFailed, err))
 
 		return buildFailed
 	}
@@ -1344,7 +1350,10 @@ func (w *writer) fillSlab(i intent, h arena.SlabHandle, window []byte) buildStat
 
 // runFill invokes fn over dst and converts a panic into an error wrapping
 // errFillPanic, so a panicking codec fails one frame instead of unwinding the
-// writer goroutine out of its run loop.
+// writer goroutine out of its run loop. Its caller wraps whichever error comes
+// back in transport.ErrPayloadFillFailed, so the two forms are indistinguishable
+// to a caller classifying the failure and distinguishable to anyone reading the
+// message.
 func runFill(fn func(dst []byte) error, dst []byte) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
