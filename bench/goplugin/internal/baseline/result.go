@@ -1,3 +1,13 @@
+// Package baseline holds the go-plugin-fork driver and the result row schema
+// for this module's benchmark suite.
+//
+// Result, WriteJSONL, and dirOf below were adapted from
+// bench/internal/benchbaseline/result.go in the root module. The two copies
+// exist independently because this module cannot import the root module's
+// internal/ packages (see bench/goplugin/go.mod) -- they are not kept in
+// sync automatically. This copy drops Regime and WakeupSyscallsPerOp, which
+// have no equivalent reachable through Styx's public API. When changing the
+// result schema here, check the root-module file too, and vice versa.
 package baseline
 
 import (

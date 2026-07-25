@@ -12,3 +12,10 @@ modules:
       # comparison, so the styx generator must not also emit a Ping client/server
       # here — the two would redeclare the same PingClient/NewPingClient symbols.
       - bench/internal/benchbaseline/pingpb
+      # A copy of the above, ported into the standalone bench/goplugin module (see
+      # bench/goplugin/go.mod) so that module can drive the arloliu/go-plugin fork
+      # without importing this repo's internal/ packages. It is generated the same
+      # way as its root-module counterpart, so it must be excluded here for the
+      # same reason: the styx generator must not emit a second, redeclaring
+      # Ping client/server into this module's tree.
+      - bench/goplugin/internal/baseline/pingpb

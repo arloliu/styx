@@ -1,3 +1,14 @@
+// Package latency runs the warmup + timed concurrent-call loop shared by
+// every implementation in this module's benchmark comparison, and computes
+// latency percentiles from the results.
+//
+// RunSuite, percentile, and expectedRounds were adapted from the equivalent
+// helpers in bench/spike/spike_bench_test.go and bench/shm/bench_test.go in
+// the root module (also duplicated between those two files). This module
+// cannot import the root module's internal/ packages (see
+// bench/goplugin/go.mod), so the copy here is independent and not kept in
+// sync automatically -- when changing the percentile formula or the warmup/
+// preallocation strategy, check the root-module files too, and vice versa.
 package latency
 
 import (
@@ -71,7 +82,10 @@ func RunSuite(b *testing.B, implName string, concurrency, payloadBytes int, call
 		return
 	}
 
-	capacityHint := 1024
+	// Without an explicit -benchtime=Nx, the round count isn't known ahead of
+	// time; fall back to a capacity that at least scales with concurrency
+	// (one round's worth of samples) instead of a flat constant.
+	capacityHint := 1024 * concurrency
 	if n, ok := expectedRounds(); ok {
 		capacityHint = n * concurrency
 	}
@@ -124,7 +138,11 @@ func percentile(sorted []time.Duration, p float64) float64 {
 // expectedRounds reads -test.benchtime=Nx, if set, so RunSuite can
 // preallocate its latency slice to the exact final sample count -- avoiding
 // a reallocation inside the timed loop that would otherwise inflate
-// allocs_per_op with a driver artifact instead of transport behavior.
+// allocs_per_op with a driver artifact instead of transport behavior. This
+// only fully eliminates the reallocation under an explicit -benchtime=Nx;
+// make bench-goplugin does not set one, so RunSuite falls back to a capacity
+// that scales with concurrency but is not guaranteed to match the eventual
+// round count exactly.
 func expectedRounds() (int, bool) {
 	f := flag.Lookup("test.benchtime")
 	if f == nil {

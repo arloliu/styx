@@ -58,7 +58,10 @@ replace github.com/arloliu/styx => ../..
 
 A root-level `go.work` adds both modules (`.` and `./bench/goplugin`) so
 editor tooling and `go build ./...`-style workflows keep working across the
-boundary without per-command flags.
+boundary without per-command flags. This `go.work` is developer-local and
+gitignored, not committed — it has no effect on `go build`/`go test` run from
+inside either module's own directory, which is how CI and the Makefile
+targets invoke them.
 
 ### 2. Root module cleanup
 

@@ -12,7 +12,7 @@ BIN_DIR                 := bin
 GENERATOR_BIN           := $(BIN_DIR)/protoc-gen-go-styx
 
 .DEFAULT_GOAL := help
-.PHONY: help build test bench bench-goplugin vet lint fmt generate tidy clean \
+.PHONY: help build test bench bench-goplugin bench-goplugin-check vet lint fmt generate tidy clean \
 	linter-update linter-version clean-linter-cache \
 	buf-update buf-version ci
 
@@ -38,6 +38,10 @@ bench:
 ## bench-goplugin: Run the go-plugin-fork vs. styx-shm/styx-uds comparison (separate module)
 bench-goplugin:
 	cd bench/goplugin && go test ./... -run='^$$' -bench=. -benchmem -timeout=$(BENCH_TIMEOUT)
+
+## bench-goplugin-check: Build/vet/test bench/goplugin (no -bench; seconds not minutes) so CI catches it drifting from the public API
+bench-goplugin-check:
+	cd bench/goplugin && go build ./... && go vet ./... && go test ./...
 
 ## vet: Run go vet
 vet:
@@ -94,4 +98,4 @@ buf-version:
 	go tool $(BUF_GOMOD) buf --version
 
 ## ci: Full local gate (lint, vet, test)
-ci: lint vet test
+ci: lint vet test bench-goplugin-check
