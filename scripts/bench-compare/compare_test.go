@@ -24,6 +24,210 @@ const baselineRatio10 = `{
   }
 }`
 
+// baselineGRPCAllocBand mirrors the shape of the checked-in shm baseline's
+// grpc reference cell — a 158 allocs/op mean with a 1%-or-2-allocations
+// tolerance band (2.0 dominates at this base) — so tests can pin the gate's
+// behavior against the real tolerance shape without touching the checked-in
+// baseline file.
+const baselineGRPCAllocBand = `{
+  "policy": {"payload_bytes":64,"concurrency":1,"reps":3,"absolute_floor_ratio":7.0,
+             "relative_tolerance":0.10,"normative_cells":["shm"],"grpc_ref":"grpc","uds_ref":"uds",
+             "grpc_alloc_rel_tolerance":0.01,"grpc_alloc_abs_tolerance":2.0},
+  "cells": {
+    "shm":  {"p50_us":10,"p99_us":20,"allocs_per_op":19},
+    "grpc": {"p50_us":100,"p99_us":200,"allocs_per_op":158},
+    "uds":  {"p50_us":40,"p99_us":80,"allocs_per_op":17}
+  }
+}`
+
+// refRowsForBand returns three clean repetitions each of the grpc and uds
+// reference cells at baselineGRPCAllocBand's own values, for tests that only
+// vary the grpc allocation count.
+func refRowsForBand(grpcAllocs float64) []string {
+	out := make([]string, 0, 6)
+	for range 3 {
+		out = append(out, row("grpc", 100, 200, grpcAllocs), row("uds", 40, 80, 17))
+	}
+
+	return out
+}
+
+// grpcAllocCheckFailed reports whether the grpc allocs/op hard check failed in
+// rep.
+func grpcAllocCheckFailed(rep report) bool {
+	for _, c := range rep.hard {
+		if c.name == "grpc allocs/op" && !c.pass {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Test the exact defect this tolerance band exists to fix: a gRPC reference
+// cell measured at 158.62 against a baseline of 158.0 — the observed value
+// that, under the old strict rounding check, rounded to 159 and failed
+// permanently every run. It must now pass.
+func TestEvaluate_GRPCAllocBandAbsorbsObservedJitter(t *testing.T) {
+	rows := append(refRowsForBand(158.62), row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))
+	rep := evalRows(t, baselineGRPCAllocBand, rows...)
+
+	if grpcAllocCheckFailed(rep) {
+		t.Fatalf("158.62 against a 158.0 baseline must pass under the tolerance band: %+v", rep.hard)
+	}
+}
+
+// Test the old rounding cliff directly: 158.5 used to be the exact point
+// where math.Round flipped the verdict (rounds to 159, above baseline's
+// rounded 158). With the tolerance band, values on both sides of that old
+// cliff must pass — the cliff no longer determines the outcome.
+func TestEvaluate_GRPCAllocBandRemovesOldRoundingCliff(t *testing.T) {
+	for _, measured := range []float64{158.49, 158.5, 158.51} {
+		rows := append(refRowsForBand(measured), row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))
+		rep := evalRows(t, baselineGRPCAllocBand, rows...)
+		if grpcAllocCheckFailed(rep) {
+			t.Errorf("measured %g must pass: the old rounding cliff at 158.5 must no longer decide the outcome: %+v",
+				measured, rep.hard)
+		}
+	}
+}
+
+// Test the tolerance band's own boundary: base (158) + band (2.0) = 160.0.
+// Exactly at the boundary must pass (the check is inclusive); just past it
+// must fail. This is the new cliff the band creates, and it must sit where
+// the policy fields say it does, not somewhere the code invented.
+func TestEvaluate_GRPCAllocBandBoundaryIsBaseplusBand(t *testing.T) {
+	pass := evalRows(t, baselineGRPCAllocBand,
+		append(refRowsForBand(160.0), row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))...)
+	if grpcAllocCheckFailed(pass) {
+		t.Fatalf("measured exactly at base+band (160.0) must pass: %+v", pass.hard)
+	}
+
+	fail := evalRows(t, baselineGRPCAllocBand,
+		append(refRowsForBand(160.01), row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))...)
+	if !grpcAllocCheckFailed(fail) {
+		t.Fatal("measured just past base+band (160.01) must fail")
+	}
+}
+
+// Test the anti-gaming property survives the band: a genuine reference
+// implementation change moves the gRPC mean far past the tolerance band (158
+// -> 175, versus a 160.0 band boundary), and must still fail the gate. A
+// dependency bump or implementation swap moves allocs/op by tens, not tenths,
+// so the band cannot be widened enough to absorb real jitter without also
+// absorbing this — proving the two are distinguishable.
+func TestEvaluate_GRPCAllocBandStillCatchesRealImplementationChange(t *testing.T) {
+	rows := append(refRowsForBand(175), row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19))
+	rep := evalRows(t, baselineGRPCAllocBand, rows...)
+
+	if !grpcAllocCheckFailed(rep) {
+		t.Fatal("a reference allocation count that moved from 158 to 175 must still fail the gate")
+	}
+}
+
+// Test that the uds reference cell keeps the strict, integer-rounded
+// allocation check despite also being a reference cell: the axis that earns a
+// tolerance band is third-party code we do not control, not "reference cell,"
+// and uds is styx's own transport. Sub-allocation float noise (17.04) still
+// passes, but a genuine extra allocation (18.1, rounding to 18) still fails —
+// the same strict behavior as any normative cell, with no band applied.
+func TestEvaluate_UDSRefAllocsStayStrictDespiteBeingAReferenceCell(t *testing.T) {
+	rowsFor := func(udsAllocs float64) []string {
+		return []string{
+			row("grpc", 100, 200, 158), row("grpc", 100, 200, 158), row("grpc", 100, 200, 158),
+			row("uds", 40, 80, udsAllocs), row("uds", 40, 80, udsAllocs), row("uds", 40, 80, udsAllocs),
+			row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19),
+		}
+	}
+	udsAllocCheckFailed := func(rep report) bool {
+		for _, c := range rep.hard {
+			if c.name == "uds allocs/op" && !c.pass {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	pass := evalRows(t, baselineGRPCAllocBand, rowsFor(17.04)...)
+	if udsAllocCheckFailed(pass) {
+		t.Errorf("sub-allocation float noise (17.04) on the uds reference must still pass: %+v", pass.hard)
+	}
+
+	fail := evalRows(t, baselineGRPCAllocBand, rowsFor(18.1)...)
+	if !udsAllocCheckFailed(fail) {
+		t.Error("a genuine extra allocation (18.1) on the uds reference must still fail; it gets no tolerance band")
+	}
+}
+
+// Test that a normative styx cell keeps the strict, integer-rounded
+// allocation check unaffected by the gRPC tolerance band: sub-allocation float
+// noise (19.04) passes, a genuine regression (20.1) fails.
+func TestEvaluate_NormativeCellAllocsStayStrictAlongsideGRPCBand(t *testing.T) {
+	rowsFor := func(shmAllocs float64) []string {
+		return []string{
+			row("grpc", 100, 200, 158), row("grpc", 100, 200, 158), row("grpc", 100, 200, 158),
+			row("uds", 40, 80, 17), row("uds", 40, 80, 17), row("uds", 40, 80, 17),
+			row("shm", 10, 20, shmAllocs), row("shm", 10, 20, shmAllocs), row("shm", 10, 20, shmAllocs),
+		}
+	}
+	shmAllocCheckFailed := func(rep report) bool {
+		for _, c := range rep.hard {
+			if c.name == "shm allocs/op" && !c.pass {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	pass := evalRows(t, baselineGRPCAllocBand, rowsFor(19.04)...)
+	if shmAllocCheckFailed(pass) {
+		t.Errorf("sub-allocation float noise (19.04) on a normative cell must still pass: %+v", pass.hard)
+	}
+
+	fail := evalRows(t, baselineGRPCAllocBand, rowsFor(20.1)...)
+	if !shmAllocCheckFailed(fail) {
+		t.Error("a genuine regression (20.1) on a normative cell must still fail; it gets no tolerance band")
+	}
+}
+
+// Test that an absent tolerance field defaults to the strict check: baselines
+// that predate this policy field (or simply don't set it) must not silently
+// gain a tolerance band on their gRPC reference cell. baselineRatio10 has
+// neither grpc_alloc_rel_tolerance nor grpc_alloc_abs_tolerance set, so a
+// fractional bump that would round away (150 -> 150.4) passes, but a whole
+// extra allocation (150 -> 151.1, rounding to 151) still fails exactly as it
+// did before this field existed.
+func TestEvaluate_AbsentGRPCAllocToleranceDefaultsToStrict(t *testing.T) {
+	grpcAllocCheckFailedNamed := func(rep report) bool {
+		for _, c := range rep.hard {
+			if c.name == "grpc allocs/op" && !c.pass {
+				return true
+			}
+		}
+
+		return false
+	}
+	rowsFor := func(grpcAllocs float64) []string {
+		return []string{
+			row("grpc", 100, 200, grpcAllocs), row("grpc", 100, 200, grpcAllocs), row("grpc", 100, 200, grpcAllocs),
+			row("uds", 40, 80, 17), row("uds", 40, 80, 17), row("uds", 40, 80, 17),
+			row("shm", 10, 20, 19), row("shm", 10, 20, 19), row("shm", 10, 20, 19),
+		}
+	}
+
+	noise := evalRows(t, baselineRatio10, rowsFor(150.4)...)
+	if grpcAllocCheckFailedNamed(noise) {
+		t.Errorf("sub-allocation float noise must still round away with no tolerance field set: %+v", noise.hard)
+	}
+
+	up := evalRows(t, baselineRatio10, rowsFor(151.1)...)
+	if !grpcAllocCheckFailedNamed(up) {
+		t.Error("a whole extra allocation must still fail when no tolerance field is set")
+	}
+}
+
 const baselineRatioNearFloor = `{
   "policy": {"payload_bytes":64,"concurrency":1,"reps":3,"absolute_floor_ratio":7.0,
              "relative_tolerance":0.10,"normative_cells":["shm"],"grpc_ref":"grpc","uds_ref":"uds"},

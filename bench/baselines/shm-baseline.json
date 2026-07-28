@@ -8,7 +8,9 @@
     "relative_tolerance": 0.10,
     "normative_cells": ["production-shm", "production-shm-sync"],
     "grpc_ref": "grpc-uds",
-    "uds_ref": "production-uds"
+    "uds_ref": "production-uds",
+    "grpc_alloc_rel_tolerance": 0.01,
+    "grpc_alloc_abs_tolerance": 2.0
   },
   "cells": {
     "production-shm": {"p50_us": 2.16, "p99_us": 5.98, "allocs_per_op": 19.0},
