@@ -136,7 +136,12 @@ func translateCtxErr(err error) error {
 // (or nil on success), decoding a successful Payload into resp via cdc. It is the
 // entry points' half that decodes on the calling goroutine, so the response bytes
 // it reads are the caller's own and outlive nothing.
-func translateResult(result rpcruntime.Result, cdc codec.Codec, resp proto.Message) error {
+//
+// result is taken by pointer, and only read: one Result lives on the invoke
+// chain's stack and every step that inspects it borrows that one, rather than
+// each frame holding a copy. See invokeCore's own note on why the chain's stack
+// footprint is worth this much care.
+func translateResult(result *rpcruntime.Result, cdc codec.Codec, resp proto.Message) error {
 	if err := terminalError(result); err != nil {
 		return err
 	}
@@ -158,7 +163,10 @@ func translateResult(result rpcruntime.Result, cdc codec.Codec, resp proto.Messa
 // to their styx equivalents; any other Result.Err is already a styx.Err* value,
 // since this package never hands the Table anything else — the "translate at the
 // public-API boundary" pattern also used for IncompatibleError/HandshakeOffer.
-func terminalError(result rpcruntime.Result) error {
+//
+// result is taken by pointer, and only read, for the reason translateResult
+// documents.
+func terminalError(result *rpcruntime.Result) error {
 	switch {
 	case errors.Is(result.Err, rpcruntime.ErrCanceledLocally):
 		return ErrCanceled
@@ -186,7 +194,10 @@ func terminalError(result rpcruntime.Result) error {
 // response was delivered as bytes to a caller with nothing to decode them into,
 // which is an internal inconsistency rather than a call outcome, so it is reported
 // as one instead of being papered over with an empty message.
-func responseFromResult(result rpcruntime.Result) (proto.Message, error) {
+//
+// result is taken by pointer, and only read, for the reason translateResult
+// documents.
+func responseFromResult(result *rpcruntime.Result) (proto.Message, error) {
 	if err := terminalError(result); err != nil {
 		return nil, err
 	}
@@ -830,24 +841,25 @@ func (c *ClientConn) InvokeIDFactory(
 		return nil, errNilResponseFactory
 	}
 
-	result, _, err := c.invokeCore(ctx, serviceID, methodID, req, newResp)
-	if err != nil {
+	var result rpcruntime.Result
+	if _, err := c.invokeCore(ctx, serviceID, methodID, req, newResp, &result); err != nil {
 		return nil, err
 	}
 
-	return responseFromResult(result)
+	return responseFromResult(&result)
 }
 
 // invokeByID is the shared core of Invoke and InvokeID: it submits and publishes a
 // unary request routed by the precomputed serviceID/methodID hashes, and decodes
 // the response bytes into the caller's own message on this goroutine.
 func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64, req, resp proto.Message) error {
-	result, cdc, err := c.invokeCore(ctx, serviceID, methodID, req, nil)
+	var result rpcruntime.Result
+	cdc, err := c.invokeCore(ctx, serviceID, methodID, req, nil, &result)
 	if err != nil {
 		return err
 	}
 
-	return translateResult(result, cdc, resp)
+	return translateResult(&result, cdc, resp)
 }
 
 // invokeCore submits and publishes one unary request and waits for its terminal
@@ -855,23 +867,57 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 // response bytes for the caller to decode, and a factory has the receive path
 // decode into the message it builds and deliver that instead.
 //
-// It returns either a Result or an error, never both: an error means the call
+// It fills *result or returns an error, never both: an error means the call
 // produced no terminal outcome to translate (routing gone, admission closed, a
 // request that could not be encoded or published, or the caller's own context
-// ending the wait). The codec returned alongside a Result is the one the
-// generation the call actually ran on negotiated — the same generation whose table
-// holds the call — so a caller decoding response bytes itself cannot pick up a
-// successor's codec after a hot reload.
+// ending the wait), and *result is then meaningless and must not be read. The
+// codec returned alongside a filled result is the one the generation the call
+// actually ran on negotiated — the same generation whose table holds the call —
+// so a caller decoding response bytes itself cannot pick up a successor's codec
+// after a hot reload.
+//
+// The terminal outcome travels through an out-param rather than a return value
+// because this chain sits right at a goroutine stack-growth boundary, which makes
+// its stack footprint load-bearing rather than a style question. A host that
+// serves each inbound request on its own goroutine — the ordinary Go server shape
+// — invokes from a freshly spawned goroutine, whose stack starts small; if the
+// frames that stay live from that goroutine's entry down through the transport
+// Send do not fit, every call pays a whole-stack copy before it can proceed, and
+// that copy costs more than the round trip it precedes. Returning an
+// rpcruntime.Result by value put one copy in this frame and a second in the
+// caller's, and those two copies alone were enough to cross the boundary and make
+// every call pay it.
+//
+// So keep the summed frame size of invokeByID/InvokeIDFactory + invokeCore +
+// sendRequest small, and measure it rather than reason about it: `go build
+// -gcflags=-S` prints each function's `locals=`, and confirm with the
+// runtime.newstack share of a profile taken on a benchmark that calls from a
+// fresh goroutine each time (a benchmark that loops inline on one long-lived
+// goroutine cannot see this cost at all — it pays the growth once, during
+// warmup). Measuring is not optional caution here: building the request
+// transport.Frame inside sendRequest instead of passing it, which reads like the
+// obvious next saving, measures WORSE. This frame shrinks by much less than the
+// Frame's own size, because its outgoing-argument area is sized by whichever of
+// its call sites needs the most, so dropping sendRequest's largest argument only
+// falls back to the next-largest site — while sendRequest's own frame grows by the
+// whole Frame. Only the measurement distinguishes the two.
+//
+// This function is far too large to inline into its two entry points, so the
+// split into entry point plus core really does cost a second live frame. That is
+// affordable at the current footprint; should a later change push the chain back
+// over the boundary with no copy left to remove, merging the entry points into a
+// single frame is the remaining lever.
 func (c *ClientConn) invokeCore(
 	ctx context.Context, serviceID, methodID uint64, req proto.Message, newResp func() proto.Message,
-) (rpcruntime.Result, codec.Codec, error) {
+	result *rpcruntime.Result,
+) (codec.Codec, error) {
 	// Fast-fail when routing is fully detached: a torn-down or crashed instance
 	// nulls c.state, and that "unavailable" outcome takes precedence over a
 	// closed-admission "draining" outcome. This reads only whether routing is gone
 	// at this instant; the value is not retained for routing (that load is below,
 	// inside the barrier), so it cannot carry a stale predecessor past a promotion.
 	if c.state.Load() == nil {
-		return rpcruntime.Result{}, nil, ErrPluginUnavailable
+		return nil, ErrPluginUnavailable
 	}
 
 	// The cutoff phase of a hot-reload closes admission before the running
@@ -882,7 +928,7 @@ func (c *ClientConn) invokeCore(
 	// below, so cutoff (AdmissionGate.Close) cannot complete until this request is
 	// published: an admitted call is never left unpublished behind a cutoff.
 	if !c.admission.Enter() {
-		return rpcruntime.Result{}, nil, ErrDrained
+		return nil, ErrDrained
 	}
 
 	// Select the routing state INSIDE the admission barrier, after Enter. Cutoff
@@ -896,13 +942,13 @@ func (c *ClientConn) invokeCore(
 	if state == nil {
 		c.admission.Leave()
 
-		return rpcruntime.Result{}, nil, ErrPluginUnavailable
+		return nil, ErrPluginUnavailable
 	}
 
 	if err := ctx.Err(); err != nil {
 		c.admission.Leave()
 
-		return rpcruntime.Result{}, nil, translateCtxErr(err)
+		return nil, translateCtxErr(err)
 	}
 
 	// Prefer producing the request bytes straight into the transport's send
@@ -918,7 +964,7 @@ func (c *ClientConn) invokeCore(
 		if err != nil {
 			c.admission.Leave()
 
-			return rpcruntime.Result{}, nil, fmt.Errorf("styx: invoke: marshal request: %w", err)
+			return nil, fmt.Errorf("styx: invoke: marshal request: %w", err)
 		}
 	}
 
@@ -960,7 +1006,7 @@ func (c *ClientConn) invokeCore(
 				c.recordAbandoned(m, start, unpublished)
 			}
 
-			return rpcruntime.Result{}, nil, translateSendFailure(unpublished)
+			return nil, translateSendFailure(unpublished)
 		}
 	}
 	// The request has been published (or Publish lost to a racing terminal, so
@@ -969,20 +1015,23 @@ func (c *ClientConn) invokeCore(
 	// side is never held across wait below.
 	c.admission.Leave()
 
-	result, waitErr := wait(ctx)
+	// Land the terminal straight in the caller's Result rather than in a local
+	// first: one Result on the chain, no copy of it in this frame.
+	var waitErr error
+	*result, waitErr = wait(ctx)
 	if waitErr != nil {
 		if m != nil {
 			c.recordAbandoned(m, start, waitErr)
 		}
 
-		return rpcruntime.Result{}, nil, c.abandon(state, callID, waitErr)
+		return nil, c.abandon(state, callID, waitErr)
 	}
 
 	if m != nil {
 		c.recordCompleted(m, start)
 	}
 
-	return result, state.codec, nil
+	return state.codec, nil
 }
 
 // sendRequest publishes callID's request frame and classifies a send failure.
