@@ -9,6 +9,8 @@ import (
 
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // Test Table racing Publish against Cancel, asserting the call always reaches
@@ -343,4 +345,87 @@ func TestTable_FailAll_SplitsTerminalsByDispatchState(t *testing.T) {
 	require.ErrorIs(t, resPublished.Err, dispatched)
 
 	_ = idSubmitted
+}
+
+// Test a call registered with a response factory resolving to the decoded
+// message rather than to bytes: the receive path constructs from the factory,
+// decodes, and hands the message over on the result channel, which is the only
+// place it is ever shared.
+func TestTable_SubmitDecoding_DeliversTheDecodedMessage(t *testing.T) {
+	// Given a factory that allocates a fresh message per call, as its contract
+	// requires: a message the caller already held could be read by that caller
+	// while the receive path was still decoding into it.
+	table := rpcruntime.NewTable(1)
+	id, wait := table.SubmitDecoding(t.Context(), time.Second,
+		func() proto.Message { return &wrapperspb.StringValue{} })
+	require.True(t, table.Publish(id))
+
+	factory, live := table.ResponseFactory(id)
+	require.True(t, live)
+	built, ok := factory().(*wrapperspb.StringValue)
+	require.True(t, ok, "the factory builds the message the call registered")
+	built.Value = "decoded on the receive path"
+
+	// When
+	require.True(t, table.CompleteMsg(id, built))
+
+	// Then
+	res, err := wait(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, res.Err)
+	require.Nil(t, res.Payload, "a runtime-decoded call carries no bytes")
+	require.Same(t, built, res.Msg)
+}
+
+// Test the lookup the receive path consults BEFORE it decodes: it reports the
+// registered factory for a live call, no factory for one whose caller decodes the
+// bytes itself, and not-live for anything else — an ID that never existed, one
+// already terminal, or one belonging to something this table does not hold.
+func TestTable_ResponseFactory_ReportsTheFactory_AndOnlyWhileTheCallIsLive(t *testing.T) {
+	// Given
+	table := rpcruntime.NewTable(1)
+	newResp := func() proto.Message { return &wrapperspb.StringValue{} }
+	decodingID, _ := table.SubmitDecoding(t.Context(), time.Second, newResp)
+	bytesID, _ := table.Submit(t.Context(), time.Second)
+
+	// Then a live call reports what it registered.
+	factory, live := table.ResponseFactory(decodingID)
+	require.True(t, live)
+	require.NotNil(t, factory)
+
+	factory, live = table.ResponseFactory(bytesID)
+	require.True(t, live)
+	require.Nil(t, factory, "a call whose caller decodes its own bytes registers no factory")
+
+	// And an ID this table does not hold reports not-live, so nothing is decoded
+	// for it.
+	_, live = table.ResponseFactory(table.NextID())
+	require.False(t, live, "an ID allocated but never registered names no call here")
+
+	// And a terminal call stops reporting live.
+	require.True(t, table.Cancel(decodingID))
+	_, live = table.ResponseFactory(decodingID)
+	require.False(t, live, "a terminated call must not be decoded for")
+}
+
+// Test that a cancel winning the terminal transition drops the decoded message
+// rather than delivering it: the caller sees its cancellation, and the message the
+// receive path built is never handed to anyone, so the two goroutines never share
+// it.
+func TestTable_CompleteMsg_DropsTheMessage_WhenACancelWonFirst(t *testing.T) {
+	// Given
+	table := rpcruntime.NewTable(1)
+	id, wait := table.SubmitDecoding(t.Context(), time.Second,
+		func() proto.Message { return &wrapperspb.StringValue{} })
+	require.True(t, table.Publish(id))
+	require.True(t, table.Cancel(id))
+
+	// When the receive path completes with a message it has already decoded.
+	require.False(t, table.CompleteMsg(id, &wrapperspb.StringValue{Value: "dropped"}))
+
+	// Then the caller sees the cancellation and no message at all.
+	res, err := wait(t.Context())
+	require.NoError(t, err)
+	require.ErrorIs(t, res.Err, rpcruntime.ErrCanceledLocally)
+	require.Nil(t, res.Msg)
 }

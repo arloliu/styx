@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // ErrCanceledLocally is delivered via Result.Err when a call is terminated by
@@ -104,8 +106,18 @@ const (
 // call.resultCh. Status is non-nil for an application-level error response; Err
 // is non-nil for any framework/plugin-fault outcome. They are mutually
 // exclusive — a successful response carries neither.
+//
+// A success carries its response in exactly one of two forms, decided at Submit
+// by whether the call registered a response factory: Payload for a call whose
+// caller decodes the bytes itself, Msg for one the receive path already decoded.
+// The Msg form is what lets a receive path decode out of memory it only borrows:
+// the send on resultCh is the happens-before edge that transfers the message to
+// the waiting caller, and nothing that produced it holds a reference afterwards,
+// so the borrowed bytes stop being read strictly before the channel send. A
+// terminal that is not a success (Status or Err) carries neither.
 type Result struct {
 	Payload []byte
+	Msg     proto.Message
 	Status  *Status
 	Err     error
 }
@@ -120,6 +132,13 @@ type call struct {
 	state    atomic.Int32
 	resultCh chan Result
 	deadline time.Time // absolute, re-anchored from the budget at Submit time; zero means none
+	// newResp constructs the message this call's response is decoded into, or is
+	// nil for a call whose caller decodes the response bytes itself. It is
+	// registered at Submit and read only by the receive path, which calls it at
+	// most once — on the frame that answers this call — and never after the call
+	// leaves the table. It is immutable for the entry's lifetime, so the receive
+	// path's read needs no synchronization beyond the map lookup that finds it.
+	newResp func() proto.Message
 }
 
 // Table is the per-connection request table keyed by call ID.
@@ -183,13 +202,39 @@ func Reanchor(budget time.Duration, receivedAt time.Time) time.Time {
 // surface; the call's deadline derives from budget (the wire-carried remaining
 // budget), not from ctx.
 // An abandoned submit context does not by itself cancel or expire the call.
+// The call's response is delivered as bytes in Result.Payload, for its caller to
+// decode; SubmitDecoding registers a call whose response the receive path decodes
+// instead.
 func (t *Table) Submit(
 	ctx context.Context, budget time.Duration,
+) (uint64, func(ctx context.Context) (Result, error)) {
+	return t.SubmitDecoding(ctx, budget, nil)
+}
+
+// SubmitDecoding is Submit for a call whose response the receive path decodes,
+// rather than one whose caller decodes the bytes itself: newResp constructs the
+// message the response is decoded into, and the Result carries that message.
+//
+// Registering the factory here, atomically with the call entry, is what lets a
+// receive path decode a response out of memory it only borrows. The factory is
+// invoked at most once for the call — on the frame that answers it — by the
+// receive path, and the decoded message reaches the caller only through the
+// terminal Result, so no message is ever touched by two goroutines: a cancel
+// that wins the terminal CAS simply drops it undelivered, and never synchronizes
+// with the decode that produced it.
+//
+// newResp MUST be allocation-only. It runs on the receive goroutine, which holds
+// up every later inbound frame for its duration, and it MUST return a message
+// nothing else references — one the caller already holds could be read by the
+// caller while the receive path is still decoding into it. A nil newResp is
+// exactly Submit: the response is delivered as bytes.
+func (t *Table) SubmitDecoding(
+	ctx context.Context, budget time.Duration, newResp func() proto.Message,
 ) (uint64, func(ctx context.Context) (Result, error)) {
 	_ = ctx // reserved; see godoc — deadline comes from budget, not ctx.
 
 	id := t.nextID.Add(1)
-	c := &call{id: id, resultCh: make(chan Result, 1)}
+	c := &call{id: id, resultCh: make(chan Result, 1), newResp: newResp}
 	if budget > 0 {
 		c.deadline = Reanchor(budget, time.Now())
 	}
@@ -260,8 +305,61 @@ func (t *Table) Cancel(id uint64) bool {
 // delivering a Result or mutating the table) if id is not currently
 // StatePublished — the late-frame-discard path: the reader goroutine must release
 // the Frame's payload slot through normal means and do nothing else.
+//
+// payload MUST be memory the delivered Result may own indefinitely. A reader
+// holding bytes it only borrows — a shared-memory receive path decoding out of
+// the peer's arena — copies them before calling this, or the caller reads memory
+// the peer has since recycled.
 func (t *Table) Complete(id uint64, payload []byte) bool {
 	return t.terminate(id, StateCompleted, Result{Payload: payload}, StatePublished)
+}
+
+// CompleteMsg is Complete for a call registered through SubmitDecoding: it
+// delivers the already-decoded response message rather than bytes, transferring
+// ownership of msg to the waiting caller on the resultCh send.
+//
+// It has Complete's false/late-frame-discard contract, and losing that CAS is
+// exactly what makes cancellation safe here: the message is simply dropped,
+// undelivered and unreferenced, so a caller that cancelled can never observe a
+// message the receive goroutine produced. The caller that wins reads msg only
+// after receiving it from the channel, so the two never touch it at once.
+//
+// msg MUST hold no memory the receive path only borrows. A message decoded out of
+// a shared-memory arena keeps whatever its decoder retained, and the head advance
+// that follows the decode hands those bytes back to the peer.
+func (t *Table) CompleteMsg(id uint64, msg proto.Message) bool {
+	return t.terminate(id, StateCompleted, Result{Msg: msg}, StatePublished)
+}
+
+// ResponseFactory reports how a response frame naming id must be turned into a
+// value: newResp is the response-message factory registered by SubmitDecoding
+// (nil for a call whose caller decodes the bytes itself), and live reports
+// whether id still names a call in this table at all.
+//
+// A receive path consults it BEFORE it decodes, so a frame nobody is waiting on
+// costs no decode and no copy: live is false for an ID that never existed, one
+// that already reached a terminal state, and one belonging to a stream (streams
+// draw from the same never-reused ID space but are registered elsewhere). Such a
+// frame is not a failure — nothing depends on it, so nothing needs failing.
+//
+// A live answer is a snapshot, and the window is wider than "may terminate the
+// instant after". terminate CASes the call's state, delivers its Result, and only
+// then deletes the entry, so a call whose terminal transition has already been
+// decided is still reported live until that delete lands. A receive path can
+// therefore construct and decode for a call that is provably dead; the message is
+// dropped by CompleteMsg's lost CAS and nothing is delivered twice. That is the
+// ordinary late-frame race — one wasted decode, never a wrong answer — and a
+// caller documenting when its factory runs must say so rather than promise a
+// terminal call costs nothing.
+func (t *Table) ResponseFactory(id uint64) (newResp func() proto.Message, live bool) {
+	t.mu.Lock()
+	c, ok := t.calls[id]
+	t.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+
+	return c.newResp, true
 }
 
 // Fail CASes id from StatePublished to StateFailed, delivers status as the

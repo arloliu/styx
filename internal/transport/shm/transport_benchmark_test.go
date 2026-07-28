@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/arloliu/styx/internal/ring"
-	"github.com/arloliu/styx/internal/transport"
 )
 
 // Benchmark the one thing decode-before-advance changes about producing a
@@ -26,7 +25,7 @@ func BenchmarkTransport_PayloadBytes_CopyVersusView(b *testing.B) {
 			b.Run(fmt.Sprintf("%s/%d", mode, size), func(b *testing.B) {
 				b.ReportAllocs()
 				for b.Loop() {
-					span, err := ep.plugin.payloadBytes(d, transport.FrameUnaryReq, view)
+					span, err := ep.plugin.payloadBytes(d, view)
 					if err != nil || len(span) != size {
 						b.Fatalf("payloadBytes(%d bytes, view=%v): %d bytes, %v", size, view, len(span), err)
 					}
