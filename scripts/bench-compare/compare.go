@@ -13,8 +13,12 @@
 // Gaming-resistance scope: the ratio gates are common-mode-invariant by
 // construction, so latency movements shared across both codebases on one runner
 // show only in advisory deltas, not hard gates. Identity is anchored on
-// machine-invariant allocation counts, which are hard-gated on both reference and
-// normative cells.
+// allocation counts, hard-gated on every reference and normative cell. The gRPC
+// reference cell alone tolerates a small drift band on that check: its allocs/op
+// is a mean over background-goroutine and one-time setup allocations amortized
+// across a varying b.N, not a machine-invariant count the way a self-contained
+// measurement loop is. Every other cell, including the uds reference (styx's own
+// transport, not third-party code), keeps the strict check with no band.
 package main
 
 import (
@@ -421,15 +425,21 @@ func allocCheck(cell string, base, measured, band float64) check {
 			message: fmt.Sprintf("allocs/op %s → %s, +%s%% above baseline", trim(base), f2(measured), f2(pct))}
 	}
 
-	if measured <= base+band {
+	// The band is a one-sided ceiling, not a symmetric window: any decrease
+	// still passes (fewer allocations is an improvement, never a regression),
+	// so the bound to report is the upper limit measured must clear, not a ±
+	// spread around the baseline.
+	upperBound := base + band
+	if measured <= upperBound {
 		return check{name: cell + " allocs/op", pass: true,
-			message: fmt.Sprintf("allocs/op %s → %s (within tolerance band ±%s)", trim(base), f2(measured), f2(band))}
+			message: fmt.Sprintf("allocs/op %s → %s (at or below tolerance ceiling %s)",
+				trim(base), f2(measured), f2(upperBound))}
 	}
 	pct := (measured - base) / base * 100
 
 	return check{name: cell + " allocs/op", pass: false,
-		message: fmt.Sprintf("allocs/op %s → %s, +%s%% above baseline (outside tolerance band ±%s)",
-			trim(base), f2(measured), f2(pct), f2(band))}
+		message: fmt.Sprintf("allocs/op %s → %s, +%s%% above baseline (exceeds tolerance ceiling %s)",
+			trim(base), f2(measured), f2(pct), f2(upperBound))}
 }
 
 // floorCheck fails when a normative cell's measured median ratio versus the
