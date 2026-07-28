@@ -9,21 +9,31 @@ import (
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/transport"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-// stubHandler adapts a func to the ServiceHandler interface for tests.
+// preparedRequest is the request a serve loop would hand Dispatch for a
+// stubHandler-served call: the message stubHandler.NewRequest builds, decoded.
+var preparedRequest = rpcruntime.Request{Msg: wrapperspb.String("req")}
+
+// stubHandler adapts a func to the ServiceHandler interface for tests. Its
+// request message is a StringValue for every method, so a test that cares about
+// the request body sets one and reads it back in fn.
 type stubHandler struct {
-	fn func(ctx context.Context, methodID uint64, payload []byte) (rpcruntime.Response, *rpcruntime.Status, error)
+	fn func(ctx context.Context, methodID uint64, req proto.Message) (rpcruntime.Response, *rpcruntime.Status, error)
 }
 
+func (h stubHandler) NewRequest(uint64) (proto.Message, bool) { return &wrapperspb.StringValue{}, true }
+
 func (h stubHandler) Handle(
-	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
+	ctx context.Context, methodID uint64, req proto.Message, onHandlerEntry func(),
 ) (rpcruntime.Response, *rpcruntime.Status, error) {
 	if onHandlerEntry != nil {
 		onHandlerEntry()
 	}
 
-	return h.fn(ctx, methodID, payload)
+	return h.fn(ctx, methodID, req)
 }
 
 // Test InflightCount reflecting an executing handler while it runs and dropping
@@ -36,7 +46,7 @@ func TestDispatcher_InflightCount_ReflectsExecutingHandler(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	d.Register(7, stubHandler{fn: func(
-		_ context.Context, _ uint64, _ []byte,
+		_ context.Context, _ uint64, _ proto.Message,
 	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		close(entered)
 		<-release
@@ -47,7 +57,7 @@ func TestDispatcher_InflightCount_ReflectsExecutingHandler(t *testing.T) {
 
 	// When: the handler is executing.
 	done := make(chan struct{})
-	go func() { defer close(done); d.Dispatch(t.Context(), req, time.Now()) }()
+	go func() { defer close(done); d.Dispatch(t.Context(), req, preparedRequest, time.Now()) }()
 	<-entered
 
 	// Then
@@ -71,7 +81,7 @@ func TestDispatcher_LeaseTable_HeldWhileHandlerRuns(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	d.Register(7, stubHandler{fn: func(
-		_ context.Context, _ uint64, _ []byte,
+		_ context.Context, _ uint64, _ proto.Message,
 	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		close(entered)
 		<-release
@@ -81,7 +91,7 @@ func TestDispatcher_LeaseTable_HeldWhileHandlerRuns(t *testing.T) {
 
 	// When: the handler is executing.
 	done := make(chan struct{})
-	go func() { defer close(done); d.Dispatch(t.Context(), req, time.Now()) }()
+	go func() { defer close(done); d.Dispatch(t.Context(), req, preparedRequest, time.Now()) }()
 	<-entered
 
 	// Then: a lease for this call is present.
@@ -108,7 +118,7 @@ func TestDispatcher_Obligation_StaysOpenUntilResponsePublished(t *testing.T) {
 	lt := rpcruntime.NewLeaseTable()
 	d.SetLeaseTable(lt)
 	d.Register(7, stubHandler{fn: func(
-		context.Context, uint64, []byte,
+		context.Context, uint64, proto.Message,
 	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		return rpcruntime.Response{Payload: []byte("ok")}, nil, nil
 	}})
@@ -117,7 +127,7 @@ func TestDispatcher_Obligation_StaysOpenUntilResponsePublished(t *testing.T) {
 	// When: the serve loop opens the obligation at consumption, then the handler runs
 	// to completion and Dispatch returns a response frame.
 	d.OpenObligation(9)
-	out := d.Dispatch(t.Context(), req, time.Now())
+	out := d.Dispatch(t.Context(), req, preparedRequest, time.Now())
 	require.Len(t, out, 1, "a response is owed")
 
 	// Then: the lease is released, but the obligation is still open (and unleased) —
@@ -148,7 +158,7 @@ func TestDispatcher_UnknownService_ObligationTrackedUntilReplyPublished(t *testi
 
 	// When: the serve loop opens the obligation at consumption, then dispatches.
 	d.OpenObligation(5)
-	out := d.Dispatch(t.Context(), req, time.Now())
+	out := d.Dispatch(t.Context(), req, preparedRequest, time.Now())
 	require.Len(t, out, 1)
 	require.Equal(t, transport.FrameUnaryErr, out[0].Kind, "an unknown service owes a UNARY_ERR reply")
 
@@ -173,14 +183,14 @@ func TestDispatcher_LeaseTable_ReleasedOnHandlerPanic(t *testing.T) {
 	lt := rpcruntime.NewLeaseTable()
 	d.SetLeaseTable(lt)
 	d.Register(7, stubHandler{fn: func(
-		_ context.Context, _ uint64, _ []byte,
+		_ context.Context, _ uint64, _ proto.Message,
 	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		panic("boom")
 	}})
 	req := transport.Frame{CallID: 5, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
 
 	// When
-	require.Panics(t, func() { d.Dispatch(t.Context(), req, time.Now()) })
+	require.Panics(t, func() { d.Dispatch(t.Context(), req, preparedRequest, time.Now()) })
 
 	// Then
 	require.Empty(t, lt.Snapshot())
@@ -192,22 +202,24 @@ func TestDispatcher_Dispatch_InvokesHandlerAndReturnsResponseFrame(t *testing.T)
 	// Given
 	d := rpcruntime.NewDispatcher()
 	var gotMethod uint64
-	var gotPayload []byte
+	var gotBody string
 	d.Register(7, stubHandler{fn: func(
-		_ context.Context, m uint64, p []byte,
+		_ context.Context, m uint64, p proto.Message,
 	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		gotMethod = m
-		gotPayload = p
+		body, _ := p.(*wrapperspb.StringValue)
+		gotBody = body.GetValue()
+
 		return rpcruntime.Response{Payload: []byte("resp")}, nil, nil
 	}})
-	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3, Payload: []byte("req")}
+	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
 
 	// When
-	out := d.Dispatch(t.Context(), req, time.Now())
+	out := d.Dispatch(t.Context(), req, preparedRequest, time.Now())
 
 	// Then
 	require.Equal(t, uint64(3), gotMethod)
-	require.Equal(t, []byte("req"), gotPayload)
+	require.Equal(t, "req", gotBody)
 	require.Len(t, out, 1)
 	require.Equal(t, transport.FrameUnaryResp, out[0].Kind)
 	require.Equal(t, uint64(1), out[0].CallID)
@@ -220,7 +232,7 @@ func TestDispatcher_Dispatch_SkipsHandler_WhenBudgetAlreadyElapsed(t *testing.T)
 	d := rpcruntime.NewDispatcher()
 	invoked := false
 	d.Register(7, stubHandler{fn: func(
-		context.Context, uint64, []byte,
+		context.Context, uint64, proto.Message,
 	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		invoked = true
 		return rpcruntime.Response{}, nil, nil
@@ -232,7 +244,7 @@ func TestDispatcher_Dispatch_SkipsHandler_WhenBudgetAlreadyElapsed(t *testing.T)
 	}
 
 	// When
-	out := d.Dispatch(t.Context(), req, recvAt)
+	out := d.Dispatch(t.Context(), req, preparedRequest, recvAt)
 
 	// Then
 	require.False(t, invoked, "handler must not run once the budget has elapsed")
@@ -246,14 +258,14 @@ func TestDispatcher_Dispatch_EmitsStatusFrame_WhenHandlerReturnsStatus(t *testin
 	// Given
 	d := rpcruntime.NewDispatcher()
 	d.Register(7, stubHandler{fn: func(
-		context.Context, uint64, []byte,
+		context.Context, uint64, proto.Message,
 	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		return rpcruntime.Response{Payload: []byte("ignored")}, &rpcruntime.Status{Code: 5, Message: "not found"}, nil
 	}})
-	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3, Payload: []byte("req")}
+	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
 
 	// When
-	out := d.Dispatch(t.Context(), req, time.Now())
+	out := d.Dispatch(t.Context(), req, preparedRequest, time.Now())
 
 	// Then: a status frame (not a UNARY_RESP) carries the application error.
 	require.Len(t, out, 1)
@@ -274,7 +286,7 @@ func TestDispatcher_Dispatch_EmitsServiceNotFoundStatus_WhenServiceUnregistered(
 	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
 
 	// When
-	out := d.Dispatch(t.Context(), req, time.Now())
+	out := d.Dispatch(t.Context(), req, preparedRequest, time.Now())
 
 	// Then
 	require.Len(t, out, 1)
@@ -290,14 +302,14 @@ func TestDispatcher_Dispatch_EmitsInternalStatus_WhenHandlerReturnsPlainError(t 
 	// Given
 	d := rpcruntime.NewDispatcher()
 	d.Register(7, stubHandler{fn: func(
-		context.Context, uint64, []byte,
+		context.Context, uint64, proto.Message,
 	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		return rpcruntime.Response{}, nil, errors.New("codec boom")
 	}})
 	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
 
 	// When
-	out := d.Dispatch(t.Context(), req, time.Now())
+	out := d.Dispatch(t.Context(), req, preparedRequest, time.Now())
 
 	// Then
 	require.Len(t, out, 1)
@@ -314,7 +326,7 @@ func TestDispatcher_Dispatch_CancelsHandlerContext_OnMatchingCancelFrame(t *test
 	started := make(chan struct{})
 	var handlerErr error
 	d.Register(7, stubHandler{fn: func(
-		ctx context.Context, _ uint64, _ []byte,
+		ctx context.Context, _ uint64, _ proto.Message,
 	) (rpcruntime.Response, *rpcruntime.Status, error) {
 		close(started)
 		<-ctx.Done()
@@ -327,9 +339,10 @@ func TestDispatcher_Dispatch_CancelsHandlerContext_OnMatchingCancelFrame(t *test
 	// When: run the request handler concurrently, wait for it to start, then
 	// deliver a CANCEL frame for the same call ID.
 	done := make(chan []rpcruntime.ResponseEnvelope, 1)
-	go func() { done <- d.Dispatch(t.Context(), req, time.Now()) }()
+	go func() { done <- d.Dispatch(t.Context(), req, preparedRequest, time.Now()) }()
 	<-started
-	out := d.Dispatch(t.Context(), transport.Frame{CallID: 42, Kind: transport.FrameCancel}, time.Now())
+	cancelFrame := transport.Frame{CallID: 42, Kind: transport.FrameCancel}
+	out := d.Dispatch(t.Context(), cancelFrame, rpcruntime.Request{}, time.Now())
 
 	// Then
 	require.Empty(t, out, "a CANCEL frame produces no response frame")
@@ -344,8 +357,92 @@ func TestDispatcher_Dispatch_DiscardsCancel_ForUnknownCallID(t *testing.T) {
 	d := rpcruntime.NewDispatcher()
 
 	// When
-	out := d.Dispatch(t.Context(), transport.Frame{CallID: 999, Kind: transport.FrameCancel}, time.Now())
+	unknownCancel := transport.Frame{CallID: 999, Kind: transport.FrameCancel}
+	out := d.Dispatch(t.Context(), unknownCancel, rpcruntime.Request{}, time.Now())
 
 	// Then
 	require.Empty(t, out, "unknown CANCEL is a silent no-op")
+}
+
+// Test Dispatcher.NewRequest reporting no request for a service nothing is
+// registered under, so the receive path decodes nothing at all for it — the
+// frame is answered with a not-found status, which needs no request, and its
+// payload is never even read.
+func TestDispatcher_NewRequest_ReportsNoRequest_ForAnUnregisteredService(t *testing.T) {
+	// Given: nothing registered for service 7.
+	d := rpcruntime.NewDispatcher()
+
+	// When
+	msg, ok := d.NewRequest(7, 3)
+
+	// Then
+	require.False(t, ok, "an unregistered service has no request to construct")
+	require.Nil(t, msg)
+}
+
+// Test Dispatcher.NewRequest delegating to the registered service, so the
+// receive path decodes into the message that service's own handler expects.
+func TestDispatcher_NewRequest_DelegatesToTheRegisteredService(t *testing.T) {
+	// Given
+	d := rpcruntime.NewDispatcher()
+	d.Register(7, stubHandler{})
+
+	// When
+	msg, ok := d.NewRequest(7, 3)
+
+	// Then
+	require.True(t, ok)
+	require.IsType(t, &wrapperspb.StringValue{}, msg)
+}
+
+// Test a request the receive path could not decode being answered with a
+// framework-internal status instead of reaching a handler.
+//
+// Answering is the whole point: the call the frame names lives in the HOST's
+// table, so no local terminal reaches it, and shm-abi.md §4 lets a caller with
+// no deadline of its own publish a zero budget — at which point nothing reaps
+// that call. A discard here would strand it on a connection the plugin
+// deliberately keeps healthy.
+func TestDispatcher_Dispatch_AnswersInternalStatus_WhenTheRequestCouldNotBeDecoded(t *testing.T) {
+	// Given: a registered service whose handler must never run.
+	d := rpcruntime.NewDispatcher()
+	invoked := false
+	d.Register(7, stubHandler{fn: func(
+		context.Context, uint64, proto.Message,
+	) (rpcruntime.Response, *rpcruntime.Status, error) {
+		invoked = true
+
+		return rpcruntime.Response{}, nil, nil
+	}})
+	req := transport.Frame{CallID: 11, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
+
+	// When: the receive path reports it could not turn the payload into a request.
+	out := d.Dispatch(t.Context(), req, rpcruntime.Request{DecodeFault: "not a Say request"}, time.Now())
+
+	// Then: the call is terminated with an internal status carrying the reason,
+	// and no handler ever saw it.
+	require.False(t, invoked, "an undecodable request must not reach a handler")
+	require.Len(t, out, 1, "an undecodable request is answered, never dropped")
+	require.Equal(t, transport.FrameUnaryErr, out[0].Kind)
+	require.Equal(t, uint64(11), out[0].CallID)
+	require.NotNil(t, out[0].Status)
+	require.Equal(t, rpcruntime.StatusCodeInternal, out[0].Status.Code)
+	require.Contains(t, out[0].Status.Message, "not a Say request")
+}
+
+// Test an undecodable request still yielding to an unknown service: a frame
+// naming no registered service is answered with the not-found classification the
+// client reconstructs, not with the decode fault, since nothing was decoded for
+// it in the first place.
+func TestDispatcher_Dispatch_PrefersServiceNotFound_OverADecodeFault(t *testing.T) {
+	// Given: nothing registered for service 7.
+	d := rpcruntime.NewDispatcher()
+	req := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Service: 7, Method: 3}
+
+	// When
+	out := d.Dispatch(t.Context(), req, rpcruntime.Request{DecodeFault: "ignored"}, time.Now())
+
+	// Then
+	require.Len(t, out, 1)
+	require.Equal(t, rpcruntime.StatusCodeServiceNotFound, out[0].Status.Code)
 }

@@ -51,14 +51,19 @@ type PluginServerConfig struct {
 	// if every handler guarantees its own isolation, since process state after a
 	// panic is whatever the handler left behind.
 	// A panic in the Styx runtime itself (outside handler frames) is never
-	// recovered under either setting, with one exception: a codec that panics
-	// while encoding a message directly into the shared-memory transport's send
-	// buffer is recovered by that transport, because a caller's bug must not take
-	// the transport down. On the plugin that message is the response: the call
+	// recovered under either setting, with two exceptions, both of them a codec
+	// panicking on a message it was handed. A codec that panics while encoding a
+	// message directly into the shared-memory transport's send buffer is
+	// recovered by that transport, because a caller's bug must not take the
+	// transport down. On the plugin that message is the response: the call
 	// terminates with an internal-error status and the plugin keeps serving,
 	// without tainting the session. The host has the same exception for the
 	// request it encodes the same way: the call fails instead of crashing the
-	// host process.
+	// host process. A codec that panics while DECODING a request is recovered the
+	// same way and for the same reason, with the same outcome — an internal-error
+	// status for that one call, no taint — because that decode runs on the receive
+	// goroutine over bytes the peer chose, and a peer must not be able to end this
+	// process by publishing a payload the codec chokes on.
 	ContinueAfterPanic bool
 
 	// Transports is the data-plane transport allowlist advertised during handshake.
@@ -117,14 +122,30 @@ type ServiceDesc struct {
 	Methods     []MethodDesc
 }
 
-// MethodDesc is one method within a ServiceDesc.
-// Handler decodes the request via dec (bound to the negotiated Codec and
-// inbound payload), invokes the user's implementation, and returns the
-// response message or an application error.
+// MethodDesc is one method within a ServiceDesc. Its two functions split
+// request construction from request handling, because the runtime runs them in
+// different places.
+//
+// NewRequest allocates the message this method's request decodes into. It runs
+// on the receive goroutine, while the inbound payload is still readable, and it
+// holds up every later inbound frame for its duration — so it MUST do nothing
+// but allocate, and MUST return a message nothing else references. Generated
+// code emits `func() proto.Message { return &Req{} }`.
+//
+// Handler receives that message already decoded, invokes the user's
+// implementation, and returns the response message or an application error. It
+// runs on the serving goroutine, after the receive path has released the frame,
+// so the request it is handed owns every byte it holds and stays valid for as
+// long as the handler wants it.
+//
+// The two are a pair: the runtime hands Handler exactly what NewRequest built
+// for the same MethodID, so a Handler may assert the concrete type of its
+// request directly.
 type MethodDesc struct {
 	MethodName string
 	MethodID   uint64
-	Handler    func(srv any, ctx context.Context, dec func(proto.Message) error) (proto.Message, error)
+	NewRequest func() proto.Message
+	Handler    func(srv any, ctx context.Context, req proto.Message) (proto.Message, error)
 }
 
 // EventKind enumerates the supervisor lifecycle event stream.

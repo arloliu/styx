@@ -45,19 +45,19 @@ type echoClient struct{ conn *styx.ClientConn }
 func NewEchoClient(conn *styx.ClientConn) EchoClient { return &echoClient{conn: conn} }
 
 func (c *echoClient) Say(ctx context.Context, req *SayRequest) (*SayResponse, error) {
-	resp := &SayResponse{}
-	if err := c.conn.InvokeID(ctx, echoServiceID, echoSayMethodID, req, resp); err != nil {
+	msg, err := c.conn.InvokeIDFactory(ctx, echoServiceID, echoSayMethodID, req, func() proto.Message { return &SayResponse{} })
+	if err != nil {
 		return nil, err
 	}
-	return resp, nil
+	return msg.(*SayResponse), nil
 }
 
 func (c *echoClient) Blob(ctx context.Context, req *BlobRequest) (*BlobResponse, error) {
-	resp := &BlobResponse{}
-	if err := c.conn.InvokeID(ctx, echoServiceID, echoBlobMethodID, req, resp); err != nil {
+	msg, err := c.conn.InvokeIDFactory(ctx, echoServiceID, echoBlobMethodID, req, func() proto.Message { return &BlobResponse{} })
+	if err != nil {
 		return nil, err
 	}
-	return resp, nil
+	return msg.(*BlobResponse), nil
 }
 
 type EchoServer interface {
@@ -74,23 +74,17 @@ func RegisterEchoServer(srv *styx.PluginServer, impl EchoServer) {
 			{
 				MethodName: "Say",
 				MethodID:   echoSayMethodID,
-				Handler: func(s any, ctx context.Context, dec func(proto.Message) error) (proto.Message, error) {
-					req := &SayRequest{}
-					if err := dec(req); err != nil {
-						return nil, err
-					}
-					return impl.Say(ctx, req)
+				NewRequest: func() proto.Message { return &SayRequest{} },
+				Handler: func(s any, ctx context.Context, req proto.Message) (proto.Message, error) {
+					return impl.Say(ctx, req.(*SayRequest))
 				},
 			},
 			{
 				MethodName: "Blob",
 				MethodID:   echoBlobMethodID,
-				Handler: func(s any, ctx context.Context, dec func(proto.Message) error) (proto.Message, error) {
-					req := &BlobRequest{}
-					if err := dec(req); err != nil {
-						return nil, err
-					}
-					return impl.Blob(ctx, req)
+				NewRequest: func() proto.Message { return &BlobRequest{} },
+				Handler: func(s any, ctx context.Context, req proto.Message) (proto.Message, error) {
+					return impl.Blob(ctx, req.(*BlobRequest))
 				},
 			},
 		},

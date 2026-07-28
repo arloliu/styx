@@ -284,13 +284,20 @@ func genClientImpl(g *protogen.GeneratedFile, svc *protogen.Service) {
 
 			continue
 		}
+		// The response message is constructed by a factory the runtime calls, not
+		// allocated here: that is what lets the runtime decode the response on its
+		// receive goroutine, straight out of the transport's own memory, and hand
+		// back a message that owns its bytes. The factory allocates exactly the
+		// message this stub used to allocate itself, so the call still costs one.
+		// The returned message is always the one the factory built, so the assertion
+		// below cannot fail.
 		g.P("func (c *", structName, ") ", clientMethodSignature(g, svc, m), " {")
-		g.P("resp := &", m.Output.GoIdent, "{}")
-		g.P("if err := c.conn.InvokeID(ctx, ", nameLower, "ServiceID, ", nameLower, m.GoName,
-			"MethodID, req, resp); err != nil {")
+		g.P("msg, err := c.conn.InvokeIDFactory(ctx, ", nameLower, "ServiceID, ", nameLower, m.GoName,
+			"MethodID, req, func() ", protoPackage.Ident("Message"), " { return &", m.Output.GoIdent, "{} })")
+		g.P("if err != nil {")
 		g.P("return nil, err")
 		g.P("}")
-		g.P("return resp, nil")
+		g.P("return msg.(*", m.Output.GoIdent, "), nil")
 		g.P("}")
 		g.P()
 	}
@@ -370,16 +377,18 @@ func genRegisterFunc(g *protogen.GeneratedFile, svc *protogen.Service) {
 		if isStreaming(m) {
 			continue
 		}
+		// NewRequest and Handler are a pair: the runtime allocates the request on its
+		// receive goroutine (allocation only — no user code may run there) and decodes
+		// the inbound payload into it while those bytes are still readable, then calls
+		// Handler with that same message once the frame is released. The assertion is
+		// therefore against the type NewRequest just built, and cannot fail.
 		g.P("{")
 		g.P("MethodName: ", strconv.Quote(string(m.Desc.Name())), ",")
 		g.P("MethodID:   ", nameLower, m.GoName, "MethodID,")
-		g.P("Handler: func(s any, ctx ", contextPackage.Ident("Context"), ", dec func(", protoPackage.Ident("Message"),
-			") error) (", protoPackage.Ident("Message"), ", error) {")
-		g.P("req := &", m.Input.GoIdent, "{}")
-		g.P("if err := dec(req); err != nil {")
-		g.P("return nil, err")
-		g.P("}")
-		g.P("return impl.", m.GoName, "(ctx, req)")
+		g.P("NewRequest: func() ", protoPackage.Ident("Message"), " { return &", m.Input.GoIdent, "{} },")
+		g.P("Handler: func(s any, ctx ", contextPackage.Ident("Context"), ", req ", protoPackage.Ident("Message"),
+			") (", protoPackage.Ident("Message"), ", error) {")
+		g.P("return impl.", m.GoName, "(ctx, req.(*", m.Input.GoIdent, "))")
 		g.P("},")
 		g.P("},")
 	}

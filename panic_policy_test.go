@@ -40,20 +40,17 @@ func newPanicTestService() *ServiceDesc {
 			{
 				MethodName: "Boom",
 				MethodID:   fnv64a("Boom"),
-				Handler: func(any, context.Context, func(proto.Message) error) (proto.Message, error) {
+				NewRequest: func() proto.Message { return &wrapperspb.StringValue{} },
+				Handler: func(any, context.Context, proto.Message) (proto.Message, error) {
 					panic("handler boom")
 				},
 			},
 			{
 				MethodName: "Echo",
 				MethodID:   fnv64a("Echo"),
-				Handler: func(_ any, _ context.Context, dec func(proto.Message) error) (proto.Message, error) {
-					var msg wrapperspb.StringValue
-					if err := dec(&msg); err != nil {
-						return nil, err
-					}
-
-					return &msg, nil
+				NewRequest: func() proto.Message { return &wrapperspb.StringValue{} },
+				Handler: func(_ any, _ context.Context, req proto.Message) (proto.Message, error) {
+					return req, nil
 				},
 			},
 		},
@@ -83,7 +80,7 @@ func TestServiceHandler_RecoverPanic_RepliesPanicStatus_AndTaints(t *testing.T) 
 	h := newServiceHandler(registeredService{desc: desc}, codec.Proto{}, pc)
 
 	// When the panicking method is dispatched.
-	resp, status, err := h.Handle(t.Context(), fnv64a("Boom"), nil, nil)
+	resp, status, err := h.Handle(t.Context(), fnv64a("Boom"), &wrapperspb.StringValue{}, nil)
 
 	// Then the panic is recovered as a status reply, not propagated, and the
 	// session is tainted for controlled termination.
@@ -103,13 +100,11 @@ func TestServiceHandler_ContinueAfterPanic_RepliesPanicStatus_WithoutTaint(t *te
 	h := newServiceHandler(registeredService{desc: desc}, codec.Proto{}, pc)
 
 	// When the panicking method is dispatched, then a normal method is dispatched.
-	_, status, err := h.Handle(t.Context(), fnv64a("Boom"), nil, nil)
+	_, status, err := h.Handle(t.Context(), fnv64a("Boom"), &wrapperspb.StringValue{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, rpcruntime.StatusCodeHandlerPanic, status.Code)
 
-	req, merr := codec.Proto{}.Marshal(wrapperspb.String("hi"))
-	require.NoError(t, merr)
-	echoResp, echoStatus, echoErr := h.Handle(t.Context(), fnv64a("Echo"), req, nil)
+	echoResp, echoStatus, echoErr := h.Handle(t.Context(), fnv64a("Echo"), wrapperspb.String("hi"), nil)
 
 	// Then the session is never tainted and the subsequent call succeeds.
 	require.False(t, pc.shouldTerminate())
@@ -740,7 +735,8 @@ func setupUnaryInterleaveHarness(t *testing.T) *unaryInterleaveHarness {
 		Methods: []MethodDesc{{
 			MethodName: watchMethod,
 			MethodID:   fnv64a(watchMethod),
-			Handler: func(any, context.Context, func(proto.Message) error) (proto.Message, error) {
+			NewRequest: func() proto.Message { return &wrapperspb.StringValue{} },
+			Handler: func(any, context.Context, proto.Message) (proto.Message, error) {
 				watchEntered <- struct{}{}
 
 				return &wrapperspb.StringValue{}, nil

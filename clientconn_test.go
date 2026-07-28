@@ -13,6 +13,7 @@ import (
 	"github.com/arloliu/styx/internal/transport"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -35,29 +36,29 @@ func newInProcessTransportPairForTest(t *testing.T) (a, b transport.Transport) {
 	return a, b
 }
 
-// echoHandler is a hand-rolled rpcruntime.ServiceHandler that decodes the
-// request via codec and returns it unchanged, proving Invoke's round trip
-// without any generated service.
+// echoHandler is a hand-rolled rpcruntime.ServiceHandler that returns the
+// decoded request unchanged, proving Invoke's round trip without any generated
+// service.
 type echoHandler struct {
 	codec codec.Codec
 }
 
+// NewRequest builds the StringValue every method of this handler takes — the
+// allocation-only construction hook the receive path decodes into.
+func (h echoHandler) NewRequest(uint64) (proto.Message, bool) { return &wrapperspb.StringValue{}, true }
+
 func (h echoHandler) Handle(
-	_ context.Context, _ uint64, payload []byte, onHandlerEntry func(),
+	_ context.Context, _ uint64, req proto.Message, onHandlerEntry func(),
 ) (rpcruntime.Response, *rpcruntime.Status, error) {
 	// Honor the handler-entry contract: a non-nil callback runs exactly once before any
 	// handler behavior.
 	if onHandlerEntry != nil {
 		onHandlerEntry()
 	}
-	var msg wrapperspb.StringValue
-	if err := h.codec.Unmarshal(payload, &msg); err != nil {
-		return rpcruntime.Response{}, nil, err
-	}
 
 	// Return the message rather than encoded bytes, as the generated service
 	// adapter does, so this loop exercises the same response send path.
-	return rpcruntime.Response{Msg: &msg}, nil, nil
+	return rpcruntime.Response{Msg: req}, nil, nil
 }
 
 // runInProcessDispatchLoop drives dispatcher over tr until tr is closed,
@@ -71,12 +72,31 @@ func runInProcessDispatchLoop(tr transport.Transport, dispatcher *rpcruntime.Dis
 			return
 		}
 
-		for _, env := range dispatcher.Dispatch(context.Background(), f, time.Now()) {
+		req := prepareDispatchRequest(dispatcher, codec.Proto{}, f)
+		for _, env := range dispatcher.Dispatch(context.Background(), f, req, time.Now()) {
 			if sendErr := sendUnaryResponse(context.Background(), tr, codec.Proto{}, env); sendErr != nil {
 				return
 			}
 		}
 	}
+}
+
+// prepareDispatchRequest builds and decodes the request a unary frame carries,
+// the step the real serve loop performs on its receive goroutine before handing
+// the frame to Dispatch. A frame whose service or method resolves to nothing
+// decodes nothing: dispatch answers it with a not-found status.
+func prepareDispatchRequest(
+	dispatcher *rpcruntime.Dispatcher, cdc codec.Codec, f transport.Frame,
+) rpcruntime.Request {
+	msg, ok := dispatcher.NewRequest(f.Service, f.Method)
+	if !ok {
+		return rpcruntime.Request{}
+	}
+	if err := cdc.Unmarshal(f.Payload, msg); err != nil {
+		return rpcruntime.Request{DecodeFault: err.Error()}
+	}
+
+	return rpcruntime.Request{Msg: msg}
 }
 
 // Test ClientConn.Invoke completing a round-trip through Table, Transport, and Dispatcher without a real subprocess

@@ -41,20 +41,24 @@ type labelHandler struct {
 	label string
 }
 
+// NewRequest builds the StringValue this handler's methods take — the
+// allocation-only construction hook the receive path decodes into.
+func (h labelHandler) NewRequest(uint64) (proto.Message, bool) {
+	return &wrapperspb.StringValue{}, true
+}
+
 func (h labelHandler) Handle(
-	_ context.Context, _ uint64, payload []byte, onHandlerEntry func(),
+	_ context.Context, _ uint64, req proto.Message, onHandlerEntry func(),
 ) (rpcruntime.Response, *rpcruntime.Status, error) {
 	// Honor the handler-entry contract: a non-nil callback runs exactly once before any
 	// handler behavior.
 	if onHandlerEntry != nil {
 		onHandlerEntry()
 	}
-	var req wrapperspb.StringValue
-	if err := h.codec.Unmarshal(payload, &req); err != nil {
-		return rpcruntime.Response{}, nil, err
-	}
 
-	return rpcruntime.Response{Msg: wrapperspb.String(h.label + ":" + req.GetValue())}, nil, nil
+	body, _ := req.(*wrapperspb.StringValue)
+
+	return rpcruntime.Response{Msg: wrapperspb.String(h.label + ":" + body.GetValue())}, nil, nil
 }
 
 // newLabeledConnState builds one connection generation backed by an
@@ -340,7 +344,7 @@ func newGatedGeneration(t *testing.T) *gatedGeneration {
 	// publication CAS before it hands the frame to the transport.
 	reqFrame, err := pluginTr.Recv(t.Context())
 	require.NoError(t, err)
-	envs := dispatcher.Dispatch(t.Context(), reqFrame, time.Now())
+	envs := dispatcher.Dispatch(t.Context(), reqFrame, prepareDispatchRequest(dispatcher, cdc, reqFrame), time.Now())
 	require.Len(t, envs, 1)
 	require.NoError(t, sendUnaryResponse(t.Context(), pluginTr, cdc, envs[0]))
 
@@ -425,13 +429,14 @@ func TestJoinPublishedResponses_ReportStragglers_WhenTheReaderNeverClaimsTheAnsw
 
 	dispatcher := rpcruntime.NewDispatcher()
 	dispatcher.Register(fnv64a("test.Echo"), labelHandler{codec: cdc, label: "old"})
-	envs := dispatcher.Dispatch(t.Context(), transport.Frame{
+	reqFrame := transport.Frame{
 		CallID:  callID,
 		Kind:    transport.FrameUnaryReq,
 		Service: fnv64a("test.Echo"),
 		Method:  fnv64a("Say"),
 		Payload: mustMarshal(t, cdc, wrapperspb.String("hello")),
-	}, time.Now())
+	}
+	envs := dispatcher.Dispatch(t.Context(), reqFrame, prepareDispatchRequest(dispatcher, cdc, reqFrame), time.Now())
 	require.Len(t, envs, 1)
 	require.NoError(t, sendUnaryResponse(t.Context(), pluginTr, cdc, envs[0]))
 

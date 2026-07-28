@@ -117,9 +117,26 @@ func TestRun_GeneratesClientAndServerStubs_WithMatchingFNV64IDs(t *testing.T) {
 	require.Equal(t, wantServiceID, hexLiteral(t, content, "echoServiceID"))
 	require.Equal(t, wantSayMethodID, hexLiteral(t, content, "echoSayMethodID"))
 
-	// And: the unary client dispatches by the precomputed ID constants (InvokeID), not
-	// by hashing the service/method name strings on every call.
-	require.Contains(t, content, "c.conn.InvokeID(ctx, echoServiceID, echoSayMethodID, req, resp)")
+	// And: the unary client dispatches by the precomputed ID constants, not by hashing
+	// the service/method name strings on every call, and hands the runtime a factory
+	// for the response instead of a message of its own — the entry point that lets the
+	// response be decoded on the receive goroutine, out of the transport's own memory.
+	require.Contains(t, content,
+		"c.conn.InvokeIDFactory(ctx, echoServiceID, echoSayMethodID, req, "+
+			"func() proto.Message { return &SayResponse{} })")
+
+	// And: the server side splits request construction from handling, so the runtime
+	// can allocate and decode the request on its receive goroutine and run the handler
+	// afterwards with a message that owns its bytes.
+	require.Contains(t, content, "NewRequest: func() proto.Message { return &SayRequest{} },")
+	require.Contains(t, content,
+		"Handler: func(s any, ctx context.Context, req proto.Message) (proto.Message, error) {")
+	require.Contains(t, content, "return impl.Say(ctx, req.(*SayRequest))")
+
+	// And: no generated handler decodes anything itself any more — the dec callback the
+	// old contract passed in is gone, so a stale generator cannot leave a decode running
+	// on the serve goroutine after the payload it read is no longer the request's source.
+	require.NotContains(t, content, "dec func(proto.Message) error")
 }
 
 // Test Run emitting an EchoRequirement() helper returning the exact

@@ -16,20 +16,63 @@ import (
 // between the package and the generated styx code; this package does not import
 // the styx package (to avoid a cycle: styx depends on internal/rpcruntime, not
 // the reverse). Status is a package-local sentinel for the same reason.
+//
+// It is deliberately two-phase — construct the request, then run the method —
+// because the two halves run in different places. A receive path that decodes
+// straight out of the transport's own memory must finish reading those bytes
+// before it releases the frame, and it cannot run an application handler there:
+// the handler would hold the receive loop for its whole duration, and any value
+// it kept would outlive the bytes. So the request is built and decoded on the
+// receive goroutine, and the handler runs afterwards with a message that owns
+// everything it holds (shm-abi.md §9).
 type ServiceHandler interface {
-	// Handle dispatches a single method call by ID, returning either a
-	// successful Response or a Status describing the failure.
+	// NewRequest returns a freshly allocated request message for methodID, or
+	// false when the method is unknown — in which case the caller decodes
+	// nothing at all and Handle answers the frame with a not-found status.
+	//
+	// It runs on the receive goroutine, inside the window where the inbound
+	// payload is still readable, and it holds up every later inbound frame while
+	// it runs. It MUST therefore be allocation-only: no application code, no
+	// blocking, no I/O. The message it returns MUST be referenced by nothing
+	// else, since the caller decodes into it.
+	NewRequest(methodID uint64) (proto.Message, bool)
+	// Handle dispatches a single method call by ID with the already-decoded
+	// request, returning either a successful Response or a Status describing the
+	// failure.
+	// req is the message NewRequest built for this same methodID, decoded by the
+	// caller; it is nil only when NewRequest reported the method unknown.
 	// onHandlerEntry, when non-nil, is called exactly once at the top of the
 	// handler frame — immediately before the application handler runs, after
-	// method resolution and request-decode setup.
+	// method resolution.
 	// The serve loop passes the release of its admission read side here so that
 	// read side spans the taint check through handler entry but never the
 	// handler's execution.
 	// A refusal that runs no handler (an unknown method) does not call it; the
 	// serve loop releases its read side itself in that case.
 	Handle(
-		ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
+		ctx context.Context, methodID uint64, req proto.Message, onHandlerEntry func(),
 	) (resp Response, status *Status, err error)
+}
+
+// Request is one inbound unary request as the receive path left it: either the
+// decoded message, or the text of the failure that stopped the decode. The zero
+// value means nothing was decoded, which is what an unknown service or method
+// produces.
+//
+// DecodeFault is text rather than an error on purpose. The decode runs while the
+// payload is still borrowed from the transport, and an error a decoder built out
+// of the bytes it was handed would carry a reference to them into a value the
+// dispatcher keeps well past the point those bytes are reclaimed. Rendering the
+// failure where it happens copies it into a string of this struct's own, so the
+// diagnostic survives and the reference does not — the same containment
+// transport.ConsumeFaultError applies to a consume fault's detail.
+type Request struct {
+	// Msg is the decoded request message, or nil when nothing was decoded.
+	Msg proto.Message
+	// DecodeFault is the rendered failure that stopped the decode, empty when
+	// there was none. A non-empty value means the request cannot be handled and
+	// the call is answered with a framework-internal status.
+	DecodeFault string
 }
 
 // Response is a unary handler's successful reply, in whichever form the handler
@@ -105,6 +148,39 @@ func (d *Dispatcher) Register(serviceID uint64, h ServiceHandler) {
 	d.mu.Unlock()
 }
 
+// NewRequest returns a freshly allocated request message for the unary request
+// (serviceID, methodID) names, or false when nothing should be decoded for it —
+// an unregistered service, or a method the registered service does not have.
+//
+// It is the receive path's construction hook: the caller decodes the inbound
+// payload into the returned message while those bytes are still readable, then
+// hands the message to Dispatch. A false result means the frame is answered with
+// a not-found status, which needs no request, so its payload is never decoded and
+// never even read.
+//
+// Like the ServiceHandler.NewRequest it delegates to, this runs on the receive
+// goroutine and is allocation-only.
+//
+// The resolved service is deliberately not carried forward to Dispatch, which
+// resolves it again. The two resolutions cannot disagree: Register is a setup-only
+// call, documented and used that way, so the service map is fixed by the time any
+// frame arrives. Threading the handler through the prepared request would trade a
+// map read for a field a caller could populate inconsistently, which is the
+// opposite of the guarantee it would look like it was buying. (The method-level
+// lookup inside one handler IS shared — see the ServiceHandler implementation —
+// because there the two answers come from two functions whose conditions could
+// drift apart in code.)
+func (d *Dispatcher) NewRequest(serviceID, methodID uint64) (proto.Message, bool) {
+	d.mu.Lock()
+	h := d.services[serviceID]
+	d.mu.Unlock()
+	if h == nil {
+		return nil, false
+	}
+
+	return h.NewRequest(methodID)
+}
+
 // SetLeaseTable installs lt as the active-handler lease table this Dispatcher
 // records unary handler leases into. Like Register, it is expected to be called
 // once during setup, before Dispatch runs. A Dispatcher with no lease table set
@@ -156,20 +232,28 @@ func (d *Dispatcher) CloseObligation(callID uint64) {
 // independently), invokes the handler under a ctx derived from
 // Reanchor(f.Budget, recvAt) registered in inFlight for the duration of the call,
 // and returns either the UNARY_RESP Frame, a FrameUnaryErr carrying a Status
-// (application error, unknown service/method, or dispatch fault), or none (only
-// when the budget already elapsed, so the client's own deadline timer reaps the
-// call).
+// (application error, unknown service/method, undecodable request, or dispatch
+// fault), or none (only when the budget already elapsed, so the client's own
+// deadline timer reaps the call).
 // For a FrameCancel: cancels the matching inFlight entry if any (a CANCEL for an
 // already-completed or unknown CallID is a no-op — the same late-frame-discard
 // rule as Table), and returns no Frame.
 // Any other kind is discarded (returns no Frame).
+//
+// req is the request the receive path prepared for f with this Dispatcher's own
+// NewRequest, decoded while f's payload was still readable. f.Payload is NOT read
+// here and need not still be valid: the payload's one reader is that decode, and
+// it has already run. A zero req is what an unknown service or method produces;
+// one carrying a DecodeFault is answered with a framework-internal status and
+// reaches no handler.
+//
 // onHandlerEntry, when supplied, is called once at handler entry for a UNARY_REQ
 // — immediately before the application handler runs (see ServiceHandler.Handle).
 // It is optional so callers that do not linearize admission (tests, the
 // differential harness) need not pass one; only the serving loop does, to release
 // its admission read side at handler entry.
 func (d *Dispatcher) Dispatch(
-	ctx context.Context, f transport.Frame, recvAt time.Time, onHandlerEntry ...func(),
+	ctx context.Context, f transport.Frame, req Request, recvAt time.Time, onHandlerEntry ...func(),
 ) []ResponseEnvelope {
 	var atHandlerEntry func()
 	if len(onHandlerEntry) > 0 {
@@ -179,7 +263,7 @@ func (d *Dispatcher) Dispatch(
 	// and never arrive here; see the doc comment above for the discard rule.
 	switch f.Kind {
 	case transport.FrameUnaryReq:
-		return d.dispatchUnary(ctx, f, recvAt, atHandlerEntry)
+		return d.dispatchUnary(ctx, f, req, recvAt, atHandlerEntry)
 	case transport.FrameCancel:
 		d.cancel(f.CallID)
 		return nil
@@ -192,7 +276,7 @@ func (d *Dispatcher) Dispatch(
 // under a cancelable/deadline-bound ctx tracked in inFlight, post-return budget
 // check, and response-frame construction.
 func (d *Dispatcher) dispatchUnary(
-	ctx context.Context, f transport.Frame, recvAt time.Time, onHandlerEntry func(),
+	ctx context.Context, f transport.Frame, req Request, recvAt time.Time, onHandlerEntry func(),
 ) []ResponseEnvelope {
 	var deadline time.Time
 	if f.Budget > 0 {
@@ -213,12 +297,25 @@ func (d *Dispatcher) dispatchUnary(
 			Code: StatusCodeServiceNotFound, Message: "service not found",
 		})}
 	}
+	if req.DecodeFault != "" {
+		// The receive path could not turn this request's bytes into its message.
+		// Answering is what discharges the caller's dependency on the frame: the
+		// call lives in the peer's table, so nothing local reaps it, and a request
+		// published with no deadline (shm-abi.md §4: budget 0 means no deadline)
+		// would otherwise wait forever on a connection that stays healthy. No
+		// handler runs, so onHandlerEntry is deliberately not called — the serve
+		// loop releases its own admission read side for a refusal that reaches no
+		// handler.
+		return []ResponseEnvelope{statusEnvelope(f, &Status{
+			Code: StatusCodeInternal, Message: "request decode failed: " + req.DecodeFault,
+		})}
+	}
 
 	callCtx, cancel := contextFor(ctx, deadline)
 	d.trackCall(f.CallID, cancel, recvAt)
 	defer d.untrackCall(f.CallID, cancel)
 
-	resp, status, err := h.Handle(callCtx, f.Method, f.Payload, onHandlerEntry)
+	resp, status, err := h.Handle(callCtx, f.Method, req.Msg, onHandlerEntry)
 
 	if !deadline.IsZero() && !time.Now().Before(deadline) {
 		return nil // budget elapsed during the handler: the plugin checks the budget again after the handler returns.

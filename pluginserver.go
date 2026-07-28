@@ -7,9 +7,11 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/control"
@@ -961,9 +963,7 @@ func runServeLoop(
 	ctx context.Context, tr transport.Transport, cdc codec.Codec, d *rpcruntime.Dispatcher, srv *streamServer,
 	panicPolicy *panicController, coord *drainCoordinator,
 ) error {
-	// One releaser for the whole loop: dispatch is inline on this single goroutine, so
-	// the unary admission release is reused per call rather than allocated per request.
-	releaser := newAdmitReleaser(panicPolicy)
+	deps := newServeDeps(tr, cdc, d, srv, panicPolicy, coord)
 	for {
 		// Signal an owed drain boundary before blocking on the next Recv, so a stream
 		// frame dispatched earlier is detected drained however many non-stream frames
@@ -973,11 +973,112 @@ func runServeLoop(
 			srv.plane.probeDrain()
 		}
 
-		done, loopErr := serveOneFrame(ctx, tr, cdc, d, srv, panicPolicy, releaser, coord)
+		done, loopErr := serveOneFrame(ctx, deps)
 		if done {
 			return loopErr
 		}
 	}
+}
+
+// serveDeps is one serving session's wiring and its per-frame scratch space,
+// bundled so the per-frame steps take the session rather than a growing parameter
+// list, and so receiving a frame allocates nothing.
+//
+// The whole struct belongs to the single serve goroutine: the wiring is fixed for
+// the session's lifetime, and the scratch fields are written and read by that one
+// goroutine within a single frame's disposition. Nothing here is safe to touch
+// from a handler goroutine.
+type serveDeps struct {
+	tr          transport.Transport
+	cdc         codec.Codec
+	d           *rpcruntime.Dispatcher
+	srv         *streamServer
+	panicPolicy *panicController
+	coord       *drainCoordinator
+	// viewRecv is the capability this session receives through, or nil to receive
+	// frames the ordinary way. See serveViewReceiver.
+	viewRecv transport.ViewReceiver
+	// releaser is the session's one reusable unary admission releaser.
+	releaser *admitReleaser
+
+	// frame and req are where the receive step leaves the frame it took and the
+	// request it prepared. They are how the consume callback reports its result:
+	// the callback's own error return is a disposition selector the transport reads
+	// and renders to text, never a channel back to this loop
+	// (transport.ViewReceiver). serveOneFrame clears both before each receive, so a
+	// path that reads them can only ever see this frame's values — a receive that
+	// produced nothing leaves the zero value rather than the previous frame's.
+	frame transport.Frame
+	req   rpcruntime.Request
+	// reserved records whether this frame's ingress reservation was taken, so the
+	// retire fires on every exit path.
+	reserved bool
+	// reserve and consume are bound once for the session rather than per frame, so
+	// the receive hot path allocates no closures. Both act on the scratch fields
+	// above.
+	reserve func()
+	consume func(transport.Frame) error
+}
+
+// newServeDeps builds one serving session's wiring and binds its two receive
+// callbacks once, so no frame allocates a closure to be received.
+func newServeDeps(
+	tr transport.Transport, cdc codec.Codec, d *rpcruntime.Dispatcher, srv *streamServer,
+	panicPolicy *panicController, coord *drainCoordinator,
+) *serveDeps {
+	deps := &serveDeps{
+		tr: tr, cdc: cdc, d: d, srv: srv, panicPolicy: panicPolicy, coord: coord,
+		viewRecv: serveViewReceiver(tr, cdc),
+		// One releaser for the whole loop: dispatch is inline on this single goroutine, so
+		// the unary admission release is reused per call rather than allocated per request.
+		releaser: newAdmitReleaser(panicPolicy),
+	}
+	deps.reserve = func() {
+		deps.reserved = true
+		if deps.coord != nil {
+			deps.coord.reserve()
+		}
+	}
+	deps.consume = func(view transport.Frame) error {
+		deps.frame, deps.req = prepareInboundFrame(deps, view, true)
+
+		// Every frame that reaches here is one this side finished with: it was
+		// decoded, it was copied, or it is a refusal dispatch answers with a status
+		// frame. None of them is a frame this side could not take while the host's
+		// call still depended on it — the one thing declining is for — so this
+		// callback never declines, and returning nil is what reports them consumed
+		// (shm-abi.md §9). Never declining is also what keeps a run of consume faults
+		// from forming here at all, and with it the transport's run-threshold
+		// teardown.
+		return nil
+	}
+
+	return deps
+}
+
+// serveViewReceiver reports the capability this serving session receives through:
+// a transport that can hand a frame over as a borrowed view of its own memory, so
+// a request is decoded before the transport reclaims the bytes it was decoded from,
+// or nil to receive private copies exactly as before.
+//
+// Two things must both hold, the same pair the host's read loop requires. The
+// transport must implement transport.ViewReceiver at all, and the negotiated codec
+// must decode into values that own their bytes (codec.OwningUnmarshaler) — a codec
+// that decodes lazily would leave the request message pointing into the host's
+// memory, which the transport reclaims as soon as the callback returns. A codec
+// that does not answer for itself is assumed not to.
+func serveViewReceiver(tr transport.Transport, cdc codec.Codec) transport.ViewReceiver {
+	vr, ok := tr.(transport.ViewReceiver)
+	if !ok {
+		return nil
+	}
+
+	owning, ok := cdc.(codec.OwningUnmarshaler)
+	if !ok || !owning.DecodedMessageOwnsBytes() {
+		return nil
+	}
+
+	return vr
 }
 
 // recvReserving receives one frame under the ingress-reservation contract: when the
@@ -1020,13 +1121,19 @@ func disposeRecvErr(err error) (done bool, loopErr error) {
 		// can answer has accepted the frame rather than declined it, so it never
 		// reaches this branch at all (shm-abi.md §9).
 		//
-		// A request this side genuinely could not take leaves the host's call to
-		// whatever budget its descriptor carried, and that budget MAY be zero (§4:
-		// 0 means no deadline), which is what a host caller with no deadline of its
-		// own publishes. At zero nothing reaps that call, and this branch keeps the
-		// connection up, so the host waits indefinitely. That gap is open, not
-		// closed: shutting it needs a route for this loop to publish an error status
-		// for a frame it never dispatched, which it does not have.
+		// This side's consume callback is written so that it always can. Every way
+		// preparing a request can fail — an unregistered service, an unknown method,
+		// a payload the codec rejects, a codec that panics on it — is carried out of
+		// the callback as an accepted frame that dispatch answers with a status, so
+		// none of them declines and none of them reaches here. What can still reach
+		// here is a fault inside the transport's own frame construction, or a panic
+		// in framework code outside the prepared decode: both are bugs on this side
+		// rather than conditions a peer's traffic produces, and neither leaves a
+		// route to answer. A host call discarded that way is left to whatever budget
+		// its descriptor carried, which §4 permits to be zero (no deadline) — so it
+		// waits on a connection this branch deliberately keeps healthy. That residue
+		// is the price of keeping the loop alive through a bug, not a disposition
+		// this side chooses for a request it could have answered.
 		return false, nil
 	}
 	if errors.Is(err, transport.ErrPoisoned) {
@@ -1041,27 +1148,24 @@ func disposeRecvErr(err error) (done bool, loopErr error) {
 	return true, nil // peer close / ErrClosed / ctx: not a self-initiated poison
 }
 
-func serveOneFrame(
-	ctx context.Context, tr transport.Transport, cdc codec.Codec, d *rpcruntime.Dispatcher, srv *streamServer,
-	panicPolicy *panicController, releaser *admitReleaser, coord *drainCoordinator,
-) (done bool, loopErr error) {
-	reserved := false
-	reserve := func() {
-		reserved = true
-		if coord != nil {
-			coord.reserve()
-		}
-	}
+func serveOneFrame(ctx context.Context, deps *serveDeps) (done bool, loopErr error) {
+	// Clear the receive scratch before taking the next frame, so no path can read a
+	// previous frame's values. Nothing reads them after a failed receive today; this
+	// makes that hold by construction rather than by argument, and it drops the
+	// previous frame's cloned payload a little sooner.
+	deps.reserved = false
+	deps.frame, deps.req = transport.Frame{}, rpcruntime.Request{}
 	defer func() {
-		if reserved && coord != nil {
-			coord.retire()
+		if deps.reserved && deps.coord != nil {
+			deps.coord.retire()
 		}
 	}()
 
-	f, err := recvReserving(ctx, tr, reserve)
-	if err != nil {
+	if err := receiveOneFrame(ctx, deps); err != nil {
 		return disposeRecvErr(err)
 	}
+	f, req := deps.frame, deps.req
+	tr, srv, panicPolicy := deps.tr, deps.srv, deps.panicPolicy
 
 	// Coarse admission fence: once a recovered handler panic has tainted the session
 	// under the default policy, drop every further frame before routing it into
@@ -1130,7 +1234,7 @@ func serveOneFrame(
 
 		return true, errServeLoopPoisoned
 	default:
-		stop, derr := dispatchNonStreamFrame(ctx, tr, cdc, d, f, panicPolicy, releaser)
+		stop, derr := dispatchNonStreamFrame(ctx, deps, f, req)
 		if derr != nil {
 			return true, derr
 		}
@@ -1140,6 +1244,159 @@ func serveOneFrame(
 	}
 
 	return false, nil // keep serving; retire runs via the defer above
+}
+
+// receiveOneFrame takes the next inbound frame and whatever request it carries,
+// under the ingress reservation.
+//
+// Where the transport can hand the frame over as a borrowed view of its own memory
+// (deps.viewRecv), it does: the request is constructed and decoded inside the
+// consume callback, while the payload is still readable, and what comes back owns
+// every byte it holds. Otherwise the frame arrives as a private copy and the same
+// preparation runs immediately afterwards — one dispatch shape either way, since
+// the only difference is whose memory the decode read.
+//
+// It leaves its result in deps.frame and deps.req, valid only when it returns a
+// nil error. Neither ever aliases transport memory on either path; see
+// prepareInboundFrame for what each kind gives up to make that true.
+func receiveOneFrame(ctx context.Context, deps *serveDeps) error {
+	if deps.viewRecv == nil {
+		f, err := recvReserving(ctx, deps.tr, deps.reserve)
+		if err != nil {
+			return err
+		}
+		deps.frame, deps.req = prepareInboundFrame(deps, f, false)
+
+		return nil
+	}
+
+	return deps.viewRecv.RecvViewConsumeReserving(ctx, deps.reserve, deps.consume)
+}
+
+// prepareInboundFrame takes everything this side will ever need out of one inbound
+// frame's payload and returns a frame that aliases none of it, together with the
+// decoded request when the frame carried one.
+//
+// borrowed says whether f's Payload may alias memory the transport reclaims the
+// moment the caller returns it. It is a property of how the frame was received, not
+// of the frame: a transport handing frames to a consume callback may pass a private
+// copy for any given frame and does not say which it did, so every frame received
+// that way is treated as borrowed. Each kind therefore accounts for its payload
+// here, before the frame travels any further:
+//
+//   - a unary request IS its decode. The payload's one and only reader is
+//     decodeUnaryRequest, and the frame carries nothing of it onward — Payload is
+//     dropped, so no later step can read a slab the transport has since reclaimed
+//     (shm-abi.md §9). Dispatch does not read it either.
+//   - a stream frame's payload crosses to the goroutine that reads the stream, long
+//     after this frame's memory is gone, so a borrowed one is copied here. This is
+//     the copy the streaming half depends on and the only one it gets.
+//   - every other kind (a unary cancel, or an unexpected kind that is discarded)
+//     carries no payload anyone reads; dropping it keeps that true by construction
+//     rather than by audit.
+func prepareInboundFrame(deps *serveDeps, f transport.Frame, borrowed bool) (transport.Frame, rpcruntime.Request) {
+	if f.Kind == transport.FrameUnaryReq {
+		req := decodeUnaryRequest(deps, f)
+		f.Payload = nil
+
+		return f, req
+	}
+
+	if isStreamKind(f.Kind) {
+		if borrowed {
+			f.Payload = clonePayload(f.Payload)
+		}
+
+		return f, rpcruntime.Request{}
+	}
+
+	f.Payload = nil
+
+	return f, rpcruntime.Request{}
+}
+
+// decodeUnaryRequest builds the request message this frame's method expects and
+// decodes the frame's payload into it, returning what dispatch needs to answer the
+// call however that turns out.
+//
+// It runs on the receive goroutine with the payload still borrowed, so all three
+// outcomes are shaped by what may leave it. A resolved method decodes into a fresh
+// message the codec has promised owns its bytes (serveViewReceiver checks that
+// promise before any frame is borrowed at all). An unresolved one — an unregistered
+// service, or a method this service does not have — decodes nothing and reads
+// nothing, because the status dispatch answers it with needs no request. A failure
+// leaves the partially-decoded message behind and carries out only text, since an
+// error a decoder built from the bytes it was handed could hold a reference into
+// them.
+//
+// The fault barrier is installed FIRST, before anything else runs, and it spans
+// both pluggable calls rather than only the decode.
+//
+// The decode needs it because the bytes are the peer's choice: a codec that panics
+// on a payload it cannot make sense of would otherwise take this process down on a
+// frame the peer published. Request construction needs it for a different reason —
+// MethodDesc.NewRequest is a public field, so a hand-written ServiceDesc can put
+// arbitrary code behind it, and its godoc's allocation-only rule is a contract
+// rather than something the runtime can enforce.
+//
+// Either panic escaping would cost all three of the things this receive path exists
+// to guarantee: it would skip the ring-head advance its caller owes (shm-abi.md
+// §9's protected consume), it would leave the host's call unanswered with no local
+// terminal to reap it, and repeated it would extend the transport's consume-fault
+// run to the point of tearing the region down. Recovered here, both become the same
+// answerable failure a returned decode error is. The panic value is rendered while
+// the payload is still valid, and never carried out.
+func decodeUnaryRequest(deps *serveDeps, f transport.Frame) (req rpcruntime.Request) {
+	defer func() {
+		if r := recover(); r != nil {
+			req = rpcruntime.Request{DecodeFault: decodeFaultText(fmt.Sprintf("panicked: %v", r))}
+		}
+	}()
+
+	msg, ok := deps.d.NewRequest(f.Service, f.Method)
+	if !ok {
+		return rpcruntime.Request{}
+	}
+
+	if err := deps.cdc.Unmarshal(f.Payload, msg); err != nil {
+		return rpcruntime.Request{DecodeFault: decodeFaultText(err.Error())}
+	}
+
+	return rpcruntime.Request{Msg: msg}
+}
+
+// maxDecodeFaultBytes bounds the rendered reason a failed request decode carries
+// into its status reply, the same bound and for the same reason the transport puts
+// on a consume fault's own detail.
+//
+// The reason is that this text becomes a frame the plugin must be able to send. A
+// decoder free to return an error of any length could otherwise produce a status
+// reply too large to publish, whose send failure stops the serve loop — turning one
+// undecodable request into a dead session. Truncating keeps the reply sendable
+// whatever the decoder does.
+const maxDecodeFaultBytes = 512
+
+// decodeFaultText renders a decode failure into text this side owns and can send.
+//
+// The clone is what makes it own the text: a decoder is free to build its error out
+// of the bytes it was handed, and a string sharing them would be read after the
+// transport reclaimed the slab behind it. The bound is what makes it sendable (see
+// maxDecodeFaultBytes); like the transport's own fault detail, the cut backs off to
+// a rune start so truncation never splits a rune that was whole in the input, and
+// the elision is marked so a reader can tell a short reason from a clipped one.
+func decodeFaultText(detail string) string {
+	if len(detail) <= maxDecodeFaultBytes {
+		return strings.Clone(detail)
+	}
+
+	cut := maxDecodeFaultBytes
+	for cut > 0 && !utf8.RuneStart(detail[cut]) {
+		cut--
+	}
+
+	// The concatenation builds a new backing array, so the result owns its bytes
+	// without a further clone.
+	return detail[:cut] + "... (truncated)"
 }
 
 // admitReleaser drops the unary admission read side exactly once per admitted call.
@@ -1191,14 +1448,19 @@ func (r *admitReleaser) release() {
 // default policy); stop true means return nil (a benign peer close / ErrClosed /
 // ctx during the reply send); both zero means keep serving.
 //
-// releaser is the serve loop's one reusable admission releaser: a unary frame arms
-// it before dispatch and reuses its bound entry func, so admitting a call adds no
-// per-request heap allocation. A non-unary frame takes no read side and never arms
-// or fires it.
+// req is the request the receive path already prepared for f: the decoded message,
+// or the decode failure dispatch answers with a status. f's payload is gone by now
+// and nothing here reads it.
+//
+// deps.releaser is the serve loop's one reusable admission releaser: a unary frame
+// arms it before dispatch and reuses its bound entry func, so admitting a call adds
+// no per-request heap allocation. A non-unary frame takes no read side and never
+// arms or fires it.
 func dispatchNonStreamFrame(
-	ctx context.Context, tr transport.Transport, cdc codec.Codec, d *rpcruntime.Dispatcher, f transport.Frame,
-	panicPolicy *panicController, releaser *admitReleaser,
+	ctx context.Context, deps *serveDeps, f transport.Frame, req rpcruntime.Request,
 ) (stop bool, err error) {
+	tr, cdc, d := deps.tr, deps.cdc, deps.d
+	panicPolicy, releaser := deps.panicPolicy, deps.releaser
 	recvAt := time.Now()
 	isUnaryReq := f.Kind == transport.FrameUnaryReq
 	var onHandlerEntry func()
@@ -1230,7 +1492,7 @@ func dispatchNonStreamFrame(
 		onHandlerEntry = releaser.entry
 		defer releaser.entry()
 	}
-	envelopes := d.Dispatch(ctx, f, recvAt, onHandlerEntry)
+	envelopes := d.Dispatch(ctx, f, req, recvAt, onHandlerEntry)
 	if isUnaryReq {
 		// Release the read side for every path that reached no handler entry — a call refused
 		// before any handler (unknown service/method, elapsed budget) opens no handler, so its
@@ -1627,10 +1889,11 @@ func (h *heartbeatSender) awaitResume(ctx context.Context) bool {
 }
 
 // serviceHandler adapts a registered styx service (ServiceDesc + impl) to the
-// internal/rpcruntime.ServiceHandler interface the Dispatcher calls: it maps
-// a method ID to its MethodDesc, decodes the request via the negotiated
-// codec, and invokes the generated handler. The response message is handed back
-// unencoded for the send path to marshal.
+// internal/rpcruntime.ServiceHandler interface the Dispatcher calls: it maps a
+// method ID to its MethodDesc, constructs that method's request message for the
+// receive path to decode into, and invokes the generated handler with the
+// decoded message. The response message is handed back unencoded for the send
+// path to marshal.
 type serviceHandler struct {
 	rs      registeredService
 	cdc     codec.Codec
@@ -1660,27 +1923,69 @@ func newServiceHandler(rs registeredService, cdc codec.Codec, panicPolicy *panic
 	return &serviceHandler{rs: rs, cdc: cdc, methods: methods, panicPolicy: panicPolicy}
 }
 
-// Handle resolves methodID, decodes payload, invokes the handler, and returns
-// the response message for the send path to encode. Every non-success outcome is
-// surfaced as a *rpcruntime.Status so the Dispatcher can frame it back to the
-// client rather than the call hanging:
+// lookupMethod resolves methodID to a method this service can actually serve.
 //
-//   - unknown method -> Status{StatusCodeMethodNotFound}, which the client
-//     reconstructs as ErrMethodNotFound.
+// A descriptor whose NewRequest is nil is not one of them, and reports false here
+// exactly as an unregistered ID does. The two functions are emitted together by
+// the generator, so a missing one means the descriptor was hand-built against an
+// older contract; there is no request for the receive path to decode into and no
+// message the handler could assert, so the method is not servable at all. Both
+// entry points ask this one question, which is what keeps NewRequest's answer and
+// Handle's answer from disagreeing about the same method ID.
+func (h *serviceHandler) lookupMethod(methodID uint64) (MethodDesc, bool) {
+	m, ok := h.methods[methodID]
+	if !ok || m.NewRequest == nil {
+		return MethodDesc{}, false
+	}
+
+	return m, true
+}
+
+// NewRequest returns a freshly allocated request message for methodID, or false
+// when this service cannot serve it — in which case the receive path decodes
+// nothing and Handle answers with the not-found status below.
+//
+// It is allocation-only by construction: the one thing it calls is the generated
+// MethodDesc.NewRequest, whose whole body is a composite literal. That matters
+// because this runs on the receive goroutine, inside the window where the inbound
+// payload is still readable, and holds up every later inbound frame while it runs.
+func (h *serviceHandler) NewRequest(methodID uint64) (proto.Message, bool) {
+	m, ok := h.lookupMethod(methodID)
+	if !ok {
+		return nil, false
+	}
+
+	return m.NewRequest(), true
+}
+
+// Handle resolves methodID, invokes the handler with the already-decoded request,
+// and returns the response message for the send path to encode. Every non-success
+// outcome is surfaced as a *rpcruntime.Status so the Dispatcher can frame it back
+// to the client rather than the call hanging:
+//
+//   - a method this service cannot serve -> Status{StatusCodeMethodNotFound},
+//     which the client reconstructs as ErrMethodNotFound. See lookupMethod for
+//     which methods those are.
 //   - a handler that returns a *styx.Status (application error) ->
 //     Status{that code/message/details}, preserved across the wire so the
 //     client's errors.As recovers the same *styx.Status.
-//   - any other handler error, including a request-decode failure the handler
-//     surfaced -> Status{CodeInternal}.
+//   - any other handler error -> Status{CodeInternal}.
+//
+// req is what this service's own NewRequest built for the same methodID, so the
+// generated handler asserts its concrete type directly. A nil req for a known
+// method means the caller dispatched without preparing a request, which is a
+// framework bug rather than a peer's: it is answered with an internal status here
+// so it terminates the call, instead of reaching the generated handler where the
+// type assertion would panic on it.
 //
 // Encoding the response is NOT done here: the response travels back as a message
 // so the serve loop can encode it straight into the transport's send buffer (see
 // sendUnaryResponse), which also owns the Status{CodeInternal} reply owed when
 // that encoding fails.
 func (h *serviceHandler) Handle(
-	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
+	ctx context.Context, methodID uint64, req proto.Message, onHandlerEntry func(),
 ) (rpcruntime.Response, *rpcruntime.Status, error) {
-	m, ok := h.methods[methodID]
+	m, ok := h.lookupMethod(methodID)
 	if !ok {
 		// An unknown method runs no handler, so onHandlerEntry is deliberately not
 		// called here — the serve loop releases its admission read side itself for a
@@ -1691,9 +1996,15 @@ func (h *serviceHandler) Handle(
 				methodID, h.rs.desc.ServiceName),
 		}, nil
 	}
+	if req == nil {
+		return rpcruntime.Response{}, &rpcruntime.Status{
+			Code: rpcruntime.StatusCodeInternal,
+			Message: fmt.Sprintf("no request was decoded for method %q of %q",
+				m.MethodName, h.rs.desc.ServiceName),
+		}, nil
+	}
 
-	dec := func(msg proto.Message) error { return h.cdc.Unmarshal(payload, msg) }
-	resp, recovered, err := h.invokeHandler(ctx, m, dec, onHandlerEntry)
+	resp, recovered, err := h.invokeHandler(ctx, m, req, onHandlerEntry)
 	if recovered != nil {
 		// The handler panicked and the tight recover boundary caught it. Reply with
 		// the panic outcome so the call terminates as a plugin fault rather than
@@ -1718,21 +2029,23 @@ func (h *serviceHandler) Handle(
 // around the handler invocation: a panic inside the handler is caught and
 // returned as recovered (with resp/err then nil), so the caller can reply with
 // the panic outcome and apply the panic policy instead of crashing mid-call. The
-// boundary wraps ONLY the handler call — a panic in the request decode the
-// handler triggers unwinds through the handler and is caught here, but a panic in
-// any other framework frame runs outside this function and still crashes the
-// process, per the runtime-panic rule.
+// boundary wraps ONLY the handler call — a panic in any other framework frame
+// runs outside this function and still crashes the process, per the runtime-panic
+// rule.
 //
-// The response marshal is the documented exception, and it is the transport that
-// makes it one: where the response is encoded into the transport's own send
-// buffer, the codec runs on the transport's writer goroutine, which recovers a
-// panicking callback rather than letting a caller's bug take the transport down
-// (transport.ErrPayloadFillFailed). That panic terminates its own call with an
-// internal status and the plugin keeps serving. Where the response is marshaled
-// into a wire buffer first, the codec runs on this goroutine and a panic in it
-// still crashes the process.
+// Two codec panics are the documented exceptions, both recovered elsewhere rather
+// than here, because both run outside the handler frame. The request decode runs
+// on the receive goroutine before dispatch, under its own barrier
+// (decodeUnaryRequest), which answers the call with an internal status. The
+// response marshal, where it is encoded into the transport's own send buffer, runs
+// on the transport's writer goroutine, which recovers a panicking callback rather
+// than letting a caller's bug take the transport down
+// (transport.ErrPayloadFillFailed); that panic likewise terminates its own call
+// with an internal status and the plugin keeps serving. Where the response is
+// marshaled into a wire buffer first, the codec runs on this goroutine and a panic
+// in it still crashes the process.
 func (h *serviceHandler) invokeHandler(
-	ctx context.Context, m MethodDesc, dec func(proto.Message) error, onHandlerEntry func(),
+	ctx context.Context, m MethodDesc, req proto.Message, onHandlerEntry func(),
 ) (resp proto.Message, recovered any, err error) {
 	if h.beforeHandlerEntry != nil {
 		h.beforeHandlerEntry(m.MethodID)
@@ -1747,7 +2060,7 @@ func (h *serviceHandler) invokeHandler(
 	}
 	defer func() { recovered = recover() }()
 
-	resp, err = m.Handler(h.rs.impl, ctx, dec)
+	resp, err = m.Handler(h.rs.impl, ctx, req)
 
 	return resp, nil, err
 }
