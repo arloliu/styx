@@ -22,15 +22,17 @@
 // and the count in flight is tail - head computed in uint64, which is
 // wrap-immune (§10).
 //
-// # Peek, copy, advance
+// # Peek, consume, advance
 //
 // Dequeue is split so head advancement is the cross-process reclaim signal
 // (§6/§9): Peek observes a descriptor without advancing, and Advance releases
 // the slot with a seq_cst head store. A consumer with an arena-backed payload
-// MUST copy the payload out before calling Advance, or the producer's
-// head-gated allocator could free a slab the consumer is still reading. Pop
-// combines Peek and Advance for the descriptor-only case that copies no
-// separate payload; it does not distinguish a corrupt ring from an empty one.
+// MUST finish reading that payload before calling Advance — copying the bytes
+// out and decoding them in place both qualify — and MUST NOT read the slab
+// afterwards, or the producer's head-gated allocator could free a slab the
+// consumer is still reading. Pop combines Peek and Advance for the
+// descriptor-only case that references no payload at all; it does not
+// distinguish a corrupt ring from an empty one.
 //
 // # Corruption is surfaced, not poisoned
 //

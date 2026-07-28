@@ -878,8 +878,9 @@ emitted).
 
 A `STREAM_MSG` on a **live, non-terminal** stream reaches exactly one terminal
 disposition: it is **delivered** — handed to the application's `Recv`, its
-payload copied out of the arena per design §12's copy-before-advance rule — and
-delivery increments `consumed`.
+payload taken out of the arena (copied out or decoded in place) before the ring
+head advances, per design §12 and shm-abi.md §9 — and delivery increments
+`consumed`.
 
 There is no second disposition on a live, non-terminal stream, and this is worth
 stating because an earlier reading of this document had one. §8 permits no

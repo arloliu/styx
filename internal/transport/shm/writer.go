@@ -1376,12 +1376,12 @@ func runFill(fn func(dst []byte) error, dst []byte) (err error) {
 // (shm-abi.md §6). Without this, a data slab whose slot is reused by a burst of
 // no-slab frames is stranded and eventually exhausts the arena.
 //
-// An awake consumer needs no producer signal (shm-abi.md §12), so it can copy
+// An awake consumer needs no producer signal (shm-abi.md §12), so it can consume
 // this frame and advance the ring head past seq (shm-abi.md §9) in the window
 // between the ring Push and this call. When that happens the leading reclaim
 // moves lastReclaimed past seq and will never revisit it, so the handle recorded
 // here would be stranded until the slot's reuse at seq + capacity overwrites it —
-// a permanent slab leak. Detect it and free the slab now: copy-before-advance
+// a permanent slab leak. Detect it and free the slab now: consume-before-advance
 // (§9) guarantees the consumer has finished reading the slab once the head has
 // passed seq, so the free is safe and happens exactly once (the slot is cleared,
 // and a later reclaim starts past seq). The single writer goroutine is the sole

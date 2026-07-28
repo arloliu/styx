@@ -75,9 +75,17 @@
 // (shm-abi.md §18), then carves the per-direction rings, arenas, and sync-page
 // words (§1/§3) and returns a Transport that satisfies transport.Transport. Send
 // hands a frame to the writer on the lane its kind selects; Recv waits for
-// inbound work, discards stale-generation descriptors (§15), verifies an
-// optional CRC32C trailer (§5), copies the payload out before releasing the slot
-// (§9), and returns the decoded frame. Close performs teardown step 4 (munmap)
+// inbound work, discards stale-generation descriptors (§15), consumes the
+// payload before releasing the slot, and returns the decoded frame.
+//
+// §9 permits consuming either by copying the bytes out or by decoding them in
+// place, and this transport does both. Recv always copies, because the frame it
+// returns outlives the slab. RecvViewConsume hands the frame to a callback whose
+// Payload aliases the arena slab, advancing the head only after that callback
+// returns — the borrow that saves the copy, bounded by the one construct that can
+// bound it. A frame carrying the per-frame CRC32C_PRESENT flag (§5) is copied out
+// and verified over that private copy either way, which is what makes the check
+// end-to-end. Close performs teardown step 4 (munmap)
 // exactly once; steps 1-3 (admission stop, waiter wake, goroutine join) are the
 // caller's, and the eventfds are the caller's to close.
 //

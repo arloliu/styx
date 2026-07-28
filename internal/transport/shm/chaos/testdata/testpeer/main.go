@@ -201,8 +201,7 @@ func serve(ctx context.Context, tr transport.Transport) {
 	for {
 		f, err := tr.Recv(ctx)
 		if err != nil {
-			if errors.Is(err, transport.ErrMalformedStatusFrame) ||
-				errors.Is(err, transport.ErrUnimplementedFrameKind) {
+			if transport.IsFrameLocalRecvErr(err) {
 				continue // frame-local: the stream stays synchronized
 			}
 			return

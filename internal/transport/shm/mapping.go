@@ -80,8 +80,9 @@ func carveRing(bytes []byte, layout shm.Layout, dir shm.Direction) (*ring.Ring, 
 
 // arenaSpan returns a direction's payload-arena byte span within the region
 // mapping (shm-abi.md §1/§6). The outbound side passes it to arena.New; the
-// inbound side holds it raw for bounds-checked copy-out, since it only reads
-// payloads the peer allocated.
+// inbound side holds it raw and reads bounds-checked payload spans out of it,
+// since it only reads payloads the peer allocated — copying them out, or lending
+// them to a consume callback that must finish before the head advances (§9).
 func arenaSpan(bytes []byte, layout shm.Layout, dir shm.Direction) []byte {
 	off := layout.Arenas[dir].Offset
 	end := off + layout.Arenas[dir].Bytes

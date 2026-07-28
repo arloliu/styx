@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/arloliu/styx/internal/arena"
 	"github.com/arloliu/styx/internal/event"
@@ -24,6 +26,52 @@ const (
 	flagCRC32CPresent uint16 = 0x0004
 	// crc32TrailerLen is the CRC32C trailer width appended after the payload.
 	crc32TrailerLen = 4
+	// faultDetailMaxBytes bounds the rendered reason a consume fault carries out.
+	// See truncateFaultDetail.
+	faultDetailMaxBytes = 512
+)
+
+// decodeInPlaceMinBytes is the smallest payload the receive path delivers as a
+// view aliasing the inbound arena instead of as a private copy. Below it the copy
+// is delivered instead: on a short payload the copy costs less than the borrow's
+// constraints buy. Its value is zero, so every frame eligible on the other
+// grounds takes the view.
+//
+// It is deliberately not configuration. There is no public knob, no negotiated
+// field, and no environment override, because the right value is a property of
+// this transport's measured copy cost rather than of any deployment — and a
+// caller able to raise it could silently turn the borrow off everywhere. Each
+// Transport copies it into its own inPlaceMin at construction, so a test drives
+// the threshold per transport and never mutates shared state under a running
+// receive loop.
+const decodeInPlaceMinBytes uint64 = 0
+
+// consumeFunc is the transport.ViewReceiver callback the receive path hands a
+// delivered frame to. A nil consumeFunc selects the copy path instead: Recv
+// returns the frame to its caller, which outlives the slab, so nothing it carries
+// may alias the arena.
+type consumeFunc = func(transport.Frame) error
+
+// consumeFault is the disposition of the shm-abi.md §9 protected consume step.
+// §9 splits consume failure three ways and decides the disposition by who owns the
+// fault; that split is the whole point, and collapsing it gets at least one of the
+// three wrong.
+type consumeFault uint8
+
+const (
+	// consumeNone means the frame was consumed and may be delivered.
+	consumeNone consumeFault = iota
+	// consumeMalformed means the PEER published bytes that do not decode under a
+	// descriptor it already certified. That is peer non-conformance: the region is
+	// poisoned rather than trusted, and the head does not advance (shm-abi.md §9/§16).
+	consumeMalformed
+	// consumeFaulted means the fault is this side's, covering both of §9's
+	// consumer-owned arms: a decode that panicked, and a frame the consumer declined
+	// for a reason of its own. §9 gives them one disposition, so they share one value
+	// here and are told apart only where the difference is observable, in the fault
+	// report — the region is healthy, the slot was consumed either way, the head MUST
+	// still advance, and the call the descriptor names is failed fast (shm-abi.md §9).
+	consumeFaulted
 )
 
 // Role selects which side of the region this Transport drives (shm-abi.md §1).
@@ -75,9 +123,9 @@ var _ regionHandle = (*shm.Region)(nil)
 
 // inboundReader is the consumer's view of its inbound ring: the seq_cst tail
 // the waiter observes new work through (shm-abi.md §11), and the peek/advance
-// the drain loop uses with copy-before-advance (shm-abi.md §9). Narrowing
+// the drain loop uses with consume-before-advance (shm-abi.md §9). Narrowing
 // *ring.Ring to these lets a test substitute a ring whose Peek lands teardown
-// between the drain loop's top gate and its post-copy dispatch gate, a race a
+// between the drain loop's top gate and its post-consume dispatch gate, a race a
 // concrete *ring.Ring cannot be forced into.
 type inboundReader interface {
 	Peek() (ring.Descriptor, ring.PeekStatus)
@@ -160,6 +208,11 @@ type Transport struct {
 	gen        shm.Generation
 	checksum   bool
 	maxPayload uint32
+	// inPlaceMin is this transport's copy of decodeInPlaceMinBytes, fixed at
+	// construction. Holding it per transport rather than reading the package
+	// constant at each decision keeps a test's threshold override off shared state,
+	// so it can never race a receive loop running on another transport.
+	inPlaceMin uint64
 	// maxRecvPayload is the largest payload_length an inbound present slab may
 	// carry: slab_size[last](inbound) − overhead (shm-abi.md §18). A received
 	// payload_length above it is a conformance fault (§9).
@@ -170,6 +223,12 @@ type Transport struct {
 	// staleDiscarded counts generation-mismatch discards (§15).
 	lastSeen       uint64
 	staleDiscarded uint64
+
+	// consumeFaults counts frames discarded because this side's own copy-or-decode
+	// step panicked — the diagnostic counter §9 requires for that discard, the twin
+	// of staleDiscarded. Only the single Recv consumer writes it; atomic so a
+	// supervisor may sample it while the reader runs.
+	consumeFaults atomic.Uint64
 
 	// framesReceived and bytesReceived count inbound progress at the single
 	// deliverable-frame chokepoint in drain: one frame and its header-plus-body
@@ -210,6 +269,7 @@ var (
 	_ transport.FrameCounter            = (*Transport)(nil)
 	_ transport.ByteCounter             = (*Transport)(nil)
 	_ transport.ReservingReceiver       = (*Transport)(nil)
+	_ transport.ViewReceiver            = (*Transport)(nil)
 	_ transport.ReportingSender         = (*Transport)(nil)
 	_ transport.PayloadFillSender       = (*Transport)(nil)
 	_ transport.ArenaOccupancyReporter  = (*Transport)(nil)
@@ -506,6 +566,7 @@ func newTransport(region regionHandle, layout shm.Layout, p AttachParams) (*Tran
 		gen:               gen,
 		checksum:          p.Config.Checksum,
 		maxPayload:        maxPayload,
+		inPlaceMin:        decodeInPlaceMinBytes,
 		maxRecvPayload:    slabSizeLast(layout.Arenas[inDir]) - overhead,
 	}, nil
 }
@@ -748,7 +809,78 @@ func (t *Transport) ReadableNow() bool {
 // words) throughout, including while blocked. Close must not unmap while any
 // of that is in flight.
 func (t *Transport) Recv(ctx context.Context) (transport.Frame, error) {
-	return t.recvCore(ctx, nil)
+	return t.recvCore(ctx, nil, nil)
+}
+
+// RecvViewConsume is Recv with the transport.ViewReceiver contract: the frame is
+// handed to consume on the receive goroutine, with Payload aliasing the inbound
+// arena slab wherever borrowing pays, and the ring head advances strictly after
+// consume returns. That ordering is the whole point — the head store is the
+// producer's reclaim signal (shm-abi.md §6), so a slab read after it races the
+// peer refilling it, and after teardown reads unmapped memory outright.
+//
+// What keeps that second hazard off the borrow is the closing gate. Like every
+// receive, this holds closeMu's read side for its whole call, and Close unmaps
+// under the write side, so the region cannot be unmapped while consume is on the
+// stack. The cost of that guarantee is a restriction consume must respect: it runs
+// inside the gate, so calling Close from it deadlocks the receive goroutine
+// against itself, permanently. StopWriter is safe (it takes only the read side and
+// never unmaps); anything that waits on this receive loop making further progress
+// is not.
+//
+// It never returns a frame, by construction rather than by convention: the value
+// consume saw may alias the arena, and §9 forbids any such value outliving the
+// advance, so it is dropped here instead of travelling back to the caller. The
+// error is held to the same rule — a *transport.ConsumeFaultError carries text
+// rendered from what the callback produced, never the callback's own value.
+//
+// Not every frame arrives as a view. A frame carrying the CRC32C_PRESENT flag is
+// copied out and verified over that private copy, a streaming frame is copied
+// because its payload outlives the receive loop, and a payload below the internal
+// in-place threshold is copied because the copy is cheaper than the borrow.
+// consume cannot tell, and correct callback code does not need to.
+//
+// It takes no reservation; RecvViewConsumeReserving is the entry point that does.
+// ConsumeFaults counts the frames a failing consume cost.
+func (t *Transport) RecvViewConsume(ctx context.Context, consume func(transport.Frame) error) error {
+	return t.RecvViewConsumeReserving(ctx, nil, consume)
+}
+
+// RecvViewConsumeReserving is RecvViewConsume with the ReservingReceiver
+// reservation, taken at the boundary this path actually hands the frame over:
+// reserve fires immediately before consume is invoked, not before the ring-head
+// advance, because on the view path consume IS the hand-off and the advance
+// follows it.
+//
+// The consequence is that a reservation is taken for frames that are then
+// discarded, and by three routes rather than two: a callback that panics, a
+// callback that reports the payload malformed, and a frame the transport could not
+// build at all — which returns a plain conformance fault and never calls consume,
+// so its reservation is real while no ConsumeFaultError names it. A
+// ConsumeFaultError therefore does not prove consume ran, and its absence does not
+// prove consume did not. Retire on every exit, not only on the ones that
+// delivered.
+func (t *Transport) RecvViewConsumeReserving(
+	ctx context.Context, reserve func(), consume func(transport.Frame) error,
+) error {
+	if consume == nil {
+		return errNilConsume
+	}
+
+	_, err := t.recvCore(ctx, reserve, consume)
+
+	return err
+}
+
+// ConsumeFaults reports the cumulative count of inbound frames discarded to a
+// fault of this side's own — a copy-or-decode step that panicked, or a consume
+// callback that reported a failure without blaming the peer. It is the diagnostic
+// counter shm-abi.md §9 requires for that discard, and the twin of the
+// stale-generation counter §15 requires for its own. A supervisor MAY escalate on
+// it at a policy threshold of its choosing; the transport only counts, because the
+// region stays healthy through such a fault. Cheap atomic snapshot.
+func (t *Transport) ConsumeFaults() uint64 {
+	return t.consumeFaults.Load()
 }
 
 // RecvReserving is Recv with the ReservingReceiver contract: reserve is invoked
@@ -759,12 +891,15 @@ func (t *Transport) Recv(ctx context.Context) (transport.Frame, error) {
 // shutdown that consumes nothing never reserves. See transport.ReservingReceiver
 // for the invariant this discharges.
 func (t *Transport) RecvReserving(ctx context.Context, reserve func()) (transport.Frame, error) {
-	return t.recvCore(ctx, reserve)
+	return t.recvCore(ctx, reserve, nil)
 }
 
-// recv is the shared Recv/RecvReserving core. reserve, when non-nil, fires once
-// before the deliverable frame's Advance (the destructive custody boundary).
-func (t *Transport) recvCore(ctx context.Context, reserve func()) (transport.Frame, error) {
+// recvCore is the shared Recv/RecvReserving/RecvViewConsume core. reserve, when
+// non-nil, fires once before the deliverable frame's Advance (the destructive
+// custody boundary). consume, when non-nil, receives the deliverable frame in
+// place of the caller and selects the view path (see RecvViewConsume); the frame
+// returned alongside it is always the zero Frame.
+func (t *Transport) recvCore(ctx context.Context, reserve func(), consume consumeFunc) (transport.Frame, error) {
 	t.closeMu.RLock()
 	defer t.closeMu.RUnlock()
 
@@ -782,7 +917,7 @@ func (t *Transport) recvCore(ctx context.Context, reserve func()) (transport.Fra
 			return transport.Frame{}, err
 		}
 
-		f, ok, err := t.drain(newTail, reserve)
+		f, ok, err := t.drain(newTail, reserve, consume)
 		if err != nil {
 			return transport.Frame{}, t.poisonOnConformanceFault(err)
 		}
@@ -794,17 +929,18 @@ func (t *Transport) recvCore(ctx context.Context, reserve func()) (transport.Fra
 }
 
 // drain consumes descriptors in [lastSeen, newTail), returning the first
-// deliverable frame. Copy-before-advance is mandatory: the slot is released
-// (Advance) only after classify has copied the payload out (shm-abi.md §9). A
-// conformance fault returns before any advance; a stale descriptor advances and
-// keeps draining.
+// deliverable frame. Consume-before-advance is mandatory: the slot is released
+// (Advance) only after the payload has been consumed — copied out, or decoded in
+// place by the consume callback — and nothing may read the slab afterwards
+// (shm-abi.md §9). A conformance fault returns before any advance; a stale
+// descriptor advances and keeps draining.
 //
-// It is fail-closed against teardown per §9: it re-loads the poison and
-// shutdown words before each peek and again after the copy-out but before the
-// dispatch/advance of a deliverable frame, so teardown landing between the
-// waiter observing work and dispatch wins the race — the frame is not delivered
-// and the head is not advanced (§14/§16).
-func (t *Transport) drain(newTail uint64, reserve func()) (transport.Frame, bool, error) {
+// It is fail-closed against teardown per §9: it re-loads the poison and shutdown
+// words before each peek, and consumeDescriptor re-loads them again with the
+// payload in hand before anything is handed onward, so teardown landing between
+// the waiter observing work and the dispatch wins the race — the frame is not
+// delivered and the head is not advanced (§14/§16).
+func (t *Transport) drain(newTail uint64, reserve func(), consume consumeFunc) (transport.Frame, bool, error) {
 	for t.lastSeen != newTail {
 		// Fail-closed gate before each peek: a poisoned or shutting-down region
 		// consumes nothing more (shm-abi.md §9).
@@ -819,44 +955,252 @@ func (t *Transport) drain(newTail uint64, reserve func()) (transport.Frame, bool
 		case ring.PeekEmpty:
 			return transport.Frame{}, false, nil // nothing more to drain; re-wait
 		case ring.PeekOK:
-			f, deliver, err := t.classify(d) // copies the payload out; never advances
+			f, deliver, err := t.consumeDescriptor(d, reserve, consume)
 			if err != nil {
-				return transport.Frame{}, false, err // §9: stop before releasing the slot
+				return transport.Frame{}, false, err
 			}
 			if deliver {
-				// Final gate before dispatch (shm-abi.md §9/§16): re-load both words
-				// after the copy; if the region is torn down, do NOT advance — the
-				// slot is never released as consumed.
-				if err := t.teardownError(); err != nil {
-					return transport.Frame{}, false, err
-				}
-				// Publication-before-read reservation (transport.ReservingReceiver):
-				// fire reserve on the reader goroutine immediately before the Advance
-				// that releases this slot — the custody boundary — so the reservation
-				// is live before the frame leaves transport custody. Only a delivered
-				// frame reserves; a stale discard below never reaches here.
-				if reserve != nil {
-					reserve()
-				}
-				t.inboundRing.Advance() // reclaim signal, after copy-out (§9)
-				t.lastSeen++
-				// Frame-completion counting: the payload is copied out and the frame
-				// is being delivered, so count one received frame and its header-
-				// plus-body wire bytes. A stale-generation discard below never
-				// reaches here, so it is correctly excluded (shm-abi.md §9/§15).
-				t.framesReceived.Add(1)
-				t.bytesReceived.Add(uint64(shm.DescriptorSize) + uint64(d.PayloadLength()))
-
 				return f, true, nil
 			}
-			// Stale-generation discard (§15): release the slot and keep draining. The
-			// next iteration's top gate re-checks teardown before the next peek.
-			t.inboundRing.Advance()
-			t.lastSeen++
+			// Stale-generation discard (§15): the slot is already released, so keep
+			// draining. The next iteration's top gate re-checks teardown before the
+			// next peek.
 		}
 	}
 
 	return transport.Frame{}, false, nil
+}
+
+// consumeDescriptor runs one peeked descriptor through the shm-abi.md §9 consume
+// path and reports the frame to deliver. It owns every head advance on that path,
+// and the placement of each one is the contract:
+//
+//   - a stale-generation descriptor is discarded — counted, advanced, dispatched
+//     nowhere, its slab never read (§15);
+//   - a conformance fault returns before any advance, so a corrupt or
+//     non-conformant descriptor never releases its slot as consumed (§9);
+//   - the final poison/shutdown gate runs with the payload already in hand and
+//     before anything is handed onward, so teardown landing mid-drain neither
+//     delivers nor advances (§16(b));
+//   - the advance follows the consume, never precedes it, because the delivered
+//     value may still alias the slab until consume returns (§9);
+//   - a panic in this side's own copy-or-decode step still advances: the slot was
+//     consumed either way, and withholding the advance would strand that slot and
+//     its slab for the region's lifetime (§9).
+func (t *Transport) consumeDescriptor(
+	d ring.Descriptor, reserve func(), consume consumeFunc,
+) (transport.Frame, bool, error) {
+	// Generation discard first (shm-abi.md §15): a stale descriptor may carry a
+	// garbage offset/length, so it is skipped without reading the arena slab.
+	if discardIfStale(d, t.gen) {
+		t.staleDiscarded++
+		// Feed the live discard stream to the escalation policy this side owns
+		// (shm-abi.md §15's supervisor-owned adjudication, recovery.go's
+		// EscalationPolicy doc): a pattern no single dying predecessor's late writes
+		// can explain escalates to PoisonPeerCrash through the same poison field
+		// teardownError checks.
+		t.escalation.Observe(t.clock(), d.Generation(), t.gen)
+		t.advanceHead()
+
+		return transport.Frame{}, false, nil
+	}
+
+	tk, descriptorOnly, err := t.classify(d)
+	if err != nil {
+		return transport.Frame{}, false, err
+	}
+
+	var span []byte
+	if !descriptorOnly {
+		if span, err = t.payloadBytes(d, tk, consume != nil); err != nil {
+			return transport.Frame{}, false, err
+		}
+	}
+
+	// Final gate (shm-abi.md §9/§16(b)): re-load both words with the payload in
+	// hand and BEFORE anything is handed onward. This path hands off before it
+	// advances — the delivered value may alias the slab until consume returns — so
+	// the gate sits ahead of both, which is the ordering §9 requires of a consumer
+	// that dispatches first. Teardown observed here delivers nothing and advances
+	// nothing: the slot is never released as consumed.
+	if err := t.teardownError(); err != nil {
+		return transport.Frame{}, false, err
+	}
+
+	// Publication-before-read reservation (transport.ReservingReceiver): fire
+	// reserve on the reader goroutine immediately before the frame leaves transport
+	// custody. Where that boundary sits depends on how the frame leaves: through a
+	// consume callback it is the callback itself, so the reservation precedes it
+	// and covers the discarding fault arms below; through a returned frame it is
+	// the Advance that releases the slot. Neither the stale discard above nor the
+	// teardown gate reaches here, so neither reserves.
+	if reserve != nil && consume != nil {
+		reserve()
+	}
+
+	f, fault, err := protectedConsume(d, tk, descriptorOnly, span, consume)
+	switch fault {
+	case consumeMalformed:
+		// The peer published bytes that do not decode under a descriptor it already
+		// certified. The head does NOT advance: a poisoned region is discarded whole
+		// and owes no further progress (shm-abi.md §9/§16).
+		return transport.Frame{}, false, err
+	case consumeFaulted:
+		// The fault is this side's and the region is still healthy, so the slot is
+		// released and the call the descriptor names is failed fast — a discarded
+		// response nobody reports strands its caller to its deadline (shm-abi.md §9).
+		t.consumeFaults.Add(1)
+		t.advanceHead()
+
+		return transport.Frame{}, false, err
+	case consumeNone:
+	}
+
+	if consume != nil {
+		// consume has taken everything it needs and the head is about to move.
+		// Nothing that aliases the slab may outlive that store (shm-abi.md §9), so
+		// the view is dropped here rather than travelling back up the drain loop.
+		f = transport.Frame{}
+	}
+
+	if reserve != nil && consume == nil {
+		reserve()
+	}
+	t.advanceHead()
+	// Frame-completion counting: the payload is consumed and the frame is being
+	// delivered, so count one received frame and its header-plus-body wire bytes. A
+	// stale-generation discard never reaches here, so it is correctly excluded
+	// (shm-abi.md §9/§15).
+	t.framesReceived.Add(1)
+	t.bytesReceived.Add(uint64(shm.DescriptorSize) + uint64(d.PayloadLength()))
+
+	return f, true, nil
+}
+
+// advanceHead releases the peeked slot to the producer — the §3 seq_cst head
+// store that is the cross-process reclaim signal (shm-abi.md §6/§9) — and moves
+// this side's drain cursor with it. No read of the referenced slab may follow it,
+// directly or through any retained slice.
+func (t *Transport) advanceHead() {
+	t.inboundRing.Advance()
+	t.lastSeen++
+}
+
+// protectedConsume runs this side's copy-or-decode step behind a fault barrier,
+// which is shm-abi.md §9's protected_consume: it builds the delivered frame from
+// span and, when consume is non-nil, hands that frame to it. The deferred recover
+// turns a panic anywhere in that step into an ordinary result, because the caller
+// owes a head advance in exactly that case and could not pay it while unwinding —
+// without the barrier the panic escapes the drain loop, the head store never runs,
+// and the slot and its slab are stranded for the region's lifetime.
+//
+// fault is consumeNone, consumeMalformed (the peer's bytes do not decode) or
+// consumeFaulted (this side's fault); err carries the detail on both fault arms
+// and is nil otherwise. A malformed result carries errBadFrame so the caller
+// routes it through the same poison mapping as any other malformed frame.
+//
+// Which arm a callback failure lands on is decided by
+// transport.ErrPayloadMalformed and nothing else: only a callback that names that
+// sentinel blames the peer and condemns the region. Any other error, and any
+// panic, is contained. Defaulting the other way would let a callback destroy a
+// healthy connection while reporting something as ordinary as a full delivery
+// queue.
+//
+// The barrier is installed before the frame is built, not just around consume, so
+// its reach is not limited to callback code: a panic in this transport's own
+// descriptorOnlyFrame or decodedFrame is contained the same way and produces the
+// same *transport.ConsumeFaultError. That arm is therefore live on the plain Recv
+// path, where consume is nil, and the reader loop that receives such an error owes
+// the call it names the same fail-fast a declining callback would.
+//
+// Nothing the callback produced leaves this function as an object. The panic
+// value and the returned error are rendered to text here, while the frame's
+// memory is still valid and before the caller advances the head, because either
+// one may hold a slice of the payload — and §9 forbids handing such a value
+// onward past the advance, where it reads a recycled slab, or past teardown,
+// where it reads unmapped memory.
+func protectedConsume(
+	d ring.Descriptor, tk transport.FrameKind, descriptorOnly bool, span []byte, consume consumeFunc,
+) (f transport.Frame, fault consumeFault, err error) {
+	// blamesPeer records that the callback already named the peer's bytes as the
+	// cause, so the recover below can keep that attribution. Rendering the reason
+	// re-enters callback code (its Error method), and a panic there must not
+	// silently re-attribute a peer fault to this side: attribution decides the arm
+	// (shm-abi.md §9), and losing it would leave a non-conformant region trusted.
+	blamesPeer := false
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		// The barrier: the panic becomes a result, never an unwind (shm-abi.md §9).
+		f = transport.Frame{}
+		if blamesPeer {
+			fault = consumeMalformed
+			err = fmt.Errorf("%w: %w: reporting the fault panicked: %s",
+				errBadFrame, transport.ErrPayloadMalformed, truncateFaultDetail(fmt.Sprint(r)))
+
+			return
+		}
+		fault = consumeFaulted
+		err = &transport.ConsumeFaultError{
+			CallID: d.CallID(), Kind: tk, Panicked: true,
+			Detail: truncateFaultDetail(fmt.Sprint(r)), Stack: debug.Stack(),
+		}
+	}()
+
+	if descriptorOnly {
+		f = descriptorOnlyFrame(d, tk)
+	} else if f, err = decodedFrame(d, tk, span); err != nil {
+		// A status body the peer published that does not decode is peer
+		// non-conformance. The reason is rendered rather than wrapped: the decoder's
+		// own error names transport.ErrMalformedStatusFrame, which a reader loop reads
+		// as "this one frame is bad, the connection is fine" — the opposite of what a
+		// poisoned region means (shm-abi.md §16). Rendering keeps the diagnostic while
+		// leaving the wrap set at errBadFrame alone.
+		return transport.Frame{}, consumeMalformed,
+			fmt.Errorf("%w: %s", errBadFrame, truncateFaultDetail(err.Error()))
+	}
+
+	if consume == nil {
+		return f, consumeNone, nil
+	}
+	if cerr := consume(f); cerr != nil {
+		blamesPeer = errors.Is(cerr, transport.ErrPayloadMalformed)
+		if blamesPeer {
+			return transport.Frame{}, consumeMalformed,
+				fmt.Errorf("%w: %w: %s", errBadFrame, transport.ErrPayloadMalformed,
+					truncateFaultDetail(cerr.Error()))
+		}
+
+		return transport.Frame{}, consumeFaulted, &transport.ConsumeFaultError{
+			CallID: d.CallID(), Kind: tk, Detail: truncateFaultDetail(cerr.Error()),
+		}
+	}
+
+	return f, consumeNone, nil
+}
+
+// truncateFaultDetail bounds a rendered consume-fault reason. A callback that
+// panics with its frame's payload renders roughly four bytes of decimal per
+// payload byte, and one that embeds the payload in its error message renders it
+// whole, so an unbounded reason turns a large frame into a multi-megabyte string
+// inside an error the caller is expected to log. The budget identifies the fault
+// and no frame size can grow it. The cut backs off to a rune start, so truncation
+// never splits a rune that was whole in the input — it does not repair an input
+// that was not valid UTF-8 to begin with — and the elision is marked so a reader
+// can tell a short reason from a clipped one.
+func truncateFaultDetail(s string) string {
+	if len(s) <= faultDetailMaxBytes {
+		return s
+	}
+
+	cut := faultDetailMaxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+
+	return s[:cut] + "... (truncated)"
 }
 
 // teardownError reports the error a torn-down region surfaces, or nil while
@@ -886,25 +1230,12 @@ func (t *Transport) poisonOnConformanceFault(err error) error {
 	return err
 }
 
-// classify validates a peeked descriptor and decodes a deliverable frame, or
-// reports a stale discard (deliver=false, err=nil) or a conformance fault
-// (shm-abi.md §5/§9/§15). It never advances the ring head.
-func (t *Transport) classify(d ring.Descriptor) (transport.Frame, bool, error) {
-	// Generation discard first (shm-abi.md §15): a stale descriptor may carry a
-	// garbage offset/length, so it is skipped without reading the arena slab.
-	if discardIfStale(d, t.gen) {
-		t.staleDiscarded++
-		// Feed the live discard stream to the escalation policy this side
-		// owns (shm-abi.md §15's supervisor-owned adjudication,
-		// recovery.go's EscalationPolicy doc): a pattern no single dying
-		// predecessor's late writes can explain escalates to
-		// PoisonPeerCrash through the same poison field teardownError
-		// checks.
-		t.escalation.Observe(t.clock(), d.Generation(), t.gen)
-
-		return transport.Frame{}, false, nil
-	}
-
+// classify validates a peeked, live-generation descriptor against the shm-abi.md
+// §9 validate rules — the ones that read no payload and advance no head — and
+// reports the frame kind plus whether the frame is descriptor-only
+// (shm-abi.md §4/§5/§9). A fault returns before any payload read, so a corrupt
+// descriptor never reaches the arena.
+func (t *Transport) classify(d ring.Descriptor) (tk transport.FrameKind, descriptorOnly bool, err error) {
 	// Fail-closed flags check (shm-abi.md §5): any bit outside allowed_flags — a
 	// reserved bit or an un-negotiated feature bit — is a conformance fault.
 	allowed := uint16(0)
@@ -912,50 +1243,51 @@ func (t *Transport) classify(d ring.Descriptor) (transport.Frame, bool, error) {
 		allowed = flagCRC32CPresent
 	}
 	if d.Flags()&^allowed != 0 {
-		return transport.Frame{}, false, errBadFrame
+		return 0, false, errBadFrame
 	}
 
 	// Kind must be assigned with a zero high byte (shm-abi.md §5).
 	if d.KindWord()>>8 != 0 {
-		return transport.Frame{}, false, errBadFrame
+		return 0, false, errBadFrame
 	}
 	tk, descriptorOnly, ok := unmapKind(d.Kind())
 	if !ok {
-		return transport.Frame{}, false, errBadFrame
+		return 0, false, errBadFrame
 	}
 
 	// budget_ns MUST NOT be negative for any kind (shm-abi.md §4/§9); a negative
 	// budget would otherwise ship to the caller as a negative time.Duration.
 	if d.BudgetNS() < 0 {
-		return transport.Frame{}, false, errBadFrame
+		return 0, false, errBadFrame
 	}
 
-	if descriptorOnly {
-		return classifyDescriptorOnly(d, tk)
+	// A CANCEL or STREAM_ACK MUST carry no payload state and no payload-layout
+	// flag (shm-abi.md §5).
+	if descriptorOnly &&
+		(d.Flags() != 0 || d.PayloadOffset() != 0 || d.PayloadLength() != 0 || d.AllocSeq() != 0) {
+		return 0, false, errBadFrame
 	}
 
-	return t.classifyPayload(d, tk)
+	return tk, descriptorOnly, nil
 }
 
-// classifyDescriptorOnly validates a CANCEL: it MUST carry no payload state and
-// no payload-layout flag (shm-abi.md §5).
-func classifyDescriptorOnly(d ring.Descriptor, tk transport.FrameKind) (transport.Frame, bool, error) {
-	if d.Flags() != 0 || d.PayloadOffset() != 0 || d.PayloadLength() != 0 || d.AllocSeq() != 0 {
-		return transport.Frame{}, false, errBadFrame
-	}
-
-	// Carry the reserved word verbatim as the stream control word (offset 56,
-	// stream-protocol.md §2.2): a STREAM_ACK's cumulative ack count, a stream
-	// CANCEL's teardown discriminant, or 0 for a unary CANCEL. The transport
-	// never interprets it.
-	return transport.Frame{CallID: d.CallID(), Kind: tk, Control: d.Reserved()}, true, nil
-}
-
-// classifyPayload validates a payload frame's §9 slab-presence and geometry
-// invariants, copies the message payload out, verifies the CRC32C trailer when
-// present, and decodes the frame (shm-abi.md §5/§6/§9). Every check precedes the
-// caller's Advance, so a conformance fault releases no slot.
-func (t *Transport) classifyPayload(d ring.Descriptor, tk transport.FrameKind) (transport.Frame, bool, error) {
+// payloadBytes validates a payload frame's §9 slab-presence and geometry
+// invariants and yields the bytes the delivered frame is built from
+// (shm-abi.md §5/§6/§9). Every check precedes the caller's Advance, so a
+// conformance fault releases no slot.
+//
+// The returned bytes are one of two things, and which one is the whole subject of
+// this function. They are a private copy — the payload consumed by copying it out
+// — or they alias the inbound arena slab directly, readable only until the head
+// advances. viewWanted reports whether the caller can bound a view's lifetime at
+// all: only a consume callback can, since a frame returned from Recv outlives the
+// slab.
+//
+// Two cases never yield a view regardless. A frame carrying CRC32C_PRESENT is
+// copied out and verified over that private copy, so that the bytes checked are
+// the bytes interpreted (§9). A streaming frame is copied because its payload is
+// queued for a goroutine that reads it long after the receive loop has moved on.
+func (t *Transport) payloadBytes(d ring.Descriptor, tk transport.FrameKind, viewWanted bool) ([]byte, error) {
 	off := uint64(d.PayloadOffset())
 	plen := uint64(d.PayloadLength())
 
@@ -970,67 +1302,129 @@ func (t *Transport) classifyPayload(d ring.Descriptor, tk transport.FrameKind) (
 
 	if storedLen == 0 {
 		// No slab: the descriptor MUST carry the reserved "no slab" encoding
-		// (shm-abi.md §5/§9 presence markers).
+		// (shm-abi.md §5/§9 presence markers). There is nothing to alias.
 		if d.PayloadOffset() != 0 || d.AllocSeq() != 0 {
-			return transport.Frame{}, false, errBadFrame
+			return nil, errBadFrame
 		}
 
-		f, err := decodedFrame(d, tk, []byte{})
-		if err != nil {
-			return transport.Frame{}, false, errBadFrame
-		}
-
-		return f, true, nil
+		return []byte{}, nil
 	}
 
 	// Slab present: offset and stamp MUST both be nonzero (offset 0 is the reserved
 	// slab-zero, shm-abi.md §5/§9 presence markers).
 	if d.PayloadOffset() == 0 || d.AllocSeq() == 0 {
-		return transport.Frame{}, false, errBadFrame
+		return nil, errBadFrame
 	}
 	// payload_length MUST NOT exceed the geometry-derived cap (shm-abi.md §9/§18).
 	if plen > uint64(t.maxRecvPayload) {
-		return transport.Frame{}, false, errBadFrame
+		return nil, errBadFrame
 	}
 	// payload_offset MUST name a whole aligned slab of the class serving
 	// stored_length within the inbound arena (shm-abi.md §5/§6/§9). This is the
 	// bounds authority: a passing slab lies wholly inside the arena.
 	if !slabInClass(t.inboundClasses, off, storedLen) {
-		return transport.Frame{}, false, errBadFrame
+		return nil, errBadFrame
 	}
 
-	// v1 is always-copy (shm-abi.md ring/arena design): copy before releasing the
-	// slot, since Advance is the producer's reclaim signal (§9). trace_prefix is 0
-	// (trace out of scope), so the message begins at payload_offset.
-	payload := make([]byte, plen)
-	copy(payload, t.inboundArenaBytes[off:off+plen])
+	// trace_prefix is 0 (trace out of scope), so the message begins at
+	// payload_offset. Capacity is bounded to the payload as well as length: a
+	// consumer that appends to these bytes must reallocate rather than write into
+	// the peer's neighbouring arena bytes.
+	slab := t.inboundArenaBytes[off : off+plen : off+plen]
 
-	if hasCRC && t.checksum {
+	// The checksum branch is per frame, on the descriptor's CRC32C_PRESENT flag,
+	// never on whether the feature was negotiated (shm-abi.md §9): negotiation only
+	// permits the flag, and a negotiated peer MAY still publish a frame without a
+	// trailer, which carries nothing to verify. Copying first is what makes the
+	// check end-to-end — the verified bytes ARE the interpreted bytes, so a
+	// producer still writing a slab it already published tears the copy and fails
+	// the check.
+	if hasCRC {
+		payload := make([]byte, plen)
+		copy(payload, slab)
 		want := crc32.Checksum(payload, castagnoliTable)
 		got := binary.LittleEndian.Uint32(t.inboundArenaBytes[off+plen : off+plen+crcTrailer])
 		if want != got {
-			return transport.Frame{}, false, errChecksum // detected, not delivered (§16 seam)
+			return nil, errChecksum // detected, not delivered (§16 seam)
 		}
+
+		return payload, nil
 	}
 
-	f, err := decodedFrame(d, tk, payload)
-	if err != nil {
-		return transport.Frame{}, false, errBadFrame
+	if !viewEligible(tk, plen, viewWanted, t.inPlaceMin) {
+		payload := make([]byte, plen)
+		copy(payload, slab)
+
+		return payload, nil
 	}
 
-	return f, true, nil
+	return slab, nil
+}
+
+// viewEligible reports whether a validated payload frame may be delivered as a
+// view aliasing the inbound arena rather than as a private copy. It is the single
+// decision point for that choice; there is no second receive path.
+//
+// A view is only ever safe when its lifetime is bounded, which viewWanted carries:
+// a consume callback ends before the head advances, while a frame returned from
+// Recv outlives the slab entirely. Streaming frames are excluded because their
+// payloads outlive the receive loop by design — a stream message is handed to a
+// consumer goroutine that reads it long after this frame's slot is gone. Below
+// minBytes the copy is delivered instead, since a short copy costs less than the
+// borrow buys.
+func viewEligible(tk transport.FrameKind, plen uint64, viewWanted bool, minBytes uint64) bool {
+	if !viewWanted || isStreamKind(tk) {
+		return false
+	}
+
+	return plen >= minBytes
+}
+
+// isStreamKind reports whether a frame kind belongs to the streaming protocol
+// (stream-protocol.md §2.1). Enumerated rather than range-checked so removing a
+// kind becomes a compile error, not a silent narrowing.
+//
+//nolint:revive // identical-switch-branches: explicit enumeration catches removals
+func isStreamKind(tk transport.FrameKind) bool {
+	switch tk {
+	case transport.FrameStreamOpen, transport.FrameStreamMsg, transport.FrameStreamAck,
+		transport.FrameStreamClose, transport.FrameStreamErr:
+		return true
+	case transport.FrameUnaryReq, transport.FrameUnaryResp, transport.FrameCancel, transport.FrameUnaryErr:
+		return false
+	default:
+		return false
+	}
+}
+
+// descriptorOnlyFrame assembles the delivered frame for a validated CANCEL or
+// STREAM_ACK, which carries no payload state at all (shm-abi.md §5).
+func descriptorOnlyFrame(d ring.Descriptor, tk transport.FrameKind) transport.Frame {
+	// Carry the reserved word verbatim as the stream control word (offset 56,
+	// stream-protocol.md §2.2): a STREAM_ACK's cumulative ack count, a stream
+	// CANCEL's teardown discriminant, or 0 for a unary CANCEL. The transport
+	// never interprets it.
+	return transport.Frame{CallID: d.CallID(), Kind: tk, Control: d.Reserved()}
 }
 
 // decodedFrame assembles the delivered transport.Frame from a validated
-// descriptor and its copied payload (shm-abi.md §4/§5). For a status-bearing
-// kind (FrameUnaryErr/FrameStreamErr), payload is the encoded Status (its wire
-// payload, shm-abi.md UNARY_ERR; STREAM_ERR carries the same status body,
-// stream-protocol.md §2.3): it is decoded into Frame.Status and Frame.Payload
-// is left nil, symmetric to what UDS produces. A status-bearing frame whose
-// payload does not decode is a conformance fault, not a deliverable frame -- the
-// error is returned so the caller can route it through the same poison path as
-// any other malformed descriptor, rather than delivering a Frame with a nil
-// Status.
+// descriptor and its payload bytes (shm-abi.md §4/§5). payload may alias the
+// inbound arena, so this must not retain it beyond what it stores in the frame:
+// Frame.Payload carries it onward under the caller's lifetime rule, and
+// everything else the frame holds is copied out of the descriptor.
+//
+// For a status-bearing kind (FrameUnaryErr/FrameStreamErr), payload is the
+// encoded Status (its wire payload, shm-abi.md UNARY_ERR; STREAM_ERR carries the
+// same status body, stream-protocol.md §2.3): it is decoded into Frame.Status and
+// Frame.Payload is left nil, symmetric to what UDS produces. That decode owns
+// everything it produces — the message through a string conversion, each detail
+// through an explicit copy — so a status frame delivers no alias of the payload
+// bytes whatever their provenance. A status-bearing frame whose payload does not
+// decode is a conformance fault, not a deliverable frame: the peer certified a
+// payload of that length in that slab, so a body that then fails to decode is peer
+// non-conformance and poisons the region (shm-abi.md §9's consume-failure rule).
+// The error is returned so the caller can route it through the same poison path as
+// any other malformed descriptor, rather than delivering a Frame with a nil Status.
 func decodedFrame(d ring.Descriptor, tk transport.FrameKind, payload []byte) (transport.Frame, error) {
 	f := transport.Frame{
 		CallID:  d.CallID(),

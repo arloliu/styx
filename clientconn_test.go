@@ -151,6 +151,133 @@ func TestClientConn_ReadLoop_SurvivesMalformedStatusFrame_ThenCompletesNextCall(
 	require.Equal(t, "after-malformed", resp.Value)
 }
 
+// consumeFaultTransport reports one frame-local error from Recv, then blocks until
+// closed. It models the shape a receive path produces when this side discarded a
+// frame it had already taken off the ring: the connection is healthy, so the error
+// is all the reader ever learns about that frame.
+type consumeFaultTransport struct {
+	fault     error
+	delivered atomic.Bool
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newConsumeFaultTransport(fault error) *consumeFaultTransport {
+	return &consumeFaultTransport{fault: fault, closed: make(chan struct{})}
+}
+
+func (c *consumeFaultTransport) Send(context.Context, transport.Frame) error { return nil }
+
+func (c *consumeFaultTransport) Recv(ctx context.Context) (transport.Frame, error) {
+	if c.delivered.CompareAndSwap(false, true) {
+		return transport.Frame{}, c.fault
+	}
+	select {
+	case <-c.closed:
+		return transport.Frame{}, transport.ErrClosed
+	case <-ctx.Done():
+		return transport.Frame{}, ctx.Err()
+	}
+}
+
+func (c *consumeFaultTransport) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+
+	return nil
+}
+
+// Test the read loop discharging the obligation a consume fault carries: the frame
+// it names was this side's to deliver and this side destroyed it, so the call it
+// named must be terminated rather than left waiting. The call here is submitted
+// with a ZERO budget, which arms no deadline timer, and the connection deliberately
+// stays open, so no other mechanism in the system can ever end this wait — skipping
+// the frame and nothing else converts one lost frame into one permanently hung call
+// (shm-abi.md §9).
+func TestRunReadLoop_FailsTheNamedCall_WhenAConsumeFaultDiscardsItsResponse(t *testing.T) {
+	// Given a published call waiting on an answer, with no deadline of its own.
+	table := rpcruntime.NewTable(firstGeneration)
+	callID, wait := table.Submit(t.Context(), 0)
+	require.True(t, table.Publish(callID))
+
+	tr := newConsumeFaultTransport(&transport.ConsumeFaultError{
+		CallID: callID, Kind: transport.FrameUnaryResp, Detail: "inbound delivery queue full",
+	})
+	state := &connState{
+		table:        table,
+		tr:           tr,
+		codec:        codec.Proto{},
+		readLoopDone: make(chan struct{}),
+	}
+	go func() { defer close(state.readLoopDone); runReadLoop(state) }()
+	t.Cleanup(func() {
+		_ = tr.Close()
+		<-state.readLoopDone
+	})
+
+	// When the receive path reports that this side discarded that call's frame.
+	waitCtx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	result, waitErr := wait(waitCtx)
+
+	// Then the call terminated instead of waiting, and it terminated as an unknown
+	// outcome: the peer answered and this side destroyed the answer, so the handler
+	// ran and its effects stand.
+	require.NoError(t, waitErr, "the call was left waiting for an answer the reader had already discarded")
+	require.ErrorIs(t, result.Err, ErrOutcomeUnknown)
+	require.ErrorIs(t, result.Err, transport.ErrConsumeFault, "the reason the answer was lost survives to the caller")
+	require.Contains(t, result.Err.Error(), "inbound delivery queue full")
+
+	// And the connection is untouched: a fault this side owns is frame-local, so the
+	// reader keeps serving rather than tearing down a healthy connection.
+	select {
+	case <-state.readLoopDone:
+		t.Fatal("the read loop exited on a frame-local consume fault")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// Test the same path leaving alone every call the fault does not name. A consume
+// fault names exactly one call; failing anything else would turn one discarded
+// frame into a connection-wide outage, which is the failure the frame-local
+// classification exists to prevent.
+func TestRunReadLoop_FailsOnlyTheNamedCall_WhenAConsumeFaultArrives(t *testing.T) {
+	// Given two published calls, only one of which the discarded frame names.
+	table := rpcruntime.NewTable(firstGeneration)
+	namedID, namedWait := table.Submit(t.Context(), 0)
+	require.True(t, table.Publish(namedID))
+	otherID, otherWait := table.Submit(t.Context(), 0)
+	require.True(t, table.Publish(otherID))
+
+	tr := newConsumeFaultTransport(&transport.ConsumeFaultError{
+		CallID: namedID, Kind: transport.FrameUnaryResp, Detail: "inbound delivery queue full",
+	})
+	state := &connState{
+		table:        table,
+		tr:           tr,
+		codec:        codec.Proto{},
+		readLoopDone: make(chan struct{}),
+	}
+	go func() { defer close(state.readLoopDone); runReadLoop(state) }()
+	t.Cleanup(func() {
+		_ = tr.Close()
+		<-state.readLoopDone
+	})
+
+	// When the fault names the first call.
+	waitCtx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	_, waitErr := namedWait(waitCtx)
+	require.NoError(t, waitErr)
+
+	// Then the other call is still live and waiting, not swept up with it.
+	shortCtx, cancelShort := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancelShort()
+	_, otherErr := otherWait(shortCtx)
+	require.ErrorIs(t, otherErr, context.DeadlineExceeded,
+		"a call the discarded frame did not name must still be waiting")
+	require.True(t, table.Cancel(otherID), "the untouched call is still live in the table")
+}
+
 // Test statusFromHandlerErr clamping an application Status whose Code lands
 // in the framework-reserved range (>= StatusCodeReservedMin) down to
 // StatusCodeInternal, so a handler can never make the client reconstruct a

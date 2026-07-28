@@ -143,7 +143,7 @@ func TestRing_PopReportsNotOK_WhenEmpty(t *testing.T) {
 	require.Equal(t, Descriptor{}, d)
 }
 
-// Test the explicit peek -> (copy) -> advance consumer path an arena-backed
+// Test the explicit peek -> consume -> advance consumer path an arena-backed
 // consumer must use (shm-abi.md §9): Peek is non-advancing (repeated peeks see
 // the same front and the depth is unchanged), and Advance releases the head in
 // FIFO order.

@@ -188,9 +188,9 @@ func (r *Ring) Push(d Descriptor) error {
 // reports PeekOK with the descriptor, PeekEmpty when the ring is empty, or
 // PeekCorrupt when the unsigned depth exceeds capacity (a corrupt tail from the
 // untrusted peer, in which case the slot is NOT read). The head is not advanced
-// and no payload is copied; a consumer with an arena-backed payload MUST copy
-// it out before calling Advance, because the head advance is the producer's
-// reclaim signal (§6/§9).
+// and no payload is read; a consumer with an arena-backed payload MUST finish
+// reading that payload before calling Advance — by copying it out or decoding it
+// in place — because the head advance is the producer's reclaim signal (§6/§9).
 func (r *Ring) Peek() (Descriptor, PeekStatus) {
 	head := atomic.LoadUint64(r.head) // seq_cst load; consumer is sole writer
 	tail := atomic.LoadUint64(r.tail) // seq_cst load — the observation edge
@@ -210,19 +210,20 @@ func (r *Ring) Peek() (Descriptor, PeekStatus) {
 // Advance releases the head slot with a seq_cst head store — the cross-process
 // reclaim signal the producer's head-gated allocator waits on (shm-abi.md
 // §6/§9). It MUST be called only after a PeekOK and, for an arena-backed
-// payload, only after that payload has been copied out.
+// payload, only after the caller has finished reading that payload — nothing may
+// read the slab once the head has moved.
 func (r *Ring) Advance() {
 	head := atomic.LoadUint64(r.head)  // seq_cst load
 	atomic.StoreUint64(r.head, head+1) // seq_cst store; releases the slot for reallocation
 }
 
 // Pop dequeues the next descriptor, combining Peek and Advance for the
-// descriptor-only case that copies no separate payload (the tests, and cancel /
-// stream-ack lifecycle frames). It reports ok=false for both an empty ring and
-// a corrupt one, collapsing the distinction; a consumer that must map
-// corruption to POISON_RING_CORRUPT, or that copies an arena payload, MUST use
-// Peek -> copy -> Advance instead so it can observe PeekCorrupt and copy before
-// releasing the slot (shm-abi.md §9).
+// descriptor-only case that references no separate payload (the tests, and
+// cancel / stream-ack lifecycle frames). It reports ok=false for both an empty
+// ring and a corrupt one, collapsing the distinction; a consumer that must map
+// corruption to POISON_RING_CORRUPT, or that reads an arena payload, MUST use
+// Peek -> consume -> Advance instead so it can observe PeekCorrupt and finish
+// reading the slab before releasing the slot (shm-abi.md §9).
 func (r *Ring) Pop() (Descriptor, bool) {
 	d, status := r.Peek()
 	if status != PeekOK {
