@@ -55,6 +55,23 @@ type policy struct {
 	NormativeCells     []string `json:"normative_cells"`
 	GRPCRef            string   `json:"grpc_ref"`
 	UDSRef             string   `json:"uds_ref"`
+
+	// GRPCAllocRelTolerance and GRPCAllocAbsTolerance bound how far the gRPC
+	// reference cell's measured allocs/op may sit above the baseline before the
+	// allocation check fails; the wider of the two (relative fraction of the
+	// baseline mean, or a flat allocation count) applies. They exist only for
+	// the gRPC reference: its allocs/op is a mean over one-time setup and
+	// background-goroutine allocations amortized across a b.N that varies from
+	// run to run, so the mean drifts by a fraction of an allocation and can sit
+	// on either side of an integer-rounding boundary without any code change.
+	// Every other cell — including the uds reference, which is styx's own
+	// transport rather than third-party code — has a tight, self-contained
+	// measurement loop and keeps the strict, integer-rounded check regardless of
+	// these fields. Both are optional and default to zero (a zero band), so a
+	// baseline that omits them keeps the pre-existing strict check on the gRPC
+	// cell too — the loosened check is opt-in, never assumed.
+	GRPCAllocRelTolerance float64 `json:"grpc_alloc_rel_tolerance"`
+	GRPCAllocAbsTolerance float64 `json:"grpc_alloc_abs_tolerance"`
 }
 
 type cellBaseline struct {
@@ -88,6 +105,14 @@ func loadBaseline(data []byte) (*baseline, error) {
 	if b.Policy.RelativeTolerance < 0 || b.Policy.RelativeTolerance >= 1 {
 		return nil, fmt.Errorf("baseline relative_tolerance must be in [0,1), got %g",
 			b.Policy.RelativeTolerance)
+	}
+	if !isFiniteNonNegative(b.Policy.GRPCAllocRelTolerance) {
+		return nil, fmt.Errorf("baseline policy.grpc_alloc_rel_tolerance must be finite and non-negative, got %g",
+			b.Policy.GRPCAllocRelTolerance)
+	}
+	if !isFiniteNonNegative(b.Policy.GRPCAllocAbsTolerance) {
+		return nil, fmt.Errorf("baseline policy.grpc_alloc_abs_tolerance must be finite and non-negative, got %g",
+			b.Policy.GRPCAllocAbsTolerance)
 	}
 	if b.Policy.Reps <= 0 {
 		return nil, fmt.Errorf("baseline policy.reps must be positive, got %d", b.Policy.Reps)
@@ -217,6 +242,13 @@ func isPositiveFinite(f float64) bool {
 	return f > 0 && !math.IsInf(f, 0) && !math.IsNaN(f)
 }
 
+// isFiniteNonNegative reports whether f is a real, non-negative number. Unlike
+// isPositiveFinite it accepts zero, which is the default (and valid) value for
+// an optional tolerance field.
+func isFiniteNonNegative(f float64) bool {
+	return f >= 0 && !math.IsInf(f, 0) && !math.IsNaN(f)
+}
+
 // median returns the median of vals (the mean of the two middle values for an even
 // count). It panics on an empty slice; callers guard with a presence check.
 func median(vals []float64) float64 {
@@ -290,7 +322,11 @@ func (r report) failed() bool {
 // the future lever if it ever matters). Identity is anchored where it is
 // machine-invariant instead: allocations per operation are hard-gated on the
 // reference cells too, so a changed reference implementation that would silently
-// re-anchor the ratios fails the gate rather than passing.
+// re-anchor the ratios fails the gate rather than passing. The gRPC reference
+// alone may carry a small tolerance band on that check (bl.Policy's doc
+// comment); the axis that earns the band is third-party code we do not
+// control, not "reference cell" — the uds reference is styx's own transport
+// and stays strict.
 func evaluate(bl *baseline, results []result) report {
 	var rep report
 
@@ -308,12 +344,19 @@ func evaluate(bl *baseline, results []result) report {
 	}
 
 	// The reference cells owe the full repetition count and must keep their
-	// allocation identity, so regressing them cannot silently re-anchor the ratios.
+	// allocation identity, so regressing them cannot silently re-anchor the
+	// ratios. The gRPC cell alone gets a tolerance band on its allocation check
+	// (see the policy fields' doc comment): it is third-party code whose
+	// allocs/op is a mean, not a count, so it is not integer-stable the way a
+	// self-contained measurement loop is. The uds reference is styx's own code
+	// and stays on the strict check despite also being a reference cell.
+	grpcBase := bl.Cells[bl.Policy.GRPCRef].AllocsPerOp
+	grpcBand := math.Max(grpcBase*bl.Policy.GRPCAllocRelTolerance, bl.Policy.GRPCAllocAbsTolerance)
 	rep.hard = append(rep.hard,
 		repsCheck(bl.Policy.GRPCRef, grpc.reps, bl.Policy.Reps),
 		repsCheck(bl.Policy.UDSRef, uds.reps, bl.Policy.Reps),
-		allocCheck(bl.Policy.GRPCRef, bl.Cells[bl.Policy.GRPCRef].AllocsPerOp, grpc.allocs),
-		allocCheck(bl.Policy.UDSRef, bl.Cells[bl.Policy.UDSRef].AllocsPerOp, uds.allocs),
+		allocCheck(bl.Policy.GRPCRef, grpcBase, grpc.allocs, grpcBand),
+		allocCheck(bl.Policy.UDSRef, bl.Cells[bl.Policy.UDSRef].AllocsPerOp, uds.allocs, 0),
 	)
 
 	for _, cell := range bl.Policy.NormativeCells {
@@ -327,7 +370,7 @@ func evaluate(bl *baseline, results []result) report {
 
 		rep.hard = append(rep.hard,
 			repsCheck(cell, cur.reps, bl.Policy.Reps),
-			allocCheck(cell, base.AllocsPerOp, cur.allocs),
+			allocCheck(cell, base.AllocsPerOp, cur.allocs, 0),
 			floorCheck(cell, bl.Policy.AbsoluteFloorRatio, grpc.p50US, cur.p50US),
 			ratioRegressionCheck(cell, bl.Policy.GRPCRef, bl.Policy.RelativeTolerance,
 				bl.Cells[bl.Policy.GRPCRef].P50US, base.P50US, grpc.p50US, cur.p50US),
@@ -356,20 +399,37 @@ func repsCheck(cell string, got, want int) check {
 		message: fmt.Sprintf("%s sampled only %d times, need %d", cell, got, want)}
 }
 
-// allocCheck fails when the measured median allocations per operation rounds above
-// the baseline: a real regression adds at least one whole allocation, while
-// sub-allocation float noise rounds away. A measured value at or below the
-// baseline — including a counter that reads far lower, i.e. a fresh transport
-// counting from zero — is never a regression.
-func allocCheck(cell string, base, measured float64) check {
-	if math.Round(measured) <= math.Round(base) {
+// allocCheck fails when the measured median allocations per operation exceeds
+// the baseline by more than band. With band zero (every cell except the gRPC
+// reference — see the policy fields' doc comment) this is the strict check: a
+// real regression adds at least one whole allocation, while sub-allocation
+// float noise rounds away, because the comparison is done on rounded values.
+// With band positive, it instead checks the raw measured value against
+// base+band directly, without rounding, since the band already exists to
+// absorb noise of less than a whole allocation. A measured value at or below
+// the baseline — including a counter that reads far lower, i.e. a fresh
+// transport counting from zero — is never a regression, for either path.
+func allocCheck(cell string, base, measured, band float64) check {
+	if band <= 0 {
+		if math.Round(measured) <= math.Round(base) {
+			return check{name: cell + " allocs/op", pass: true,
+				message: fmt.Sprintf("allocs/op %s → %s (not increased)", trim(base), f2(measured))}
+		}
+		pct := (measured - base) / base * 100
+
+		return check{name: cell + " allocs/op", pass: false,
+			message: fmt.Sprintf("allocs/op %s → %s, +%s%% above baseline", trim(base), f2(measured), f2(pct))}
+	}
+
+	if measured <= base+band {
 		return check{name: cell + " allocs/op", pass: true,
-			message: fmt.Sprintf("allocs/op %s → %s (not increased)", trim(base), f2(measured))}
+			message: fmt.Sprintf("allocs/op %s → %s (within tolerance band ±%s)", trim(base), f2(measured), f2(band))}
 	}
 	pct := (measured - base) / base * 100
 
 	return check{name: cell + " allocs/op", pass: false,
-		message: fmt.Sprintf("allocs/op %s → %s, +%s%% above baseline", trim(base), f2(measured), f2(pct))}
+		message: fmt.Sprintf("allocs/op %s → %s, +%s%% above baseline (outside tolerance band ±%s)",
+			trim(base), f2(measured), f2(pct), f2(band))}
 }
 
 // floorCheck fails when a normative cell's measured median ratio versus the
