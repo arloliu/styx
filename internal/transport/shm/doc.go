@@ -126,4 +126,66 @@
 // (counted), never a poison (§15): PoisonFlag and the fault->cause mapping
 // live in poison.go, the generation-recovery helpers and the discard-
 // escalation policy in recovery.go.
+//
+// # A consume fault is contained; an unbroken run of them is not
+//
+// A frame this side could not consume for a reason of its own — its decode
+// panicked, or a consume callback declined it — is not a peer fault. Recv
+// discards that one frame, advances past it, fails the call the descriptor
+// names, and leaves the region healthy and serving (shm-abi.md §9). Nothing an
+// individual frame does escalates.
+//
+// The reason it cannot end there is that §9 hands the peer-versus-consumer
+// attribution to the consume callback, and this transport cannot check its work:
+// it proves peer fault for every class it can decide itself (descriptor
+// validation, CRC32C, status-body decode, all before the callback runs), and what
+// remains is an opaque body whose schema it does not hold. A callback that
+// declines what was really the peer publishing garbage therefore keeps a corrupt
+// region alive.
+//
+// So the fault stream is escalated on its shape: once faults arrive back to back
+// with no successful delivery between them, and the run reaches
+// EscalationConfig.ConsumeFaultRunThreshold, the region is poisoned with
+// PoisonGeneric. Any single delivered frame resets the run to zero, which is what
+// makes the rule mean something — a consumer that is merely busy or backpressured
+// keeps succeeding between its declines and never accumulates a run, while a
+// region whose every frame is unusable accumulates one without bound. A rate of
+// faults would not distinguish those two, because a fault fires once per inbound
+// frame and both cases produce them at whatever rate the peer publishes.
+//
+// The escalation is deliberately conservative, because poisoning is unrepairable
+// and bilateral: it tears down both sides and fails every call in flight. It can
+// be tuned, or switched off for one side, through
+// EscalationConfig.ConsumeFaultRunThreshold and ConsumeFaultEscalationDisabled,
+// which leaves the faults to Transport.ConsumeFaults and the supervisor — the
+// owner §16 names for escalation policy.
+//
+// Two properties of that control are easy to over-read, and both are set out on
+// the constants themselves. The threshold counts frames, so the rule means the
+// same event everywhere, but the amount of stall time it tolerates shrinks as the
+// link gets faster (DefaultConsumeFaultRunThreshold). And each side runs its own
+// guard over its own inbound stream with no negotiation between them, so
+// disabling one side does not keep the region alive when the other side's guard
+// fires (ConsumeFaultEscalationDisabled).
+//
+// # Telling this teardown apart from any other
+//
+// The escalation records PoisonGeneric, because this side genuinely cannot tell a
+// peer publishing garbage from its own consumer having stopped — which is the
+// premise of the whole rule, and why naming the peer would be a false report. The
+// cost is that a region torn down this way reports "shm: region poisoned:
+// generic", the same reason string an ordinary control-plane teardown produces.
+//
+// Transport.ConsumeFaults is the evidence, and it is per side, so read it that
+// way. The side whose run fired has a count of at least its configured
+// ConsumeFaultRunThreshold — below that the escalation cannot have fired, so a
+// merely nonzero count proves nothing on its own. The side that did NOT escalate
+// is torn down by the same bilateral poison while its own count stays wherever it
+// was, commonly zero. So a zero count rules out THIS side having escalated and
+// rules out nothing whatever about the peer, which is the case worth suspecting
+// precisely because disabling one side leaves the other armed.
+//
+// The count is reported to an operator's metrics sink as observe.MetricConsumeFault,
+// by the periodic reporter on both the host and the plugin, so this is readable
+// without access to the Transport itself.
 package shm

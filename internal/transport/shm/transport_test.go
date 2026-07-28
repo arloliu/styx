@@ -962,6 +962,156 @@ func TestTransport_Recv_EscalatesLiveStaleGenerationStream_ToPoisonPeerCrash(t *
 	})
 }
 
+// Test that the live, attached Transport actually feeds its CONSUME-FAULT stream
+// to the escalation policy -- the twin of the stale-generation wiring above, and
+// not just the standalone policy harness recovery_test.go drives directly. If the
+// consume-faulted arm only incremented its counter, a peer publishing garbage
+// that the consume step declines instead of attributing could never poison the
+// region at all (shm-abi.md §9's "MAY escalate at a documented threshold").
+//
+// All three halves of the rule are proven through a real Attach plus
+// RecvViewConsume: an isolated decline leaves the region serving, an unbroken run
+// of the identical decline poisons it with PoisonGeneric, and the same declines
+// interleaved with successful deliveries never escalate at all -- the last being
+// the case that separates a corrupt region from a merely busy one, and the one a
+// rate-based rule gets wrong.
+func TestTransport_RecvViewConsume_EscalatesLiveConsumeFaultRun_ToPoisonGeneric(t *testing.T) {
+	// declineAll is the misattributing consume step this guard exists for: it
+	// fails every frame without naming the peer, so §9 routes each one to the
+	// consumer's own arm and the transport can never prove peer fault itself.
+	declineAll := func(transport.Frame) error { return errors.New("rpcruntime: inbound delivery queue full") }
+	accept := func(transport.Frame) error { return nil }
+
+	// newDecliningEndpoints attaches a pair on an injected clock whose escalation
+	// config has a 1ms grace window and a 3-fault run threshold, and publishes n
+	// frames for the plugin side to consume. The clock is left already advanced
+	// past the grace window, so nothing in the returned endpoints is still
+	// protected by it and only the run rule is under test.
+	newDecliningEndpoints := func(t *testing.T, n int) *endpoints {
+		t.Helper()
+
+		clock := &fakeClock{now: time.Now()}
+		t.Cleanup(swapAttachClock(clock.Now))
+
+		cfg := validConfig(false)
+		cfg.Escalation = EscalationConfig{GraceWindow: time.Millisecond, ConsumeFaultRunThreshold: 3}
+		ep := newEndpoints(t, roundTripLayout(), cfg)
+		setInPlaceThreshold(ep.plugin, 0)
+		for i := range n {
+			require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
+				CallID: uint64(i + 1), Kind: transport.FrameUnaryReq, Payload: []byte("undecodable to this consumer"),
+			}))
+		}
+		clock.now = clock.now.Add(10 * time.Millisecond) // past the grace window
+
+		return ep
+	}
+
+	t.Run("an isolated consume fault past the grace window leaves the region serving", func(t *testing.T) {
+		// Given one frame the consume step declines and one it accepts.
+		ep := newDecliningEndpoints(t, 1)
+		require.NoError(t, ep.host.Send(t.Context(), transport.Frame{CallID: 99, Kind: transport.FrameCancel}))
+
+		// When the first is declined.
+		err := ep.plugin.RecvViewConsume(t.Context(), declineAll)
+		require.ErrorIs(t, err, transport.ErrConsumeFault)
+
+		// Then the region is healthy and still delivering: one fault escalates
+		// nothing, which is the containment §9 requires of this arm.
+		_, poisoned := ep.plugin.poison.Check()
+		require.False(t, poisoned, "an isolated consume fault must never poison the region")
+		require.Equal(t, uint64(1), ep.plugin.ConsumeFaults())
+
+		var next transport.Frame
+		require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+			next = f
+
+			return nil
+		}))
+		require.Equal(t, uint64(99), next.CallID)
+	})
+
+	t.Run("an unbroken run of consume faults poisons the region with PoisonGeneric", func(t *testing.T) {
+		// Given three frames the consume step declines identically -- the shape a
+		// producer publishing undecodable bodies produces, since every later frame
+		// from it fails the same way and none of them ever succeeds.
+		ep := newDecliningEndpoints(t, 3)
+
+		// When each is declined in turn, with no delivery between them.
+		for range 3 {
+			require.ErrorIs(t, ep.plugin.RecvViewConsume(t.Context(), declineAll), transport.ErrConsumeFault)
+		}
+
+		// Then the region is poisoned, and with the unspecified cause: this side
+		// cannot tell a garbage-publishing peer from its own failing consumer, so
+		// the supervisor's authoritative reason must not name the peer
+		// (shm-abi.md §3/§16).
+		cause, poisoned := ep.plugin.poison.Check()
+		require.True(t, poisoned, "an unbroken consume-fault run must escalate")
+		require.Equal(t, PoisonGeneric, cause)
+		require.Equal(t, uint64(3), ep.plugin.ConsumeFaults())
+
+		// And the next receive reports the region as poisoned rather than serving on.
+		_, err := ep.plugin.Recv(t.Context())
+		require.ErrorIs(t, err, ErrPoisoned)
+	})
+
+	t.Run("declines interleaved with deliveries never escalate, however many accumulate", func(t *testing.T) {
+		// Given an attached pair and no frames published yet: this case sends and
+		// receives in lockstep, because it runs far more frames than the region's
+		// smallest size class has slabs and relies on each consumed frame's slab
+		// being reclaimed before the next send.
+		ep := newDecliningEndpoints(t, 0)
+
+		// When two frames in every three are declined and the third is taken -- a
+		// consumer that is busy or backpressured rather than broken. Two in a row
+		// deliberately stops one short of the run threshold every time.
+		const frames = 60
+		faults := 0
+		for i := range frames {
+			require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
+				CallID: uint64(i + 1), Kind: transport.FrameUnaryReq, Payload: []byte("payload"),
+			}))
+			if i%3 == 2 {
+				require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), accept))
+
+				continue
+			}
+			require.ErrorIs(t, ep.plugin.RecvViewConsume(t.Context(), declineAll), transport.ErrConsumeFault)
+			faults++
+		}
+
+		// Then the region is never poisoned, though the cumulative fault count is
+		// more than ten times the threshold. Each delivery resets the run, which is
+		// the only thing that distinguishes this consumer from the broken one above
+		// -- both produce faults at the same rate, set by how fast the peer
+		// publishes, so no rate over that stream could tell them apart.
+		require.Equal(t, 2*frames/3, faults)
+		require.Greater(t, faults, 3, "the cumulative total must exceed the run threshold")
+		_, poisoned := ep.plugin.poison.Check()
+		require.False(t, poisoned, "a consumer that keeps serving must never be poisoned")
+		require.Equal(t, uint64(faults), ep.plugin.ConsumeFaults())
+	})
+
+	t.Run("every declined frame still advances the head, escalation or not", func(t *testing.T) {
+		// Given the unbroken-run case, whose third fault escalates.
+		ep := newDecliningEndpoints(t, 3)
+
+		// When all three are declined.
+		for range 3 {
+			require.ErrorIs(t, ep.plugin.RecvViewConsume(t.Context(), declineAll), transport.ErrConsumeFault)
+		}
+
+		// Then every slot was released, including the one whose fault escalated.
+		// Escalation adjudicates the stream; it never changes a single frame's
+		// disposition, and §9 requires the advance on this arm precisely so no slot
+		// or slab is stranded for the region's lifetime -- withholding it on the
+		// escalating frame, the way the peer-fault arm withholds it, would strand
+		// that slot in a region the supervisor is about to inspect.
+		require.Equal(t, uint64(3), ep.plugin.lastSeen)
+	})
+}
+
 // Test that the producer signal's conformance fault is reachable through a real
 // attached Transport (shm-abi.md §3/§12/§16): when the signal observes an
 // illegal park-state value on publish, the fault surfaces via the transport's

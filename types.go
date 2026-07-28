@@ -29,8 +29,10 @@ var ExpBackoff = supervisor.ExpBackoff
 // policy, and both data-plane transports advertised.
 // Pass it to NewPluginServer (fields are read-only once set).
 //
-// Transports is the plugin's only data-plane configuration knob; the region
-// geometry and transport preference are host-authored via PluginSpec.
+// The region geometry and transport preference are host-authored via PluginSpec.
+// What this side does configure is what it does with its own receive path:
+// Transports selects which transports it advertises, and ConsumeFaultRunThreshold
+// bounds how long it keeps a region it cannot consume from.
 type PluginServerConfig struct {
 	// Metrics optionally sends the plugin's built-in metrics to the sink.
 	// nil disables plugin-side metrics (no dispatcher goroutine, no hot-path allocation).
@@ -66,6 +68,27 @@ type PluginServerConfig struct {
 	// []Transport{TransportSHM} for a shared-memory-only plugin.
 	// NewPluginServer panics on an unknown transport name.
 	Transports []Transport
+
+	// ConsumeFaultRunThreshold is how many inbound frames this plugin may fail to
+	// consume back to back, with no frame delivered successfully between them,
+	// before it tears the shared-memory region down. Ignored for the uds transport.
+	//
+	// It is the plugin-side twin of PluginSpec.ConsumeFaultRunThreshold and carries
+	// the same meaning; see that field for what the run measures, why a single
+	// success resets it, and why the threshold buys less stall time the faster the
+	// link runs. Each side adjudicates only its own receive path, so the two are
+	// set independently and need not agree.
+	//
+	// Because they need not agree, neither side's setting governs the region on its
+	// own. Tearing the region down takes only one side and stops both, so a plugin
+	// that raises or disables its threshold still gets torn down by a host whose own
+	// guard fires.
+	//
+	// Zero selects the default. ConsumeFaultEscalationDisabled switches this
+	// plugin's half of the teardown off; see that constant for what one-sided
+	// disabling does and does not achieve. Do not set a small value: at 1 a single
+	// unconsumable frame tears the region down.
+	ConsumeFaultRunThreshold int
 }
 
 // validatePluginTransports panics if names contains a transport this build does

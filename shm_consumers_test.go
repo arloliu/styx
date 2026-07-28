@@ -1,6 +1,7 @@
 package styx
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -81,4 +82,44 @@ func TestMetricsReporterConsumer_FromLiveShmTransport_EmitsBytesAndRingDepth(t *
 		time.Second, 5*time.Millisecond, "a non-zero bytes-moved counter must be emitted")
 	require.Eventually(t, func() bool { v, ok := sink.gauge(observe.MetricRingDepth); return ok && v > 0 },
 		time.Second, 5*time.Millisecond, "a non-zero ring-depth gauge must be emitted")
+}
+
+// Test the metrics consumer of the shared-memory transport's CONSUME-FAULT
+// counter, driven by a real declined frame on a live shm transport rather than a
+// fake counter: a consume step that fails without blaming the peer is discarded
+// and counted, and the periodic reporter emits that count to the sink.
+//
+// This is the diagnostic an operator needs after the fact. A long enough unbroken
+// run of these faults makes the transport poison the region, and the poison word
+// records only the generic cause, which reads the same as an ordinary
+// control-plane teardown. The counter reaching a sink is what tells them apart,
+// so a count that never leaves the transport is a teardown nobody can diagnose.
+func TestMetricsReporterConsumer_FromLiveShmTransport_EmitsConsumeFaults(t *testing.T) {
+	pair, err := shmtest.NewInProcessPair(1, shmtest.DefaultConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pair.Close() })
+
+	ctx := t.Context()
+	require.NoError(t, pair.Host.Send(ctx, unaryFrame(1)))
+
+	// Given a consume step that declines the frame for a reason of its own, without
+	// naming the peer's bytes -- the fault class that is counted and contained.
+	vr, ok := any(pair.Plugin).(transport.ViewReceiver)
+	require.True(t, ok, "the shared-memory transport must expose the view-consume path")
+	rerr := vr.RecvViewConsume(ctx, func(transport.Frame) error {
+		return errors.New("rpcruntime: inbound delivery queue full")
+	})
+	require.ErrorIs(t, rerr, transport.ErrConsumeFault)
+
+	sink := newCountingSink()
+	cc := &ClientConn{name: "shm", metrics: newMetricsDispatcher(sink, 64)}
+	go cc.metrics.Run(t.Context())
+
+	// When the periodic reporter samples the live transport.
+	last := cc.reportConsumeFaults(cc.metrics, pair.Plugin, 0)
+
+	// Then the fault reaches the operator's sink.
+	require.Equal(t, uint64(1), last)
+	require.Eventually(t, func() bool { return sink.counter(observe.MetricConsumeFault) == 1 },
+		time.Second, 5*time.Millisecond, "a declined frame must reach the sink as a consume fault")
 }

@@ -8,6 +8,7 @@ import (
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/transport"
+	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 )
 
 // HandshakeAndAttachForTest re-exports handshakeAndAttach for supervisor_test
@@ -226,3 +227,11 @@ func (b *EventBus) DroppedInformationalCounts() []uint64 {
 // *os.ProcessState values here, without needing a full Supervisor run for
 // every case.
 var ExitStatusFromState = exitStatusFromState
+
+// ShmConfigForTest re-exports shmConfig for supervisor_test (external test
+// package): it is the pure host-side mapping from Config into the shared-memory
+// transport's own configuration, so the knobs it must carry across that boundary
+// are exercised directly here, without a real region, handshake, or child process.
+func (s *Supervisor) ShmConfigForTest(maxInflight int, tuple control.Tuple) shmtransport.Config {
+	return s.shmConfig(maxInflight, tuple)
+}

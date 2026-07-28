@@ -1521,3 +1521,37 @@ func TestSupervisor_AttachSHM_PerStepFailure_ClosesExactlyWhatItOwns(t *testing.
 		})
 	}
 }
+
+// Test that the host-side consume-fault teardown threshold actually reaches the
+// shared-memory transport's own configuration.
+//
+// The knob is only a knob if it survives that trip. A field that stopped at the
+// supervisor would leave every deployment on the transport's built-in default,
+// with no way to raise it for a plugin that legitimately stalls in long bursts
+// and no way to switch it off -- and the action it governs is an unrepairable
+// teardown of the region and every call in flight on it.
+func TestSupervisor_ShmConfig_CarriesTheConsumeFaultRunThreshold(t *testing.T) {
+	tuple := control.Tuple{Features: map[string]bool{}}
+	thresholdFor := func(t *testing.T, configured int) int {
+		t.Helper()
+		s := supervisor.New(supervisor.Config{ConsumeFaultRunThreshold: configured}, supervisor.NewEventBus())
+
+		return s.ShmConfigForTest(16, tuple).Escalation.ConsumeFaultRunThreshold
+	}
+
+	t.Run("an explicit threshold reaches the transport unchanged", func(t *testing.T) {
+		require.Equal(t, 4096, thresholdFor(t, 4096))
+	})
+
+	t.Run("the disable sentinel survives rather than folding into the default", func(t *testing.T) {
+		// It has to arrive still negative: the transport reads any negative value
+		// as "off" and only an exact zero as "unset", so a supervisor that
+		// normalized this to zero would silently re-enable the teardown an operator
+		// switched off.
+		require.Negative(t, thresholdFor(t, -1))
+	})
+
+	t.Run("an unset threshold stays zero so the transport picks its own default", func(t *testing.T) {
+		require.Zero(t, thresholdFor(t, 0))
+	})
+}

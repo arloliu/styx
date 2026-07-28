@@ -444,6 +444,7 @@ type capTransport struct {
 	edges    atomic.Uint64
 	sent     atomic.Uint64
 	received atomic.Uint64
+	faults   atomic.Uint64
 }
 
 func (*capTransport) Send(context.Context, transport.Frame) error { return nil }
@@ -459,6 +460,7 @@ func (t *capTransport) WakeupSyscalls() uint64      { return t.wakeups.Load() }
 func (t *capTransport) BackpressureEdges() uint64   { return t.edges.Load() }
 func (t *capTransport) BytesSent() uint64           { return t.sent.Load() }
 func (t *capTransport) BytesReceived() uint64       { return t.received.Load() }
+func (t *capTransport) ConsumeFaults() uint64       { return t.faults.Load() }
 
 // udsShapedTransport is a fake Transport exposing only byte counting, like the uds
 // transport: none of the shared-memory reporter capabilities. The reporter must
@@ -781,6 +783,7 @@ func TestClientConn_Reporter_ResetsBaselinesOnGenerationChange(t *testing.T) {
 	trA.received.Store(400)
 	trA.edges.Store(3)
 	trA.wakeups.Store(1000)
+	trA.faults.Store(4)
 	cc.state.Store(&connState{tr: trA})
 
 	repCtx, repCancel := context.WithCancel(context.Background())
@@ -790,6 +793,13 @@ func TestClientConn_Reporter_ResetsBaselinesOnGenerationChange(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return sink.counter(observe.MetricBytesMoved) == 1000 && sink.counter(observe.MetricBackpressureEvent) == 3
 	}, time.Second, time.Millisecond, "generation A's bytes and edges are counted")
+
+	// The consume-fault count rides the same loop. It is asserted here rather than
+	// only through its helper because the loop's call site is what actually delivers
+	// it to an operator, and a teardown this counter is the only evidence for is not
+	// diagnosable if the reporter never samples it.
+	require.Eventually(t, func() bool { return sink.counter(observe.MetricConsumeFault) == 4 },
+		time.Second, time.Millisecond, "generation A's consume faults are counted")
 
 	// A's wakeup baseline is established; a bump emits A's own rate (50/0.005s = 10000).
 	trA.wakeups.Store(1050)
@@ -802,6 +812,7 @@ func TestClientConn_Reporter_ResetsBaselinesOnGenerationChange(t *testing.T) {
 	trB.sent.Store(1500)
 	trB.edges.Store(7)
 	trB.wakeups.Store(8000) // far above A's last wakeup sample (1050)
+	trB.faults.Store(9)
 	cc.state.Store(&connState{tr: trB})
 
 	// Bytes and edges count B's full counters, not B minus A's baseline.
@@ -809,6 +820,11 @@ func TestClientConn_Reporter_ResetsBaselinesOnGenerationChange(t *testing.T) {
 		return sink.counter(observe.MetricBytesMoved) == 2500 && sink.counter(observe.MetricBackpressureEvent) == 10
 	}, time.Second, time.Millisecond,
 		"a fresh generation is counted from zero, not aliased against the predecessor baseline")
+
+	// Consume faults reset with the rest: B's own 9 are added whole, never B minus
+	// A's baseline, so a restart cannot make a fresh region look already faulted.
+	require.Eventually(t, func() bool { return sink.counter(observe.MetricConsumeFault) == 13 },
+		time.Second, time.Millisecond, "a fresh generation's consume faults are counted from zero")
 
 	// B's wakeup baseline resets to its own first sample (8000, silently), so a bump
 	// emits B's own rate (100/0.005s = 20000) — never an aliased (8000-1050)/interval
@@ -899,4 +915,84 @@ func TestClientConn_ReleaseTransportGuarded_WaitsForReporterRead(t *testing.T) {
 		t.Fatal("transport release never completed after the capability read finished")
 	}
 	require.True(t, tr.closed.Load(), "the transport is released once the in-flight capability read completed")
+}
+
+// Test that the consume-fault counter actually reaches an operator's MetricsSink,
+// on both sides, and that the uds-shaped transport emits nothing.
+//
+// This is the compensating diagnostic for a teardown the poison word cannot
+// describe: an unbroken run of consume faults makes the shared-memory transport
+// poison the region, and the recorded reason is the same generic one an ordinary
+// control-plane teardown produces. The count is what distinguishes them, so a
+// count that stops inside the transport is a teardown nobody can diagnose.
+func TestMetricsReporter_ConsumeFaults_ReachTheSink(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	t.Run("the host reporter submits the per-interval delta", func(t *testing.T) {
+		sink := newCountingSink()
+		cc := &ClientConn{name: "echo", metrics: newMetricsDispatcher(sink, 64)}
+		go cc.metrics.Run(ctx)
+
+		// Given a transport that has discarded three frames to its own faults.
+		tr := &capTransport{}
+		tr.faults.Store(3)
+
+		// When the reporter samples it.
+		last := cc.reportConsumeFaults(cc.metrics, tr, 0)
+
+		// Then the operator's sink sees them.
+		require.Equal(t, uint64(3), last)
+		require.Eventually(t, func() bool { return sink.counter(observe.MetricConsumeFault) == 3 },
+			time.Second, 5*time.Millisecond)
+
+		// And a second sample with no new faults submits nothing.
+		before := sink.counter(observe.MetricConsumeFault)
+		require.Equal(t, last, cc.reportConsumeFaults(cc.metrics, tr, last))
+		require.Equal(t, before, sink.counter(observe.MetricConsumeFault))
+
+		// And a further climb is added as a delta, which is the shape an operator
+		// alerts on -- a run building toward a teardown, not a single fault.
+		tr.faults.Store(9)
+		require.Equal(t, uint64(9), cc.reportConsumeFaults(cc.metrics, tr, last))
+		require.Eventually(t, func() bool { return sink.counter(observe.MetricConsumeFault) == 9 },
+			time.Second, 5*time.Millisecond)
+	})
+
+	t.Run("a transport without the capability emits nothing", func(t *testing.T) {
+		sink := newCountingSink()
+		cc := &ClientConn{name: "echo", metrics: newMetricsDispatcher(sink, 64)}
+		go cc.metrics.Run(ctx)
+
+		// Given the uds-shaped transport, which cannot poison and has no such faults.
+		last := cc.reportConsumeFaults(cc.metrics, udsShapedTransport{}, 42)
+
+		// Then the baseline is untouched and no value is fabricated.
+		require.Equal(t, uint64(42), last, "an absent capability leaves the baseline unchanged")
+		drainMarker(t, cc.metrics, sink)
+		require.Zero(t, sink.counter(observe.MetricConsumeFault))
+	})
+
+	t.Run("the plugin reporter submits them too", func(t *testing.T) {
+		sink := newCountingSink()
+		srv := NewPluginServer(PluginServerConfig{})
+		srv.metrics = newMetricsDispatcher(sink, 64)
+		srv.metricsInterval = 5 * time.Millisecond
+		go srv.metrics.Run(ctx)
+
+		// Given a plugin-side transport carrying its own faults. The two sides count
+		// independently: a teardown one side's run triggers stops both, so only the
+		// side that faulted shows the climb.
+		tr := &capTransport{}
+		tr.faults.Store(7)
+
+		// When the plugin's own reporter loop runs.
+		loopCtx, stop := context.WithCancel(ctx)
+		defer stop()
+		go srv.runMetricsReporter(loopCtx, tr)
+
+		// Then the plugin's sink sees them, unlabeled (the plugin has no name).
+		require.Eventually(t, func() bool { return sink.counter(observe.MetricConsumeFault) == 7 },
+			time.Second, 5*time.Millisecond)
+	})
 }

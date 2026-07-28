@@ -35,8 +35,9 @@ type Config struct {
 	// payload, and the receiver verifies it (shm-abi.md §5). The 4-byte
 	// trailer is included in per-frame overhead calculations (shm-abi.md §18).
 	Checksum bool
-	// Escalation configures the stale-generation discard escalation policy
-	// (recovery.go's EscalationPolicy, shm-abi.md §15). The zero value is valid:
+	// Escalation configures the discard escalation policy that adjudicates both
+	// the stale-generation discard stream (shm-abi.md §15) and the consume-fault
+	// stream (§9) — recovery.go's EscalationPolicy. The zero value is valid:
 	// every zero field falls back to its Default* constant at policy creation
 	// time, not during admission validation.
 	Escalation EscalationConfig

@@ -95,15 +95,25 @@ var ErrBackpressure = errors.New("transport: backpressure")
 // attribute to the peer. The concrete error is a *ConsumeFaultError naming the
 // call whose frame was discarded, recoverable with errors.As.
 //
-// It is call-scoped, never transport-scoped: the failure came from the receiving
-// side, not from the peer's bytes, so the connection is healthy and the next
-// receive continues with the following frame. A caller that treats it as a
-// connection failure tears down a working transport over one bad frame.
+// It is call-scoped: the failure came from the receiving side, not from the
+// peer's bytes, so the connection is healthy and the next receive continues with
+// the following frame. A caller that treats one of these as a connection failure
+// tears down a working transport over one bad frame.
+//
+// What is scoped to the call is the error, not the transport's whole tolerance
+// for them. A transport with a poison protocol MAY additionally act on an
+// unbroken RUN of these faults — one that no successful delivery interrupts —
+// since a region whose every frame is unusable produces nothing else, and no
+// individual error can reveal that. Such an escalation is a property of the run
+// and never of the error a caller is holding: receiving this sentinel still means
+// "this frame failed, the connection is fine", and a caller must not read it as a
+// warning that the transport is about to give up. See the shared-memory
+// transport's EscalationPolicy for the one implementation of that rule.
 var ErrConsumeFault = errors.New("transport: consume callback failed")
 
 // ErrPayloadMalformed is the one signal a ViewReceiver consume callback can send
 // that blames the PEER rather than itself, and it is the only error return that
-// condemns the connection.
+// condemns the connection on its own.
 //
 // A callback returns an error wrapping it to say: the descriptor certified a
 // payload of this length in this slab, and the bytes are not a payload of that
@@ -114,7 +124,14 @@ var ErrConsumeFault = errors.New("transport: consume callback failed")
 // full delivery queue, a cancelled context, a resource it could not obtain — and
 // is contained to that one frame. The default is deliberately containment, so that
 // a callback reporting a local problem cannot destroy a healthy connection by
-// accident; condemning it takes this explicit sentinel.
+// accident; condemning it with a single return takes this explicit sentinel.
+//
+// "On its own" is the exact claim. A transport MAY also condemn a connection on a
+// long enough unbroken run of non-malformed consume failures, because a callback
+// that declines what was really peer non-conformance is indistinguishable from
+// one declining for a local reason until the run makes it so. That is a decision
+// about many frames, not about any one error, and it does not make this sentinel
+// any less the only way a single return condemns anything.
 //
 // A frame the callback deliberately dropped is neither of those things: a response
 // whose call is already terminal, a CallID no longer in the call table, or a
@@ -126,11 +143,19 @@ var ErrPayloadMalformed = errors.New("transport: payload does not decode")
 // IsFrameLocalRecvErr reports whether a Recv error is confined to the single frame
 // that produced it, leaving the stream synchronized and the connection usable: a
 // malformed status body, an unimplemented (reserved streaming) frame kind, or a
-// consume fault the receiving side owns. All three leave the transport unpoisoned
-// and the frame fully accounted for, so a reader loop must skip that frame and
-// keep serving the rest rather than treating it as a terminal transport error.
-// Every other Recv error — a context end, a peer close, a mid-frame poison — is
+// consume fault the receiving side owns. All three account for their frame fully
+// and leave the transport usable, so a reader loop must skip that frame and keep
+// serving the rest rather than treating it as a terminal transport error. Every
+// other Recv error — a context end, a peer close, a mid-frame poison — is
 // genuinely terminal.
+//
+// This classifies the error, and a true answer is not a promise that the
+// transport is still healthy by the time the caller reads it. A transport MAY
+// poison itself on an unbroken run of consume faults (see ErrConsumeFault), in
+// which case the frame this error describes is still fully accounted for and the
+// classification is still correct — but the NEXT receive reports the poison, as a
+// terminal error, through the ordinary path. A reader loop needs no special case
+// for that: skipping and continuing is exactly what surfaces it.
 //
 // It lives here, next to the three sentinels, because every reader loop over any
 // transport must agree on the answer: a loop that classifies one of them as
@@ -593,6 +618,23 @@ type BackpressureEdgeCounter interface {
 type WakeupSyscallCounter interface {
 	// WakeupSyscalls reports the cumulative eventfd wakeup syscall count as a cheap snapshot.
 	WakeupSyscalls() uint64
+}
+
+// ConsumeFaultCounter is an optional Transport capability exposing the cumulative
+// count of inbound frames this side discarded to a fault it owns itself — a
+// copy-or-decode step that panicked, or a consume callback that reported a failure
+// without blaming the peer (ErrConsumeFault). Counts are cumulative and monotonic
+// within one transport instance; a decrease signals a fresh transport after restart.
+//
+// It is worth reporting rather than merely counting because a transport with a
+// poison protocol may tear its connection down over a long enough unbroken run of
+// these, and the recorded teardown reason cannot say so. Without this count an
+// operator cannot tell such a teardown from an ordinary one. Only the shared-memory
+// transport has that behavior; uds omits this capability.
+type ConsumeFaultCounter interface {
+	// ConsumeFaults reports the cumulative consumer-owned consume-fault count as a
+	// cheap snapshot.
+	ConsumeFaults() uint64
 }
 
 // checkImplementedKind returns nil for the nine implemented kinds (unary

@@ -10,6 +10,7 @@ import (
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/transport"
+	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 	"github.com/arloliu/styx/internal/transport/shm/shmtest"
 	"golang.org/x/sys/unix"
 )
@@ -348,4 +349,13 @@ func DisposeRecvErrForTest(err error) (done bool, loopErr error) {
 // classification of a Recv error.
 func IsFrameLocalRecvErrForTest(err error) bool {
 	return isFrameLocalRecvErr(err)
+}
+
+// ShmConfigForTest re-exports the plugin side's shmConfig for pluginserver_test
+// (external test package): it is the pure mapping from PluginServerConfig plus
+// the host's wire-carried admission bound into the shared-memory transport's own
+// configuration, so the knobs it must carry across that boundary are exercised
+// directly, without a handshake or a real region.
+func (s *PluginServer) ShmConfigForTest(maxInflight int, tuple control.Tuple) shmtransport.Config {
+	return s.shmConfig(maxInflight, tuple)
 }
