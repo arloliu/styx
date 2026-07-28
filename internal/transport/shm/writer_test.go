@@ -1854,12 +1854,11 @@ func TestWriter_Reclaim_BoundsCorruptPeerHead_BeforeAnyFreeOrAlloc(t *testing.T)
 
 // fastConsumerRing wraps a real *ring.Ring and, once armed, advances the
 // ring's head immediately after a successful Push returns -- modeling a fast
-// consumer that copies and consumes a just-published frame before the
-// producer's own post-push bookkeeping (published's reclaim) runs. Every
-// Tail/Len read afterward still comes from the same real ring, so reclaim's
-// wrap-safe arithmetic is genuine, not simulated; only the timing of the
-// consumer's head advance is injected, deterministically and without
-// goroutines or sleeps.
+// consumer that consumes a just-published frame before the producer's own
+// post-push bookkeeping (published's reclaim) runs. Every Tail/Len read
+// afterward still comes from the same real ring, so reclaim's wrap-safe
+// arithmetic is genuine, not simulated; only the timing of the consumer's head
+// advance is injected, deterministically and without goroutines or sleeps.
 type fastConsumerRing struct {
 	*ring.Ring
 	armed bool // when true, Push advances the head right after it succeeds

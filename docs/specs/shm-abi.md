@@ -799,9 +799,10 @@ logged (and cross-checked against producer-side records in tests), but the
 consumer does **not** treat a particular `alloc_seq` value as proof of freshness.
 **Head-gated reclamation (§6, below) is the sole normative proof against
 use-after-free and ABA**, and it is airtight by construction: a producer reclaims a
-slab only after the consumer's head has advanced past the referencing descriptor
-and the payload has been copied out, so a slab can never be simultaneously
-in-flight and reallocated. This is honest about what the ABI can actually
+slab only after the consumer's head has advanced past the referencing descriptor,
+and a conforming consumer reads nothing from the slab after that advance (§9), so
+a slab can never be simultaneously in-flight and reallocated.
+This is honest about what the ABI can actually
 guarantee (the reviewer's requirement) and matches the retained `bench/spike`
 allocator, which carries no per-slab stamp at all.
 
@@ -829,8 +830,10 @@ overhead when those flags are set).
 
 Reclamation is **head-gated** (design §12): a producer MAY return a slab to its
 free list only after the consumer's ring head has advanced past the descriptor
-referencing it **and** the payload has been fully copied out (v1 consumers copy
-before advancing head, §9). Cancellation/timeout never reclaims a slab early
+referencing it. The head advance is itself the proof that the payload has been
+consumed — §9 requires the consumer to finish reading the slab (by copying the
+bytes out or decoding them in place) *before* it advances, and to read nothing
+from the slab afterwards. Cancellation/timeout never reclaims a slab early
 (design §12); the slot is released only via normal head advancement or region
 teardown, so use-after-free and ABA are impossible by construction.
 
@@ -853,7 +856,7 @@ is **explicitly forbidden** for the tail and park-state words (§13 shows why).
 | `poison` | Sync page (§3) | **seq_cst CAS** (0→cause), first-setter-wins; **seq_cst** load on both read and write paths. |
 | `shutdown` | Sync page (§3) | **seq_cst** store on teardown; **seq_cst** load by consumers in the park loop. |
 | `call_id`, `service_id`, `method_id`, `payload_offset`, `payload_length`, `alloc_seq`, `budget_ns`, `kind`, `flags`, `generation` (desc), `reserved` | Descriptor (§4) | **write-once before publish**, then read-only. Ordered solely by the producer's seq_cst `tail` store and the consumer's seq_cst `tail` load — no per-field atomic. Validated against the cached generation on read (§15). |
-| Payload bytes, trace block, CRC trailer | Arena slab (§5, §6) | **write-once before publish** by producer; read-then-copy by consumer before head advance. Ordered by the same tail store/load edge as the descriptor. |
+| Payload bytes, trace block, CRC trailer | Arena slab (§5, §6) | **write-once before publish** by producer; read by consumer only before its head advance — copied out or decoded in place, never read after (§9). Ordered by the same tail store/load edge as the descriptor. |
 | `alloc_seq` counter, free lists | Process-local (§6) | not shared; ordinary in-process state, single owning goroutine. |
 
 ---
@@ -977,10 +980,169 @@ proceeds to teardown (§16 race resolution).
 
 ## §9 Ring dequeue pseudocode (consumer)
 
-Single-consumer per ring. Dequeue is split into **peek → copy → advance** so that
+Single-consumer per ring. Dequeue is split into **peek → consume → advance** so that
 head advancement is the cross-process reclaim signal (§6): the head MUST NOT
-advance until the payload has been copied out, or the producer's head-gated
+advance until the payload has been consumed, or the producer's head-gated
 reclaim could free a slab the (possibly cross-process) consumer is still reading.
+
+**What "consume" means (normative).** To consume a frame is to take everything
+the consumer will ever need out of the referenced slab. Copying the payload
+bytes into consumer-owned memory is one way to do it; decoding them in place
+into consumer-owned values is another. Both satisfy this section equally: the
+ABI constrains **when** the slab stops being read, never how the bytes are used
+in the meantime.
+
+The invariant is stated in terms of reads, not copies: **after the head store in
+`AdvanceHead`, the consumer MUST NOT read the referenced slab again** — not
+directly, and not through any retained slice, pointer, or lazily-decoded field
+that still aliases arena bytes. A consumer that hands out a value aliasing the
+slab and then advances the head violates this section no matter what the
+intervening step was called; a consumer that copies, or that decodes into fully
+owned values, satisfies it.
+
+Slab reuse is the near hazard, and it is not the worst one. The region is a
+single mapping torn down whole (§15): once teardown unmaps it, a retained alias
+does not read a recycled payload, it reads unmapped memory. That is a fatal
+process-level fault, not a recoverable error, so the no-alias rule is what keeps
+teardown safe as well as what keeps reclaim safe.
+
+A copying consumer and a decoding consumer are indistinguishable to the
+producer — same bytes in the slab, same head/tail edges — so the rule is
+expressed wholly in consumer behaviour and draws no distinction the producer or
+the layout could observe.
+
+**Where the advance sits relative to dispatch.** The pseudocode below advances
+**before** handing the frame onward, because that is the ordering a conforming
+consumer naturally produces: once the value owns its bytes, the slot has no
+reason to stay held while the RPC layer runs. A consumer MAY instead dispatch
+first and advance after; the invariant above governs both orderings identically,
+so under the dispatch-first shape **nothing dispatch hands onward may alias the
+slab either** — not the frame, not a field inside it, not a value the layer above
+retains. The rule is about what leaves the consumer, not about which step it left
+through, so a **fault report is bound by it too**: a consume fault MUST be
+rendered into consumer-owned values before it leaves the consume step, which is
+earlier than either the advance or the poison, because a report holding a
+reference into the slab reads a recycled payload after the advance and unmapped
+memory after teardown, exactly as a dispatched value would. Both hazards are live:
+the arm that advances meets the first, and the arm that poisons — which never
+advances at all — meets the second. Both orderings sit
+after the final poison/shutdown gate.
+
+Advancing first also means a fault in the layer above cannot strand the slot: by
+the time `dispatch` runs, the slot is already released and the slab already
+reclaimable, so a panic there costs a call, not a permanently held ring slot.
+
+**Checksums (normative).** The branch is **per frame**, on the descriptor's
+`CRC32C_PRESENT` flag (§5) — not on whether the `checksum` feature was
+negotiated. Negotiation only *permits* the flag: a peer that negotiated
+`checksum` MAY still publish a frame without a trailer, and that frame carries
+nothing to verify.
+
+When a frame carries `CRC32C_PRESENT`, the consumer MUST copy the payload out and
+verify the CRC over that private copy, then consume the copy. The copy is what
+makes the verification end-to-end: the bytes that were checked and the bytes that
+are interpreted are the same bytes, so a producer still writing a slab it already
+published tears the copy and fails the check. When a frame does not carry the
+flag, the consumer consumes the slab directly. This is one branch in the
+consumer, not two receive paths.
+
+The scope of what a checksum proves is worth stating plainly rather than leaving
+to inference. CRC32C is a corruption detector, not a MAC: a peer that rewrites a
+slab it has already published and recomputes the trailer defeats the check under
+any ordering, and catching that is outside what the checksum provides. What it
+does buy, on the frames that carry it, is detection of a conforming-but-faulty
+producer — the class this protocol defends against (design §20). The slab's
+*lifetime* is made safe by §6 head-gated reclamation, never by the CRC.
+
+**Consume failure (normative).** A consume step can fail three ways on a payload
+that already passed `validate`. Which way it failed is decided by **who owns the
+fault**, and the disposition follows the owner. Collapsing them into one rule gets
+at least one of the three wrong.
+
+- **The peer published bytes that do not decode — poison, no advance.** The
+  descriptor passed `validate`, so the peer certified a payload of that length in
+  that slab of that class; a body that then fails to decode is peer
+  non-conformance, and §0 is explicit that a peer violating a MUST "is
+  non-conformant and the region is poisoned rather than trusted". Poison with
+  `POISON_BAD_FRAME` (§16) and stop consuming; the head does **not** advance,
+  because a poisoned region is discarded whole and owes no further progress. This
+  is *not* the §16 discard case: that class exists for anomalies with a benign
+  explanation — a dying predecessor's late write (§15) — and an undecodable body
+  under a certified descriptor has none.
+- **The consumer's own decode path faulted — advance, discard, fail the call.**
+  A panic inside the consumer's copy-or-decode step is this side's bug, not the
+  peer's, and the region is still healthy. **The head MUST still advance**: the
+  slot was consumed either way, and withholding the advance strands both the slot
+  and its slab for the region's lifetime. Count the discard on a diagnostic
+  counter the supervisor may escalate on, exactly as the stale-generation discard
+  is counted (§15/§16). The frame is not dispatched — and because it is not, the
+  consumer MUST fail the call the descriptor names rather than let it sit: a
+  discarded *response* that nobody reports strands its caller until the deadline
+  expires, converting a fail-fast into a hang.
+- **The consumer declined the frame for a reason of its own — advance, discard,
+  fail the call.** A consume step MAY fail without the peer's bytes being at
+  fault: a full delivery queue, a cancelled context, a resource it could not
+  obtain. That is this side's condition on a **healthy** region, so it takes this
+  side's disposition, identical to the panic above — count the discard on the same
+  diagnostic counter, **advance the head**, fail the call the descriptor names, and
+  do **NOT** poison.
+
+  **A frame the consumer is finished with is not a failure at all.** Declining is
+  for a frame the consumer could not take *while a call still depends on it* —
+  that dependency is the whole reason the arm fails the call rather than dropping
+  it silently, and the disposition above is meaningless without one. A frame the
+  consumer disposed of deliberately is a success: a response whose call is already
+  terminal, a `call_id` no longer in the call table, a request whose method the
+  consumer answers with an error status. Nothing is waiting on those, so nothing
+  needs failing, and reporting them as failures would count healthy traffic as
+  faults and fail calls that do not exist. Such a frame MUST be reported consumed,
+  exactly as one the consumer used.
+
+  **Attribution MUST be explicit, and an unattributed failure MUST take this
+  arm.** A consume step reports `MALFORMED` only by naming the peer's bytes as the
+  cause; a failure that names nothing is `DECLINED`, never `MALFORMED`. Defaulting
+  the other way lets a routine local condition condemn a healthy region — and
+  every call in flight on it — by omission rather than by decision, which is not a
+  price any diagnostic gain repays. The cost of this default is stated plainly
+  rather than hidden: a consume step that observes real peer non-conformance and
+  neglects to attribute it leaves the region un-poisoned and still trusted, so
+  attributing correctly is a consumer **MUST**, not a courtesy.
+
+**"Fail the call the descriptor names" binds where that call is local.** Both
+consumer-owned arms end in it, and on the **response** direction it is
+performable exactly as written: the descriptor names a call in this side's own
+table, and failing it is what converts the discard into the fail-fast the arm
+exists to produce. On the **request** direction it is not. The call a discarded
+request names lives in the *peer's* table, and no local terminal reaches it; the
+only act that discharges its dependency is answering the peer with an error
+status — which the paragraph above already classes as an **acceptance**, to be
+reported consumed. So a request-receiving consumer that can answer MUST accept
+rather than decline, and a request it genuinely could not take is declined for
+the parts of the disposition it can still perform (count the fault, advance the
+head, do not poison). A consumer that declines a request has not failed to meet
+this rule; there is nothing on this side for the rule to name.
+
+That leaves the peer's call to whatever budget its descriptor carried, and §4
+defines `budget_ns = 0` as **no deadline** — a caller that issued the call with no
+deadline of its own publishes zero, and a peer that arms its expiry from that
+budget arms nothing. So a declined request whose descriptor carried a zero budget
+strands the peer's call with nothing to reap it, on a connection this arm
+deliberately keeps healthy. That is a **known gap in this arm, not a property of
+it**: closing it requires the request-receiving side to be able to answer a frame
+it never dispatched, which this section does not yet give it. Until it does, a
+consumer on this direction SHOULD treat declining as a last resort and answer
+wherever it can, and MUST NOT be read as having discharged the peer's dependency
+merely by advancing the head.
+
+**The advance MUST survive the panic.** "The head still advances after a panic"
+is only a real rule if the implementation cannot skip it while unwinding, so the
+consume step MUST run behind a fault barrier that converts a panic into an
+ordinary result before the advance decision is made — in Go, the step is called
+from a function whose deferred `recover` writes its named results. The pseudocode
+models this as `protected_consume`. Without the barrier the panic propagates out
+of the consume loop, the head store never executes, and the slot and slab are
+stranded for the region's lifetime — precisely the outcome the rule exists to
+prevent.
 
 `poison(cause)` is the §16 helper (CAS + unconditional teardown wake).
 
@@ -1008,26 +1170,52 @@ func Consume():
         stale_frames_discarded += 1                 // diagnostic counter (§15); MAY escalate at a documented threshold
         AdvanceHead(); return                       // DISCARD (design of record): skip, release slot, no dispatch
     if not validate(d):                             // §4/§5/§16; poisons + returns false on any violation
-        stop_consuming(); return                    // STOP before any copy or head advance
+        stop_consuming(); return                    // STOP before any payload read or head advance
     // Normative ordering (design §12, §15):
-    //   seq_cst tail load (TryPeek) → descriptor read → payload read/copy.
+    //   seq_cst tail load (TryPeek) → descriptor read → payload read.
     if stored_length(d) != 0:
         base = arena_base + d.payload_offset        // §5 slab start (validated present & in serving class)
-        payload = copy_out(base + trace_prefix(d), d.payload_length)   // copy before advancing
-        if d.flags.CRC32C_PRESENT:                  // feature negotiated (validated via allowed_flags, §5)
-            if not verify_crc32c(payload, crc_at(base, d)):
+        payload_span = span(base + trace_prefix(d), d.payload_length)  // arena bytes; readable only until AdvanceHead
+        if d.flags.CRC32C_PRESENT:                  // per-frame checksum arm (flag validated via allowed_flags, §5)
+            payload_span = copy_out(payload_span)   // private copy: verified bytes ARE the interpreted bytes
+            if not verify_crc32c(payload_span, crc_at(base, d)):
                 poison(POISON_CHECKSUM); stop_consuming(); return   // §16; no advance
+        value, fault = protected_consume(payload_span)   // consume the span — see "consume" above
+        if fault == MALFORMED:                      // the PEER published bytes that do not decode
+            poison(POISON_BAD_FRAME); stop_consuming(); return      // §16; no advance
+        if fault == PANICKED or fault == DECLINED:  // OUR OWN fault; the region is still healthy
+            consume_faults += 1                     // diagnostic counter (§16); MAY escalate at a documented threshold
+            AdvanceHead()                           // the slot was consumed either way; never strand it
+            fail_call(d.call_id)                    // fail fast; a silent discard strands the caller to its deadline
+                                                    // response direction only: the call is local there. On the request
+                                                    // direction it names the PEER's call and is a no-op (see above).
+            return
     else:
-        payload = empty                             // no slab (§5)
+        value = empty                               // no slab (§5)
     // FINAL GATE (§16 TOCTOU / §14): no dispatch may BEGIN after a poison or shutdown
     // observation. Re-load BOTH immediately before dispatch.
     if atomic.Load_seqcst(poison) != 0 or atomic.Load_seqcst(shutdown) != 0:
         stop_consuming(); return                    // do NOT advance; region is torn down whole
-    dispatch(d, payload)                            // hand to rpcruntime (response path re-checks poison/shutdown)
-    AdvanceHead()                                   // §3 seq_cst head store: reclaim signal (§6)
+    AdvanceHead()                                   // §3 seq_cst head store: reclaim signal (§6). Safe here
+                                                    // because value aliases no arena byte (see "consume" above)
+    dispatch(d, value)                              // hand to rpcruntime (response path re-checks poison/shutdown)
+
+// protected_consume runs the consumer's own copy-or-decode step behind a fault
+// barrier, so a panic inside it cannot skip the head advance its caller owes
+// (Go: a deferred recover writing the named results). fault is NONE, MALFORMED
+// (the peer's bytes do not decode, and consume attributed the failure to them),
+// DECLINED (consume failed for a reason of its own), or PANICKED (this
+// consumer's own bug).
+func protected_consume(payload_span) (value, fault):
+    on_panic: return zero, PANICKED                 // barrier: the panic becomes a result, never an unwind
+    value, ok, blames_peer = consume(payload_span)  // the consumer's copy or in-place decode
+    if not ok:
+        if blames_peer: return zero, MALFORMED
+        return zero, DECLINED                       // an unattributed failure never poisons
+    return value, NONE
 
 // validate returns false (and poisons) on any conformance violation; otherwise true.
-// It performs NO copy and NO head advance — a false result stops Consume before both.
+// It reads NO payload and advances NO head — a false result stops Consume before both.
 func validate(d) bool:
     if (d.kind >> 8) != 0 or lowByte(d.kind) not in {0..8}:   // §5 assigned kinds
         poison(POISON_BAD_FRAME); return false
@@ -1068,12 +1256,25 @@ reserved slab-zero, §5/§6) and `len ≤ slab_size[c]` — i.e. `off` names a w
 arena boundary.
 
 **Ordering (normative):** seq_cst tail load **happens-before** descriptor read
-**happens-before** payload read. The head store in `AdvanceHead` happens **after**
-copy-out **and** after both a successful `validate` and the final poison/shutdown
-gate; any `validate` failure, CRC failure, or observed poison/shutdown returns
-**before** dispatch and **before** any head advance, so a corrupt, poisoned, or
-post-teardown descriptor is never dispatched and its slot is never released as
-consumed. The consumer's parking (`Wait`, §11) wraps this consume loop.
+**happens-before** payload read. On the **dispatch path** the head store in
+`AdvanceHead` happens **after** the consume **and** after both a successful
+`validate` and the final poison/shutdown gate; on **every** path, **no read of
+the referenced slab may follow it**. Any `validate` failure, CRC failure,
+undecodable payload, or observed poison/shutdown returns **before** dispatch and
+**before** any head advance, so a corrupt, poisoned, or post-teardown descriptor
+is never dispatched and its slot is never released as consumed.
+
+Two paths advance without reaching the final gate: the stale-generation discard
+and a consume fault the consumer owns. Both dispatch nothing, which is what §16(b)
+actually guarantees, so neither weakens it — and a head store into a region that
+is poisoning or tearing down is inert, because the region is discarded whole and
+never repaired (§16). Releasing a slot nobody will reuse costs nothing; declining
+to release it strands the slot and its slab for as long as the region lives. A
+fault the consumer owns — a panic in its own consume step, or a frame it declined
+— is therefore the one class of consume failure that still advances: its slot is
+released and its frame is not dispatched, so the call it named is failed rather
+than left to time out. The consumer's parking (`Wait`,
+§11) wraps this consume loop.
 
 ---
 
@@ -1351,13 +1552,13 @@ One eventfd per direction wakes that direction's parked consumer.
   record, §15/§11 adjudication; M1 precedent): the consumer skips the frame,
   advances head (releasing the slot), and increments a **diagnostic counter**
   (`stale_frames_discarded`). This is the late-write detection signal that feeds
-  the higher-layer machinery (Task 8); it is deliberately not fatal, because a
+  the supervisor's escalation machinery; it is deliberately not fatal, because a
   late write from a dying incarnation is an expected, bounded event, not
   corruption. **The discard count is exposed as a diagnostic signal the supervisor
-  (Task 8) consumes to drive escalation policy.** Escalation to `poison` after a
+  consumes to drive escalation policy.** Escalation to `poison` after a
   threshold of discards (a heuristic for "this is not late writes, this is a storm
   of corruption") is **supervisor policy**, not an ABI rule: at the ABI level it is
-  a **MAY**, and the concrete threshold and action are **owned by Task 8**, not
+  a **MAY**, and the concrete threshold and action are **owned by the supervisor**, not
   frozen here. The **normative** ABI disposition of a single mismatch is discard.
   Note the consumer
   does **not** read the discarded frame's arena slab (it only advances head), so a
@@ -1411,16 +1612,30 @@ and stops. No parked waiter is ever left dangling across a poison or crash.
 ## §16 Poison protocol
 
 - **Safety principle (normative — poison vs. discard).** The disposition of an
-  anomaly is governed by one rule: **poison when continuing to process would be
-  unsafe** — an out-of-bounds arena/slab read, a mis-dispatch to the wrong call, a
+  anomaly is governed by one rule, with one qualification stated below it:
+  **poison when continuing to process would be unsafe** — an out-of-bounds arena/slab read, a mis-dispatch to the wrong call, a
   corrupt sync word, or any state whose *interpretation* could act on bad memory —
   and **discard (skip) when the anomaly is safely skippable** without touching
   untrusted memory. A **generation mismatch is the canonical skippable case** (§15):
   the consumer only advances head, never reads the slab, so the frame is discarded
-  and counted, not poisoned. Everything in the "who may set it" list below is a
-  *would-be-unsafe* case and therefore poisons. Discardable anomalies feed a
-  diagnostic counter that the supervisor (Task 8) may escalate on — escalation is
-  supervisor policy, not an ABI-frozen threshold (§15).
+  and counted, not poisoned. A consume fault the **consumer itself owns** — its own
+  decode panicking, or a frame it declined for a local reason — is the other
+  skippable class, and §9's consume-failure rule governs it. Everything in the
+  "who may set it" list below is a *would-be-unsafe* case and therefore poisons.
+
+  **Safety is necessary for a discard, not sufficient — the anomaly must also
+  have a benign explanation.** A generation mismatch has one: a late write from a
+  dying incarnation is expected and bounded (§15). Peer non-conformance does not.
+  A payload body the peer published under a descriptor that already passed
+  `validate` is memory-safe to skip, yet §9 **poisons** it, because §0 makes a
+  peer that violates a MUST untrusted rather than merely unlucky — there is no
+  innocent reading of a certified descriptor over bytes that do not decode. §9's
+  consume-failure rule states the split by fault owner (the peer's fault poisons,
+  the consumer's own fault discards) and governs that case.
+
+  Discardable anomalies feed a diagnostic counter that the supervisor may
+  escalate on — escalation is supervisor policy, not an ABI-frozen threshold
+  (§15).
 - **Location / width / atomic.** The `poison` word: sync page (§3), offset 4480,
   `uint32` LE, one cache line, accessed with **seq_cst** atomics. `0` =
   `POISON_NONE` (healthy); any nonzero value is a frozen cause enum (§3).
@@ -1770,6 +1985,28 @@ sizes, including:
 `ring_capacity`, per-direction size-class table (sizes/counts), arena byte totals,
 `region_size`, or `R`; these vary per region and are validated structurally at
 attach (§1), never versioned.
+
+**Neither (a consumer-side rule relaxed).** A change that leaves every byte and
+every cross-process edge where it was, and only widens what one side is permitted
+to do with bytes already handed to it, is neither additive nor breaking. §9's
+consume rule is the worked example: a consumer that copies the payload out and
+one that decodes it in place write the same slab bytes and the same head/tail
+sequence, so no peer can tell which one it is talking to, and no version pairing
+can be made incompatible by the change. Such a relaxation ships as an amendment
+to this document with **no** `layout_version` bump.
+
+Observability is a **sufficient** test, not a necessary one: if a conforming peer
+cannot detect the difference, there is plainly no compatibility axis to version.
+A change a peer *can* detect still qualifies when what it detects is confined to
+a failure path this side already owns — a consumer that discards one frame where
+it previously poisoned the region is visible to the peer (a head advance instead
+of a poison word and a teardown wake, §16), yet the two outcomes differ only in
+how this side fails a frame it was never going to deliver. The necessary tests
+are the ones the classes above turn on, and both must hold: no schema element
+moves, and no version pairing can be made incompatible by the change. Bumping for
+a change that meets both would break every existing peer over a rule those peers
+never have to agree on — `layout_version` is matched exactly and negotiated before
+any region is attached, so it carries no partial compatibility.
 
 ### Introducing a new `layout_version`
 

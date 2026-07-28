@@ -336,3 +336,16 @@ func SetDuplicateUnaryResponseHookForTest(f func(callID uint64)) func() {
 
 	return func() { duplicateUnaryResponseHook.Store(prev) }
 }
+
+// DisposeRecvErrForTest exposes the serve loop's Recv-error disposition so a test
+// can assert which errors end the loop and which are skipped. done reports whether
+// the loop exits.
+func DisposeRecvErrForTest(err error) (done bool, loopErr error) {
+	return disposeRecvErr(err)
+}
+
+// IsFrameLocalRecvErrForTest exposes the reader loops' shared frame-local
+// classification of a Recv error.
+func IsFrameLocalRecvErrForTest(err error) bool {
+	return isFrameLocalRecvErr(err)
+}

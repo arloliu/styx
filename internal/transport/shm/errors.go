@@ -40,6 +40,12 @@ var (
 	// It is surfaced through the producer signal's fault seam rather than dropped.
 	errLostWake = errors.New("shm: lost consumer wake")
 
+	// errNilConsume reports a view receive called without a consume callback, on
+	// either entry point. The callback is the only thing that bounds a delivered
+	// view's lifetime (transport.ViewReceiver), so there is no sensible behavior
+	// without one and the call is refused before it touches the ring.
+	errNilConsume = errors.New("shm: view receive: nil consume callback")
+
 	// errGenerationMismatch reports that an allocated slab's generation stamp
 	// disagrees with the region generation. A real region builds its arena from
 	// the same generation (shm-abi.md §2/§6), so this names a construction bug.

@@ -30,12 +30,13 @@
 // descriptor and its stamp are the same untrusted record (§6). The sole normative
 // proof against use-after-free and ABA is head-gated reclamation, airtight by
 // construction — a producer returns a slab to its free list only after the
-// consumer's ring head has passed the referencing descriptor and the payload has
-// been copied out (§6, §9). Free trusts that single-writer, head-gated discipline
-// and does not re-derive it; wiring the ring head into the reclaim decision is the
-// transport's job, not this package's. Validate is process-local diagnostic
-// bookkeeping (a producer-side cross-check used in tests), never a cross-process
-// safety mechanism.
+// consumer's ring head has passed the referencing descriptor, and the consumer
+// must finish reading that slab before it advances (§6, §9), whether it copies
+// the payload out or decodes it in place. Free trusts that single-writer,
+// head-gated discipline and does not re-derive it; wiring the ring head into the
+// reclaim decision is the transport's job, not this package's.
+// Validate is process-local diagnostic bookkeeping (a producer-side cross-check
+// used in tests), never a cross-process safety mechanism.
 //
 // # Backpressure and scope
 //

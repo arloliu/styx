@@ -988,9 +988,25 @@ func recvReserving(ctx context.Context, tr transport.Transport, reserve func()) 
 func disposeRecvErr(err error) (done bool, loopErr error) {
 	if isFrameLocalRecvErr(err) {
 		// Frame-local (a malformed status body or an unimplemented-kind frame from a
-		// buggy/hostile peer): the stream is still synchronized, so skip this frame and
-		// keep serving rather than silently killing an otherwise-healthy serving loop.
-		// See isFrameLocalRecvErr.
+		// buggy/hostile peer, or a consume fault this side owns): the stream is still
+		// synchronized, so skip this frame and keep serving rather than silently
+		// killing an otherwise-healthy serving loop.
+		//
+		// Skipping is the whole disposition here, unlike the client read loop, which
+		// also fails the call a consume fault names. This loop receives REQUESTS, so
+		// the call the descriptor names lives in the host's table and no local
+		// terminal can reach it. The only local act that would discharge the host's
+		// dependency is answering the peer with an error status — and a consumer that
+		// can answer has accepted the frame rather than declined it, so it never
+		// reaches this branch at all (shm-abi.md §9).
+		//
+		// A request this side genuinely could not take leaves the host's call to
+		// whatever budget its descriptor carried, and that budget MAY be zero (§4:
+		// 0 means no deadline), which is what a host caller with no deadline of its
+		// own publishes. At zero nothing reaps that call, and this branch keeps the
+		// connection up, so the host waits indefinitely. That gap is open, not
+		// closed: shutting it needs a route for this loop to publish an error status
+		// for a frame it never dispatched, which it does not have.
 		return false, nil
 	}
 	if errors.Is(err, transport.ErrPoisoned) {

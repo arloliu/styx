@@ -296,13 +296,18 @@ func runReadLoop(state *connState) {
 		f, err := state.tr.Recv(context.Background())
 		if err != nil {
 			if isFrameLocalRecvErr(err) {
-				// A malformed status body or an unimplemented-kind frame is
-				// frame-local: Recv proved the stream still synchronized (that
-				// is exactly why it did NOT poison the transport). Killing the
-				// reader here would hang every other in-flight call on an
+				// A malformed status body, an unimplemented-kind frame, or a consume
+				// fault this side owns is frame-local: Recv proved the stream still
+				// synchronized (that is exactly why it did NOT poison the transport).
+				// Killing the reader here would hang every other in-flight call on an
 				// otherwise-healthy, still-open connection with no event and no
-				// restart. Skip the bad frame instead; its own call (if any) is
-				// reaped by its deadline.
+				// restart. Skip the frame and keep serving — but fail whatever call the
+				// frame was carrying an answer to first, because skipping alone trades
+				// one lost frame for one call that waits forever (a call submitted with
+				// no deadline has no timer to reap it, and this connection is
+				// deliberately kept alive, so FailAll never runs either).
+				failCallOnDiscardedFrame(state.table, err)
+
 				continue
 			}
 
@@ -390,16 +395,55 @@ func translateReadLoopExit(err error) error {
 	}
 }
 
-// isFrameLocalRecvErr reports whether a transport.Recv error is confined to
-// the single frame that produced it, leaving the stream synchronized and the
-// connection usable — a malformed status body or an unimplemented (reserved
-// streaming) frame kind. Both are drained/decoded in full by Recv without
-// poisoning, so a reader loop must skip the offending frame and keep serving
-// the rest rather than treating it as a terminal transport error. Every other
-// Recv error (ctx done, peer close, a mid-frame poison) is genuinely terminal.
+// isFrameLocalRecvErr reports whether a transport.Recv error is confined to the
+// single frame that produced it, leaving the connection usable. The
+// classification and the three classes it covers belong to the package that owns
+// the sentinels: see transport.IsFrameLocalRecvErr. This package's reader loops
+// share that one predicate so they cannot drift apart in what they tolerate.
+//
+// Skipping the frame is only half of what a frame-local error asks of a reader. A
+// consume fault names a call whose answer this side discarded, so a reader that
+// skips and does nothing else converts one lost frame into one call that never
+// completes. failCallOnDiscardedFrame is the other half, and the read loop calls
+// it before it continues.
 func isFrameLocalRecvErr(err error) bool {
-	return errors.Is(err, transport.ErrMalformedStatusFrame) ||
-		errors.Is(err, transport.ErrUnimplementedFrameKind)
+	return transport.IsFrameLocalRecvErr(err)
+}
+
+// failCallOnDiscardedFrame terminates the call that an inbound frame the reader
+// discarded was carrying an answer to, so the loss costs that one call instead of
+// stranding it. It is the "fail the call the descriptor names" half of the
+// disposition shm-abi.md §9 prescribes for a consume fault: the transport has
+// already released the frame's slot and left the connection healthy, and failing
+// the call is the part only the layer holding the call table can do.
+//
+// Only a *transport.ConsumeFaultError names a call. The other frame-local classes
+// carry no call ID — their frame is the peer's to resend — so they return here
+// having touched nothing.
+//
+// The terminal is OUTCOME_UNKNOWN rather than a status. The peer answered and this
+// side destroyed the answer before reading it, so the handler ran and whatever it
+// did stands; the one conclusion a caller must not draw is that the call never
+// happened. A CallID the table no longer holds — already terminal, or a streaming
+// call, which StreamTable keys separately out of the same never-reused ID space —
+// takes Table's ordinary late-frame discard and changes nothing.
+//
+// The obligation binds only where the named call is local, which is the response
+// direction. A loop receiving requests cannot perform it, because the call the
+// descriptor names lives in the peer's table. §9 routes a request such a loop CAN
+// answer to an acceptance, so it never reaches here — but a request it could not
+// take at all leaves the peer's call to whatever budget its descriptor carried,
+// and a peer that issued the call with no deadline published zero. Nothing reaps
+// that call. The request direction is not covered by this function and is not
+// covered anywhere else either.
+func failCallOnDiscardedFrame(table *rpcruntime.Table, err error) {
+	var fault *transport.ConsumeFaultError
+	if !errors.As(err, &fault) {
+		return
+	}
+
+	table.OutcomeUnknown(fault.CallID,
+		fmt.Errorf("styx: inbound frame discarded: %w: %w", err, ErrOutcomeUnknown))
 }
 
 // duplicateUnaryResponseHook, when set, is invoked with a CallID whose unary response

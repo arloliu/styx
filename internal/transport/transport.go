@@ -7,6 +7,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -88,6 +89,71 @@ var ErrPoisoned = errors.New("transport: poisoned")
 // is retryable. Only the shared-memory transport in reject mode returns this; the
 // uds transport blocks instead.
 var ErrBackpressure = errors.New("transport: backpressure")
+
+// ErrConsumeFault is the sentinel every ViewReceiver consume-callback failure
+// matches, whether the callback panicked or returned an error it did not
+// attribute to the peer. The concrete error is a *ConsumeFaultError naming the
+// call whose frame was discarded, recoverable with errors.As.
+//
+// It is call-scoped, never transport-scoped: the failure came from the receiving
+// side, not from the peer's bytes, so the connection is healthy and the next
+// receive continues with the following frame. A caller that treats it as a
+// connection failure tears down a working transport over one bad frame.
+var ErrConsumeFault = errors.New("transport: consume callback failed")
+
+// ErrPayloadMalformed is the one signal a ViewReceiver consume callback can send
+// that blames the PEER rather than itself, and it is the only error return that
+// condemns the connection.
+//
+// A callback returns an error wrapping it to say: the descriptor certified a
+// payload of this length in this slab, and the bytes are not a payload of that
+// shape. That is peer non-conformance, so a transport with a poison protocol
+// poisons the connection and stops (shm-abi.md §9/§16).
+//
+// Every other error a callback returns is a failure of the receiving side — a
+// full delivery queue, a cancelled context, a resource it could not obtain — and
+// is contained to that one frame. The default is deliberately containment, so that
+// a callback reporting a local problem cannot destroy a healthy connection by
+// accident; condemning it takes this explicit sentinel.
+//
+// A frame the callback deliberately dropped is neither of those things: a response
+// whose call is already terminal, a CallID no longer in the call table, or a
+// request answered with an error status is a frame the callback is finished with,
+// and it is accepted by returning nil. See ViewReceiver for the line between the
+// two.
+var ErrPayloadMalformed = errors.New("transport: payload does not decode")
+
+// IsFrameLocalRecvErr reports whether a Recv error is confined to the single frame
+// that produced it, leaving the stream synchronized and the connection usable: a
+// malformed status body, an unimplemented (reserved streaming) frame kind, or a
+// consume fault the receiving side owns. All three leave the transport unpoisoned
+// and the frame fully accounted for, so a reader loop must skip that frame and
+// keep serving the rest rather than treating it as a terminal transport error.
+// Every other Recv error — a context end, a peer close, a mid-frame poison — is
+// genuinely terminal.
+//
+// It lives here, next to the three sentinels, because every reader loop over any
+// transport must agree on the answer: a loop that classifies one of them as
+// terminal kills a healthy connection, and a loop that classifies anything else as
+// frame-local spins on a desynchronized one.
+//
+// A consume fault carries an obligation the other two do not, because it names a
+// call: ConsumeFaultError.CallID identifies a call whose frame was discarded, and
+// a reader that only skips leaves that call with no answer and, if it was
+// submitted without a deadline, nothing to reap it. Recovering the fault with
+// errors.As and failing that call is what turns the discard back into a fail-fast.
+// The obligation binds only where the named call is local, which is the response
+// direction. On the request direction the call lives in the peer's table, and a
+// reader there has no way to reach it: shm-abi.md §9 routes a request the consumer
+// CAN answer to an acceptance instead, but a request it could not take at all
+// leaves the peer's call to whatever budget its descriptor carried — which may be
+// zero, meaning no deadline, and therefore nothing that ends the wait. That gap is
+// open on the request direction, not closed.
+func IsFrameLocalRecvErr(err error) bool {
+	return errors.Is(err, ErrMalformedStatusFrame) ||
+		errors.Is(err, ErrUnimplementedFrameKind) ||
+		errors.Is(err, ErrConsumeFault)
+}
 
 // FrameKind identifies a Frame's role in the RPC protocol.
 // All nine kinds (unary request/response/error, cancel, and five streaming
@@ -242,6 +308,145 @@ type ReservingReceiver interface {
 	// RecvReserving is Recv that invokes reserve exactly once per produced result,
 	// after readiness commits and before the first destructive read.
 	RecvReserving(ctx context.Context, reserve func()) (Frame, error)
+}
+
+// ConsumeFaultError reports that a ViewReceiver's consume callback failed on a
+// frame the transport had already accepted, without blaming the peer for it.
+// Two things produce it: a callback that panicked, and a callback that returned
+// an error not wrapping ErrPayloadMalformed. Either way the receiving side owns
+// the fault, so the transport releases the frame's buffer, delivers nothing, and
+// stays usable.
+//
+// CallID names the call the discarded frame belonged to so the caller can fail
+// that call immediately. Dropping the frame silently instead would leave a caller
+// waiting out its full deadline for a response that no longer exists, turning a
+// fail-fast into a hang.
+//
+// It carries no value the callback produced, only text rendered from one. A
+// callback that panics with, or returns an error holding, a slice of the frame's
+// Payload would otherwise put a reference to transport-owned memory into an error
+// the caller keeps indefinitely — exactly what the borrow contract forbids, and
+// worse after the transport is closed, where the reference points at memory the
+// process has unmapped. Detail is rendered while the frame is still valid, so the
+// diagnostic survives without the reference.
+type ConsumeFaultError struct {
+	// CallID is the call the discarded frame named.
+	CallID uint64
+	// Kind is the discarded frame's kind.
+	Kind FrameKind
+	// Panicked distinguishes the two ways a callback fails: true when it panicked,
+	// false when it returned an error the transport did not attribute to the peer.
+	Panicked bool
+	// Detail is the panic value or the returned error rendered as text, captured
+	// while the frame's memory was still valid. It is text, never the callback's own
+	// value, so nothing here can reference a buffer the transport has since released.
+	Detail string
+	// Stack is the callback's stack, captured inside the recover that stopped it.
+	// It is nil when the callback returned an error rather than panicking.
+	Stack []byte
+}
+
+// Error reports how the callback failed, on which call, and with what.
+func (e *ConsumeFaultError) Error() string {
+	how := "returned an error"
+	if e.Panicked {
+		how = "panicked"
+	}
+
+	return fmt.Sprintf("transport: consume callback %s on call %d (kind %d): %s", how, e.CallID, e.Kind, e.Detail)
+}
+
+// Unwrap reports ErrConsumeFault, so a caller matches the class with errors.Is
+// and recovers the call it names with errors.As.
+func (e *ConsumeFaultError) Unwrap() error { return ErrConsumeFault }
+
+// ViewReceiver is an optional Transport capability that hands the next inbound
+// frame to a callback instead of returning it, so the frame's Payload can alias
+// transport-owned memory the callback decodes straight out of — one traversal of
+// the bytes instead of a copy followed by a decode.
+//
+// The borrow is what makes it worth having and what makes it sharp. Payload, and
+// every sub-slice of it, is valid ONLY while consume runs. The moment consume
+// returns, the transport may hand those bytes back to the peer to overwrite, or
+// unmap them outright; a slice retained past that point reads memory this process
+// no longer owns. consume must copy or decode everything it needs before
+// returning, and must retain nothing — not the Frame, not Payload, not a
+// sub-slice, not a lazily-decoded field that still points into it, and not a
+// value it panics with or returns as an error. A transport renders those last two
+// to text rather than carrying them out, but everything else is the callback's to
+// get right.
+//
+// consume runs on the receive goroutine, exactly once per delivered frame, and
+// holds up every later frame for its whole duration. Ownership of whatever it
+// produces crosses to another goroutine by the caller's own means, after it
+// returns. It runs while the transport holds whatever it must hold to keep the
+// borrowed memory alive, so it MUST NOT call Close, and MUST NOT block on
+// anything that needs this receive loop to make progress first.
+//
+// Not every frame arrives as a view: a transport may hand consume a private copy
+// whenever borrowing does not pay or is unsafe for that frame, and it does not
+// say which it did. A callback that only reads Payload before returning is
+// correct under both, which is exactly the contract above.
+//
+// How consume reports failure decides who is blamed and what survives:
+//
+//   - returning nil accepts the frame, whether or not the callback did anything
+//     with it. A frame the callback is finished with is a success, including one
+//     it deliberately dropped: a response whose call is already terminal, a CallID
+//     no longer in the call table, a request whose method the callback answers with
+//     an error status. Nothing is waiting on those, so nothing needs failing.
+//   - returning an error wrapping ErrPayloadMalformed blames the PEER: the bytes
+//     do not decode under a descriptor the peer certified, so a transport with a
+//     poison protocol poisons the connection and stops.
+//   - returning any other error blames the receiving side. The transport releases
+//     the frame, delivers nothing, and returns a *ConsumeFaultError naming the
+//     call so the caller can fail it fast. The connection stays healthy.
+//   - panicking is the same fault arrived at less politely, and is handled the
+//     same way, with ConsumeFaultError.Panicked set.
+//
+// The line between the first outcome and the third is what the frame leaves
+// behind, not how routine it was. Take the THIRD outcome only when the callback
+// could not take the frame AND a call still depends on it — a full delivery queue,
+// a cancelled context, a resource it could not obtain — because failing that call
+// is the whole point of it. A frame nobody is waiting on is the first outcome, and
+// reporting it as the third counts healthy traffic as faults and fails calls that
+// do not exist. The second outcome is not on this line at all: bytes that do not
+// decode under a descriptor the peer certified are the peer's fault whether or not
+// anything is waiting on them.
+//
+// Failing the call is the caller's half of the third outcome, and only the
+// response direction can perform it: a callback consuming REQUESTS names a call in
+// the peer's table, so a request it cannot take has no local terminal. A request
+// the callback can answer with an error status is the first outcome, not the
+// third, and answering is what discharges the peer's dependency (shm-abi.md §9).
+//
+// The error return is a disposition selector, not a channel. It decides which of
+// those four things happens to the frame and nothing else; the transport renders
+// it to text and drops the object, so no information encoded in its type or its
+// wrapped sentinels survives the call. A callback with something to tell its own
+// caller writes it to a variable they share — they run on the same goroutine, in
+// the same closure — and returns a bare error purely to pick the disposition.
+type ViewReceiver interface {
+	// RecvViewConsume waits for the next inbound frame and hands it to consume,
+	// whose Payload is valid only until it returns. consume must not be nil.
+	//
+	// It takes NO reservation. A caller that needs the ReservingReceiver
+	// reservation must use RecvViewConsumeReserving; migrating from RecvReserving
+	// to this method silently drops the reservation and, with it, the guarantee
+	// that a quiescence check cannot observe a gap while a frame is in flight.
+	RecvViewConsume(ctx context.Context, consume func(f Frame) error) error
+	// RecvViewConsumeReserving is RecvViewConsume with the ReservingReceiver
+	// contract, adapted to where the frame actually leaves transport custody on
+	// this path: reserve fires immediately before consume is invoked, not before
+	// the transport releases the frame's buffer, because consume is the hand-off.
+	//
+	// It therefore reserves for frames that are then discarded, in three ways and
+	// not two: the callback panicked, the callback reported the payload malformed,
+	// or the transport failed to build the frame at all and never called consume —
+	// which surfaces as a plain conformance error, not a ConsumeFaultError. So a
+	// ConsumeFaultError does not prove consume ran, and the absence of one does not
+	// prove it did not. Retire on every exit, not only on success.
+	RecvViewConsumeReserving(ctx context.Context, reserve func(), consume func(f Frame) error) error
 }
 
 // ReportingSender is an optional Transport capability resolving the acceptance-unknown

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 
@@ -110,7 +112,7 @@ type endpoints struct {
 // Transport to it with cross-wired eventfds (shm-abi.md §14): the H->P eventfd
 // is the host's outbound and the plugin's inbound; the P->H eventfd is the
 // reverse.
-func newEndpoints(t *testing.T, layout shm.Layout, cfg Config) *endpoints {
+func newEndpoints(t testing.TB, layout shm.Layout, cfg Config) *endpoints {
 	t.Helper()
 
 	region, err := shm.CreateRegion(layout)
@@ -148,7 +150,7 @@ func newEndpoints(t *testing.T, layout shm.Layout, cfg Config) *endpoints {
 // hpProducer carves a raw H->P producer ring over the region's own mapping so a
 // test can publish crafted descriptors the writer would never emit (stale
 // stamps, corrupt flags), driving the consumer's fail-closed paths.
-func hpProducer(t *testing.T, region *shm.Region) *ring.Ring {
+func hpProducer(t testing.TB, region *shm.Region) *ring.Ring {
 	t.Helper()
 	r, err := carveRing(region.Bytes(), region.Layout(), shm.HostToPlugin)
 	require.NoError(t, err)
@@ -1438,8 +1440,8 @@ func TestTransport_Send_ReclaimsSlabAfterNoSlabRingWrap(t *testing.T) {
 
 // Test that head-gated reclaim frees consumed slabs when a separate consumer
 // goroutine drains the peer end concurrently, racing the producer's post-publish
-// bookkeeping (shm-abi.md §6). An awake consumer can copy a frame and advance the
-// ring head (§9) in the window between the producer's ring Push and the moment
+// bookkeeping (shm-abi.md §6). An awake consumer can consume a frame and advance
+// the ring head (§9) in the window between the producer's ring Push and the moment
 // the producer records that frame's slab handle. If the producer advances its
 // reclaim cursor past the sequence before recording the handle, the slab is
 // stranded — never freed — and the small arena exhausts, blocking the producer
@@ -1450,14 +1452,17 @@ func TestTransport_Send_ReclaimsSlabAfterNoSlabRingWrap(t *testing.T) {
 //
 // The consumer is ABI-conforming (shm-abi.md §9): it peeks the descriptor,
 // copies the payload out of the peer's inbound arena, and only then advances the
-// head — the advance is the producer's reclaim signal, so copying first is what
-// makes a free safe. Each frame carries a distinct little-endian marker equal to
-// its send index, and the consumer asserts the copied bytes equal the marker the
-// producer sent in that position. That turns the race into a two-sided proof: no
-// arena exhaustion over N ≫ capacity proves no slab is stranded (no leak), and
-// every copied marker matching proves no slab is freed while the consumer is
-// still reading it (no premature free/corruption) — a non-copying Pop consumer
-// could detect neither of the second kind. Run with -race -count.
+// head — the advance is the producer's reclaim signal, so finishing the read
+// before advancing is what makes a free safe. §9 also permits decoding the slab
+// in place instead of copying; this consumer copies because the copied bytes are
+// what the assertion below checks. Each frame carries a distinct little-endian
+// marker equal to its send index, and the consumer asserts the copied bytes equal
+// the marker the producer sent in that position. That turns the race into a
+// two-sided proof: no arena exhaustion over N ≫ capacity proves no slab is
+// stranded (no leak), and every copied marker matching proves no slab is freed
+// while the consumer is still reading it (no premature free/corruption) — a
+// non-copying Pop consumer could detect neither of the second kind.
+// Run with -race -count.
 func TestTransport_Send_ReclaimsSlabs_UnderConcurrentConsumer(t *testing.T) {
 	// Given a host whose outbound ring is drained by a tight, separate consumer
 	// goroutine that peeks, copies, and advances the head (shm-abi.md §9) — no
@@ -1522,9 +1527,10 @@ func TestTransport_Send_ReclaimsSlabs_UnderConcurrentConsumer(t *testing.T) {
 				runtime.Gosched()
 			}
 
-			// Copy the payload out BEFORE advancing (shm-abi.md §9): the advance is
-			// the producer's reclaim signal, so the slab is guaranteed intact only up
-			// to this point. Bounds-check the span against the mapping first.
+			// Consume the payload — here by copying it out — BEFORE advancing
+			// (shm-abi.md §9): the advance is the producer's reclaim signal, so the
+			// slab is guaranteed intact only up to this point. Bounds-check the span
+			// against the mapping first.
 			off := arenaBase + uint64(d.PayloadOffset())
 			end := off + uint64(d.PayloadLength())
 			if d.PayloadLength() != 8 || end > uint64(len(regionBytes)) {
@@ -1664,7 +1670,7 @@ func TestTransport_Recv_RejectsDescriptorsFailingSection9Validation(t *testing.T
 // Test the §9 fail-closed shutdown gate at the top of the drain loop: shutdown
 // set before drain even peeks makes drain return ErrClosed, deliver nothing, and
 // NOT advance the head — the slot is never released as consumed (shm-abi.md
-// §9/§14/§16). This exercises the pre-peek gate; the post-copy gate below is a
+// §9/§14/§16). This exercises the pre-peek gate; the post-consume gate below is a
 // separate MUST. RED against the ungated pre-fix drain (delivers, advances),
 // GREEN after.
 func TestTransport_Recv_ShutdownWinsRaceBeforeDispatch(t *testing.T) {
@@ -1672,7 +1678,7 @@ func TestTransport_Recv_ShutdownWinsRaceBeforeDispatch(t *testing.T) {
 	require.NoError(t, hpProducer(t, ep.region).Push(makeDesc(ring.KindCancel, 5, 7)))
 	atomic.StoreUint32(ep.plugin.shutdownPtr, 1)
 
-	f, ok, err := ep.plugin.drain(ep.plugin.lastSeen+1, nil)
+	f, ok, err := ep.plugin.drain(ep.plugin.lastSeen+1, nil, nil)
 
 	require.ErrorIs(t, err, transport.ErrClosed)
 	require.False(t, ok)
@@ -1685,10 +1691,11 @@ func TestTransport_Recv_ShutdownWinsRaceBeforeDispatch(t *testing.T) {
 
 // shutdownOnPeekRing is an inbound-ring double whose Peek publishes teardown just
 // as it hands back a deliverable descriptor: the shutdown word is still clear when
-// the drain loop's top gate runs, then set by the time classify returns. It models
-// teardown landing after the copy-out but before dispatch, forcing the post-copy
-// gate specifically (shm-abi.md §9/§16). Advance must never be called — the slot
-// is not released past that gate — so it fails loudly if drain advances.
+// the drain loop's top gate runs, and set by the time that descriptor is
+// validated. It models teardown landing between the top gate and the hand-off,
+// forcing the final gate specifically (shm-abi.md §9/§16(b)). Advance must never
+// be called — the slot is not released past that gate — so it fails loudly if the
+// drain advances.
 type shutdownOnPeekRing struct {
 	d        ring.Descriptor
 	shutdown *uint32
@@ -1701,14 +1708,14 @@ func (r *shutdownOnPeekRing) Peek() (ring.Descriptor, ring.PeekStatus) {
 	}
 	r.peeked = true
 	// Teardown lands here: after the drain loop's top gate (which already passed
-	// with shutdown clear), before classify returns to the post-copy gate.
+	// with shutdown clear) and before the final gate that guards the hand-off.
 	atomic.StoreUint32(r.shutdown, 1)
 
 	return r.d, ring.PeekOK
 }
 
 func (r *shutdownOnPeekRing) Advance() {
-	panic("drain advanced the head past the post-copy shutdown gate")
+	panic("drain advanced the head past the final shutdown gate")
 }
 func (r *shutdownOnPeekRing) Tail() uint64 { return 1 }
 func (r *shutdownOnPeekRing) Empty() bool  { return r.peeked }
@@ -1720,13 +1727,13 @@ func (r *shutdownOnPeekRing) Len() uint64 {
 	return 1
 }
 
-// Test the §9 fail-closed shutdown gate AFTER copy-out but before dispatch: a
-// frame that the top gate already admitted (shutdown clear) must still not be
-// delivered or advanced when teardown lands during classify (shm-abi.md §9/§16).
-// The double sets shutdown inside Peek, so the pre-peek gate cannot catch it —
-// only the post-copy gate can. RED if the post-copy gate is removed (the frame is
-// delivered and the head advances), GREEN with it.
-func TestTransport_Recv_ShutdownWinsRace_AfterCopyBeforeDispatch(t *testing.T) {
+// Test the §9 fail-closed shutdown gate that runs with the payload in hand and
+// before the frame is handed onward: a frame the top gate already admitted
+// (shutdown clear) must still not be delivered or advanced when teardown lands
+// mid-drain (shm-abi.md §9/§16(b)). The double sets shutdown inside Peek, so the
+// pre-peek gate cannot catch it — only the final gate can. RED if that gate is
+// removed (the frame is delivered and the head advances), GREEN with it.
+func TestTransport_Recv_ShutdownWinsRace_AfterPayloadBeforeDispatch(t *testing.T) {
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
 	atomic.StoreUint32(ep.plugin.shutdownPtr, 0) // clear: the top gate must pass
 	ep.plugin.inboundRing = &shutdownOnPeekRing{
@@ -1734,12 +1741,12 @@ func TestTransport_Recv_ShutdownWinsRace_AfterCopyBeforeDispatch(t *testing.T) {
 		shutdown: ep.plugin.shutdownPtr,
 	}
 
-	f, ok, err := ep.plugin.drain(ep.plugin.lastSeen+1, nil)
+	f, ok, err := ep.plugin.drain(ep.plugin.lastSeen+1, nil, nil)
 
 	require.ErrorIs(t, err, transport.ErrClosed)
 	require.False(t, ok)
 	require.Equal(t, transport.Frame{}, f)
-	require.Equal(t, uint64(0), ep.plugin.lastSeen, "the post-copy gate must not advance the head")
+	require.Equal(t, uint64(0), ep.plugin.lastSeen, "the post-consume gate must not advance the head")
 }
 
 // Test that an empty-payload data frame is checksummed when the feature is
@@ -2565,4 +2572,996 @@ func TestTransport_RecvReserving_NoReserveWhenNothingConsumed(t *testing.T) {
 	_, err := ep.plugin.RecvReserving(ctx, func() { reserves++ })
 	require.Error(t, err)
 	require.Zero(t, reserves, "no reservation is taken when nothing is consumed")
+}
+
+// setInPlaceThreshold overrides one transport's in-place threshold so a test can
+// drive both sides of the copy/view decision. It writes that transport's own
+// field and no shared state, so it can never race a receive loop running on any
+// other transport. Call it before the transport starts receiving.
+func setInPlaceThreshold(tr *Transport, n uint64) {
+	tr.inPlaceMin = n
+}
+
+// inboundSlabAtHead returns the plugin's inbound arena bytes named by the
+// descriptor currently at its ring head, read non-destructively (the producer's
+// own ring handle) so the reader still delivers the frame. A test mutates them to
+// discover whether a delivered payload aliases the arena or is a private copy.
+func inboundSlabAtHead(t *testing.T, ep *endpoints) []byte {
+	t.Helper()
+	d, status := hpProducer(t, ep.region).Peek()
+	require.Equal(t, ring.PeekOK, status, "a published frame must be sitting at the ring head")
+	off := uint64(d.PayloadOffset())
+	plen := uint64(d.PayloadLength())
+	require.NotZero(t, plen, "an aliasing check needs a payload-carrying frame")
+
+	return ep.plugin.inboundArenaBytes[off : off+plen]
+}
+
+// observesArenaMutation reports whether payload aliases slab: it flips a byte in
+// the arena slab, reports whether the delivered payload sees the change, and puts
+// the byte back. Both the write and the read happen on the calling goroutine, so
+// nothing here races the peer's producer, which cannot touch a published slab
+// until the head releases it (shm-abi.md §6).
+func observesArenaMutation(slab, payload []byte) bool {
+	if len(slab) == 0 || len(payload) != len(slab) {
+		return false
+	}
+	orig := slab[0]
+	slab[0] = ^orig
+	aliased := payload[0] == ^orig
+	slab[0] = orig
+
+	return aliased
+}
+
+// craftPayloadFrame writes payload into slab index 1 of the serving class of the
+// plugin's inbound arena and returns a descriptor naming it, without publishing.
+// It bypasses the writer so a test can build frames the writer never emits. The
+// descriptor carries NO payload-layout flag, which is the point on a
+// checksum-negotiated region: it is a conforming peer choosing not to stamp a
+// trailer on this frame. The returned bytes are the arena slab itself.
+func craftPayloadFrame(
+	t testing.TB, ep *endpoints, kind ring.FrameKind, callID uint64, payload []byte,
+) (ring.Descriptor, []byte) {
+	t.Helper()
+
+	classes := ep.region.Layout().Arenas[shm.HostToPlugin].Classes
+	ci, ok := servingClass(classes, uint64(len(payload)))
+	require.True(t, ok, "no size class serves a %d-byte payload", len(payload))
+	require.Greater(t, classes[ci].SlabCount, uint32(1),
+		"the crafted slab uses index 1, never the reserved slab-zero")
+
+	off := uint64(classes[ci].ClassBaseOffset) + uint64(classes[ci].SlabSize)
+	slab := ep.plugin.inboundArenaBytes[off : off+uint64(len(payload))]
+	copy(slab, payload)
+
+	d := makeDesc(kind, callID, 7)
+	//nolint:gosec // off and len are bounded by the test layout's arena geometry
+	d.SetPayloadOffset(uint32(off))
+	//nolint:gosec // same as above
+	d.SetPayloadLength(uint32(len(payload)))
+	d.SetAllocSeq(1)
+
+	return d, slab
+}
+
+// publishCraftedPayload is craftPayloadFrame followed by a raw push onto the
+// plugin's inbound ring, returning the arena slab the descriptor names.
+func publishCraftedPayload(
+	t *testing.T, ep *endpoints, kind ring.FrameKind, callID uint64, payload []byte,
+) []byte {
+	t.Helper()
+	d, slab := craftPayloadFrame(t, ep, kind, callID, payload)
+	require.NoError(t, hpProducer(t, ep.region).Push(d))
+
+	return slab
+}
+
+// Test the view path's two load-bearing orderings at once: the payload the
+// callback sees aliases the inbound arena slab, and the ring head does not
+// advance until the callback returns. The head store is the producer's reclaim
+// signal (shm-abi.md §6/§9), so advancing while the borrow is live would hand the
+// slab back mid-read. Run with -race.
+func TestTransport_RecvViewConsume_DeliversArenaView_AndAdvancesOnlyAfterConsumeReturns(t *testing.T) {
+	// Given a published unary request whose slab the test can watch.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	payload := []byte("decoded straight out of the arena")
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 42, Kind: transport.FrameUnaryReq, Payload: payload}))
+	slab := inboundSlabAtHead(t, ep)
+
+	// When the view path hands it to a callback.
+	var aliased, slotHeld bool
+	var seen []byte
+	err := ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		seen = bytes.Clone(f.Payload)
+		aliased = observesArenaMutation(slab, f.Payload)
+		_, status := hpProducer(t, ep.region).Peek()
+		slotHeld = status == ring.PeekOK
+
+		return nil
+	})
+
+	// Then the callback saw the arena's own bytes, with the slot still held.
+	require.NoError(t, err)
+	require.Equal(t, payload, seen)
+	require.True(t, aliased, "the delivered payload must alias the arena slab, not a copy of it")
+	require.True(t, slotHeld, "the head must not advance until consume returns (shm-abi.md §9)")
+
+	// And the slot is released once it returns.
+	_, status := hpProducer(t, ep.region).Peek()
+	require.Equal(t, ring.PeekEmpty, status, "the head advances after consume returns")
+	require.Equal(t, uint64(1), ep.plugin.lastSeen)
+	require.Equal(t, uint64(1), ep.plugin.FramesReceived())
+}
+
+// Test that RecvViewConsume returns no frame at all: the value the callback saw
+// may alias the slab, and nothing that aliases it may outlive the head advance
+// (shm-abi.md §9), so the drain loop hands back the zero Frame rather than the
+// view it just released.
+func TestTransport_RecvViewConsume_ReturnsNoFrame_SoNoAliasOutlivesTheAdvance(t *testing.T) {
+	// Given a published payload frame.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	payload := []byte("this must not travel past the advance")
+	publishCraftedPayload(t, ep, ring.KindUnaryReq, 42, payload)
+
+	// When the drain loop delivers it through a callback.
+	var seenLen int
+	var seenCallID uint64
+	f, ok, err := ep.plugin.drain(ep.plugin.lastSeen+1, nil, func(fr transport.Frame) error {
+		seenLen = len(fr.Payload)
+		seenCallID = fr.CallID
+
+		return nil
+	})
+
+	// Then the callback saw the whole payload and the drain loop returned nothing.
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, len(payload), seenLen)
+	require.Equal(t, uint64(42), seenCallID)
+	require.Equal(t, transport.Frame{}, f, "no value that could alias the slab may be returned")
+}
+
+// Test that a payload the peer published but that does not decode poisons the
+// region and releases nothing: the descriptor already passed validate, so the
+// peer certified a payload of that length in that slab, and a body that then
+// fails to decode is peer non-conformance rather than a skippable anomaly
+// (shm-abi.md §9/§16). A poisoned region is discarded whole and owes no further
+// progress, so the head stays put. Blaming the peer takes the explicit sentinel.
+func TestTransport_RecvViewConsume_PoisonsAndHoldsTheSlot_WhenTheConsumeReportsUndecodableBytes(t *testing.T) {
+	// Given a published payload frame whose bytes the callback blames the peer for.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	publishCraftedPayload(t, ep, ring.KindUnaryReq, 77, []byte("not a valid message"))
+	undecodable := fmt.Errorf("proto: cannot parse invalid wire-format data: %w", transport.ErrPayloadMalformed)
+
+	// When the callback reports the payload undecodable.
+	err := ep.plugin.RecvViewConsume(t.Context(), func(transport.Frame) error { return undecodable })
+
+	// Then the region is poisoned as a bad frame, the reason survives to the caller,
+	// and the slot was never released as consumed.
+	require.ErrorIs(t, err, errBadFrame)
+	require.ErrorIs(t, err, transport.ErrPayloadMalformed)
+	require.Contains(t, err.Error(), "invalid wire-format data", "the callback's reason survives as text")
+	cause, poisoned := ep.plugin.poison.Check()
+	require.True(t, poisoned)
+	require.Equal(t, PoisonBadFrame, cause)
+	require.Equal(t, uint64(0), ep.plugin.lastSeen, "a poisoned region advances no head (shm-abi.md §9)")
+	d, status := hpProducer(t, ep.region).Peek()
+	require.Equal(t, ring.PeekOK, status, "the undecodable frame is still in the ring, not consumed")
+	require.Equal(t, uint64(77), d.CallID())
+}
+
+// Test that only the explicit sentinel condemns the region: a callback reporting a
+// failure of its own — a full delivery queue, a cancelled context, a resource it
+// could not obtain — is contained to that one frame. Everything about the
+// disposition matches the panicking arm, because it is the same fault reported
+// politely: this side's, on a healthy region (shm-abi.md §9). Defaulting the other
+// way would let a routine local failure destroy every in-flight call on the
+// connection.
+//
+// The fixture is a full delivery queue deliberately. A frame the callback merely
+// had no use for — a response whose call is already terminal, a CallID the table
+// no longer holds — is an acceptance, not this arm, so using one of those as the
+// worked example would demonstrate the contract's counter-example.
+func TestTransport_RecvViewConsume_ContainsTheFailure_WhenConsumeReportsItsOwnError(t *testing.T) {
+	// Given two published frames, the first of which the callback declines.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 21, Kind: transport.FrameUnaryReq, Payload: []byte("no room for this one")}))
+	require.NoError(t, ep.host.Send(t.Context(), transport.Frame{CallID: 22, Kind: transport.FrameCancel}))
+	local := errors.New("rpcruntime: inbound delivery queue full")
+
+	// When the callback returns an error that does not name the peer.
+	err := ep.plugin.RecvViewConsume(t.Context(), func(transport.Frame) error { return local })
+
+	// Then the fault is call-scoped, not a conformance fault, and never poisons.
+	var fault *transport.ConsumeFaultError
+	require.ErrorAs(t, err, &fault)
+	require.ErrorIs(t, err, transport.ErrConsumeFault)
+	require.NotErrorIs(t, err, errBadFrame, "a local failure is not a conformance fault")
+	require.False(t, fault.Panicked, "the callback returned rather than panicked")
+	require.Equal(t, uint64(21), fault.CallID)
+	require.Equal(t, local.Error(), fault.Detail)
+	require.Nil(t, fault.Stack, "a returned error has no panic stack")
+	_, poisoned := ep.plugin.poison.Check()
+	require.False(t, poisoned, "only transport.ErrPayloadMalformed condemns the region")
+
+	// And the slot was released, the discard counted, and the transport keeps serving.
+	require.Equal(t, uint64(1), ep.plugin.lastSeen)
+	require.Equal(t, uint64(1), ep.plugin.ConsumeFaults())
+	var next transport.Frame
+	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		next = f
+
+		return nil
+	}))
+	require.Equal(t, uint64(22), next.CallID)
+}
+
+// Test the other consume-failure arm: a panic inside this side's own decode is
+// this side's bug, not the peer's, so the region stays healthy, the head still
+// advances (withholding it would strand that slot and its slab for the region's
+// lifetime), the call the descriptor names is failed fast rather than left to its
+// deadline, and the transport keeps serving (shm-abi.md §9).
+func TestTransport_RecvViewConsume_AdvancesAndFailsTheCall_WhenConsumePanics(t *testing.T) {
+	// Given two published frames, the first of which the callback panics on.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 11, Kind: transport.FrameUnaryReq, Payload: []byte("panics on decode")}))
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 12, Kind: transport.FrameCancel}))
+
+	// When the callback panics on the first.
+	err := ep.plugin.RecvViewConsume(t.Context(), func(transport.Frame) error { panic("decoder bug") })
+
+	// Then the fault names the call so the caller can fail it, not the connection.
+	var fault *transport.ConsumeFaultError
+	require.ErrorAs(t, err, &fault)
+	require.ErrorIs(t, err, transport.ErrConsumeFault)
+	require.Equal(t, uint64(11), fault.CallID)
+	require.Equal(t, transport.FrameUnaryReq, fault.Kind)
+	require.Equal(t, "decoder bug", fault.Detail)
+	require.NotEmpty(t, fault.Stack)
+
+	// And the slot was released, the region left healthy, and the discard counted.
+	require.Equal(t, uint64(1), ep.plugin.lastSeen, "the advance must survive the panic (shm-abi.md §9)")
+	_, poisoned := ep.plugin.poison.Check()
+	require.False(t, poisoned, "this side's own decode bug never poisons the region")
+	require.Equal(t, uint64(1), ep.plugin.ConsumeFaults())
+
+	// And the transport keeps serving: the next frame is delivered normally.
+	var next transport.Frame
+	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		next = f
+
+		return nil
+	}))
+	require.Equal(t, uint64(12), next.CallID)
+	require.Equal(t, transport.FrameCancel, next.Kind)
+}
+
+// Test that a payload below the in-place threshold is delivered as a private copy
+// instead of a view: below it the copy costs less than the borrow's constraints
+// buy, and the choice is one decision inside the single receive path.
+func TestTransport_RecvViewConsume_DeliversPrivateCopy_BelowTheInPlaceThreshold(t *testing.T) {
+	// Given a threshold above the payload's length.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	payload := []byte("under the threshold")
+	setInPlaceThreshold(ep.plugin, uint64(len(payload))+1)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 3, Kind: transport.FrameUnaryReq, Payload: payload}))
+	slab := inboundSlabAtHead(t, ep)
+
+	// When the view path delivers it.
+	var aliased bool
+	var seen []byte
+	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		aliased = observesArenaMutation(slab, f.Payload)
+		seen = bytes.Clone(f.Payload)
+
+		return nil
+	}))
+
+	// Then the callback got the right bytes, in a copy that owes the arena nothing.
+	require.Equal(t, payload, seen)
+	require.False(t, aliased, "a payload below the threshold is delivered as a private copy")
+
+	// And a payload at the threshold takes the view, so the boundary is the length,
+	// not the transport giving up on views altogether.
+	atThreshold := append(bytes.Clone(payload), '!')
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 4, Kind: transport.FrameUnaryReq, Payload: atThreshold}))
+	slab = inboundSlabAtHead(t, ep)
+	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		aliased = observesArenaMutation(slab, f.Payload)
+
+		return nil
+	}))
+	require.True(t, aliased, "a payload at the threshold is delivered as a view")
+}
+
+// Test that streaming frames stay on the copy path: a stream message is queued
+// for a consumer goroutine that reads it long after the receive loop has moved
+// on, so its payload must own its bytes. The unary control in the same test rules
+// out the copy being an accident of size or region state.
+func TestTransport_RecvViewConsume_DeliversPrivateCopy_ForStreamingFrames(t *testing.T) {
+	// Given a stream message and a unary request carrying identical payloads.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	payload := []byte("a stream message outlives the receive loop")
+
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 5, Kind: transport.FrameStreamMsg, Payload: payload, Control: 1}))
+	slab := inboundSlabAtHead(t, ep)
+
+	// When the view path delivers the stream message.
+	var streamAliased bool
+	var seen []byte
+	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		streamAliased = observesArenaMutation(slab, f.Payload)
+		seen = bytes.Clone(f.Payload)
+
+		return nil
+	}))
+
+	// Then it was copied, not borrowed.
+	require.Equal(t, payload, seen)
+	require.False(t, streamAliased, "a streaming payload must own its bytes")
+
+	// While the same payload on a unary frame is borrowed.
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 6, Kind: transport.FrameUnaryReq, Payload: payload}))
+	slab = inboundSlabAtHead(t, ep)
+	var unaryAliased bool
+	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		unaryAliased = observesArenaMutation(slab, f.Payload)
+
+		return nil
+	}))
+	require.True(t, unaryAliased, "the exclusion is the streaming kind, not the payload or the region")
+}
+
+// Test that the checksum branch keys on the per-frame CRC32C_PRESENT flag, not on
+// whether the feature was negotiated (shm-abi.md §9). A flagged frame is copied
+// out and verified over that private copy, so the bytes checked are the bytes
+// interpreted; a frame the same negotiated peer publishes without the flag
+// carries nothing to verify and is borrowed like any other.
+func TestTransport_RecvViewConsume_CopiesFlaggedFramesAndBorrowsUnflaggedOnes_UnderNegotiatedChecksum(t *testing.T) {
+	// Given checksum negotiated on both ends.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(true))
+	setInPlaceThreshold(ep.plugin, 0)
+	payload := []byte("verified over the copy that gets interpreted")
+
+	// When the writer publishes a frame, which always carries the flag once
+	// negotiated, and the view path delivers it.
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 8, Kind: transport.FrameUnaryReq, Payload: payload}))
+	d, status := hpProducer(t, ep.region).Peek()
+	require.Equal(t, ring.PeekOK, status)
+	require.NotZero(t, d.Flags()&flagCRC32CPresent, "a negotiated writer stamps the flag")
+	slab := inboundSlabAtHead(t, ep)
+
+	var flaggedAliased bool
+	var seen []byte
+	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		flaggedAliased = observesArenaMutation(slab, f.Payload)
+		seen = bytes.Clone(f.Payload)
+
+		return nil
+	}))
+
+	// Then it was verified over a private copy, which is what the callback got.
+	require.Equal(t, payload, seen)
+	require.False(t, flaggedAliased, "a checksummed frame is interpreted from the verified copy")
+
+	// And the same negotiated peer omitting the flag on the next frame gets the
+	// view: the branch is the flag, not the negotiation.
+	slab = publishCraftedPayload(t, ep, ring.KindUnaryReq, 9, payload)
+	var unflaggedAliased bool
+	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		unflaggedAliased = observesArenaMutation(slab, f.Payload)
+		seen = bytes.Clone(f.Payload)
+
+		return nil
+	}))
+	require.Equal(t, payload, seen)
+	require.True(t, unflaggedAliased, "an unflagged frame carries nothing to verify and is borrowed")
+}
+
+// Test that a corrupted checksummed payload is still detected on the view path:
+// the copy-and-verify arm runs before anything is handed onward, so a mismatch
+// never reaches the callback and never releases the slot (shm-abi.md §9/§16).
+func TestTransport_RecvViewConsume_DetectsChecksumMismatch_BeforeAnythingIsHandedOnward(t *testing.T) {
+	// Given a published, checksummed frame whose slab is corrupted after stamping.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(true))
+	setInPlaceThreshold(ep.plugin, 0)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 10, Kind: transport.FrameUnaryReq, Payload: []byte("corrupt me")}))
+	slab := inboundSlabAtHead(t, ep)
+	slab[0] = ^slab[0]
+
+	// When the view path drains it.
+	var consumed int
+	err := ep.plugin.RecvViewConsume(t.Context(), func(transport.Frame) error {
+		consumed++
+
+		return nil
+	})
+
+	// Then the mismatch is detected, nothing is handed onward, and no slot is released.
+	require.ErrorIs(t, err, errChecksum)
+	require.Zero(t, consumed, "a frame failing its checksum is never handed onward")
+	require.Equal(t, uint64(0), ep.plugin.lastSeen)
+}
+
+// Test that a status-bearing frame delivers a Status that owns its bytes even
+// when its body was decoded straight out of the arena: the status decode copies
+// the message and every detail, so nothing the callback keeps points into a slab
+// the head is about to release (shm-abi.md §9).
+func TestTransport_RecvViewConsume_DeliversOwnedStatus_ForAStatusFrame(t *testing.T) {
+	// Given a published error response carrying a status with details.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	want := &transport.FrameStatus{Code: 7, Message: "upstream refused", Details: [][]byte{[]byte("detail-one")}}
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 13, Kind: transport.FrameUnaryErr, Status: want}))
+	slab := inboundSlabAtHead(t, ep)
+
+	// When the view path delivers it and the arena is scribbled on mid-callback.
+	var got *transport.FrameStatus
+	var payload []byte
+	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		got = f.Status
+		payload = f.Payload
+		for i := range slab {
+			slab[i] = 0xFF
+		}
+
+		return nil
+	}))
+
+	// Then the status is intact: it was decoded into values it owns.
+	require.Nil(t, payload, "a status frame carries no payload")
+	require.Equal(t, want, got)
+}
+
+// Test that a no-slab frame survives the view path: there is nothing to alias, so
+// the callback gets an empty payload and the slot is released as usual
+// (shm-abi.md §5/§9).
+func TestTransport_RecvViewConsume_DeliversEmptyPayloadFrame_WhenNoSlabIsPresent(t *testing.T) {
+	// Given a published data frame with no payload and no checksum negotiated, so
+	// no slab is allocated at all.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 14, Kind: transport.FrameUnaryReq}))
+	d, status := hpProducer(t, ep.region).Peek()
+	require.Equal(t, ring.PeekOK, status)
+	require.Zero(t, d.PayloadOffset(), "the no-slab encoding carries a zero offset")
+
+	// When the view path delivers it.
+	var got transport.Frame
+	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		got = f
+
+		return nil
+	}))
+
+	// Then an empty payload arrives and the slot is released.
+	require.Equal(t, uint64(14), got.CallID)
+	require.Empty(t, got.Payload)
+	require.Equal(t, uint64(1), ep.plugin.lastSeen)
+}
+
+// Test the fail-closed gate on the view path: teardown that lands after the peek
+// stops the frame before the callback ever sees it, and releases no slot
+// (shm-abi.md §9/§16(b)). The ring double sets shutdown inside Peek, so the drain
+// loop's top gate cannot catch it — only the gate that runs with the payload in
+// hand can — and its Advance panics, so a released slot fails loudly.
+func TestTransport_RecvViewConsume_NeverConsumes_WhenTeardownLandsAfterThePeek(t *testing.T) {
+	// Given a deliverable payload frame the top gate has already admitted.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	atomic.StoreUint32(ep.plugin.shutdownPtr, 0)
+	d, _ := craftPayloadFrame(t, ep, ring.KindUnaryReq, 15, []byte("never handed onward"))
+	ep.plugin.inboundRing = &shutdownOnPeekRing{d: d, shutdown: ep.plugin.shutdownPtr}
+
+	// When teardown lands between that gate and the hand-off.
+	var consumed int
+	f, ok, err := ep.plugin.drain(ep.plugin.lastSeen+1, nil, func(transport.Frame) error {
+		consumed++
+
+		return nil
+	})
+
+	// Then nothing reached the callback, nothing was delivered, nothing advanced.
+	require.ErrorIs(t, err, transport.ErrClosed)
+	require.False(t, ok)
+	require.Equal(t, transport.Frame{}, f)
+	require.Zero(t, consumed, "no frame may be handed onward after a teardown observation")
+	require.Equal(t, uint64(0), ep.plugin.lastSeen)
+}
+
+// Test a poison that lands on another goroutine while a borrow is live: the
+// dispatch was already in flight when poison won, so it runs to completion and
+// its slot is released, while the NEXT receive is the one the quarantine stops
+// (shm-abi.md §16). The region is poisoned, never unmapped, so the live view stays
+// readable throughout. Run with -race.
+func TestTransport_RecvViewConsume_CompletesTheInFlightConsume_WhenPoisonLandsDuringIt(t *testing.T) {
+	// Given a published payload frame.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	payload := []byte("poisoned while this is being decoded")
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 16, Kind: transport.FrameUnaryReq, Payload: payload}))
+
+	// When the region is poisoned from another goroutine mid-callback.
+	var seen []byte
+	err := ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ep.plugin.poison.Set(PoisonGeneric)
+		}()
+		<-done
+		seen = bytes.Clone(f.Payload)
+
+		return nil
+	})
+
+	// Then the in-flight consume completed over intact bytes and released its slot.
+	require.NoError(t, err)
+	require.Equal(t, payload, seen)
+	require.Equal(t, uint64(1), ep.plugin.lastSeen)
+
+	// And the next receive is refused by the poison quarantine.
+	_, err = ep.plugin.Recv(t.Context())
+	require.ErrorIs(t, err, ErrPoisoned)
+}
+
+// Test the sharpest composition of the two: this side's decode panics while the
+// region is concurrently torn down. The head advance the panic arm owes must
+// still happen, the fault must still surface as the call-scoped error, and
+// nothing may deadlock against the teardown holding the closing gate. Run with
+// -race.
+func TestTransport_RecvViewConsume_StillAdvancesAndReports_WhenConsumePanicsDuringTeardown(t *testing.T) {
+	// Given a published payload frame.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 17, Kind: transport.FrameUnaryReq, Payload: []byte("torn down mid-decode")}))
+
+	// When teardown completes on another goroutine and then the callback panics.
+	err := ep.plugin.RecvViewConsume(t.Context(), func(transport.Frame) error {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_ = ep.plugin.StopWriter()
+		}()
+		<-done
+		panic("decoder bug under teardown")
+	})
+
+	// Then the fault surfaced, the slot was still released, and the discard counted.
+	var fault *transport.ConsumeFaultError
+	require.ErrorAs(t, err, &fault)
+	require.Equal(t, uint64(17), fault.CallID)
+	require.Equal(t, uint64(1), ep.plugin.lastSeen, "the advance must survive the panic (shm-abi.md §9)")
+	require.Equal(t, uint64(1), ep.plugin.ConsumeFaults())
+
+	// And the transport still closes cleanly.
+	require.NoError(t, ep.plugin.Close())
+}
+
+// Test that Recv never hands back a view: the frame it returns outlives the slab,
+// so its payload must be a copy no matter what the view path does elsewhere.
+func TestTransport_Recv_DeliversPrivateCopy_NeverAnArenaView(t *testing.T) {
+	// Given a published payload frame and a threshold that would borrow it.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	payload := []byte("a frame Recv returns outlives its slab")
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 18, Kind: transport.FrameUnaryReq, Payload: payload}))
+	slab := inboundSlabAtHead(t, ep)
+
+	// When Recv returns it.
+	f, err := ep.plugin.Recv(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, payload, f.Payload)
+
+	// Then scribbling on the released slab leaves the returned payload untouched.
+	// Nothing republishes into it in this test, so the touch is safe here even
+	// though the head has released it to the producer (shm-abi.md §6).
+	require.False(t, observesArenaMutation(slab, f.Payload),
+		"a frame returned from Recv must own its payload")
+	require.Equal(t, payload, f.Payload)
+}
+
+// Test that a view receive without a callback is refused before it touches the
+// ring: the callback is the only thing bounding a delivered view's lifetime.
+func TestTransport_RecvViewConsume_RefusesANilConsumeCallback(t *testing.T) {
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+	require.ErrorIs(t, ep.plugin.RecvViewConsume(t.Context(), nil), errNilConsume)
+	require.Equal(t, uint64(0), ep.plugin.lastSeen)
+}
+
+// payloadHolderError is a callback error that captures the frame's payload, the
+// shape a decoder produces when it attaches the bytes it failed on. It exists to
+// prove the transport does not carry such a value out: everything it renders is
+// rendered while the payload is still valid.
+type payloadHolderError struct {
+	sentinel error
+	payload  []byte
+}
+
+func (e *payloadHolderError) Error() string { return "decode failed on " + string(e.payload) }
+func (e *payloadHolderError) Unwrap() error { return e.sentinel }
+
+// Test that a callback panicking with the frame's own payload cannot put an arena
+// alias into the error the caller keeps. The head advances on this arm, so a
+// retained reference would read a slab the producer may already have refilled, and
+// after teardown one the process has unmapped — the escape §9 forbids for anything
+// handed onward. The fault is rendered to text before the advance instead.
+func TestTransport_RecvViewConsume_CarriesNoArenaAlias_WhenConsumePanicsWithThePayload(t *testing.T) {
+	// Given a published payload frame the callback panics with.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	payload := []byte("panicked with the borrowed bytes")
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 31, Kind: transport.FrameUnaryReq, Payload: payload}))
+	slab := inboundSlabAtHead(t, ep)
+
+	// When the callback panics with the payload itself.
+	err := ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error { panic(f.Payload) })
+
+	// Then the fault names the call and reports the panic, rendered while the bytes
+	// it came from were still valid.
+	var fault *transport.ConsumeFaultError
+	require.ErrorAs(t, err, &fault)
+	require.Equal(t, uint64(31), fault.CallID)
+	require.True(t, fault.Panicked)
+	require.NotEmpty(t, fault.Detail)
+	before := err.Error()
+
+	// And overwriting the released slab cannot change what the caller holds: the
+	// fault kept no reference into it. Nothing republishes into the slab in this
+	// test, so the touch is safe even though the head has released it (shm-abi.md §6).
+	for i := range slab {
+		slab[i] = 0xFF
+	}
+	require.Equal(t, before, err.Error(), "the fault must hold text, never a slice of the arena")
+}
+
+// Test the same rule on the arm that does not advance: a callback error that
+// captured the payload must not reach the caller as an object either. This arm
+// poisons, and a poisoned region is torn down whole, so a reference surviving here
+// reads unmapped memory rather than a recycled slab — the worse of the two hazards
+// §9 names.
+func TestTransport_RecvViewConsume_CarriesNoArenaAlias_WhenConsumeReturnsAnErrorHoldingThePayload(t *testing.T) {
+	// Given a published payload frame the callback blames the peer for, in an error
+	// that captured the payload.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	payload := []byte("returned with the borrowed bytes")
+	publishCraftedPayload(t, ep, ring.KindUnaryReq, 32, payload)
+
+	// When the callback returns that error.
+	err := ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		return &payloadHolderError{sentinel: transport.ErrPayloadMalformed, payload: f.Payload}
+	})
+
+	// Then the conformance fault surfaced with the reason rendered as text.
+	require.ErrorIs(t, err, errBadFrame)
+	require.ErrorIs(t, err, transport.ErrPayloadMalformed)
+	require.Contains(t, err.Error(), string(payload), "the callback's reason survives as text")
+
+	// And the callback's own error object never reached the caller, so there is no
+	// route back to the slice it captured. This is the load-bearing assertion for
+	// this arm: fmt.Errorf renders eagerly, so the message string is already fixed
+	// at construction whether the object was retained or not, and a check that the
+	// message stays stable across an arena overwrite cannot discriminate here.
+	var holder *payloadHolderError
+	require.False(t, errors.As(err, &holder),
+		"the callback's error object must not travel out; only text rendered from it may")
+}
+
+// Test that a contained callback failure carries no alias either, on the arm that
+// both advances the head and hands the caller an error.
+func TestTransport_RecvViewConsume_CarriesNoArenaAlias_WhenAContainedErrorHoldsThePayload(t *testing.T) {
+	// Given a published payload frame the callback declines with an error holding it.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	payload := []byte("declined with the borrowed bytes")
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 33, Kind: transport.FrameUnaryReq, Payload: payload}))
+	slab := inboundSlabAtHead(t, ep)
+
+	// When the callback returns it without naming the peer.
+	err := ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		return &payloadHolderError{payload: f.Payload}
+	})
+
+	// Then the fault is contained and holds only text.
+	var fault *transport.ConsumeFaultError
+	require.ErrorAs(t, err, &fault)
+	require.False(t, fault.Panicked)
+	before := err.Error()
+	require.Contains(t, before, string(payload), "the callback's reason survives as text")
+
+	var holder *payloadHolderError
+	require.False(t, errors.As(err, &holder),
+		"the callback's error object must not travel out; only text rendered from it may")
+
+	for i := range slab {
+		slab[i] = 0xFF
+	}
+	require.Equal(t, before, err.Error(), "the fault must hold text, never a slice of the arena")
+}
+
+// Test that an shm conformance fault is never classified frame-local. A reader
+// loop skips a frame-local error and keeps serving because the transport proved
+// the stream still synchronized — which is exactly what a poisoned region has NOT
+// done (shm-abi.md §16). Wrapping the status decoder's own error would carry
+// transport.ErrMalformedStatusFrame out and flip that classification, so the fault
+// surfaces bare.
+func TestTransport_Recv_ConformanceFaultIsNeverFrameLocal_ForAMalformedStatusSlab(t *testing.T) {
+	// Given a published UNARY_ERR whose status body is too short to decode.
+	assertNotFrameLocal := func(t *testing.T, err error) {
+		t.Helper()
+		require.ErrorIs(t, err, errBadFrame)
+		require.NotErrorIs(t, err, transport.ErrMalformedStatusFrame,
+			"a poisoned region must not be classified frame-local by a reader loop")
+		require.NotErrorIs(t, err, transport.ErrUnimplementedFrameKind)
+	}
+
+	t.Run("through Recv", func(t *testing.T) {
+		ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+		publishCraftedPayload(t, ep, ring.KindUnaryErr, 41, []byte{0x00, 0x01})
+
+		_, err := ep.plugin.Recv(t.Context())
+
+		assertNotFrameLocal(t, err)
+		cause, poisoned := ep.plugin.poison.Check()
+		require.True(t, poisoned)
+		require.Equal(t, PoisonBadFrame, cause)
+	})
+
+	t.Run("through the view path", func(t *testing.T) {
+		ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+		setInPlaceThreshold(ep.plugin, 0)
+		publishCraftedPayload(t, ep, ring.KindUnaryErr, 42, []byte{0x00, 0x01})
+
+		var consumed int
+		err := ep.plugin.RecvViewConsume(t.Context(), func(transport.Frame) error {
+			consumed++
+
+			return nil
+		})
+
+		assertNotFrameLocal(t, err)
+		require.Zero(t, consumed, "a frame that does not decode is never handed onward")
+	})
+}
+
+// Test the reservation on the view path: it fires once per frame handed to the
+// callback, and it fires BEFORE the callback rather than before the head advance,
+// because on this path the callback is where the frame leaves transport custody.
+// A reservation taken after the hand-off would leave a gap a quiescence check can
+// observe while a frame is in flight.
+func TestTransport_RecvViewConsumeReserving_ReservesBeforeTheCallbackForEachFrame(t *testing.T) {
+	// Given two published frames.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 51, Kind: transport.FrameUnaryReq, Payload: []byte("first")}))
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 52, Kind: transport.FrameUnaryReq, Payload: []byte("second")}))
+
+	// When each is received with a reservation.
+	var reserves int
+	var reservedAtCallback []int
+	recv := func() error {
+		return ep.plugin.RecvViewConsumeReserving(t.Context(),
+			func() { reserves++ },
+			func(transport.Frame) error {
+				reservedAtCallback = append(reservedAtCallback, reserves)
+
+				return nil
+			})
+	}
+	require.NoError(t, recv())
+	require.NoError(t, recv())
+
+	// Then every frame was reserved before its callback ran, exactly once each.
+	require.Equal(t, 2, reserves)
+	require.Equal(t, []int{1, 2}, reservedAtCallback,
+		"the reservation must be live before the frame leaves transport custody")
+	require.Equal(t, uint64(2), ep.plugin.lastSeen)
+}
+
+// Test that a discarded frame still reserved: the callback ran, so the frame left
+// transport custody, and a caller that retires only on success would leak the
+// reservation forever. This is why the contract says retire on every exit.
+func TestTransport_RecvViewConsumeReserving_ReservesEvenWhenTheFrameIsDiscarded(t *testing.T) {
+	// Given a published frame whose callback panics.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 53, Kind: transport.FrameUnaryReq, Payload: []byte("discarded")}))
+
+	// When it is received with a reservation.
+	var reserves int
+	err := ep.plugin.RecvViewConsumeReserving(t.Context(),
+		func() { reserves++ },
+		func(transport.Frame) error { panic("decoder bug") })
+
+	// Then the reservation was taken even though nothing was delivered.
+	require.ErrorIs(t, err, transport.ErrConsumeFault)
+	require.Equal(t, 1, reserves, "a frame handed to the callback is reserved even when discarded")
+	require.Equal(t, uint64(1), ep.plugin.lastSeen)
+}
+
+// Test that nothing reserves when the final gate stops the frame: the reservation
+// belongs immediately before the hand-off, so a gate that runs first must leave it
+// untaken. Teardown lands inside Peek here, past the drain loop's top gate, so only
+// the final gate can catch it — the placement a reservation taken any earlier would
+// break by leaking on a path that delivers nothing (shm-abi.md §9/§16(b)).
+func TestTransport_RecvViewConsumeReserving_TakesNoReservation_WhenTeardownStopsTheFrame(t *testing.T) {
+	// Given a deliverable frame the top gate already admitted.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	atomic.StoreUint32(ep.plugin.shutdownPtr, 0)
+	d, _ := craftPayloadFrame(t, ep, ring.KindUnaryReq, 54, []byte("never handed onward"))
+	ep.plugin.inboundRing = &shutdownOnPeekRing{d: d, shutdown: ep.plugin.shutdownPtr}
+
+	// When teardown lands between that gate and the hand-off.
+	var reserves, consumed int
+	f, ok, err := ep.plugin.drain(ep.plugin.lastSeen+1, func() { reserves++ },
+		func(transport.Frame) error {
+			consumed++
+
+			return nil
+		})
+
+	// Then neither the callback nor the reservation ran.
+	require.ErrorIs(t, err, transport.ErrClosed)
+	require.False(t, ok)
+	require.Equal(t, transport.Frame{}, f)
+	require.Zero(t, consumed)
+	require.Zero(t, reserves, "the final gate stops the drain before any reservation")
+	require.Equal(t, uint64(0), ep.plugin.lastSeen)
+}
+
+// Test that a view receive without a callback is refused on the reserving entry
+// point too, before it touches the ring or takes a reservation.
+func TestTransport_RecvViewConsumeReserving_RefusesANilConsumeCallback(t *testing.T) {
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+	var reserves int
+	require.ErrorIs(t, ep.plugin.RecvViewConsumeReserving(t.Context(), func() { reserves++ }, nil), errNilConsume)
+	require.Zero(t, reserves)
+	require.Equal(t, uint64(0), ep.plugin.lastSeen)
+}
+
+// Test that the transport's own decode failure keeps its reason. A caller that
+// gets a bare "bad frame" cannot tell a short status body from an overrunning
+// length prefix, and the callback arm one branch away keeps its reason — the
+// asymmetry is not worth the diagnostic. The reason is rendered, not wrapped, so
+// the sentinel set stays closed (see the frame-local test).
+func TestTransport_Recv_ReportsWhyTheFrameDidNotDecode_OnAConformanceFault(t *testing.T) {
+	// Given a published UNARY_ERR whose status body is too short to decode.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	publishCraftedPayload(t, ep, ring.KindUnaryErr, 61, []byte{0x00, 0x01})
+
+	// When Recv drains it.
+	_, err := ep.plugin.Recv(t.Context())
+
+	// Then the fault names the frame and says what was wrong with it, with the
+	// disposition unchanged: peer non-conformance poisons and releases no slot.
+	require.ErrorIs(t, err, errBadFrame)
+	require.Contains(t, err.Error(), "status body", "a conformance fault must say why the frame did not decode")
+	cause, poisoned := ep.plugin.poison.Check()
+	require.True(t, poisoned)
+	require.Equal(t, PoisonBadFrame, cause)
+	require.Equal(t, uint64(0), ep.plugin.lastSeen, "carrying the reason does not release the slot")
+}
+
+// Test that a consume fault's rendered reason is bounded. A callback panicking
+// with its frame's payload renders roughly four bytes of decimal per payload byte,
+// so an unbounded reason turns a large frame into a multi-megabyte string inside
+// an error the caller is expected to log.
+func TestTransport_RecvViewConsume_BoundsTheFaultDetail_WhenTheCallbackPanicsWithALargePayload(t *testing.T) {
+	// Given a published frame whose payload renders far past the detail budget.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	payload := bytes.Repeat([]byte{0xAB}, 1000)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 62, Kind: transport.FrameUnaryReq, Payload: payload}))
+
+	// When the callback panics with it.
+	err := ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error { panic(f.Payload) })
+
+	// Then the reason is clipped to the budget, marked as clipped, and still UTF-8.
+	var fault *transport.ConsumeFaultError
+	require.ErrorAs(t, err, &fault)
+	require.LessOrEqual(t, len(fault.Detail), faultDetailMaxBytes+len("... (truncated)"))
+	require.Contains(t, fault.Detail, "(truncated)")
+	require.True(t, utf8.ValidString(fault.Detail))
+	require.Equal(t, uint64(1), ep.plugin.lastSeen, "bounding the reason does not change the disposition")
+}
+
+// panicOnRenderError blames the peer but panics when asked for its message: the
+// callback attributes the failure and then faults while the transport renders it.
+type panicOnRenderError struct{}
+
+func (e *panicOnRenderError) Error() string { panic("Error() is broken") }
+func (e *panicOnRenderError) Is(target error) bool {
+	return errors.Is(target, transport.ErrPayloadMalformed)
+}
+
+// Test that attribution survives a fault in reporting it. The callback named the
+// peer's bytes as the cause, so the frame is the peer's fault whatever happens
+// while the reason is being rendered; re-attributing it to this side would advance
+// the head and leave a non-conformant region trusted, which is exactly what §9's
+// attribution rule exists to prevent (shm-abi.md §9/§16).
+func TestTransport_RecvViewConsume_KeepsThePeerAttribution_WhenRenderingTheReasonPanics(t *testing.T) {
+	// Given a published frame the callback blames the peer for, with a broken
+	// message method.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	publishCraftedPayload(t, ep, ring.KindUnaryReq, 63, []byte("blamed on the peer"))
+
+	// When the render of that error panics.
+	err := ep.plugin.RecvViewConsume(t.Context(), func(transport.Frame) error {
+		return &panicOnRenderError{}
+	})
+
+	// Then the peer's arm still applies: poisoned, and no slot released.
+	require.ErrorIs(t, err, errBadFrame)
+	require.ErrorIs(t, err, transport.ErrPayloadMalformed)
+	cause, poisoned := ep.plugin.poison.Check()
+	require.True(t, poisoned, "an attributed failure poisons even when reporting it faults")
+	require.Equal(t, PoisonBadFrame, cause)
+	require.Equal(t, uint64(0), ep.plugin.lastSeen, "the peer's arm advances no head (shm-abi.md §9)")
+}
+
+// Test that a stale-generation discard reserves nothing on the view path. The
+// discard is the one path that keeps draining, so a reservation leaked there is
+// cumulative rather than one-shot: a long run of stale frames would strand a
+// quiescence check permanently (shm-abi.md §15).
+func TestTransport_RecvViewConsumeReserving_StaleDiscard_TakesNoReservation(t *testing.T) {
+	// Given a stale descriptor ahead of a deliverable one.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	producer := hpProducer(t, ep.region)
+	stale := makeDesc(ring.KindUnaryReq, 71, 6)
+	stale.SetPayloadOffset(0xFFFFFFF0)
+	stale.SetPayloadLength(0xFFFF)
+	stale.SetAllocSeq(123)
+	require.NoError(t, producer.Push(stale))
+	require.NoError(t, producer.Push(makeDesc(ring.KindCancel, 72, 7)))
+
+	// When the view path drains both.
+	var reserves int
+	var seen []uint64
+	require.NoError(t, ep.plugin.RecvViewConsumeReserving(t.Context(),
+		func() { reserves++ },
+		func(f transport.Frame) error {
+			seen = append(seen, f.CallID)
+
+			return nil
+		}))
+
+	// Then only the delivered frame reserved; the discard took nothing.
+	require.Equal(t, []uint64{72}, seen, "the stale frame is discarded without reaching the callback")
+	require.Equal(t, 1, reserves, "only the delivered frame reserves; the stale discard never does")
+	require.Equal(t, uint64(1), ep.plugin.staleDiscarded)
+	require.Equal(t, uint64(2), ep.plugin.lastSeen)
 }

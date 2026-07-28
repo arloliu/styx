@@ -940,3 +940,29 @@ func TestPluginServer_ServeWithoutRestore_WhenNotSuccessor(t *testing.T) {
 
 	h.shutdownAndExpectAck(done)
 }
+
+// Test that a consume fault does not end the serve loop. The transport reports one
+// for a frame this side could not take on a region it has just certified healthy —
+// the head advanced, nothing was poisoned — so ending the loop would tear down a
+// working connection and every call on it over one lost frame. Poison stays
+// terminal, and so does everything unclassified.
+func TestPluginServer_ServeLoopKeepsServing_OnAConsumeFault(t *testing.T) {
+	// Given a consume fault naming the call whose frame was discarded.
+	fault := &transport.ConsumeFaultError{CallID: 91, Kind: transport.FrameUnaryReq, Detail: "no capacity"}
+
+	// When the serve loop disposes of it.
+	done, loopErr := styx.DisposeRecvErrForTest(fault)
+
+	// Then the loop keeps serving and reports no failure.
+	require.False(t, done, "a consume fault leaves the connection healthy; ending the loop tears it down")
+	require.NoError(t, loopErr)
+	require.True(t, styx.IsFrameLocalRecvErrForTest(fault), "a consume fault is confined to its frame")
+
+	// And the terminal classifications are unchanged.
+	done, loopErr = styx.DisposeRecvErrForTest(transport.ErrPoisoned)
+	require.True(t, done, "a poisoned region still ends the loop")
+	require.Error(t, loopErr)
+
+	done, _ = styx.DisposeRecvErrForTest(transport.ErrClosed)
+	require.True(t, done, "a closed transport still ends the loop")
+}

@@ -388,8 +388,10 @@ One region per plugin (v1), fixed layout, versioned by `layout_version`:
   from and freed to only by that direction's producer (its single writer goroutine) —
   the free lists are never touched by two processes. Consumption is acknowledged by
   ring-head advancement: the producer may reclaim a slab only after the consumer's head
-  has passed the descriptor referencing it AND the message's payload has been fully
-  copied out (v1 consumers copy before advancing head — see zero-copy below). Every
+  has passed the descriptor referencing it, and the head advance is itself the proof
+  that the payload has been consumed — consumers finish reading the slab, by copying the
+  bytes out or decoding them in place, before advancing, and read nothing from the slab
+  afterwards (shm-abi.md §9 states the rule normatively). Every
   slab handle carries (generation, allocation sequence); a stale pair is a protocol
   violation. Cancellation/timeout never reclaims a slab early — the slot is released
   only via normal head advancement or region teardown, so use-after-free and ABA are

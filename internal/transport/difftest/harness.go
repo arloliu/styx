@@ -322,7 +322,7 @@ func runClientReadLoop(ctx context.Context, tr transport.Transport, table *rpcru
 	for {
 		f, err := tr.Recv(ctx)
 		if err != nil {
-			if isFrameLocalRecvErr(err) {
+			if transport.IsFrameLocalRecvErr(err) {
 				continue
 			}
 
@@ -348,7 +348,7 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 	for {
 		f, err := tr.Recv(ctx)
 		if err != nil {
-			if isFrameLocalRecvErr(err) {
+			if transport.IsFrameLocalRecvErr(err) {
 				continue
 			}
 
@@ -370,12 +370,6 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 			}
 		}
 	}
-}
-
-// isFrameLocalRecvErr reports whether a transport.Recv error is confined to
-// the single frame that produced it, leaving the stream synchronized.
-func isFrameLocalRecvErr(err error) bool {
-	return errors.Is(err, transport.ErrMalformedStatusFrame) || errors.Is(err, transport.ErrUnimplementedFrameKind)
 }
 
 // statusFromFrame converts a transport-owned FrameStatus into

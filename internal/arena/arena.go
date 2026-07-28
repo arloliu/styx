@@ -230,9 +230,10 @@ func (a *Arena) Alloc(size uint32) (SlabHandle, []byte, error) {
 
 // Free returns h's slab to its class free list. The caller — the direction's
 // single writer — must only call Free after the consumer's ring head has passed
-// the referencing descriptor AND the payload has been copied out (shm-abi.md §6
-// head-gated reclamation); Free does not re-derive that condition, it trusts the
-// single-writer discipline. Free does, however, reject a handle that does not
+// the referencing descriptor; that advance is itself the consumer's promise that
+// it has finished reading the slab and will not read it again (shm-abi.md §6
+// head-gated reclamation, §9). Free does not re-derive that condition, it trusts
+// the single-writer discipline. Free does, however, reject a handle that does not
 // name a currently live slab of this arena (foreign identity, stale generation,
 // double free, stale-after-reuse, unknown, or out-of-range) with ErrInvalidFree
 // rather than corrupting the free list.
