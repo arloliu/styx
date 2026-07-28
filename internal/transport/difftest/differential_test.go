@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/internal/rpcruntime"
@@ -209,8 +212,14 @@ type blockingHandler struct {
 	invoked chan struct{}
 }
 
+// NewRequest builds the same request shape every scenario method takes, so this
+// handler is dispatched through the identical two-phase path.
+func (h *blockingHandler) NewRequest(uint64) (proto.Message, bool) {
+	return &wrapperspb.BytesValue{}, true
+}
+
 func (h *blockingHandler) Handle(
-	ctx context.Context, _ uint64, _ []byte, onHandlerEntry func(),
+	ctx context.Context, _ uint64, _ proto.Message, onHandlerEntry func(),
 ) (rpcruntime.Response, *rpcruntime.Status, error) {
 	// Honor the handler-entry contract: a non-nil callback runs exactly once before any
 	// handler behavior.
@@ -340,8 +349,14 @@ func newSpyHandler() *spyHandler {
 // Handle records the call and then defers to scenarioHandler's own
 // Echo/AppError/Slow/not-found behavior, so a spy-served workload behaves
 // identically to one served by the plain scenario dispatcher.
+// NewRequest delegates to the scenario handler it wraps, so a spy-served
+// workload constructs and decodes its requests exactly as the plain one does.
+func (s *spyHandler) NewRequest(methodID uint64) (proto.Message, bool) {
+	return scenarioHandler{}.NewRequest(methodID)
+}
+
 func (s *spyHandler) Handle(
-	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
+	ctx context.Context, methodID uint64, req proto.Message, onHandlerEntry func(),
 ) (rpcruntime.Response, *rpcruntime.Status, error) {
 	// Honor the handler-entry contract: a non-nil callback runs exactly once at the top of
 	// this handler frame, before any spy behavior. The forwarded scenarioHandler would run
@@ -353,7 +368,7 @@ func (s *spyHandler) Handle(
 	s.calls[methodID]++
 	s.mu.Unlock()
 
-	return scenarioHandler{}.Handle(ctx, methodID, payload, nil)
+	return scenarioHandler{}.Handle(ctx, methodID, req, nil)
 }
 
 // count returns how many times Handle ran for methodID.
@@ -789,4 +804,44 @@ func TestRunDifferential_FrameStreamErrStatus_AgreesAcrossTransports(t *testing.
 	require.Equal(t, sent.Status.Code, shmGot.Status.Code)
 	require.Equal(t, sent.Status.Message, shmGot.Status.Message)
 	require.Equal(t, sent.Status.Details, shmGot.Status.Details)
+}
+
+// Test each arm of the differential harness running the receive shape production
+// runs on that transport: the shared-memory arm takes every frame through the
+// borrowed-view callback, and the uds arm — which has nothing to lend — takes none.
+//
+// This is what keeps the oracle honest about what it differentiates. A harness that
+// received both arms by copy would still agree with itself on every workload while
+// exercising neither the borrow nor the decode-before-advance ordering the shm
+// receive path is built on, and the agreement would prove nothing about the path
+// production actually takes.
+func TestRunServeLoop_TakesTheBorrowedViewPath_OnlyOnSharedMemory(t *testing.T) {
+	w := GenerateWorkload(11, 6)
+
+	t.Run("shared memory lends every frame", func(t *testing.T) {
+		pair, err := shmtest.NewInProcessPair(1, shmtest.DefaultConfig())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = pair.Close() })
+
+		var viewed atomic.Int64
+		go runServeLoopCounting(t.Context(), pair.Plugin, newScenarioDispatcher(), &viewed)
+
+		results, err := Run(t.Context(), pair.Host, w)
+		require.NoError(t, err)
+		require.Len(t, results, len(w.Calls))
+		require.Equal(t, int64(len(w.Calls)), viewed.Load(),
+			"every request must be decoded inside the consume callback, before the head advances")
+	})
+
+	t.Run("uds lends nothing", func(t *testing.T) {
+		client, server := newUDSPairForTest(t)
+
+		var viewed atomic.Int64
+		go runServeLoopCounting(t.Context(), server, newScenarioDispatcher(), &viewed)
+
+		results, err := Run(t.Context(), client, w)
+		require.NoError(t, err)
+		require.Len(t, results, len(w.Calls))
+		require.Zero(t, viewed.Load(), "a transport with nothing to lend receives the ordinary way")
+	})
 }

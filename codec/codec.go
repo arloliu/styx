@@ -226,6 +226,15 @@ func (Proto) Unmarshal(data []byte, m proto.Message) error {
 // the input — copies the buffer up front unless the caller opts into aliasing it,
 // which this codec never does.
 //
+// One build configuration falls outside that: protobuf-go's LAZY EXTENSION
+// unmarshal retains a slice of the input rather than copying it, and is gated on
+// the protolegacy build tag. Under `-tags protolegacy`, a message with lazily
+// decoded extensions can hold the buffer it was decoded from, and this method's
+// answer is wrong for it. Styx is never built that way; the tag is named here
+// because this answer is what decides whether a receive path may decode straight
+// out of the peer's memory, so anyone adding that tag is changing the premise
+// rather than just a build flag.
+//
 // The vtproto path is not, and that is why the requirement is stated where the
 // obligation falls rather than observed here: Unmarshal dispatches to
 // UnmarshalVT whenever the message TYPE provides it, so the answer this method

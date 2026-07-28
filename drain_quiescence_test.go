@@ -396,10 +396,8 @@ func TestServeOneFrame_RetiresReservation_OnTransportErrorEdges(t *testing.T) {
 			_, err = unix.Write(fds[0], tc.raw)
 			require.NoError(t, err)
 
-			releaser := newAdmitReleaser(nil)
-			done, loopErr := serveOneFrame(
-				t.Context(), plugin, codec.Proto{}, rpcruntime.NewDispatcher(), nil, nil, releaser, coord,
-			)
+			deps := newServeDeps(plugin, codec.Proto{}, rpcruntime.NewDispatcher(), nil, nil, coord)
+			done, loopErr := serveOneFrame(t.Context(), deps)
 
 			require.Equal(t, tc.wantDone, done)
 			require.Equal(t, tc.wantErr, loopErr != nil)

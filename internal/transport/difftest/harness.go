@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/arloliu/styx"
+	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/transport"
 	"github.com/arloliu/styx/internal/transport/shm/shmtest"
@@ -270,16 +274,78 @@ func runServed(ctx context.Context, serverTr transport.Transport, run func() ([]
 	return results, err
 }
 
+// rawCodec is the harness's Codec: its decode copies the frame payload into the
+// message's bytes field verbatim, and its encode hands those bytes straight back.
+//
+// The harness drives pseudo-random payloads whose whole point is to prove that
+// arbitrary bytes survive both transports unmodified, and those bytes are not
+// valid protobuf encodings of anything. A real codec would reject them before the
+// comparison this package exists to make. So the harness supplies its own, which
+// satisfies the Codec seam exactly as a real one does — the two-phase handler
+// contract is exercised in full, with the request constructed on the receive
+// goroutine and decoded before the frame is released — while leaving the payload
+// bytes the identity they need to be.
+//
+// Its decode copies, so a decoded message owns its bytes and the shared-memory
+// receive path may decode straight out of the peer's arena (codec.OwningUnmarshaler).
+type rawCodec struct{}
+
+var (
+	_ codec.Codec             = rawCodec{}
+	_ codec.OwningUnmarshaler = rawCodec{}
+)
+
+// Name identifies this codec in the same namespace a negotiated codec name uses.
+func (rawCodec) Name() string { return "difftest-raw" }
+
+// Marshal returns m's bytes field as the wire payload.
+func (rawCodec) Marshal(m proto.Message) ([]byte, error) {
+	bv, ok := m.(*wrapperspb.BytesValue)
+	if !ok {
+		return nil, fmt.Errorf("difftest: rawCodec cannot marshal %T", m)
+	}
+
+	return bv.GetValue(), nil
+}
+
+// Unmarshal copies data into m's bytes field, so the decoded message shares no
+// memory with data.
+func (rawCodec) Unmarshal(data []byte, m proto.Message) error {
+	bv, ok := m.(*wrapperspb.BytesValue)
+	if !ok {
+		return fmt.Errorf("difftest: rawCodec cannot unmarshal into %T", m)
+	}
+	bv.Value = append([]byte(nil), data...)
+
+	return nil
+}
+
+// DecodedMessageOwnsBytes reports true: Unmarshal copies.
+func (rawCodec) DecodedMessageOwnsBytes() bool { return true }
+
 // scenarioHandler is the harness's rpcruntime.ServiceHandler.
 // It reproduces the classification a real generated handler applies to unknown
 // methods without depending on the styx package's unexported machinery.
 type scenarioHandler struct{}
 
-// Handle dispatches methodID: Echo returns payload unchanged, AppError returns
-// a fixed Status, Slow sleeps past slowHandlerDelay before echoing (exercising
-// post-handler budget checks), and unknown methods report StatusCodeMethodNotFound.
+// NewRequest builds the request message every scenario method takes, or reports
+// the method unknown so no payload is decoded for it — the same allocation-only
+// receive-goroutine hook generated code provides.
+func (scenarioHandler) NewRequest(methodID uint64) (proto.Message, bool) {
+	switch methodID {
+	case methodEcho, methodAppErr, methodSlow:
+		return &wrapperspb.BytesValue{}, true
+	default:
+		return nil, false
+	}
+}
+
+// Handle dispatches methodID: Echo returns the request's bytes unchanged, AppError
+// returns a fixed Status, Slow sleeps past slowHandlerDelay before echoing
+// (exercising post-handler budget checks), and unknown methods report
+// StatusCodeMethodNotFound.
 func (scenarioHandler) Handle(
-	ctx context.Context, methodID uint64, payload []byte, onHandlerEntry func(),
+	ctx context.Context, methodID uint64, req proto.Message, onHandlerEntry func(),
 ) (rpcruntime.Response, *rpcruntime.Status, error) {
 	// Handler-entry callback runs exactly once before handler behavior.
 	if onHandlerEntry != nil {
@@ -287,7 +353,7 @@ func (scenarioHandler) Handle(
 	}
 	switch methodID {
 	case methodEcho:
-		return rpcruntime.Response{Payload: payload}, nil, nil
+		return rpcruntime.Response{Payload: scenarioPayload(req)}, nil, nil
 	case methodAppErr:
 		return rpcruntime.Response{}, &rpcruntime.Status{Code: uint32(appErrorCode), Message: appErrorMessage}, nil
 	case methodSlow:
@@ -296,13 +362,25 @@ func (scenarioHandler) Handle(
 		case <-ctx.Done():
 		}
 
-		return rpcruntime.Response{Payload: payload}, nil, nil
+		return rpcruntime.Response{Payload: scenarioPayload(req)}, nil, nil
 	default:
 		return rpcruntime.Response{}, &rpcruntime.Status{
 			Code:    rpcruntime.StatusCodeMethodNotFound,
 			Message: fmt.Sprintf("difftest: method %d not found", methodID),
 		}, nil
 	}
+}
+
+// scenarioPayload recovers the request bytes a scenario method echoes. A request
+// of any other shape is impossible — NewRequest built it — so it echoes nothing
+// rather than carrying a type check no caller could act on.
+func scenarioPayload(req proto.Message) []byte {
+	bv, ok := req.(*wrapperspb.BytesValue)
+	if !ok {
+		return nil
+	}
+
+	return bv.GetValue()
 }
 
 // newScenarioDispatcher returns a Dispatcher with knownServiceID registered.
@@ -343,10 +421,57 @@ func runClientReadLoop(ctx context.Context, tr transport.Transport, table *rpcru
 
 // runServeLoop reads request frames from tr and dispatches each to d, sending back
 // response frames. It is the plugin-side counterpart to runClientReadLoop.
-// It returns once Recv reports a non-frame-local terminal error or a Send fails.
+// It returns once a receive reports a non-frame-local terminal error or a Send fails.
+//
+// It mirrors the production serve loop's receive shape, which is the whole point of
+// a differential harness: where the transport can hand a frame over as a borrowed
+// view of its own memory, the request is constructed and decoded INSIDE the consume
+// callback, before the ring head advances and the peer may reuse the slab; where it
+// cannot, the frame arrives as a private copy and the same preparation runs straight
+// after. The shared-memory arm therefore exercises the borrow and the uds arm does
+// not — which is exactly the difference the two arms exist to hold to the same
+// observable outcome. Dispatch and the reply send run after the receive returns,
+// never inside the callback, because a callback must not block on anything needing
+// the receive loop to make progress first (transport.ViewReceiver).
 func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher) {
+	runServeLoopCounting(ctx, tr, d, nil)
+}
+
+// runServeLoopCounting is runServeLoop with a counter of the frames it took through
+// the borrowed-view path, so a test can prove which receive shape each arm actually
+// ran rather than inferring it from the transport's type. viewed may be nil.
+func runServeLoopCounting(
+	ctx context.Context, tr transport.Transport, d *rpcruntime.Dispatcher, viewed *atomic.Int64,
+) {
+	viewRecv, _ := tr.(transport.ViewReceiver)
+
+	var (
+		f   transport.Frame
+		req rpcruntime.Request
+	)
+	// Bound once, like the production loop's: the callback reports its result through
+	// these shared variables, never through its error return, which the transport
+	// reads as a disposition selector and renders to text.
+	consume := func(view transport.Frame) error {
+		f, req = prepareRequest(d, view)
+		if viewed != nil {
+			viewed.Add(1)
+		}
+
+		// Never a decline: every frame here is one this side finished with, and
+		// dispatch answers the ones it could not decode (shm-abi.md §9).
+		return nil
+	}
+
 	for {
-		f, err := tr.Recv(ctx)
+		f, req = transport.Frame{}, rpcruntime.Request{}
+
+		var err error
+		if viewRecv != nil {
+			err = viewRecv.RecvViewConsume(ctx, consume)
+		} else if f, err = tr.Recv(ctx); err == nil {
+			f, req = prepareRequest(d, f)
+		}
 		if err != nil {
 			if transport.IsFrameLocalRecvErr(err) {
 				continue
@@ -356,7 +481,7 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 		}
 
 		recvAt := time.Now()
-		for _, env := range d.Dispatch(ctx, f, recvAt) {
+		for _, env := range d.Dispatch(ctx, f, req, recvAt) {
 			if env.Msg != nil {
 				// scenarioHandler only ever returns Response{Payload: ...}, so this
 				// path is unreached today. It stays a hard failure rather than a
@@ -370,6 +495,34 @@ func runServeLoop(ctx context.Context, tr transport.Transport, d *rpcruntime.Dis
 			}
 		}
 	}
+}
+
+// prepareRequest takes everything this side will ever need out of one inbound
+// frame's payload, returning a frame that aliases none of it and the decoded
+// request when the frame carried one — the step the production serve loop performs
+// on its receive goroutine while the payload is still readable.
+//
+// The payload is dropped from the frame either way, which is what lets the result
+// outlive the borrow: the decode is its only reader, and no kind this harness
+// dispatches (a unary request or a CANCEL) carries a payload past that point. A
+// frame whose service or method resolves to nothing decodes nothing at all, because
+// the not-found status dispatch answers it with needs no request.
+func prepareRequest(d *rpcruntime.Dispatcher, f transport.Frame) (transport.Frame, rpcruntime.Request) {
+	payload := f.Payload
+	f.Payload = nil
+
+	if f.Kind != transport.FrameUnaryReq {
+		return f, rpcruntime.Request{}
+	}
+	msg, ok := d.NewRequest(f.Service, f.Method)
+	if !ok {
+		return f, rpcruntime.Request{}
+	}
+	if err := (rawCodec{}).Unmarshal(payload, msg); err != nil {
+		return f, rpcruntime.Request{DecodeFault: err.Error()}
+	}
+
+	return f, rpcruntime.Request{Msg: msg}
 }
 
 // statusFromFrame converts a transport-owned FrameStatus into

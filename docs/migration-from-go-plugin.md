@@ -90,6 +90,48 @@ host, then drives the handshake, attaches the data plane, and serves until the
 host disconnects or shuts it down. A non-nil return means the process should exit
 non-zero.
 
+### The generated dispatch contract has no byte-handler form
+
+`styx.MethodDesc` — what `Register<Service>Server` fills in — carries two
+functions rather than one, and neither ever sees the request's bytes:
+
+```go
+styx.MethodDesc{
+    MethodName: "Say",
+    MethodID:   echoSayMethodID,
+    NewRequest: func() proto.Message { return &SayRequest{} },
+    Handler: func(s any, ctx context.Context, req proto.Message) (proto.Message, error) {
+        return impl.Say(ctx, req.(*SayRequest))
+    },
+}
+```
+
+The split exists because the two halves run in different places. Over the
+shared-memory transport the request payload lives in the peer's arena and stops
+being readable the moment the receive path releases the frame, so the runtime
+allocates the request with `NewRequest` and decodes it *there*, on its own
+receive goroutine, and then runs `Handler` with a message that owns everything
+it holds. That removes a payload copy and a payload-sized allocation from every
+call, and it is why `NewRequest` must do nothing but allocate: it holds up every
+later inbound frame while it runs, and the message it returns must be referenced
+by nothing else.
+
+There is no compatibility form taking `dec func(proto.Message) error` or raw
+`[]byte`, and none is planned — a handler that received bytes would either be
+handed a copy (the cost this removes) or a slice of memory the peer reclaims
+underneath it. Regenerate with `protoc-gen-go-styx` and the change is invisible;
+the only code that needs editing by hand is a `styx.ServiceDesc` someone wrote
+themselves.
+
+One caller-visible consequence: a request the plugin's codec cannot decode — and a
+codec that *panics* trying — now fails that one call with `*styx.Status`/
+`CodeInternal` and leaves the plugin serving. Previously the decode ran inside the
+handler frame, so a panic in it was reported as `*styx.PluginPanicError` and, under
+the default panic policy, terminated the instance. A peer could therefore end a
+plugin process by sending a payload the codec chokes on; it no longer can. Code
+matching on `PluginPanicError` still sees genuine handler panics and stops seeing
+this case.
+
 ## Host side
 
 go-plugin:

@@ -49,11 +49,11 @@ type streamerClient struct{ conn *styx.ClientConn }
 func NewStreamerClient(conn *styx.ClientConn) StreamerClient { return &streamerClient{conn: conn} }
 
 func (c *streamerClient) Unary(ctx context.Context, req *Chunk) (*Chunk, error) {
-	resp := &Chunk{}
-	if err := c.conn.InvokeID(ctx, streamerServiceID, streamerUnaryMethodID, req, resp); err != nil {
+	msg, err := c.conn.InvokeIDFactory(ctx, streamerServiceID, streamerUnaryMethodID, req, func() proto.Message { return &Chunk{} })
+	if err != nil {
 		return nil, err
 	}
-	return resp, nil
+	return msg.(*Chunk), nil
 }
 
 func (c *streamerClient) Collect(ctx context.Context) (Streamer_CollectClient, error) {
@@ -96,12 +96,9 @@ func RegisterStreamerServer(srv *styx.PluginServer, impl StreamerServer) {
 			{
 				MethodName: "Unary",
 				MethodID:   streamerUnaryMethodID,
-				Handler: func(s any, ctx context.Context, dec func(proto.Message) error) (proto.Message, error) {
-					req := &Chunk{}
-					if err := dec(req); err != nil {
-						return nil, err
-					}
-					return impl.Unary(ctx, req)
+				NewRequest: func() proto.Message { return &Chunk{} },
+				Handler: func(s any, ctx context.Context, req proto.Message) (proto.Message, error) {
+					return impl.Unary(ctx, req.(*Chunk))
 				},
 			},
 		},
