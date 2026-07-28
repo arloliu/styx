@@ -191,11 +191,14 @@ type Transport struct {
 	// actuates (Set) for a detected conformance fault (shm-abi.md §16). This
 	// is the sole access path to that word; there is no separate raw pointer.
 	poison *PoisonFlag
-	// escalation adjudicates the stale-generation discard stream classify feeds
-	// via Observe (recovery.go's EscalationPolicy). A discard stream this side
-	// cannot explain as a single dying predecessor's late writes escalates to
-	// PoisonPeerCrash through poison. Constructed once per Attach, scoped to
-	// this generation's grace window.
+	// escalation adjudicates both discard streams the receive path feeds it
+	// (recovery.go's EscalationPolicy): stale-generation discards via Observe, and
+	// consumer-owned consume faults via ObserveConsumeFault/ObserveConsumeSuccess.
+	// A stale stream this side cannot explain as a single dying predecessor's late
+	// writes escalates to PoisonPeerCrash; an unbroken run of consume faults, one
+	// that no successful delivery interrupts, escalates to PoisonGeneric. Both act
+	// through poison. Constructed once per Attach, scoped to this generation's
+	// grace window.
 	escalation *EscalationPolicy
 	// clock returns the current time for escalation.Observe's grace/rate-
 	// window evaluation. It is attachClock's value captured at construction
@@ -224,10 +227,11 @@ type Transport struct {
 	lastSeen       uint64
 	staleDiscarded uint64
 
-	// consumeFaults counts frames discarded because this side's own copy-or-decode
-	// step panicked — the diagnostic counter §9 requires for that discard, the twin
-	// of staleDiscarded. Only the single Recv consumer writes it; atomic so a
-	// supervisor may sample it while the reader runs.
+	// consumeFaults counts frames discarded to a fault this side owns — its own
+	// copy-or-decode step panicking, or a consume callback declining the frame
+	// without blaming the peer. It is the diagnostic counter §9 requires for that
+	// discard, the twin of staleDiscarded. Only the single Recv consumer writes it;
+	// atomic so a supervisor may sample it while the reader runs.
 	consumeFaults atomic.Uint64
 
 	// framesReceived and bytesReceived count inbound progress at the single
@@ -275,6 +279,7 @@ var (
 	_ transport.ArenaOccupancyReporter  = (*Transport)(nil)
 	_ transport.RingDepthReporter       = (*Transport)(nil)
 	_ transport.WakeupSyscallCounter    = (*Transport)(nil)
+	_ transport.ConsumeFaultCounter     = (*Transport)(nil)
 )
 
 // BackpressureEdges reports the cumulative count of transitions into reject-mode
@@ -876,9 +881,27 @@ func (t *Transport) RecvViewConsumeReserving(
 // fault of this side's own — a copy-or-decode step that panicked, or a consume
 // callback that reported a failure without blaming the peer. It is the diagnostic
 // counter shm-abi.md §9 requires for that discard, and the twin of the
-// stale-generation counter §15 requires for its own. A supervisor MAY escalate on
-// it at a policy threshold of its choosing; the transport only counts, because the
-// region stays healthy through such a fault. Cheap atomic snapshot.
+// stale-generation counter §15 requires for its own. Cheap atomic snapshot.
+//
+// A single such fault leaves the region healthy and is never escalated, and
+// neither is any number of them that a successful delivery interrupts. The same
+// faults also feed this transport's EscalationPolicy, which poisons the region
+// with PoisonGeneric once they form an unbroken run — see
+// EscalationPolicy.ObserveConsumeFault for the rule and
+// EscalationConfig.ConsumeFaultRunThreshold for the knob, including how to turn
+// this side's escalation off and why that alone does not keep a region alive.
+// This counter is cumulative and keeps counting either way; it is a diagnostic,
+// not the input to that threshold, because no cumulative total can distinguish a
+// region that is still failing from one that merely has failed.
+//
+// It is also the evidence that identifies such a teardown after the fact, since
+// the escalation records PoisonGeneric and reads identically to a control-plane
+// teardown. Read it as a per-side signal: the side that escalated shows at least
+// its configured ConsumeFaultRunThreshold, so a count below that did not escalate
+// and a merely nonzero one proves nothing; and the side that did not escalate is
+// torn down by the same bilateral poison with its own count unchanged, commonly
+// zero. A zero count therefore rules out this side, never the peer. It reaches an
+// operator as observe.MetricConsumeFault through the periodic metrics reporter.
 func (t *Transport) ConsumeFaults() uint64 {
 	return t.consumeFaults.Load()
 }
@@ -1050,6 +1073,14 @@ func (t *Transport) consumeDescriptor(
 		// released and the call the descriptor names is failed fast — a discarded
 		// response nobody reports strands its caller to its deadline (shm-abi.md §9).
 		t.consumeFaults.Add(1)
+		// Extend this side's consume-fault run (shm-abi.md §9's "MAY escalate at a
+		// documented threshold"; the rule and its threshold are documented on
+		// EscalationPolicy.ObserveConsumeFault). This frame's disposition is settled
+		// either way — the advance below is unconditional, escalation or not — but
+		// an unbroken run of faults, ended by the success reset below, is the one
+		// shape a consume step that misattributed real peer non-conformance still
+		// leaves visible to this side.
+		t.escalation.ObserveConsumeFault(t.clock())
 		t.advanceHead()
 
 		return transport.Frame{}, false, err
@@ -1073,6 +1104,12 @@ func (t *Transport) consumeDescriptor(
 	// (shm-abi.md §9/§15).
 	t.framesReceived.Add(1)
 	t.bytesReceived.Add(uint64(shm.DescriptorSize) + uint64(d.PayloadLength()))
+	// A delivered frame ends any consume-fault run in progress: the region just
+	// produced something this side could use, which is the evidence the run rule
+	// resets on. This is the same chokepoint the frame counter uses, so both the
+	// view path and the plain copy path reach it, and both can raise the faults it
+	// clears (EscalationPolicy.ObserveConsumeFault).
+	t.escalation.ObserveConsumeSuccess()
 
 	return f, true, nil
 }

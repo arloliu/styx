@@ -274,3 +274,282 @@ func TestEscalation_BenignBurst_DoesNotPoisonHealthySuccessor(t *testing.T) {
 		require.Equal(t, uint32(0), *poisonWord)
 	})
 }
+
+// Test the consume-fault arm of the escalation policy (shm-abi.md §9's "MAY
+// escalate at a documented threshold"): faults escalate only when they arrive
+// back to back with no successful delivery between them.
+//
+// The reset is the whole design, not a detail of it. §9 delegates the
+// peer-versus-consumer attribution to the consume step and requires an
+// unattributed failure to take the consumer's arm, so a step that meets real peer
+// non-conformance and declines it leaves a corrupt region serving. What still
+// separates that region from a merely busy one is that a busy consumer keeps
+// succeeding between its declines while a corrupt region never succeeds at all --
+// so the run, and only the run, carries the signal. A rate would not: a fault
+// fires once per inbound frame, so both regions produce faults at whatever rate
+// the peer publishes.
+//
+// Every case drives ObserveConsumeFault with an explicitly injected `now`, never
+// a real sleep (.agents/rules/300-testing.md), as the stale-discard cases above do.
+func TestEscalation_ConsumeFaults_EscalateOnlyOnAnUnbrokenRun(t *testing.T) {
+	base := time.Now()
+
+	// afterGrace is past every grace window these cases configure, so nothing but
+	// the run rule is left to protect any fault they observe.
+	afterGrace := base.Add(200 * time.Millisecond)
+	runCfg := func(threshold int) EscalationConfig {
+		return EscalationConfig{GraceWindow: 100 * time.Millisecond, ConsumeFaultRunThreshold: threshold}
+	}
+
+	t.Run("an isolated consume fault past the grace window never escalates", func(t *testing.T) {
+		// Given a closed grace window and a run threshold of four.
+		policy, poisonWord := newEscalationHarness(t, runCfg(4), base)
+
+		// When exactly one consume fault arrives.
+		policy.ObserveConsumeFault(afterGrace)
+
+		// Then the region is untouched: one fault is the case §9 contains to its
+		// own frame, and escalating on it would be poison-by-omission.
+		require.Equal(t, uint32(0), *poisonWord)
+	})
+
+	t.Run("an unbroken run reaching the threshold escalates to PoisonGeneric", func(t *testing.T) {
+		// Given the same threshold of four.
+		policy, poisonWord := newEscalationHarness(t, runCfg(4), base)
+
+		// When four faults arrive with no delivery between them -- the shape a
+		// region whose every frame is unusable produces.
+		for i := range 4 {
+			policy.ObserveConsumeFault(afterGrace.Add(time.Duration(i) * time.Millisecond))
+		}
+
+		// Then it escalates, and with the unspecified cause: this side cannot tell
+		// whether the peer published garbage or its own consumer stopped coping, so
+		// it must not record a cause that blames the peer (shm-abi.md §3/§16).
+		require.Equal(t, uint32(PoisonGeneric), *poisonWord)
+	})
+
+	t.Run("one successful delivery resets the run, however close it came", func(t *testing.T) {
+		// Given a threshold of four and a run that stops one short of it.
+		policy, poisonWord := newEscalationHarness(t, runCfg(4), base)
+		for range 3 {
+			policy.ObserveConsumeFault(afterGrace)
+		}
+
+		// When a single frame is delivered successfully, and three more faults follow.
+		policy.ObserveConsumeSuccess()
+		for range 3 {
+			policy.ObserveConsumeFault(afterGrace)
+		}
+
+		// Then nothing escalates: six faults have been observed in total, but never
+		// four in a row, and the total is not what the rule reads.
+		require.Equal(t, uint32(0), *poisonWord)
+
+		// And the count really did restart from zero rather than merely pausing:
+		// exactly one more fault completes a fresh run of four and escalates.
+		policy.ObserveConsumeFault(afterGrace)
+		require.Equal(t, uint32(PoisonGeneric), *poisonWord)
+	})
+
+	t.Run("consume faults inside the grace window never escalate", func(t *testing.T) {
+		// Given a grace window that covers the whole burst.
+		policy, poisonWord := newEscalationHarness(t, EscalationConfig{
+			GraceWindow: 5 * time.Second, ConsumeFaultRunThreshold: 4,
+		}, base)
+
+		// When a run far past the threshold lands inside it -- a fresh attach, with
+		// this side's call table still settling.
+		for i := range 100 {
+			policy.ObserveConsumeFault(base.Add(time.Duration(i) * time.Millisecond))
+		}
+
+		// Then nothing escalates.
+		require.Equal(t, uint32(0), *poisonWord)
+	})
+
+	t.Run("a run begun inside the grace window carries across its close", func(t *testing.T) {
+		// Given a grace window and a run that fills inside it without escalating.
+		policy, poisonWord := newEscalationHarness(t, EscalationConfig{
+			GraceWindow: time.Second, ConsumeFaultRunThreshold: 4,
+		}, base)
+		for i := range 100 {
+			policy.ObserveConsumeFault(base.Add(time.Duration(i) * time.Millisecond))
+		}
+		require.Equal(t, uint32(0), *poisonWord, "the grace window must hold while it is open")
+
+		// When one more fault arrives just after the window closes.
+		policy.ObserveConsumeFault(base.Add(2 * time.Second))
+
+		// Then it escalates immediately, rather than starting a fresh count. The run
+		// is never reset by the boundary, so grace DELAYS this arm where it forgives
+		// the stale-discard arm -- an unbroken run spanning the whole window is a
+		// region that has delivered nothing at all, not a call table still settling.
+		require.Equal(t, uint32(PoisonGeneric), *poisonWord)
+	})
+
+	t.Run("a success inside the grace window still resets the run", func(t *testing.T) {
+		// Given the same window, and a run interrupted by one delivery while still
+		// inside it.
+		policy, poisonWord := newEscalationHarness(t, EscalationConfig{
+			GraceWindow: time.Second, ConsumeFaultRunThreshold: 4,
+		}, base)
+		for i := range 100 {
+			policy.ObserveConsumeFault(base.Add(time.Duration(i) * time.Millisecond))
+		}
+		policy.ObserveConsumeSuccess()
+
+		// When three more faults follow, after the window has closed.
+		for i := range 3 {
+			policy.ObserveConsumeFault(base.Add(2*time.Second + time.Duration(i)*time.Millisecond))
+		}
+
+		// Then nothing escalates: the carryover above is a property of the run being
+		// unbroken, not of the grace window, so a region that delivered even once
+		// inside grace starts from zero like any other.
+		require.Equal(t, uint32(0), *poisonWord)
+	})
+
+	t.Run("ConsumeFaultEscalationDisabled stands the escalation down entirely", func(t *testing.T) {
+		// Given an operator who has switched the guard off.
+		policy, poisonWord := newEscalationHarness(t, EscalationConfig{
+			GraceWindow:              100 * time.Millisecond,
+			ConsumeFaultRunThreshold: ConsumeFaultEscalationDisabled,
+		}, base)
+
+		// When an unbroken run far past any threshold arrives past the grace window.
+		for i := range 10_000 {
+			policy.ObserveConsumeFault(afterGrace.Add(time.Duration(i) * time.Millisecond))
+		}
+
+		// Then the region is never poisoned. The off switch has to be reachable for
+		// a heuristic whose action is an unrepairable bilateral teardown, and a
+		// value the config folds into the default would not be one.
+		require.Equal(t, uint32(0), *poisonWord)
+	})
+
+	t.Run("a consume-fault run never counts toward the stale-discard threshold", func(t *testing.T) {
+		// Given a low stale threshold and a high consume-fault threshold, with the
+		// grace window closed.
+		policy, poisonWord := newEscalationHarness(t, EscalationConfig{
+			GraceWindow: 100 * time.Millisecond, RateWindow: time.Second,
+			RateThreshold: 3, ConsumeFaultRunThreshold: 1000,
+		}, base)
+
+		// When a consume-fault run well past the stale threshold, but well under its
+		// own, arrives alongside a couple of stale discards.
+		for i := range 50 {
+			policy.ObserveConsumeFault(afterGrace.Add(time.Duration(i) * time.Millisecond))
+		}
+		policy.Observe(afterGrace, 6, shm.Generation(7))
+		policy.Observe(afterGrace.Add(time.Millisecond), 6, shm.Generation(7))
+
+		// Then neither stream escalates: the run counter and the stale window share
+		// no state, so one stream's traffic can never push the other over a line its
+		// rule does not describe.
+		require.Equal(t, uint32(0), *poisonWord)
+	})
+}
+
+// Test the regression that guards the whole design: a healthy region that keeps
+// serving must NEVER escalate, however many consume faults it accumulates in
+// total and however fast they arrive.
+//
+// Two shapes have to stay safe, and they are the two a wrong rule gets wrong.
+// A CUMULATIVE total is reached eventually by any long-lived region, because §9
+// names a full delivery queue and a cancelled context as legitimate reasons to
+// decline and those recur for as long as the region runs. An absolute RATE is
+// reached by a healthy region under load, because a consume fault fires once per
+// inbound frame and a fast link carries orders of magnitude more frames per
+// second than any threshold a slow link could ever reach -- so a rate condemns a
+// consumer that is successfully serving almost all of its traffic, while being
+// simultaneously unreachable on the links this framework was built for. Both
+// failures poison a region with nothing wrong with it, which is exactly what §9's
+// attribution default exists to prevent.
+//
+// Both cases run against the SHIPPED default threshold rather than a test-chosen
+// one, because it is the default an operator gets.
+func TestEscalation_ConsumeFaults_NeverEscalateWhileTheRegionKeepsServing(t *testing.T) {
+	base := time.Now()
+	// Past the default grace window, so only the run rule is in play.
+	start := base.Add(time.Hour)
+
+	// declineOneInEveryN drives a full second of traffic at this data plane's
+	// measured peak, declining one frame in every n and delivering the rest, and
+	// reports how many faults that produced. No two declines are ever adjacent, so
+	// the run never reaches two however large the fault count grows.
+	declineOneInEveryN := func(policy *EscalationPolicy, n int) int {
+		const framesPerSecond = 775_000
+
+		gap := time.Second / framesPerSecond
+		faults := 0
+		for i := range framesPerSecond {
+			if i%n == 0 {
+				policy.ObserveConsumeFault(start.Add(time.Duration(i) * gap))
+				faults++
+
+				continue
+			}
+			policy.ObserveConsumeSuccess()
+		}
+
+		return faults
+	}
+
+	t.Run("a fault rate far above any threshold never escalates without a run", func(t *testing.T) {
+		// Given a policy on the shipped defaults.
+		policy, poisonWord := newEscalationHarness(t, EscalationConfig{}, base)
+
+		// When every other frame is declined for a full second at peak throughput:
+		// hundreds of thousands of faults per second, orders of magnitude past any
+		// faults-per-second threshold anyone could pick, and never two in a row.
+		faults := declineOneInEveryN(policy, 2)
+
+		// Then the region is never poisoned. This is the case that settles it: the
+		// fault RATE can be arbitrarily high on a consumer that is successfully
+		// serving half its traffic, because a fault fires once per inbound frame and
+		// the peer's publish rate sets the ceiling for corrupt and busy regions
+		// alike. No threshold over that rate separates them; the run does.
+		require.Greater(t, faults, 100*DefaultConsumeFaultRunThreshold,
+			"the scenario must produce a fault rate far past any plausible threshold")
+		require.Equal(t, uint32(0), *poisonWord)
+	})
+
+	t.Run("a busy consumer declining a fraction of a fast stream never escalates", func(t *testing.T) {
+		// Given the same defaults.
+		policy, poisonWord := newEscalationHarness(t, EscalationConfig{}, base)
+
+		// When one frame in a thousand is declined for a second at peak throughput
+		// -- a bounded queue transiently full, which is what bounded queues do.
+		faults := declineOneInEveryN(policy, 1000)
+
+		// Then it never escalates either. A consumer serving 99.9% of its frames is
+		// healthy by any reading, yet its absolute fault rate still lands in the
+		// same range a slow but genuinely corrupt link would produce, which is why
+		// the rate cannot be what decides.
+		require.Positive(t, faults, "the scenario must actually produce faults")
+		require.Equal(t, uint32(0), *poisonWord)
+	})
+
+	t.Run("bursts of declines separated by a single success never escalate", func(t *testing.T) {
+		// Given the same defaults.
+		policy, poisonWord := newEscalationHarness(t, EscalationConfig{}, base)
+
+		// When declines arrive in bursts that stop just short of the threshold, each
+		// burst ended by one delivered frame, repeated 200 times -- a cumulative
+		// total roughly 200x the threshold.
+		burst := DefaultConsumeFaultRunThreshold - 1
+		for b := range 200 {
+			for i := range burst {
+				policy.ObserveConsumeFault(start.Add(time.Duration(b*burst+i) * time.Millisecond))
+			}
+			policy.ObserveConsumeSuccess()
+		}
+
+		// Then it never escalates: the cumulative count is irrelevant, and no run
+		// ever completed.
+		require.Greater(t, burst*200, DefaultConsumeFaultRunThreshold,
+			"the run must exceed any cumulative threshold")
+		require.Equal(t, uint32(0), *poisonWord)
+	})
+}

@@ -304,6 +304,17 @@ type Config struct {
 	// Off by default (the two mandatory ABI checks still apply).
 	StrictCapacity bool
 
+	// ConsumeFaultRunThreshold bounds how many consecutive inbound frames the host
+	// may fail to consume, with none delivered in between, before the region is
+	// poisoned and the plugin restarted (shm-abi.md §9's escalation permission).
+	// It is a local decision on this side's own receive path, so it is not carried
+	// to the plugin; each side configures its own.
+	// Zero selects the transport's default. A negative value stands THIS side's
+	// escalation down, which is not the same as keeping the region alive: the
+	// teardown is bilateral and the plugin's own guard stays armed at its default,
+	// still able to tear the region down on its own.
+	ConsumeFaultRunThreshold int
+
 	// ResetWindow restores the restart budget.
 	// Once an instance has stayed continuously Ready for at least ResetWindow,
 	// a subsequent crash's restart bookkeeping starts fresh rather than continuing
@@ -1341,6 +1352,8 @@ func (s *Supervisor) shmMaxDataInflight(layout shm.Layout) int {
 // Contains host-selected MaxInflight, negotiated checksum feature, process-local
 // queue depths, and a zero MaxPayload so the transport derives each direction's
 // payload limit from the region header (both sides derive identically, no wire field).
+// The consume-fault run threshold is process-local too: each side adjudicates only
+// its own receive path, so it needs no agreement with the plugin.
 func (s *Supervisor) shmConfig(maxInflight int, tuple control.Tuple) shmtransport.Config {
 	return shmtransport.Config{
 		MaxInflight:         maxInflight,
@@ -1348,6 +1361,9 @@ func (s *Supervisor) shmConfig(maxInflight int, tuple control.Tuple) shmtranspor
 		DataQueueDepth:      shmDataQueueDepth,
 		LifecycleQueueDepth: shmLifecycleQueueDepth,
 		Checksum:            tuple.Features["checksum"],
+		Escalation: shmtransport.EscalationConfig{
+			ConsumeFaultRunThreshold: s.cfg.ConsumeFaultRunThreshold,
+		},
 	}
 }
 

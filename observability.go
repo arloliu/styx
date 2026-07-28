@@ -126,6 +126,7 @@ func (c *ClientConn) runMetricsReporter(
 	var lastTr transport.Transport
 	var lastBytes uint64
 	var lastEdges uint64
+	var lastFaults uint64
 	var lastWakeups uint64
 	var haveWakeups bool
 	for {
@@ -148,9 +149,11 @@ func (c *ClientConn) runMetricsReporter(
 				// zero start so the first delta counts the new generation, not a
 				// difference against the predecessor's unrelated counter.
 				lastTr, lastBytes, lastEdges, lastWakeups, haveWakeups = tr, 0, 0, 0, false
+				lastFaults = 0
 			}
 			lastBytes = c.reportBytesMoved(m, tr, lastBytes)
 			lastEdges = c.reportBackpressureEdges(m, tr, lastEdges)
+			lastFaults = c.reportConsumeFaults(m, tr, lastFaults)
 			c.reportArenaOccupancy(m, tr)
 			c.reportRingDepth(m, tr)
 			lastWakeups, haveWakeups = c.reportWakeupRate(m, tr, lastWakeups, haveWakeups, interval)
@@ -188,6 +191,41 @@ func (c *ClientConn) reportBackpressureEdges(
 	m.Submit(func(s observe.MetricsSink) {
 		//nolint:gosec // cumulative edge count; a per-interval delta never overflows int64.
 		s.IncrCounter(observe.MetricBackpressureEvent, int64(delta), observe.Label{Key: labelPlugin, Value: name})
+	})
+
+	return cur
+}
+
+// reportConsumeFaults reports the per-interval delta of the live transport's
+// consumer-owned consume-fault count when the transport exposes it. The uds
+// transport does not, so nothing is reported over it — no value is fabricated.
+//
+// It is reported rather than left as an in-process counter because the
+// shared-memory transport tears its region down over a long enough unbroken run
+// of these faults, and the teardown's recorded reason cannot say that it did.
+// This is the signal that tells the two apart after the fact, so it has to reach
+// the operator's sink rather than stopping at the transport.
+func (c *ClientConn) reportConsumeFaults(
+	m *observeq.Dispatcher[observe.MetricsSink], tr transport.Transport, lastFaults uint64,
+) uint64 {
+	cf, ok := tr.(transport.ConsumeFaultCounter)
+	if !ok {
+		return lastFaults
+	}
+
+	cur := cf.ConsumeFaults()
+	delta := cur
+	if cur >= lastFaults {
+		delta = cur - lastFaults
+	}
+	if delta == 0 {
+		return cur
+	}
+
+	name := c.name
+	m.Submit(func(s observe.MetricsSink) {
+		//nolint:gosec // cumulative fault count; a per-interval delta never overflows int64.
+		s.IncrCounter(observe.MetricConsumeFault, int64(delta), observe.Label{Key: labelPlugin, Value: name})
 	})
 
 	return cur
@@ -302,11 +340,17 @@ func (c *ClientConn) reportWakeupRate(
 }
 
 // runMetricsReporter is the plugin-side cold reporter goroutine. It reports the
-// shared-memory gauges the live transport exposes — arena occupancy, ring depth,
-// and eventfd wakeup rate — each as a gauge. The uds serve-path transport exposes
-// none of them, so nothing is reported over it (no value is fabricated). The
-// plugin has no name of its own, so plugin-side signals carry no plugin label. It
-// returns when ctx is done. Only started when s.metrics is non-nil.
+// shared-memory signals the live transport exposes: arena occupancy, ring depth,
+// and eventfd wakeup rate as gauges, and backpressure edges and consume faults as
+// per-interval counter deltas. The uds serve-path transport exposes none of them,
+// so nothing is reported over it (no value is fabricated). The plugin has no name
+// of its own, so plugin-side signals carry no plugin label. It returns when ctx is
+// done. Only started when s.metrics is non-nil.
+//
+// The plugin reports consume faults for the same reason the host does, and the
+// two counts are not redundant: each side counts only the frames IT could not
+// consume, while a teardown one side's run triggers stops both. A region torn
+// down this way therefore shows the climb on one side only.
 func (s *PluginServer) runMetricsReporter(ctx context.Context, tr transport.Transport) {
 	ticker := time.NewTicker(s.metricsInterval)
 	defer ticker.Stop()
@@ -315,7 +359,9 @@ func (s *PluginServer) runMetricsReporter(ctx context.Context, tr transport.Tran
 	rd, haveRing := tr.(transport.RingDepthReporter)
 	ec, haveEdges := tr.(transport.BackpressureEdgeCounter)
 	wc, haveWakeups := tr.(transport.WakeupSyscallCounter)
+	cf, haveFaults := tr.(transport.ConsumeFaultCounter)
 	var lastEdges uint64
+	var lastFaults uint64
 	var lastWakeups uint64
 	var haveBaseline bool
 	for {
@@ -341,6 +387,18 @@ func (s *PluginServer) runMetricsReporter(ctx context.Context, tr transport.Tran
 					})
 				} else {
 					lastEdges = cur // establish or re-establish (after a reset) the baseline.
+				}
+			}
+			if haveFaults {
+				cur := cf.ConsumeFaults()
+				if delta := cur - lastFaults; cur >= lastFaults && delta != 0 {
+					lastFaults = cur
+					//nolint:gosec // cumulative fault count; a per-interval delta never overflows int64.
+					s.metrics.Submit(func(sink observe.MetricsSink) {
+						sink.IncrCounter(observe.MetricConsumeFault, int64(delta))
+					})
+				} else {
+					lastFaults = cur // establish or re-establish (after a reset) the baseline.
 				}
 			}
 			if haveWakeups {

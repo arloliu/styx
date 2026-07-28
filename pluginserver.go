@@ -76,10 +76,16 @@ type PluginServer struct {
 
 	// transports is the plugin's data-plane transport allowlist — the transports it
 	// advertises during negotiation, set once at construction from
-	// PluginServerConfig.Transports (default both). It is the plugin's only
-	// data-plane knob; geometry and the transport preference are host-authored.
-	// Read-only after NewPluginServer.
+	// PluginServerConfig.Transports (default both). Geometry and the transport
+	// preference are host-authored. Read-only after NewPluginServer.
 	transports []string
+
+	// consumeFaultRunThreshold bounds how many inbound frames this side may fail to
+	// consume back to back before it tears the shared-memory region down, set once
+	// at construction from PluginServerConfig.ConsumeFaultRunThreshold and passed
+	// straight through to the transport (zero means its default, negative disables).
+	// Read-only after NewPluginServer.
+	consumeFaultRunThreshold int
 }
 
 // registeredService pairs one RegisterService call's desc and impl for
@@ -98,10 +104,11 @@ func NewPluginServer(cfg PluginServerConfig) *PluginServer {
 	validatePluginTransports(cfg.Transports)
 
 	s := &PluginServer{
-		services:           make(map[uint64]registeredService),
-		metricsInterval:    resolveMetricsInterval(cfg.MetricsInterval),
-		transports:         resolvePluginTransports(transportNames(cfg.Transports)),
-		continueAfterPanic: cfg.ContinueAfterPanic,
+		services:                 make(map[uint64]registeredService),
+		metricsInterval:          resolveMetricsInterval(cfg.MetricsInterval),
+		transports:               resolvePluginTransports(transportNames(cfg.Transports)),
+		continueAfterPanic:       cfg.ContinueAfterPanic,
+		consumeFaultRunThreshold: cfg.ConsumeFaultRunThreshold,
 	}
 	if cfg.Metrics != nil {
 		s.metrics = observeq.NewDispatcher(cfg.Metrics, metricsBufferSize)
@@ -717,6 +724,25 @@ func pluginAttachFailStep(step string) error {
 	return nil
 }
 
+// shmConfig builds the plugin-side shm.Config, mirroring the host's own mapping.
+// maxInflight arrives on the wire (the host selects it so both sides admit
+// identically); the queue depths and the consume-fault run threshold are
+// process-local, because each side runs its own writer and adjudicates only its
+// own receive path. MaxPayload is zero so the transport derives each direction's
+// limit from the region header, exactly as the host does.
+func (s *PluginServer) shmConfig(maxInflight int, tuple control.Tuple) shmtransport.Config {
+	return shmtransport.Config{
+		MaxInflight:         maxInflight,
+		MaxPayload:          0, // derive per-direction from the region header
+		DataQueueDepth:      shmDataQueueDepth,
+		LifecycleQueueDepth: shmLifecycleQueueDepth,
+		Checksum:            tuple.Features["checksum"],
+		Escalation: shmtransport.EscalationConfig{
+			ConsumeFaultRunThreshold: s.consumeFaultRunThreshold,
+		},
+	}
+}
+
 func (s *PluginServer) pluginAttachSHM(
 	ctx context.Context, conn *control.Conn, tuple control.Tuple,
 ) (tr transport.Transport, res *pluginShmResources, err error) {
@@ -772,13 +798,7 @@ func (s *PluginServer) pluginAttachSHM(
 	}
 
 	ar := msg.GetAttachRegion()
-	cfg := shmtransport.Config{
-		MaxInflight:         int(ar.GetMaxDataInflight()),
-		MaxPayload:          0, // derive per-direction from the region header
-		DataQueueDepth:      shmDataQueueDepth,
-		LifecycleQueueDepth: shmLifecycleQueueDepth,
-		Checksum:            tuple.Features["checksum"],
-	}
+	cfg := s.shmConfig(int(ar.GetMaxDataInflight()), tuple)
 	pluginTr, terr := shmtransport.Attach(shmtransport.AttachParams{
 		RegionFD:     regionFD,
 		ExpectedSize: ar.GetLayoutSize(),

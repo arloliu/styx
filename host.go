@@ -14,6 +14,7 @@ import (
 	"github.com/arloliu/styx/internal/observeq"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
+	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 	"github.com/arloliu/styx/observe"
 )
 
@@ -117,7 +118,59 @@ type PluginSpec struct {
 	// Off by default; a non-strict geometry experiences typed backpressure
 	// under load instead.
 	StrictCapacity bool
+
+	// ConsumeFaultRunThreshold is how many inbound frames this Host may fail to
+	// consume back to back, with no frame delivered successfully between them,
+	// before it tears the shared-memory region down and restarts the plugin.
+	// Ignored for the uds transport.
+	//
+	// The run exists to bound the damage a receive path can do when it cannot tell
+	// a peer publishing unusable bytes from its own inability to take them: a
+	// consumer that is merely busy still succeeds between its failures and never
+	// accumulates a run, while a region producing nothing usable accumulates one
+	// without bound. Any single successful delivery resets it.
+	//
+	// It counts frames, not time, so what it buys depends on how fast the link
+	// runs: the same threshold is a few milliseconds of total stall on a
+	// high-throughput link and several seconds on a latency-bound one. Raise it if
+	// this Host's traffic is fast enough that an ordinary pause (a garbage
+	// collection assist, a descheduled goroutine) could span the default; the only
+	// cost of raising it is a proportionally longer detection delay.
+	//
+	// Zero selects the default, which is high enough that no consumer making
+	// progress reaches it. ConsumeFaultEscalationDisabled switches this Host's half
+	// of the teardown off -- read that constant first, because it does not on its
+	// own keep the region alive. Do not set a small value: at 1 every single
+	// unconsumable frame tears the region down, and the threshold needs to stay
+	// well clear of the inbound queue depths it is meant to outlast.
+	ConsumeFaultRunThreshold int
 }
+
+// ConsumeFaultEscalationDisabled switches off the consume-fault teardown for the
+// side it is assigned to -- PluginSpec.ConsumeFaultRunThreshold for this Host,
+// PluginServerConfig.ConsumeFaultRunThreshold for the plugin. Frames that cannot
+// be consumed are still discarded and still fail their own calls; no run of them
+// makes that side tear the region down.
+//
+// Reach for it when a region is being restarted for a consumer that is slow
+// rather than broken. The cost arrives only once BOTH sides are set, and it is
+// that a peer publishing bytes neither side can use will keep a region alive
+// indefinitely, failing every call on it. Set on one side alone this buys less
+// than it appears to -- see below.
+//
+// # It disables one side, and a region has two
+//
+// Each side runs the guard over its own inbound stream, the threshold is never
+// negotiated or carried to the peer, and tearing the region down takes only one
+// side: the teardown stops both. So setting this here stops THIS side from
+// tearing the region down and leaves the other side's guard armed at its default,
+// still able to do it.
+//
+// Standing the behavior down for a region means setting it on both sides. A Host
+// running a plugin binary it does not build cannot set the plugin's half, and for
+// that deployment the teardown cannot be fully switched off -- raising both this
+// threshold and, where possible, the plugin's is the available remedy.
+const ConsumeFaultEscalationDisabled = shmtransport.ConsumeFaultEscalationDisabled
 
 // ServiceRequirement is the host's declared acceptable version range for one
 // service it intends to call on a plugin.
@@ -321,9 +374,11 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 		ShmLayout:       spec.Geometry.toLayout(),
 		MaxDataInflight: spec.MaxDataInflight,
 		StrictCapacity:  spec.StrictCapacity,
-		OnHeartbeatMiss: h.heartbeatMissHook(spec.Name),
-		OnRestart:       h.restartHook(spec.Name),
-		OnReloadDropped: h.reloadDroppedHook(spec.Name),
+
+		ConsumeFaultRunThreshold: spec.ConsumeFaultRunThreshold,
+		OnHeartbeatMiss:          h.heartbeatMissHook(spec.Name),
+		OnRestart:                h.restartHook(spec.Name),
+		OnReloadDropped:          h.reloadDroppedHook(spec.Name),
 		// The reload transaction drives the SAME admission gate a caller's
 		// Invoke checks, so a cutoff a reload begins is the cutoff Invoke
 		// observes. internal/supervisor never names *ClientConn; it holds only

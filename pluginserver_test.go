@@ -966,3 +966,26 @@ func TestPluginServer_ServeLoopKeepsServing_OnAConsumeFault(t *testing.T) {
 	done, _ = styx.DisposeRecvErrForTest(transport.ErrClosed)
 	require.True(t, done, "a closed transport still ends the loop")
 }
+
+// Test that the plugin-side consume-fault teardown threshold actually reaches the
+// shared-memory transport's own configuration, the twin of the host-side mapping.
+//
+// The two sides set it independently and neither carries it on the wire, because
+// each adjudicates only its own receive path. That makes this mapping the whole
+// of the plugin's control over an action that tears the region down and fails
+// every call in flight on it, so the value has to arrive unchanged -- including
+// the disable sentinel, which the transport reads as "off" only while it is still
+// negative.
+func TestPluginServer_ShmConfig_CarriesTheConsumeFaultRunThreshold(t *testing.T) {
+	tuple := control.Tuple{Features: map[string]bool{}}
+	thresholdFor := func(configured int) int {
+		s := styx.NewPluginServer(styx.PluginServerConfig{ConsumeFaultRunThreshold: configured})
+
+		return s.ShmConfigForTest(16, tuple).Escalation.ConsumeFaultRunThreshold
+	}
+
+	require.Equal(t, 4096, thresholdFor(4096), "an explicit threshold must reach the transport unchanged")
+	require.Negative(t, thresholdFor(styx.ConsumeFaultEscalationDisabled),
+		"the disable sentinel must stay negative, or an operator's off switch is silently re-enabled")
+	require.Zero(t, thresholdFor(0), "an unset threshold must stay zero so the transport picks its own default")
+}

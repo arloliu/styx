@@ -14,9 +14,8 @@ import "time"
 // that the periodic reporter samples; the uds transport omits those capabilities,
 // so no value is reported and none is fabricated.
 // The shared-memory transport implements the backpressure-edge capability
-// (zero until reject mode is negotiated); ring depth, arena utilization, and
-// wakeup syscalls are seam-only — the names and reporter exist, but no
-// transport implements those capabilities yet.
+// (zero until reject mode is negotiated), along with ring depth, arena
+// utilization, wakeup syscalls, and consume faults.
 const (
 	// MetricRPCLatency is the wall-clock duration of one host-side unary call,
 	// observed as a latency distribution.
@@ -58,6 +57,20 @@ const (
 	// MetricWakeupSyscalls is the eventfd wakeup rate, reported as a gauge
 	// (shared-memory transport only).
 	MetricWakeupSyscalls = "styx.wakeup.syscalls_per_sec"
+	// MetricConsumeFault counts inbound frames a side discarded because its own
+	// copy-or-decode step failed, rather than because the peer's bytes were bad.
+	// Each one fails the single call it names and leaves the connection healthy,
+	// so an occasional fault is ordinary and not on its own worth alerting on.
+	// Shared-memory transport only.
+	//
+	// It is worth dashboarding because a long enough UNBROKEN run of these — one
+	// no successful delivery interrupts — makes the shared-memory transport tear
+	// the region down, and the recorded teardown reason cannot distinguish that
+	// from any other. This counter is what does. Alert on a sharp climb rather
+	// than on any nonzero value, and note that it is reported per side: the side
+	// whose run fired shows the climb, and its peer, torn down by the same event,
+	// may show nothing at all.
+	MetricConsumeFault = "styx.consume.fault.count"
 )
 
 // Label is a key/value dimension attached to a metric (for example, the plugin name).

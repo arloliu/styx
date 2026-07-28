@@ -31,7 +31,18 @@ func main() {
 			{Name: "default-profile", Path: "/nonexistent", Transport: "auto", Geometry: styx.GeometryDefault()},
 			{Name: "lean-profile", Path: "/nonexistent", Transport: "shm", Geometry: styx.GeometryLean(), MaxDataInflight: 32, StrictCapacity: true},
 			{Name: "uds", Path: "/nonexistent", Transport: "uds"},
+
+			// The consume-fault teardown is tunable and switchable from out here,
+			// which is what makes it an operator's knob rather than a constant.
+			{Name: "tuned-teardown", Path: "/nonexistent", Transport: "shm", ConsumeFaultRunThreshold: 4096},
+			{Name: "no-teardown", Path: "/nonexistent", Transport: "shm",
+				ConsumeFaultRunThreshold: styx.ConsumeFaultEscalationDisabled},
 		},
 	}
 	_ = styx.NewHost(cfg)
+
+	// The plugin side sets its own, independently of the host's.
+	_ = styx.NewPluginServer(styx.PluginServerConfig{
+		ConsumeFaultRunThreshold: styx.ConsumeFaultEscalationDisabled,
+	})
 }
