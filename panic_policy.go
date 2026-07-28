@@ -1,10 +1,10 @@
 package styx
 
 import (
-	"fmt"
 	"sync"
 	"sync/atomic"
 
+	"github.com/arloliu/styx/internal/panics"
 	"github.com/arloliu/styx/internal/rpcruntime"
 )
 
@@ -129,8 +129,16 @@ func newPanicController(continueAfterPanic bool) *panicController {
 // application status can never impersonate a panic reply.
 func panicStatus(recovered any) *rpcruntime.Status {
 	return &rpcruntime.Status{
-		Code:    rpcruntime.StatusCodeHandlerPanic,
-		Message: fmt.Sprint(recovered),
+		Code: rpcruntime.StatusCodeHandlerPanic,
+		// Rendered through panics.Text, never fmt directly: the value is the
+		// handler's, and rendering it calls the handler's own String or Error method.
+		// A panic there that fmt cannot render in turn re-raises out of this call,
+		// through a serve path that recovers nothing, and the runtime answers a panic
+		// it cannot print with an unrecoverable throw. That would kill the plugin on
+		// the one path whose whole purpose is to survive a handler panic — replying
+		// with the outcome under the default policy, and continuing to serve under
+		// ContinueAfterPanic.
+		Message: panics.Text(recovered),
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/arloliu/styx/internal/arena"
+	"github.com/arloliu/styx/internal/panics"
 	"github.com/arloliu/styx/internal/ring"
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/transport"
@@ -1354,10 +1355,17 @@ func (w *writer) fillSlab(i intent, h arena.SlabHandle, window []byte) buildStat
 // back in transport.ErrPayloadFillFailed, so the two forms are indistinguishable
 // to a caller classifying the failure and distinguishable to anyone reading the
 // message.
+// The panic value is rendered through panics.Text rather than by fmt directly. It
+// is the caller's value, so rendering it calls the caller's own String or Error
+// method, and a panic there that fmt cannot render in turn re-raises from inside
+// this deferred recover — where nothing is left to catch it, and the runtime answers
+// a panic it cannot print by throwing. That would take down the writer goroutine,
+// and the process with it, through the very barrier that exists to keep a panicking
+// codec to one frame.
 func runFill(fn func(dst []byte) error, dst []byte) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("%w: %v", errFillPanic, r)
+			err = fmt.Errorf("%w: %s", errFillPanic, panics.Text(r))
 		}
 	}()
 
