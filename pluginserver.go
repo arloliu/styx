@@ -19,6 +19,7 @@ import (
 	"github.com/arloliu/styx/internal/event"
 	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/observeq"
+	"github.com/arloliu/styx/internal/panics"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/transport"
@@ -1005,9 +1006,10 @@ type serveDeps struct {
 	// request it prepared. They are how the consume callback reports its result:
 	// the callback's own error return is a disposition selector the transport reads
 	// and renders to text, never a channel back to this loop
-	// (transport.ViewReceiver). serveOneFrame clears both before each receive, so a
-	// path that reads them can only ever see this frame's values — a receive that
-	// produced nothing leaves the zero value rather than the previous frame's.
+	// (transport.ViewReceiver). serveOneFrame clears both before each receive (see
+	// clearReceiveScratch), so a path that reads them can only ever see this frame's
+	// values — a receive that produced nothing leaves an inert frame rather than the
+	// previous one's.
 	frame transport.Frame
 	req   rpcruntime.Request
 	// reserved records whether this frame's ingress reservation was taken, so the
@@ -1054,6 +1056,27 @@ func newServeDeps(
 	}
 
 	return deps
+}
+
+// scratchFrameKind is the frame kind the serve loop leaves in its cleared receive
+// scratch, and it is deliberately NOT the zero value.
+//
+// A zero transport.Frame is a FrameUnaryReq — FrameUnaryReq is the zero of
+// FrameKind — so clearing to the zero value would leave a routable synthetic
+// request behind, for call 0 of service 0. Nothing reads the scratch without a
+// successful receive having just overwritten it, so that costs nothing today; but a
+// sentinel whose failure mode is "answer an unsolicited status frame to a call that
+// does not exist" is not much of a sentinel. FrameUnaryResp flows plugin to host and
+// never inbound, so the serve loop's routing switch falls through to the unary arm
+// and the dispatcher discards it: it reaches no handler, opens no obligation, and
+// sends nothing.
+const scratchFrameKind = transport.FrameUnaryResp
+
+// clearReceiveScratch resets the per-frame receive scratch to values that route
+// nowhere, so a frame this loop never took cannot be mistaken for one it did.
+func (deps *serveDeps) clearReceiveScratch() {
+	deps.frame = transport.Frame{Kind: scratchFrameKind}
+	deps.req = rpcruntime.Request{}
 }
 
 // serveViewReceiver reports the capability this serving session receives through:
@@ -1154,7 +1177,7 @@ func serveOneFrame(ctx context.Context, deps *serveDeps) (done bool, loopErr err
 	// makes that hold by construction rather than by argument, and it drops the
 	// previous frame's cloned payload a little sooner.
 	deps.reserved = false
-	deps.frame, deps.req = transport.Frame{}, rpcruntime.Request{}
+	deps.clearReceiveScratch()
 	defer func() {
 		if deps.reserved && deps.coord != nil {
 			deps.coord.retire()
@@ -1349,7 +1372,7 @@ func prepareInboundFrame(deps *serveDeps, f transport.Frame, borrowed bool) (tra
 func decodeUnaryRequest(deps *serveDeps, f transport.Frame) (req rpcruntime.Request) {
 	defer func() {
 		if r := recover(); r != nil {
-			req = rpcruntime.Request{DecodeFault: decodeFaultText(fmt.Sprintf("panicked: %v", r))}
+			req = rpcruntime.Request{DecodeFault: decodeFaultText("panicked: " + panics.Text(r))}
 		}
 	}()
 

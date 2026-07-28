@@ -3754,3 +3754,98 @@ func TestTransport_RecvViewConsumeReserving_StaleDiscard_TakesNoReservation(t *t
 	require.Equal(t, uint64(1), ep.plugin.staleDiscarded)
 	require.Equal(t, uint64(2), ep.plugin.lastSeen)
 }
+
+// unrenderablePanic panics when rendered, with itself, so rendering the value the
+// first panic produced panics too. fmt survives a single level (it prints a
+// placeholder) but re-raises on the second, and that re-raise lands inside
+// protectedConsume's deferred recover, where nothing is left to catch it.
+type unrenderablePanic struct{}
+
+func (unrenderablePanic) String() string { panic(unrenderablePanic{}) }
+
+// unrenderableMalformedError is the peer-blaming twin: an error that names
+// ErrPayloadMalformed for attribution — errors.Is reads the sentinel without
+// touching Error — and then panics unrenderably when the reason is rendered.
+type unrenderableMalformedError struct{}
+
+func (unrenderableMalformedError) Error() string { panic(unrenderablePanic{}) }
+
+func (unrenderableMalformedError) Is(target error) bool {
+	return target == transport.ErrPayloadMalformed
+}
+
+// Test the consume barrier surviving a panic value it cannot render.
+//
+// The barrier recovers the callback's panic and then renders it, and rendering
+// calls the value's own String method — callback code, re-entered from inside the
+// deferred recover. When fmt cannot complete that render it re-raises, and there is
+// nothing beneath a deferred recover to catch it: the runtime answers a panic it
+// cannot print with "fatal error: panic while printing panic value", a throw no
+// recover intercepts. The barrier that exists to contain a callback panic would
+// then be the thing that kills the process, on every consume path, host and plugin
+// alike.
+//
+// This test dies with the whole test binary if that regresses, rather than failing
+// an assertion.
+func TestTransport_ProtectedConsume_SurvivesAPanicValueItCannotRender(t *testing.T) {
+	// Given a published frame and a callback that panics unrenderably.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 11, Kind: transport.FrameUnaryReq, Payload: []byte("payload")}))
+
+	// When it consumes.
+	err := ep.plugin.RecvViewConsume(t.Context(), func(transport.Frame) error {
+		panic(unrenderablePanic{})
+	})
+
+	// Then the fault is contained and reported, naming the type it could not render.
+	require.ErrorIs(t, err, transport.ErrConsumeFault)
+	var fault *transport.ConsumeFaultError
+	require.ErrorAs(t, err, &fault)
+	require.True(t, fault.Panicked)
+	require.Equal(t, uint64(11), fault.CallID)
+	require.Contains(t, fault.Detail, "unrenderablePanic",
+		"a value that cannot be rendered must still be identified by type")
+
+	// And the region is healthy: the slot was released and the next frame is served.
+	require.Equal(t, uint64(1), ep.plugin.ConsumeFaults())
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 12, Kind: transport.FrameUnaryReq, Payload: []byte("next")}))
+	var next []byte
+	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
+		next = bytes.Clone(f.Payload)
+
+		return nil
+	}))
+	require.Equal(t, []byte("next"), next)
+}
+
+// Test the peer-blaming arm of the same barrier surviving the same value, with its
+// attribution intact.
+//
+// This is the arm the barrier already guarded for one consequence and not the
+// other: blamesPeer is captured before the reason is rendered so that a panic in
+// the callback's Error method cannot silently re-attribute a peer fault to this
+// side (shm-abi.md §9). The render itself was left unguarded, so the same re-entry
+// that attribution was protected against could still kill the process.
+func TestTransport_ProtectedConsume_SurvivesAnUnrenderableMalformedReport(t *testing.T) {
+	// Given a published frame and a callback that blames the peer with an error
+	// whose reason cannot be rendered.
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+	setInPlaceThreshold(ep.plugin, 0)
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 13, Kind: transport.FrameUnaryReq, Payload: []byte("payload")}))
+
+	// When it consumes.
+	err := ep.plugin.RecvViewConsume(t.Context(), func(transport.Frame) error {
+		return unrenderableMalformedError{}
+	})
+
+	// Then the peer keeps the blame — this is a poison, not a consume fault — and the
+	// reason names the type it could not render.
+	require.ErrorIs(t, err, transport.ErrPayloadMalformed)
+	require.NotErrorIs(t, err, transport.ErrConsumeFault)
+	require.Contains(t, err.Error(), "unrenderablePanic")
+	require.Zero(t, ep.plugin.ConsumeFaults(), "a peer fault is never counted against this side")
+}

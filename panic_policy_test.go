@@ -924,3 +924,78 @@ func TestPluginServer_ContinueServing_OnStreamingPanic_WhenOptedIn(t *testing.T)
 	require.ErrorIs(t, rerr, io.EOF)
 	require.NoError(t, ok.Err())
 }
+
+// unrenderableHandlerPanic panics when rendered, with itself, so rendering the
+// value the first panic produced panics too. fmt survives one level and re-raises
+// on the second.
+type unrenderableHandlerPanic struct{}
+
+func (unrenderableHandlerPanic) String() string { panic(unrenderableHandlerPanic{}) }
+
+// newUnrenderablePanicService is newPanicTestService with a Boom that panics with a
+// value nothing can render.
+func newUnrenderablePanicService() *ServiceDesc {
+	desc := newPanicTestService()
+	for i := range desc.Methods {
+		if desc.Methods[i].MethodName == "Boom" {
+			desc.Methods[i].Handler = func(any, context.Context, proto.Message) (proto.Message, error) {
+				panic(unrenderableHandlerPanic{})
+			}
+		}
+	}
+
+	return desc
+}
+
+// Test the handler-panic reply surviving a panic value it cannot render, with the
+// plugin still serving afterwards.
+//
+// Building that reply renders the handler's panic value, which calls the handler's
+// own String method — application code, re-entered on the serve goroutine. fmt
+// survives one level of panic there and re-raises on the second, and nothing on the
+// serve path recovers it: the runtime answers a panic it cannot print with a throw
+// no recover intercepts. The plugin would die instead of replying, on the one path
+// whose entire purpose is to survive a handler panic — and under
+// ContinueAfterPanic, which promises the process keeps serving, it would die anyway.
+//
+// This test dies with the whole test binary if that regresses, rather than failing
+// an assertion.
+func TestPluginServer_ContinueServing_WhenAPanicValueCannotBeRendered(t *testing.T) {
+	// Given an opted-in serving loop whose handler panics unrenderably.
+	desc := newUnrenderablePanicService()
+	pc := newPanicController(true)
+	dispatcher := rpcruntime.NewDispatcher()
+	dispatcher.Register(desc.ServiceID, newServiceHandler(registeredService{desc: desc}, codec.Proto{}, pc))
+
+	clientTr, pluginTr := newInProcessTransportPairForTest(t)
+	serveResult := make(chan error, 1)
+	go func() {
+		serveResult <- runServeLoop(context.Background(), pluginTr, codec.Proto{}, dispatcher, nil, pc, nil)
+	}()
+	cc := newClientConn("p", rpcruntime.NewTable(firstGeneration), clientTr, codec.Proto{})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	// When the client invokes the panicking method.
+	err := cc.Invoke(ctx, "panic.Svc", "Boom", wrapperspb.String("x"), &wrapperspb.StringValue{})
+
+	// Then the call still terminates with the panic outcome, naming the type the
+	// reply could not render.
+	var panicErr *PluginPanicError
+	require.ErrorAs(t, err, &panicErr)
+	require.Contains(t, panicErr.Value, "unrenderableHandlerPanic",
+		"a panic value that cannot be rendered must still reach the caller by type")
+
+	// ...the serve loop keeps running...
+	select {
+	case res := <-serveResult:
+		t.Fatalf("serve loop must keep serving when opted in, got %v", res)
+	default:
+	}
+
+	// ...and a subsequent call succeeds on the same connection.
+	resp := &wrapperspb.StringValue{}
+	require.NoError(t, cc.Invoke(ctx, "panic.Svc", "Echo", wrapperspb.String("hi"), resp))
+	require.Equal(t, "hi", resp.GetValue())
+}

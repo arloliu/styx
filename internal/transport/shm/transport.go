@@ -14,6 +14,7 @@ import (
 
 	"github.com/arloliu/styx/internal/arena"
 	"github.com/arloliu/styx/internal/event"
+	"github.com/arloliu/styx/internal/panics"
 	"github.com/arloliu/styx/internal/ring"
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/transport"
@@ -1166,6 +1167,14 @@ func protectedConsume(
 	// re-enters callback code (its Error method), and a panic there must not
 	// silently re-attribute a peer fault to this side: attribution decides the arm
 	// (shm-abi.md §9), and losing it would leave a non-conformant region trusted.
+	//
+	// That same re-entry has a second consequence, and both arms below answer it by
+	// rendering through panics.Text rather than fmt. A render that fmt cannot
+	// complete re-raises from inside this deferred recover, where nothing is left to
+	// catch it, and the runtime answers a panic it cannot print with an
+	// unrecoverable throw — turning the barrier that exists to contain a callback
+	// panic into the thing that kills the process. The guarded render runs BEFORE the
+	// truncation, so the bound applies to text this side produced.
 	blamesPeer := false
 	defer func() {
 		r := recover()
@@ -1177,14 +1186,14 @@ func protectedConsume(
 		if blamesPeer {
 			fault = consumeMalformed
 			err = fmt.Errorf("%w: %w: reporting the fault panicked: %s",
-				errBadFrame, transport.ErrPayloadMalformed, truncateFaultDetail(fmt.Sprint(r)))
+				errBadFrame, transport.ErrPayloadMalformed, truncateFaultDetail(panics.Text(r)))
 
 			return
 		}
 		fault = consumeFaulted
 		err = &transport.ConsumeFaultError{
 			CallID: d.CallID(), Kind: tk, Panicked: true,
-			Detail: truncateFaultDetail(fmt.Sprint(r)), Stack: debug.Stack(),
+			Detail: truncateFaultDetail(panics.Text(r)), Stack: debug.Stack(),
 		}
 	}()
 

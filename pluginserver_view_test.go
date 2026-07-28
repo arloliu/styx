@@ -675,20 +675,26 @@ func TestRunServeLoop_ContainsAPanickingRequestConstructor(t *testing.T) {
 
 // hugeErrorCodec fails every decode with an error far longer than any status reply
 // should carry.
+//
+// The rune is deliberately three bytes wide. maxDecodeFaultBytes is 512, which is
+// not a multiple of three, so the byte the bound lands on is mid-rune and the
+// truncation's backoff is actually exercised — with a one- or two-byte rune the
+// bound would already fall on a rune start and the backoff would never run, leaving
+// the test green with that half of the production code deleted.
 type hugeErrorCodec struct{ codec.Proto }
 
 func (hugeErrorCodec) Unmarshal([]byte, proto.Message) error {
-	return errors.New(strings.Repeat("é", 4096) + "tail")
+	return errors.New(strings.Repeat("€", 4096) + "tail")
 }
 
-// Test a decode fault's text being bounded before it becomes a status reply.
+// Test a decode fault's text being bounded before it becomes a status reply, and cut
+// at a rune boundary when it is.
 //
 // A decoder is free to return an error of any length — one that embeds the payload
 // it was handed renders the whole frame — and that text becomes a frame this plugin
 // must be able to send. Unbounded, one undecodable request could produce a reply too
 // large to publish, whose send failure stops the serve loop: a dead session from a
-// single bad frame. The cut backs off to a rune start, so it never splits a rune
-// that was whole in the input.
+// single bad frame.
 func TestDecodeUnaryRequest_BoundsTheFaultText(t *testing.T) {
 	deps := newViewTestDeps(t, hugeErrorCodec{}, newViewTestService(func(*wrapperspb.BytesValue) {}))
 
@@ -697,7 +703,107 @@ func TestDecodeUnaryRequest_BoundsTheFaultText(t *testing.T) {
 		Payload: []byte("rejected"),
 	}, true)
 
-	require.LessOrEqual(t, len(req.DecodeFault), maxDecodeFaultBytes+len("... (truncated)"))
-	require.True(t, strings.HasSuffix(req.DecodeFault, "... (truncated)"), "a clipped reason must say so")
+	const elision = "... (truncated)"
+	require.True(t, strings.HasSuffix(req.DecodeFault, elision), "a clipped reason must say so")
+	require.LessOrEqual(t, len(req.DecodeFault), maxDecodeFaultBytes+len(elision))
+
+	// The kept prefix is strictly shorter than the bound: the bound lands mid-rune, so
+	// a cut that did not back off would keep exactly maxDecodeFaultBytes bytes and
+	// split a rune that arrived whole.
+	kept := strings.TrimSuffix(req.DecodeFault, elision)
+	require.Less(t, len(kept), maxDecodeFaultBytes, "the cut must back off to a rune start")
 	require.True(t, utf8.ValidString(req.DecodeFault), "the cut must not split a rune that was whole")
+}
+
+// Test the frame the serve loop leaves in its cleared receive scratch routing
+// nowhere.
+//
+// The scratch is only ever read after a receive that overwrote it, so this value is
+// not reachable today. It is chosen anyway for what it would do if that ever changed:
+// a zero transport.Frame is a FrameUnaryReq, so clearing to the zero value would
+// leave a synthetic request for call 0 of service 0 — which the loop would answer
+// with an unsolicited status frame rather than ignore. This pins the sentinel against
+// every arm of the loop's routing switch.
+func TestClearReceiveScratch_LeavesAFrameThatRoutesNowhere(t *testing.T) {
+	deps := newServeDeps(nil, codec.Proto{}, rpcruntime.NewDispatcher(), nil, nil, nil)
+	deps.frame = transport.Frame{CallID: 9, Kind: transport.FrameUnaryReq, Payload: []byte("stale")}
+	deps.req = rpcruntime.Request{Msg: &wrapperspb.BytesValue{}}
+
+	deps.clearReceiveScratch()
+
+	require.Zero(t, deps.req, "a cleared scratch carries no request")
+	require.Nil(t, deps.frame.Payload)
+	require.NotEqual(t, transport.FrameUnaryReq, deps.frame.Kind,
+		"a cleared frame must not read as a request the loop would dispatch")
+	require.False(t, isStreamKind(deps.frame.Kind), "nor as a stream frame the stream half would route")
+	require.NotEqual(t, transport.FrameCancel, deps.frame.Kind, "nor as a cancel")
+	require.Empty(t,
+		rpcruntime.NewDispatcher().Dispatch(t.Context(), deps.frame, rpcruntime.Request{}, time.Now()),
+		"the dispatcher must discard it, so nothing is ever sent for a frame that was never received")
+}
+
+// unrenderablePanic panics again while being rendered, and panics with itself, so the
+// second render panics too.
+//
+// That second level is the point. fmt catches a panic in a value's own String method
+// once and prints a placeholder, but re-panics when rendering THAT panic value panics
+// in turn — and the render runs inside the deferred recover that is the decode fault
+// barrier, so a re-panic there unwinds straight out of the consume callback.
+type unrenderablePanic struct{}
+
+func (unrenderablePanic) String() string { panic(unrenderablePanic{}) }
+
+// Test a panic value that cannot be rendered still being contained and answered.
+//
+// This is the last way a hand-written descriptor could reach the outcomes the fault
+// barrier exists to prevent: not by panicking, which the barrier catches, but by
+// panicking with something whose rendering panics — inside the barrier's own recover,
+// where nothing else is watching.
+func TestRunServeLoop_ContainsAPanicValueThatCannotBeRendered(t *testing.T) {
+	pair, err := shmtest.NewInProcessPair(firstGeneration, shmtest.DefaultConfig())
+	require.NoError(t, err)
+
+	desc := &ServiceDesc{
+		ServiceName: "view.Svc",
+		ServiceID:   viewServiceID,
+		Methods: []MethodDesc{{
+			MethodName: "Take",
+			MethodID:   viewMethodID,
+			NewRequest: func() proto.Message { panic(unrenderablePanic{}) },
+			Handler: func(any, context.Context, proto.Message) (proto.Message, error) {
+				return &wrapperspb.BytesValue{}, nil
+			},
+		}},
+	}
+	d := rpcruntime.NewDispatcher()
+	d.Register(desc.ServiceID, newServiceHandler(registeredService{desc: desc}, codec.Proto{}, nil))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = runServeLoop(context.Background(), pair.Plugin, codec.Proto{}, d, nil, nil, nil)
+	}()
+	t.Cleanup(func() { _ = pair.Close(); <-done })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	require.NoError(t, pair.Host.Send(ctx, transport.Frame{
+		CallID: 5, Kind: transport.FrameUnaryReq, Service: viewServiceID, Method: viewMethodID,
+		Payload: []byte("a request whose panic value cannot be rendered"),
+	}))
+
+	reply, err := pair.Host.Recv(ctx)
+	require.NoError(t, err)
+	require.Equal(t, transport.FrameUnaryErr, reply.Kind)
+	require.Equal(t, uint64(5), reply.CallID)
+	require.NotNil(t, reply.Status)
+	require.Equal(t, rpcruntime.StatusCodeInternal, reply.Status.Code)
+	require.Contains(t, reply.Status.Message, "unrenderable",
+		"the fault names what it could not render, by type rather than by value")
+
+	faults, ok := any(pair.Plugin).(interface{ ConsumeFaults() uint64 })
+	require.True(t, ok, "the shared-memory transport must report consume faults")
+	require.Zero(t, faults.ConsumeFaults(),
+		"an unrenderable panic value must be answered, not declined into the escalation run")
 }

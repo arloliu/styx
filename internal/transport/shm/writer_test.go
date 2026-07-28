@@ -3182,3 +3182,42 @@ func TestWriter_RejectsFillOnDescriptorOnlyKind(t *testing.T) {
 	require.False(t, ran.Load())
 	require.True(t, i.fill.abandon())
 }
+
+// Test the fill barrier surviving a panic value it cannot render.
+//
+// runFill recovers a panicking fill callback and renders the value into the error
+// it hands back — and rendering calls the callback's own String method, re-entered
+// from inside the deferred recover. When fmt cannot complete that render it
+// re-raises with nothing beneath it, and the runtime answers a panic it cannot
+// print by throwing, which no recover intercepts. The barrier that keeps a
+// panicking codec to one frame would instead take down the writer goroutine and the
+// process with it.
+//
+// This test dies with the whole test binary if that regresses, rather than failing
+// an assertion.
+func TestWriter_SurvivesAFillPanicValueItCannotRender(t *testing.T) {
+	// Given a running writer over a real ring and arena, at a known occupancy.
+	ra := realArena(t)
+	rr := &recordRing{}
+	w := newWriterFromParts(rr, ra, 2, 2, admitBlock)
+	w.start()
+	t.Cleanup(w.stop)
+
+	baseline := ra.OccupancyBytes()
+
+	// When a fill callback panics with a value whose rendering panics in turn.
+	err := w.submitFill(t.Context(), dataReqFrame(1), 16, func([]byte) error {
+		panic(unrenderablePanic{})
+	})
+
+	// Then the panic is still reported to that frame's caller, naming the type it
+	// could not render.
+	require.ErrorIs(t, err, errFillPanic)
+	require.ErrorContains(t, err, "unrenderablePanic",
+		"a value that cannot be rendered must still be identified by type")
+
+	// And the slab is freed and the writer goroutine survived.
+	require.Equal(t, baseline, ra.OccupancyBytes(), "a panicking fill must not strand its slab")
+	require.NoError(t, w.submit(t.Context(),
+		transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq, Payload: []byte("still publishing")}, laneData))
+}
