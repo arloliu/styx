@@ -840,10 +840,12 @@ func (t *Transport) Recv(ctx context.Context) (transport.Frame, error) {
 // rendered from what the callback produced, never the callback's own value.
 //
 // Not every frame arrives as a view. A frame carrying the CRC32C_PRESENT flag is
-// copied out and verified over that private copy, a streaming frame is copied
-// because its payload outlives the receive loop, and a payload below the internal
-// in-place threshold is copied because the copy is cheaper than the borrow.
-// consume cannot tell, and correct callback code does not need to.
+// copied out and verified over that private copy, and a payload below the internal
+// in-place threshold is copied because the copy is cheaper than the borrow. The
+// frame's kind decides nothing: a streaming payload is lent like any other, and a
+// callback that queues one for a consumer goroutine owns the copy, exactly as the
+// borrow rule above already required of it. consume cannot tell which frames were
+// lent, and correct callback code does not need to.
 //
 // It takes no reservation; RecvViewConsumeReserving is the entry point that does.
 // ConsumeFaults counts the frames a failing consume cost.
@@ -1035,7 +1037,7 @@ func (t *Transport) consumeDescriptor(
 
 	var span []byte
 	if !descriptorOnly {
-		if span, err = t.payloadBytes(d, tk, consume != nil); err != nil {
+		if span, err = t.payloadBytes(d, consume != nil); err != nil {
 			return transport.Frame{}, false, err
 		}
 	}
@@ -1320,11 +1322,11 @@ func (t *Transport) classify(d ring.Descriptor) (tk transport.FrameKind, descrip
 // all: only a consume callback can, since a frame returned from Recv outlives the
 // slab.
 //
-// Two cases never yield a view regardless. A frame carrying CRC32C_PRESENT is
+// One case never yields a view regardless: a frame carrying CRC32C_PRESENT is
 // copied out and verified over that private copy, so that the bytes checked are
-// the bytes interpreted (§9). A streaming frame is copied because its payload is
-// queued for a goroutine that reads it long after the receive loop has moved on.
-func (t *Transport) payloadBytes(d ring.Descriptor, tk transport.FrameKind, viewWanted bool) ([]byte, error) {
+// the bytes interpreted (§9). Nothing else keys on the frame's kind — see
+// viewEligible for why a streaming payload is borrowed like any other.
+func (t *Transport) payloadBytes(d ring.Descriptor, viewWanted bool) ([]byte, error) {
 	off := uint64(d.PayloadOffset())
 	plen := uint64(d.PayloadLength())
 
@@ -1388,7 +1390,7 @@ func (t *Transport) payloadBytes(d ring.Descriptor, tk transport.FrameKind, view
 		return payload, nil
 	}
 
-	if !viewEligible(tk, plen, viewWanted, t.inPlaceMin) {
+	if !viewEligible(plen, viewWanted, t.inPlaceMin) {
 		payload := make([]byte, plen)
 		copy(payload, slab)
 
@@ -1404,34 +1406,24 @@ func (t *Transport) payloadBytes(d ring.Descriptor, tk transport.FrameKind, view
 //
 // A view is only ever safe when its lifetime is bounded, which viewWanted carries:
 // a consume callback ends before the head advances, while a frame returned from
-// Recv outlives the slab entirely. Streaming frames are excluded because their
-// payloads outlive the receive loop by design — a stream message is handed to a
-// consumer goroutine that reads it long after this frame's slot is gone. Below
-// minBytes the copy is delivered instead, since a short copy costs less than the
-// borrow buys.
-func viewEligible(tk transport.FrameKind, plen uint64, viewWanted bool, minBytes uint64) bool {
-	if !viewWanted || isStreamKind(tk) {
+// Recv outlives the slab entirely. Below minBytes the copy is delivered instead,
+// since a short copy costs less than the borrow buys.
+//
+// The frame's kind does not enter into it, streaming kinds included. A stream
+// payload does outlive the receive loop — it is queued for a consumer goroutine —
+// but that is the callback's problem to solve and the callback is already required
+// to solve it: the transport.ViewReceiver contract says consume must copy or
+// decode everything it needs and retain nothing, for every frame, because a
+// callback is never told which frames were borrowed. Copying such a frame here
+// would not make a forgetful callback correct; it would only add a second copy
+// under a careful one, which is what a callback that clones what it queues
+// already pays for.
+func viewEligible(plen uint64, viewWanted bool, minBytes uint64) bool {
+	if !viewWanted {
 		return false
 	}
 
 	return plen >= minBytes
-}
-
-// isStreamKind reports whether a frame kind belongs to the streaming protocol
-// (stream-protocol.md §2.1). Enumerated rather than range-checked so removing a
-// kind becomes a compile error, not a silent narrowing.
-//
-//nolint:revive // identical-switch-branches: explicit enumeration catches removals
-func isStreamKind(tk transport.FrameKind) bool {
-	switch tk {
-	case transport.FrameStreamOpen, transport.FrameStreamMsg, transport.FrameStreamAck,
-		transport.FrameStreamClose, transport.FrameStreamErr:
-		return true
-	case transport.FrameUnaryReq, transport.FrameUnaryResp, transport.FrameCancel, transport.FrameUnaryErr:
-		return false
-	default:
-		return false
-	}
 }
 
 // descriptorOnlyFrame assembles the delivered frame for a validated CANCEL or

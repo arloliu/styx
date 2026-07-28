@@ -115,6 +115,12 @@ func newUnavailableClientConn(name string) *ClientConn {
 	return &ClientConn{name: name}
 }
 
+// errNilResponseFactory is returned by InvokeIDFactory when it is handed no
+// factory. It is a caller mistake rather than a call outcome, so it is not part
+// of the styx error taxonomy IsRetryable classifies: nothing was submitted, and
+// retrying the same call with the same nil factory would fail identically.
+var errNilResponseFactory = errors.New("styx: invoke: nil response factory")
+
 // translateCtxErr maps a context error observed locally — ctx already
 // done before Invoke could submit a call, or wait's wctx firing while a
 // call was still outstanding — to the styx taxonomy.
@@ -127,13 +133,32 @@ func translateCtxErr(err error) error {
 }
 
 // translateResult converts a terminal rpcruntime.Result into a styx error
-// (or nil on success), decoding a successful Payload into resp via cdc.
-// The two rpcruntime-local sentinels (ErrCanceledLocally,
-// ErrDeadlineExceeded) map to their styx equivalents; any other
-// Result.Err is already a styx.Err* value, since Invoke never hands the
-// Table anything else — the "translate at the public-API boundary"
-// pattern also used for IncompatibleError/HandshakeOffer.
+// (or nil on success), decoding a successful Payload into resp via cdc. It is the
+// entry points' half that decodes on the calling goroutine, so the response bytes
+// it reads are the caller's own and outlive nothing.
 func translateResult(result rpcruntime.Result, cdc codec.Codec, resp proto.Message) error {
+	if err := terminalError(result); err != nil {
+		return err
+	}
+
+	if err := cdc.Unmarshal(result.Payload, resp); err != nil {
+		return fmt.Errorf("styx: invoke: unmarshal response: %w", err)
+	}
+
+	return nil
+}
+
+// terminalError maps a Result that is not a successful response to the styx error
+// its caller sees, or returns nil for one that is. It is the half of result
+// translation that does not depend on how the response is carried, so both the
+// caller-decoded and the runtime-decoded entry points share it and cannot drift
+// apart in how they classify a cancellation, a deadline, or an application status.
+//
+// The two rpcruntime-local sentinels (ErrCanceledLocally, ErrDeadlineExceeded) map
+// to their styx equivalents; any other Result.Err is already a styx.Err* value,
+// since this package never hands the Table anything else — the "translate at the
+// public-API boundary" pattern also used for IncompatibleError/HandshakeOffer.
+func terminalError(result rpcruntime.Result) error {
 	switch {
 	case errors.Is(result.Err, rpcruntime.ErrCanceledLocally):
 		return ErrCanceled
@@ -147,11 +172,48 @@ func translateResult(result rpcruntime.Result, cdc codec.Codec, resp proto.Messa
 		return statusFromRPC(result.Status)
 	}
 
-	if err := cdc.Unmarshal(result.Payload, resp); err != nil {
-		return fmt.Errorf("styx: invoke: unmarshal response: %w", err)
+	return nil
+}
+
+// responseFromResult reports the message a runtime-decoded call resolved to. The
+// receive path decoded it and transferred it on the result channel, so this only
+// converts a non-success terminal into the caller's error and hands the message
+// over otherwise.
+//
+// A success always carries a message: the receive path is the only producer of a
+// terminal for a call registered with a factory, and it either decodes into the
+// factory's message or fails the call. A success without one would mean the
+// response was delivered as bytes to a caller with nothing to decode them into,
+// which is an internal inconsistency rather than a call outcome, so it is reported
+// as one instead of being papered over with an empty message.
+func responseFromResult(result rpcruntime.Result) (proto.Message, error) {
+	if err := terminalError(result); err != nil {
+		return nil, err
 	}
 
-	return nil
+	if result.Msg == nil {
+		return nil, fmt.Errorf("styx: invoke: response carried no message: %w", ErrOutcomeUnknown)
+	}
+
+	return result.Msg, nil
+}
+
+// decodeResponseErr renders a failed response decode as the terminal error of the
+// call it answered.
+//
+// It carries ErrOutcomeUnknown because the peer ran the handler and answered: what
+// the handler did stands, and the one conclusion a caller must not draw is that
+// the call never happened. Retrying it would run the handler a second time.
+//
+// The decoder's error is rendered to text rather than wrapped, because this runs
+// on the receive path with the payload still borrowed, and an error a decoder
+// built from bytes it was handed would otherwise travel out to a caller that keeps
+// it long after the transport has reclaimed them. Formatting the rendering copies
+// it into a string of this error's own, so the text survives and the reference
+// does not — the same containment the transport applies to a consume fault's
+// detail, for the same reason.
+func decodeResponseErr(err error) error {
+	return fmt.Errorf("styx: invoke: decode response: %s: %w", err.Error(), ErrOutcomeUnknown)
 }
 
 // statusFromRPC converts a package-local rpcruntime.Status (transport-
@@ -237,12 +299,41 @@ func (state *connState) escalatePoison() {
 	}
 }
 
+// inboundFault is what the read loop must do about a frame it has just handled.
+// Handling runs on the receive path — inside the consume callback when the loop
+// receives through transport.ViewReceiver — and tearing the connection down there
+// is not something a consume callback may do: its error return is a disposition
+// selector the transport reads, never a channel back to this loop. So the handler
+// reports its decision and the loop performs it once the receive call has
+// returned and the frame's buffer is no longer borrowed.
+type inboundFault uint8
+
+const (
+	// inboundNoFault means the frame was handled and the connection keeps serving.
+	inboundNoFault inboundFault = iota
+	// inboundStreamFeatureAbsent means a STREAM_* frame — or a stream-teardown
+	// CANCEL — arrived on a generation that negotiated no streaming half, which is
+	// fail-closed (stream-protocol.md §11.2).
+	inboundStreamFeatureAbsent
+	// inboundStreamConformance means a conformance violation on a LIVE stream,
+	// where there is no such thing as a late or out-of-order frame
+	// (stream-protocol.md §8.1).
+	inboundStreamConformance
+)
+
 // runReadLoop drains response frames for one connection generation from
 // state.tr, completing outstanding calls in state.table. It runs until
 // Recv returns a terminal error (the transport closed, locally or by the
 // peer) and then exits. internal/lifecycle owns starting and
 // joining this goroutine as part of teardown once it exists; until then a
 // ClientConn's read loop simply runs until its Transport is closed.
+//
+// Where the transport can hand a frame over as a borrowed view of its own memory
+// (transport.ViewReceiver), the loop receives that way and handles each frame
+// inside the callback, so a response is decoded before the transport reclaims the
+// bytes it was decoded from. Everything the callback produces either stays on
+// this goroutine or crosses to a caller through the call table's result channel;
+// nothing that could alias the borrowed bytes outlives the callback.
 func runReadLoop(state *connState) {
 	// cause is the outcome the streaming half fails every open stream with when
 	// the read loop exits: a peer close/crash or a poisoned connection. It is
@@ -283,6 +374,25 @@ func runReadLoop(state *connState) {
 		}
 	}()
 
+	// The consume callback and this loop share fault rather than communicating
+	// through the callback's return value: that return is a disposition selector
+	// the transport reads to decide the frame's fate, and the transport renders it
+	// to text and drops it, so nothing encoded in it would survive
+	// (transport.ViewReceiver). Both are hoisted out of the loop so receiving
+	// allocates no closure per frame.
+	var fault inboundFault
+	consume := func(f transport.Frame) error {
+		fault = state.handleInboundFrame(f, true)
+
+		// Every frame that reaches here is one this side finished with — it
+		// completed a call, failed one, or was deliberately dropped because nothing
+		// was waiting on it. None of those is a frame this side could not take while
+		// a call still depended on it, so none of them declines, and returning nil
+		// is what reports them consumed (shm-abi.md §9).
+		return nil
+	}
+	viewRecv := state.viewReceiver()
+
 	for {
 		// Signal an owed drain boundary before blocking on the next Recv: a stream
 		// frame dispatched on an earlier iteration is detected drained however many
@@ -293,7 +403,17 @@ func runReadLoop(state *connState) {
 			state.streams.probeDrain()
 		}
 
-		f, err := state.tr.Recv(context.Background())
+		var err error
+		fault = inboundNoFault
+		if viewRecv != nil {
+			err = viewRecv.RecvViewConsume(context.Background(), consume)
+		} else {
+			var f transport.Frame
+			if f, err = state.tr.Recv(context.Background()); err == nil {
+				fault = state.handleInboundFrame(f, false)
+			}
+		}
+
 		if err != nil {
 			if isFrameLocalRecvErr(err) {
 				// A malformed status body, an unimplemented-kind frame, or a consume
@@ -316,63 +436,228 @@ func runReadLoop(state *connState) {
 			return
 		}
 
-		//exhaustive:ignore -- FrameUnaryReq flows host->plugin only and never arrives
-		// here; the streaming kinds and stream-teardown CANCEL route to the stream
-		// table; the trailing comment documents the discard of anything else.
-		switch {
-		case f.Kind == transport.FrameUnaryResp:
-			if !state.table.Complete(f.CallID, f.Payload) {
-				notifyDiscardedUnaryResponse(f.CallID) // late or duplicate: the call was already terminal
-			}
-		case f.Kind == transport.FrameUnaryErr:
-			// An error response: fail the call with the carried
-			// status. Fail is a no-op for an already-terminal/unknown CallID,
-			// the same late-frame-discard rule Complete follows.
-			if !state.table.Fail(f.CallID, statusFromFrame(f.Status)) {
-				notifyDiscardedUnaryResponse(f.CallID)
-			}
-		case state.streams == nil && isFeatureAbsentStreamFrame(f):
-			// Feature-absent, fail-closed (stream-protocol.md §11.2): this
-			// generation negotiated no streaming half, so any STREAM_* frame (or a
-			// stream-teardown CANCEL) a peer puts on the wire is a conformance
-			// violation. Poison the connection rather than discarding it.
+		if fault != inboundNoFault {
 			cause = ErrPoisoned
-			stopTransportWriter(state.tr)
+			state.stopWriterOnFault(fault)
 
 			return
-		case state.streams != nil && (isStreamDataFrame(f.Kind) || f.Kind == transport.FrameCancel):
-			// A CANCEL is routed here whenever streaming is negotiated; dispatchStreamFrame
-			// decides its disposition by call-ID lookup — a live stream makes it a teardown
-			// (whose discriminant, 0 or illegal, poisons), any other call ID discards it.
-			// The host never receives a unary CANCEL, so no unary path is bypassed.
-			if derr := state.streams.dispatchStreamFrame(f); derr != nil {
-				// A conformance violation on a LIVE stream: there is no such thing as
-				// a late or out-of-order frame there, so poison the connection
-				// (stream-protocol.md §8.1). stopWriter marks the table closing and
-				// stops the writer, unblocking any parked lifecycle Send WITHOUT
-				// releasing the mapped region, so the deferred teardown's finisher
-				// join completes before the region is released — the peer-crash
-				// teardown ordering (§9), carried structurally by
-				// transport.WriterStopper. Marking closing before the stop keeps a
-				// released finisher from recording a false Fatal during this teardown.
-				cause = ErrPoisoned
-				state.streams.stopWriter()
-
-				return
-			}
-			// A dispatched DATA frame leaves the §4.6 drain boundary OWED; the
-			// top-of-loop probeDrain signals it once the inbound queue empties, however
-			// many non-stream frames follow. A lifecycle CANCEL is not a receive-queue
-			// event, so it owes nothing.
-			if isStreamDataFrame(f.Kind) {
-				state.streams.drainOwedMark()
-			}
 		}
-		// Any other Kind (a unary CANCEL flowing plugin->host, which is never
-		// sent, or something unexpected from an adversarial peer) is
-		// discarded — the same late-frame-discard posture Table and
-		// Dispatcher already document for unrecognized or late frames.
 	}
+}
+
+// handleInboundFrame routes one inbound frame to the half of this generation that
+// owns it, and reports whether the frame poisoned the connection.
+//
+// It runs inside the transport's closing gate on the receive path, so it MUST NOT
+// issue a transport Send or Close. A receive holds that gate's read side for its
+// whole call; a Send from here would take the same read side recursively, which
+// deadlocks the moment a Close is waiting on the write side, and a Close from here
+// waits on the receive that is calling it.
+//
+// Nothing on this path issues either today, and it takes two separate mechanisms to
+// keep it that way, so a change to either is what would break this. The stream
+// engine's terminal CANCEL is sent only from a locally initiated terminal, and an
+// inbound frame never produces one. Its other synchronous sends — the STREAM_ACK
+// and the CANCEL an ack resolution hands off, and the emitter's STREAM_ERR — are
+// kept off this stack instead by running on their own goroutines, so a change that
+// made any of them run inline on the dispatching goroutine would reach here. The
+// poison arms report a fault rather than acting on the transport, and the loop stops
+// the writer after the receive has returned.
+//
+// borrowed says whether f's Payload may alias memory the transport reclaims the
+// moment this returns. It is a property of how the frame was received, not of the
+// frame: a transport handing frames to a consume callback may pass a private copy
+// for any given frame and does not say which it did, so every frame received that
+// way is treated as borrowed. Nothing that outlives this call may hold those bytes
+// — the stream half queues a payload for a consumer goroutine, so its copy is
+// taken here, and a unary response is either decoded or copied by
+// completeUnaryResponse.
+func (state *connState) handleInboundFrame(f transport.Frame, borrowed bool) inboundFault {
+	//exhaustive:ignore -- FrameUnaryReq flows host->plugin only and never arrives
+	// here; the streaming kinds and stream-teardown CANCEL route to the stream
+	// table; the trailing comment documents the discard of anything else.
+	switch {
+	case f.Kind == transport.FrameUnaryResp:
+		state.completeUnaryResponse(f, borrowed)
+	case f.Kind == transport.FrameUnaryErr:
+		// An error response: fail the call with the carried
+		// status. Fail is a no-op for an already-terminal/unknown CallID,
+		// the same late-frame-discard rule Complete follows.
+		// The status is never borrowed whatever the payload was: a transport decodes
+		// a status body into values of its own (message and details both copied out)
+		// before it ever reaches a frame.
+		if !state.table.Fail(f.CallID, statusFromFrame(f.Status)) {
+			notifyDiscardedUnaryResponse(f.CallID)
+		}
+	case state.streams == nil && isFeatureAbsentStreamFrame(f):
+		// Feature-absent, fail-closed (stream-protocol.md §11.2): this
+		// generation negotiated no streaming half, so any STREAM_* frame (or a
+		// stream-teardown CANCEL) a peer puts on the wire is a conformance
+		// violation. Poison the connection rather than discarding it.
+		return inboundStreamFeatureAbsent
+	case state.streams != nil && (isStreamDataFrame(f.Kind) || f.Kind == transport.FrameCancel):
+		// A stream payload is queued for the goroutine that will read it long after
+		// this frame's buffer is gone, so a borrowed one is copied first. f is a
+		// value, so this rebinding is local to this call.
+		if borrowed {
+			f.Payload = clonePayload(f.Payload)
+		}
+		// A CANCEL is routed here whenever streaming is negotiated; dispatchStreamFrame
+		// decides its disposition by call-ID lookup — a live stream makes it a teardown
+		// (whose discriminant, 0 or illegal, poisons), any other call ID discards it.
+		// The host never receives a unary CANCEL, so no unary path is bypassed.
+		if derr := state.streams.dispatchStreamFrame(f); derr != nil {
+			return inboundStreamConformance
+		}
+		// A dispatched DATA frame leaves the §4.6 drain boundary OWED; the
+		// top-of-loop probeDrain signals it once the inbound queue empties, however
+		// many non-stream frames follow. A lifecycle CANCEL is not a receive-queue
+		// event, so it owes nothing.
+		if isStreamDataFrame(f.Kind) {
+			state.streams.drainOwedMark()
+		}
+	}
+	// Any other Kind (a unary CANCEL flowing plugin->host, which is never
+	// sent, or something unexpected from an adversarial peer) is
+	// discarded — the same late-frame-discard posture Table and
+	// Dispatcher already document for unrecognized or late frames.
+
+	return inboundNoFault
+}
+
+// completeUnaryResponse terminates the call a UNARY_RESP answers, in whichever of
+// the two forms that call registered at submit time.
+//
+// A call with a response factory is decoded here, on the receive goroutine, and
+// completed with the message: that is the whole point of receiving through a
+// borrowed view, since the decode is the last read of the payload and it finishes
+// before this returns. A call without one is completed with its bytes, which are
+// copied first when they are borrowed — a caller-supplied response message is
+// never decoded on this goroutine, because the caller holds it and could read it
+// while this decoded into it.
+//
+// A frame naming no live call is dropped without constructing or decoding
+// anything. That is not a failure: nothing is waiting on it, so nothing needs
+// failing, and reporting it as one would count healthy traffic as a fault
+// (shm-abi.md §9).
+func (state *connState) completeUnaryResponse(f transport.Frame, borrowed bool) {
+	newResp, live := state.table.ResponseFactory(f.CallID)
+	if !live {
+		notifyDiscardedUnaryResponse(f.CallID) // late or duplicate: the call was already terminal
+
+		return
+	}
+
+	if newResp == nil {
+		payload := f.Payload
+		if borrowed {
+			payload = clonePayload(payload)
+		}
+		if !state.table.Complete(f.CallID, payload) {
+			notifyDiscardedUnaryResponse(f.CallID)
+		}
+
+		return
+	}
+
+	msg := newResp()
+	if msg == nil {
+		// A factory that builds nothing leaves this call with no possible answer.
+		// Failing it here is what keeps it from waiting out its whole deadline.
+		if !state.table.OutcomeUnknown(f.CallID,
+			fmt.Errorf("styx: invoke: response factory returned no message: %w", ErrOutcomeUnknown)) {
+			notifyDiscardedUnaryResponse(f.CallID)
+		}
+
+		return
+	}
+
+	if err := state.codec.Unmarshal(f.Payload, msg); err != nil {
+		// A response this side cannot decode fails ITS call and nothing else.
+		//
+		// It is not attributed to the peer, because attribution under shm-abi.md §9
+		// must be a decision and not a default: a consume step reports the peer's
+		// bytes malformed only by naming them as the cause, and this one cannot —
+		// the decode it ran was selected by a message type this side chose. What
+		// makes the default the right one here is blast radius. Condemning the
+		// region fails every call in flight on it and every call after, repeatedly,
+		// where failing this one call costs one call and leaves the connection
+		// serving.
+		//
+		// The call is discharged here rather than declined, so the frame is one this
+		// side finished with (§9): declining is for a frame this side could not take
+		// while a call still depended on it, and nothing depends on this one once it
+		// is failed.
+		if !state.table.OutcomeUnknown(f.CallID, decodeResponseErr(err)) {
+			notifyDiscardedUnaryResponse(f.CallID)
+		}
+
+		return
+	}
+
+	if !state.table.CompleteMsg(f.CallID, msg) {
+		notifyDiscardedUnaryResponse(f.CallID)
+	}
+}
+
+// clonePayload returns a private copy of borrowed payload bytes, or nil for an
+// empty payload (there is nothing to alias, and an empty Payload and a nil one are
+// indistinguishable to every consumer of a Frame).
+func clonePayload(payload []byte) []byte {
+	if len(payload) == 0 {
+		return nil
+	}
+
+	out := make([]byte, len(payload))
+	copy(out, payload)
+
+	return out
+}
+
+// viewReceiver reports the capability this generation's read loop receives
+// through, or nil to receive frames the ordinary way.
+//
+// Two things must both hold. The transport must be able to hand a frame over as a
+// borrowed view at all, and the negotiated codec must decode into values that own
+// their bytes (codec.OwningUnmarshaler) — a codec that decodes lazily would leave
+// the response message pointing into the peer's memory, which the transport
+// reclaims as soon as the callback returns. A codec that does not answer for
+// itself is assumed not to, so the borrow is simply not taken and every frame
+// arrives as a private copy, exactly as before.
+func (state *connState) viewReceiver() transport.ViewReceiver {
+	vr, ok := state.tr.(transport.ViewReceiver)
+	if !ok {
+		return nil
+	}
+
+	owning, ok := state.codec.(codec.OwningUnmarshaler)
+	if !ok || !owning.DecodedMessageOwnsBytes() {
+		return nil
+	}
+
+	return vr
+}
+
+// stopWriterOnFault stops this generation's outbound writer for a fault that
+// poisons the connection, in the form the fault calls for. Both stop the writer
+// WITHOUT releasing the transport's mapped region, so the deferred teardown's
+// finisher join completes before the region is released — the peer-crash teardown
+// ordering (stream-protocol.md §9), carried structurally by
+// transport.WriterStopper.
+//
+// A conformance violation on a live stream additionally marks the stream table
+// closing first, which keeps a released finisher from recording a false Fatal
+// during this teardown. A feature-absent stream frame has no stream table to mark.
+func (state *connState) stopWriterOnFault(fault inboundFault) {
+	// inboundStreamConformance is only ever returned from the arm guarded by a
+	// non-nil streams, so the streaming half exists whenever it is seen.
+	if fault == inboundStreamConformance {
+		state.streams.stopWriter()
+
+		return
+	}
+
+	stopTransportWriter(state.tr)
 }
 
 // translateReadLoopExit maps the transport error that ended the read loop to the
@@ -417,9 +702,16 @@ func isFrameLocalRecvErr(err error) bool {
 // already released the frame's slot and left the connection healthy, and failing
 // the call is the part only the layer holding the call table can do.
 //
-// Only a *transport.ConsumeFaultError names a call. The other frame-local classes
-// carry no call ID — their frame is the peer's to resend — so they return here
-// having touched nothing.
+// Only a *transport.ConsumeFaultError names a call, and only for the two kinds
+// whose call lives in THIS table: a unary response and a unary error response.
+// The other frame-local classes carry no call ID at all, and a fault on any other
+// kind names something this table does not hold — a stream draws from the same
+// never-reused ID space but is registered in the stream table, and a CANCEL names
+// a call the peer has already stopped waiting on. Failing on kind alone rather
+// than relying on the lookup missing is what keeps that distinction stated: the
+// gap it leaves is a discarded STREAM frame, whose stream is reaped by its own
+// deadline (a stream cannot be opened without a positive finite one), not the
+// unbounded wait a deadline-less unary call would face.
 //
 // The terminal is OUTCOME_UNKNOWN rather than a status. The peer answered and this
 // side destroyed the answer before reading it, so the handler ran and whatever it
@@ -439,6 +731,9 @@ func isFrameLocalRecvErr(err error) bool {
 func failCallOnDiscardedFrame(table *rpcruntime.Table, err error) {
 	var fault *transport.ConsumeFaultError
 	if !errors.As(err, &fault) {
+		return
+	}
+	if fault.Kind != transport.FrameUnaryResp && fault.Kind != transport.FrameUnaryErr {
 		return
 	}
 
@@ -494,16 +789,89 @@ func (c *ClientConn) InvokeID(ctx context.Context, serviceID, methodID uint64, r
 	return c.invokeByID(ctx, serviceID, methodID, req, resp)
 }
 
+// InvokeIDFactory is InvokeID for a caller that lets the runtime own the response
+// message: instead of supplying one to decode into, it supplies newResp to
+// construct one, and receives the decoded message back.
+//
+// That inversion is what lets the runtime decode a response straight out of the
+// transport's own memory, without copying the bytes out first — the decode happens
+// on the receive goroutine while those bytes are still readable, and the message
+// reaches this caller only afterwards, through the same channel every other call
+// outcome travels on. Generated unary client stubs call it and type-assert the
+// result, so the message this allocates replaces the one the stub used to allocate
+// itself.
+//
+// newResp is called at most once for the call, on the receive goroutine, and only
+// if a response arrives while the call table still holds the call — so a
+// cancelled call whose cancellation has landed costs no construction and no
+// decode. One that terminates inside the delivery window may still cost a single
+// construction and decode, whose message is then dropped undelivered. It MUST be
+// allocation-only: it holds up every later inbound frame while it runs, and it MUST
+// return a message nothing else references, since a message this caller already
+// held could be read here while the receive goroutine was still decoding into it.
+// That last requirement is exactly why Invoke and InvokeID, which take a
+// caller-supplied response message, keep decoding on the calling goroutine instead.
+//
+// The returned message is the one newResp built, and it is this caller's alone
+// and valid indefinitely: it borrows nothing from the transport, whatever memory
+// it was decoded from, and no other goroutine holds a reference to it once this
+// returns. Every error is the one the matching InvokeID call would return, plus
+// one more: a response the codec cannot decode fails this call alone, as an
+// unknown outcome, and leaves the connection serving.
+//
+// It is safe for concurrent use, like every other call on a ClientConn.
+func (c *ClientConn) InvokeIDFactory(
+	ctx context.Context, serviceID, methodID uint64, req proto.Message, newResp func() proto.Message,
+) (proto.Message, error) {
+	if newResp == nil {
+		// A caller error, refused before anything is submitted: without a factory
+		// there is no message for a response to become, and admitting the call would
+		// only turn the mistake into a call that fails once the peer answers.
+		return nil, errNilResponseFactory
+	}
+
+	result, _, err := c.invokeCore(ctx, serviceID, methodID, req, newResp)
+	if err != nil {
+		return nil, err
+	}
+
+	return responseFromResult(result)
+}
+
 // invokeByID is the shared core of Invoke and InvokeID: it submits and publishes a
-// unary request routed by the precomputed serviceID/methodID hashes.
+// unary request routed by the precomputed serviceID/methodID hashes, and decodes
+// the response bytes into the caller's own message on this goroutine.
 func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64, req, resp proto.Message) error {
+	result, cdc, err := c.invokeCore(ctx, serviceID, methodID, req, nil)
+	if err != nil {
+		return err
+	}
+
+	return translateResult(result, cdc, resp)
+}
+
+// invokeCore submits and publishes one unary request and waits for its terminal
+// Result. newResp selects how the response is carried back: nil delivers the
+// response bytes for the caller to decode, and a factory has the receive path
+// decode into the message it builds and deliver that instead.
+//
+// It returns either a Result or an error, never both: an error means the call
+// produced no terminal outcome to translate (routing gone, admission closed, a
+// request that could not be encoded or published, or the caller's own context
+// ending the wait). The codec returned alongside a Result is the one the
+// generation the call actually ran on negotiated — the same generation whose table
+// holds the call — so a caller decoding response bytes itself cannot pick up a
+// successor's codec after a hot reload.
+func (c *ClientConn) invokeCore(
+	ctx context.Context, serviceID, methodID uint64, req proto.Message, newResp func() proto.Message,
+) (rpcruntime.Result, codec.Codec, error) {
 	// Fast-fail when routing is fully detached: a torn-down or crashed instance
 	// nulls c.state, and that "unavailable" outcome takes precedence over a
 	// closed-admission "draining" outcome. This reads only whether routing is gone
 	// at this instant; the value is not retained for routing (that load is below,
 	// inside the barrier), so it cannot carry a stale predecessor past a promotion.
 	if c.state.Load() == nil {
-		return ErrPluginUnavailable
+		return rpcruntime.Result{}, nil, ErrPluginUnavailable
 	}
 
 	// The cutoff phase of a hot-reload closes admission before the running
@@ -514,7 +882,7 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 	// below, so cutoff (AdmissionGate.Close) cannot complete until this request is
 	// published: an admitted call is never left unpublished behind a cutoff.
 	if !c.admission.Enter() {
-		return ErrDrained
+		return rpcruntime.Result{}, nil, ErrDrained
 	}
 
 	// Select the routing state INSIDE the admission barrier, after Enter. Cutoff
@@ -528,13 +896,13 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 	if state == nil {
 		c.admission.Leave()
 
-		return ErrPluginUnavailable
+		return rpcruntime.Result{}, nil, ErrPluginUnavailable
 	}
 
 	if err := ctx.Err(); err != nil {
 		c.admission.Leave()
 
-		return translateCtxErr(err)
+		return rpcruntime.Result{}, nil, translateCtxErr(err)
 	}
 
 	// Prefer producing the request bytes straight into the transport's send
@@ -550,7 +918,7 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 		if err != nil {
 			c.admission.Leave()
 
-			return fmt.Errorf("styx: invoke: marshal request: %w", err)
+			return rpcruntime.Result{}, nil, fmt.Errorf("styx: invoke: marshal request: %w", err)
 		}
 	}
 
@@ -569,7 +937,7 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 		start = time.Now()
 	}
 
-	callID, wait := state.table.Submit(ctx, budget)
+	callID, wait := state.table.SubmitDecoding(ctx, budget, newResp)
 
 	if state.table.Publish(callID) {
 		f := transport.Frame{
@@ -592,7 +960,7 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 				c.recordAbandoned(m, start, unpublished)
 			}
 
-			return translateSendFailure(unpublished)
+			return rpcruntime.Result{}, nil, translateSendFailure(unpublished)
 		}
 	}
 	// The request has been published (or Publish lost to a racing terminal, so
@@ -607,14 +975,14 @@ func (c *ClientConn) invokeByID(ctx context.Context, serviceID, methodID uint64,
 			c.recordAbandoned(m, start, waitErr)
 		}
 
-		return c.abandon(state, callID, waitErr)
+		return rpcruntime.Result{}, nil, c.abandon(state, callID, waitErr)
 	}
 
 	if m != nil {
 		c.recordCompleted(m, start)
 	}
 
-	return translateResult(result, state.codec, resp)
+	return result, state.codec, nil
 }
 
 // sendRequest publishes callID's request frame and classifies a send failure.

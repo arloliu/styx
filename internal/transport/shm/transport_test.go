@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/stretchr/testify/require"
 
@@ -2747,6 +2748,22 @@ func inboundSlabAtHead(t *testing.T, ep *endpoints) []byte {
 	return ep.plugin.inboundArenaBytes[off : off+plen]
 }
 
+// liesInInboundArena reports whether payload's backing array sits inside t's
+// inbound arena mapping. It reads addresses and writes nothing, so — unlike
+// observesArenaMutation, whose write is only safe while the head still holds the
+// slab — it can be asked AFTER the head has released one, which is exactly when a
+// frame returned from Recv has to own its bytes.
+func liesInInboundArena(t *Transport, payload []byte) bool {
+	arena := t.inboundArenaBytes
+	if len(payload) == 0 || len(arena) == 0 {
+		return false
+	}
+	base := uintptr(unsafe.Pointer(unsafe.SliceData(arena)))
+	at := uintptr(unsafe.Pointer(unsafe.SliceData(payload)))
+
+	return at >= base && at < base+uintptr(len(arena))
+}
+
 // observesArenaMutation reports whether payload aliases slab: it flips a byte in
 // the arena slab, reports whether the delivered payload sees the change, and puts
 // the byte back. Both the write and the read happen on the calling goroutine, so
@@ -3036,11 +3053,16 @@ func TestTransport_RecvViewConsume_DeliversPrivateCopy_BelowTheInPlaceThreshold(
 	require.True(t, aliased, "a payload at the threshold is delivered as a view")
 }
 
-// Test that streaming frames stay on the copy path: a stream message is queued
-// for a consumer goroutine that reads it long after the receive loop has moved
-// on, so its payload must own its bytes. The unary control in the same test rules
-// out the copy being an accident of size or region state.
-func TestTransport_RecvViewConsume_DeliversPrivateCopy_ForStreamingFrames(t *testing.T) {
+// Test that the borrow does not key on the frame's kind: a streaming payload is
+// lent to a consume callback exactly as a unary one is, and both are copied when
+// the frame is returned from Recv instead.
+//
+// A stream payload does outlive the receive loop — it is queued for a consumer
+// goroutine — but the callback is required to copy what it keeps for EVERY frame,
+// since it is never told which were borrowed. Copying here as well would not make
+// a forgetful callback correct; it would only charge a careful one a second copy
+// on top of the clone it already takes.
+func TestTransport_RecvViewConsume_LendsStreamingPayloads_LikeAnyOther(t *testing.T) {
 	// Given a stream message and a unary request carrying identical payloads.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
 	setInPlaceThreshold(ep.plugin, 0)
@@ -3051,20 +3073,22 @@ func TestTransport_RecvViewConsume_DeliversPrivateCopy_ForStreamingFrames(t *tes
 	slab := inboundSlabAtHead(t, ep)
 
 	// When the view path delivers the stream message.
-	var streamAliased bool
+	var streamAliased, streamInArena bool
 	var seen []byte
 	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
 		streamAliased = observesArenaMutation(slab, f.Payload)
+		streamInArena = liesInInboundArena(ep.plugin, f.Payload)
 		seen = bytes.Clone(f.Payload)
 
 		return nil
 	}))
 
-	// Then it was copied, not borrowed.
+	// Then it was borrowed, carrying the right bytes, and cost the transport no copy.
 	require.Equal(t, payload, seen)
-	require.False(t, streamAliased, "a streaming payload must own its bytes")
+	require.True(t, streamAliased, "a streaming payload is lent like any other")
+	require.True(t, streamInArena, "a lent payload sits in the arena, which is what the copy leg below rules out")
 
-	// While the same payload on a unary frame is borrowed.
+	// And so is the same payload on a unary frame — the borrow is kind-independent.
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 6, Kind: transport.FrameUnaryReq, Payload: payload}))
 	slab = inboundSlabAtHead(t, ep)
@@ -3074,7 +3098,22 @@ func TestTransport_RecvViewConsume_DeliversPrivateCopy_ForStreamingFrames(t *tes
 
 		return nil
 	}))
-	require.True(t, unaryAliased, "the exclusion is the streaming kind, not the payload or the region")
+	require.True(t, unaryAliased, "a unary payload is lent too")
+
+	// While a streaming frame returned from Recv, which outlives the slab, is still
+	// copied: the lifetime bound is the callback, never the kind.
+	//
+	// The check is by address rather than by mutation, because Recv has already
+	// advanced the head by the time it returns: the slab belongs to the producer
+	// again, and writing into it here would model the very invariant this asserts
+	// backwards.
+	require.NoError(t, ep.host.Send(t.Context(),
+		transport.Frame{CallID: 7, Kind: transport.FrameStreamMsg, Payload: payload, Control: 2}))
+	f, err := ep.plugin.Recv(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, payload, f.Payload)
+	require.False(t, liesInInboundArena(ep.plugin, f.Payload),
+		"a frame returned from Recv outlives the slab and must own its bytes")
 }
 
 // Test that the checksum branch keys on the per-frame CRC32C_PRESENT flag, not on
