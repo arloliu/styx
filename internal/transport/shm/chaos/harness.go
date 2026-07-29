@@ -59,6 +59,15 @@ const (
 	// wedgeDeadline bounds the host call issued against a SIGSTOP-frozen peer:
 	// short, because the whole point is that ctx — not a reply — ends it.
 	wedgeDeadline = 2 * time.Second
+	// stopSettleDeadline bounds the wait for a queued SIGSTOP to actually land on
+	// every peer thread. The stop is a handful of scheduler hops away, so this is
+	// generous by orders of magnitude; it exists so a peer that never stops fails
+	// the run with a diagnosis instead of turning into the flake it replaces.
+	stopSettleDeadline = 5 * time.Second
+	// stopSettlePoll paces the procfs poll that watches for that stop. The whole
+	// wait normally ends on the first or second read, so this only bounds how long
+	// a scenario idles past the moment the peer froze.
+	stopSettlePoll = 200 * time.Microsecond
 	// reapDeadline bounds waitpid after the process group is SIGKILLed: a reap that
 	// has not returned by now is a harness-visible anomaly to report, not to hang
 	// on — the harness must never itself hang.
@@ -449,6 +458,86 @@ func (s *session) signalGroup(sig unix.Signal) error {
 	}
 
 	return nil
+}
+
+// awaitStopped blocks until every thread of the peer reports a stopped state, or
+// the bound elapses.
+//
+// kill(2) only queues a stop. For a multithreaded process the kernel wakes one
+// thread to take the process-directed signal, and the siblings keep running user
+// code until that thread is scheduled and propagates the stop to them. A caller
+// that issues work in that window can have it answered by a peer it believes is
+// frozen — and right after a round trip both sides sit in their spin windows
+// with wakeup syscalls elided, so a whole request/response can complete in it.
+// Waiting here turns the asynchronous signal into a precondition the scenario
+// can rely on, without weakening what the scenario proves.
+func (s *session) awaitStopped(bound time.Duration) error {
+	deadline := time.Now().Add(bound)
+	for {
+		stopped, err := allThreadsStopped(s.pid)
+		if err != nil {
+			return err
+		}
+		if stopped {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("chaos: peer %d did not stop within %s", s.pid, bound)
+		}
+
+		time.Sleep(stopSettlePoll)
+	}
+}
+
+// allThreadsStopped reports whether every live thread of pid is stopped. A
+// thread that vanishes between the listing and its read has exited and cannot
+// serve, so it does not hold the answer back.
+func allThreadsStopped(pid int) (bool, error) {
+	taskDir := "/proc/" + strconv.Itoa(pid) + "/task"
+
+	entries, err := os.ReadDir(taskDir)
+	if err != nil {
+		return false, fmt.Errorf("chaos: list threads of %d: %w", pid, err)
+	}
+	if len(entries) == 0 {
+		return false, fmt.Errorf("chaos: peer %d reported no threads", pid)
+	}
+
+	for _, e := range entries {
+		state, err := threadState(taskDir + "/" + e.Name() + "/stat")
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		// 'T' is the job-control stop this scenario induces; 't' is how the same
+		// stop reads while a tracer is attached, which a debugger-run peer reports.
+		if state != 'T' && state != 't' {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// threadState returns the state field of a procfs stat file. The command name
+// sits in parentheses and may itself contain spaces and parentheses, so the
+// state is taken from after the final ')' rather than by splitting on
+// whitespace — the field-splitting reading misparses any peer whose binary is
+// named with either.
+func threadState(statPath string) (byte, error) {
+	data, err := os.ReadFile(statPath) //nolint:gosec // a procfs path this package built from a pid it spawned
+	if err != nil {
+		return 0, err
+	}
+
+	end := bytes.LastIndexByte(data, ')')
+	if end < 0 || end+2 >= len(data) {
+		return 0, fmt.Errorf("chaos: unparsable stat file %s", statPath)
+	}
+
+	return data[end+2], nil
 }
 
 // Close tears the session down in the documented order: reap the child, then
@@ -1025,9 +1114,9 @@ func (s *session) corruptLastResponseDescriptor() error {
 }
 
 // RunSIGSTOPWedge spawns a peer, completes a round trip to prove it is making
-// progress, then SIGSTOPs it and issues one more call: a frozen peer cannot
-// answer, so the call must be bounded by its own context — not hang. SIGCONT
-// then a reap clean up.
+// progress, then SIGSTOPs it, waits for that stop to actually land, and issues
+// one more call: a frozen peer cannot answer, so the call must be bounded by its
+// own context — not hang. SIGCONT then a reap clean up.
 func RunSIGSTOPWedge(ctx context.Context, peerBin string) (Outcome, error) {
 	oc := Outcome{Window: "none", Action: ActionSIGSTOP}
 
@@ -1050,6 +1139,14 @@ func RunSIGSTOPWedge(ctx context.Context, peerBin string) (Outcome, error) {
 	oc.Reached = true
 
 	if err := s.signalGroup(unix.SIGSTOP); err != nil {
+		return oc, err
+	}
+	// The call below only tests what it claims to once the peer is actually
+	// frozen; until then it can be answered by a peer still running on borrowed
+	// time (awaitStopped's doc).
+	if err := s.awaitStopped(stopSettleDeadline); err != nil {
+		_ = s.signalGroup(unix.SIGCONT)
+
 		return oc, err
 	}
 
