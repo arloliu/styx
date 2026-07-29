@@ -586,11 +586,95 @@ func TestWriter_ResumesStuckData_OnRetrySignal(t *testing.T) {
 	require.Equal(t, uint64(7), pushed[0].CallID())
 }
 
+// awaitStuckWake drains the causes the onStuckWake hook reports until want
+// appears, failing the test rather than hanging when it never does. It drains
+// rather than reading once because a carry that stays stuck keeps re-arming its
+// backoff timer, so resumeTimer causes are expected alongside the one under test.
+func awaitStuckWake(t *testing.T, ch <-chan resumeCause, want resumeCause) {
+	t.Helper()
+
+	seen := make(map[resumeCause]int)
+	deadline := time.After(testTimeout)
+	for {
+		select {
+		case c := <-ch:
+			if c == want {
+				return
+			}
+			seen[c]++
+		case <-deadline:
+			t.Fatalf("no stuck-carry wake with cause %d was observed; saw causes %v", want, seen)
+
+			return
+		}
+	}
+}
+
+// Test that a peer-progress signal raised while NO carry is set aside is retained
+// and consumed by the next carry that parks. The retry channel's single slot is
+// what retains it, so a signaller needs no view of the writer's state and no
+// signal is lost in the window between one carry being placed and the next being
+// set aside. Nothing signals after this carry parks, so observing resumeSignal at
+// all proves the earlier wake survived; drop the retention and the carry can only
+// resume on its backoff timer, which reports resumeTimer instead.
+func TestWriter_RetainsRetrySignal_RaisedWithNoCarrySetAside(t *testing.T) {
+	// Given a running writer parked idle with no carry set aside, over an arena
+	// that starts exhausted so the next payload-bearing intent will go stuck.
+	rr := &recordRing{}
+	sa := &switchArena{allocated: make(chan struct{}, 1)}
+	w := newWriterFromParts(rr, sa, 2, 2, admitBlock)
+
+	causes := make(chan resumeCause, 8)
+	// Installed before w.start() below, so ordering against run's reads comes
+	// from goroutine creation; setOnStuckWake would also be safe after start; see
+	// its doc.
+	w.setOnStuckWake(func(c resumeCause) {
+		select {
+		case causes <- c:
+		default:
+		}
+	})
+	blocked := make(chan blockSite, 8)
+	w.setOnBlock(func(s blockSite) {
+		select {
+		case blocked <- s:
+		default:
+		}
+	})
+	w.start()
+	t.Cleanup(w.stop)
+
+	require.Equal(t, blockIdle, <-blocked, "run did not park idle before the signal")
+
+	// When a peer-progress signal is raised in that state — no carry exists to
+	// resume, so the signal is only useful if the channel holds it.
+	w.notePeerProgress()
+
+	// And a data intent is then set aside on the exhausted arena.
+	dataI := intent{
+		frame: transport.Frame{CallID: 11, Kind: transport.FrameUnaryReq, Payload: []byte("retained")},
+		lane:  laneData,
+		done:  make(chan error, 1),
+	}
+	w.dataQueue <- dataI
+	<-sa.allocated
+
+	// Then the retained signal is what resumes it: nothing signals after the carry
+	// parks, so a resumeSignal wake can only be the retained one. A carry left
+	// stuck also re-arms its timer, so resumeTimer causes may precede it.
+	awaitStuckWake(t, causes, resumeSignal)
+
+	// The carry is still stuck (the arena is still exhausted); freeing space lets
+	// it publish so the writer stops with nothing outstanding.
+	sa.release()
+	require.NoError(t, recvWithin(t, dataI.done, "stuck data never published after space freed"))
+}
+
 // Test that a data intent set aside on arena backpressure resumes on the
-// writer's own self-retry timer, with NO lifecycle traffic and no signalRetry:
+// writer's own self-retry timer, with NO lifecycle traffic and no retry signal:
 // once space frees, the writer re-attempts the carry on its backoff schedule and
-// publishes it. The timer is the production resume path; retry/signalRetry are
-// the test seam.
+// publishes it. The timer is the backstop for a stall no inbound frame can
+// report, so it must resume the carry with no signal at all.
 func TestWriter_StuckDataIntent_ResumesViaTimer_NoLifecycleTraffic(t *testing.T) {
 	// Given a running writer whose arena starts exhausted, so a payload-bearing
 	// data intent goes stuck and is set aside.

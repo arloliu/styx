@@ -691,8 +691,8 @@ region. It is this: the writer's `Alloc` returns `ErrExhausted`, `place` returns
 head-gated reclaim frees a slab. No frame is published without a slab, no slab is
 double-issued, and nothing is over-committed — a credit unit that cannot get a
 slab simply has not been spent yet. §10.4 discharges the liveness question this
-raises, including the writer's currently-unwired space-available retry seam
-(§5.4), and bounds the wait by the stream's deadline.
+raises, including the gap that remains in the writer's space-available retry
+seam (§5.4), and bounds the wait by the stream's deadline.
 
 A deployment that wants the stronger property — that a stream `Send` never meets
 arena backpressure at all — opts into **(S3)**, which is the streaming analogue
@@ -1485,13 +1485,17 @@ invariant:
    which is why it is stated as a header shape in §2.4 and not left to whichever
    side implements first.
 
-**One known gap in the data lane, disclosed rather than assumed away.** The
-writer's space-available retry seam is **not wired**: `signalRetry` has no
-production caller, because the cross-process consumer→producer "space-available"
-wake it exists for is not specified for this milestone — `shm-abi.md` §11/§12
-define only producer→consumer wakes. The writer's own documentation states the
-consequence: *"absent further lifecycle traffic the set-aside intent resumes at
-shutdown."*
+**A gap remains in the data lane's space-available retry seam, disclosed rather
+than assumed away.** `signalRetry` now has a production caller: this side's own
+receive path raises it once per delivered frame (`notePeerProgress`), closing
+the in-process half of the seam — a frame from the peer is a hint that its head
+on this side's outbound ring has moved, worth an early retry. What remains
+unwired is the cross-process half: the consumer→producer "space-available" wake
+`signalRetry` was built for is still not specified for this milestone —
+`shm-abi.md` §11/§12 define only producer→consumer wakes — so a peer that frees
+space while it has nothing of its own to send still cannot report it across the
+process boundary. The writer's own documentation states the consequence:
+*"absent further lifecycle traffic the set-aside intent resumes at shutdown."*
 
 This is a real data-lane liveness gap and streaming newly depends on the path it
 sits on, so it is stated here rather than left for a downstream task to
@@ -1506,14 +1510,23 @@ rediscover. Its scope, precisely:
   `CANCEL` traffic supplies exactly such wakeups — and under the collapse ACKs
   arrive on that very queue, so a streaming connection recovers from arena
   backpressure sooner than a purely unary one does.
-- Absent any lifecycle traffic at all, a set-aside stream `STREAM_MSG` waits
-  until the stream's deadline elapses, which terminates the stream (§7, §10.2).
+- A set-aside intent also resumes on **any frame delivered from the peer** on
+  this connection, lifecycle or data, because `consumeDescriptor` raises the
+  retry signal on every delivery. The hint can be wrong — a delivered frame need
+  not be caused by anything this side sent, and even when it is, it does not
+  confirm the freed slab is in the size class this intent is waiting on — so a
+  wrong guess costs one failed retry, never a missed one.
+- Absent any lifecycle traffic and any frame from the peer, a set-aside stream
+  `STREAM_MSG` still resumes on the writer's backoff timer, which retries on its
+  own schedule independent of both kinds of wakeup. Only a peer that neither
+  sends a frame nor supplies lifecycle traffic at all leaves a set-aside intent
+  to wait out the stream's deadline, which terminates the stream (§7, §10.2).
   The wait is bounded, and it is bounded by the deadline rather than by the
   consumer's progress.
 
 §10.4 discharges the deadlock question against this gap explicitly rather than
-against an idealized writer. Wiring the retry seam would shorten the wait; it
-would not change any bound this document claims.
+against an idealized writer. Wiring the remaining cross-process half would
+shorten the wait further; it would not change any bound this document claims.
 
 ### §5.5 The ACK dispatch path and its fairness guarantee
 
@@ -3111,16 +3124,20 @@ deadlock:
    and restarting it is the wedge-detection machinery's job (design §18), not
    this ABI's"*). A wedged consumer is detected as transport-wedged and
    restarted, and every stream on the region terminates per §9.
-2. **The unwired space-available retry seam.** The writer's `signalRetry` has no
-   production caller (§5.4), so a data intent set aside under arena exhaustion is
-   not woken when a slab is freed; it resumes on the next lifecycle intent or at
-   shutdown. This delays the **data** direction, never the ACK path: ACK
-   publication is governed by **L4**, which touches no data-lane resource. A
-   stream blocked behind it is bounded by §10.2's deadline, and a connection
-   carrying streams supplies the very lifecycle traffic that shortens the wait —
-   more so under the collapse, since ACKs now arrive on the queue that wakes the
-   set-aside intent. Wiring the seam would improve latency; no bound in this
-   section depends on it.
+2. **The remaining gap in the space-available retry seam.** `signalRetry` now
+   has a production caller (§5.4): a frame delivered from the peer raises it, so
+   a data intent set aside under arena exhaustion is woken as soon as this side
+   receives anything, not only on its next lifecycle intent. What remains
+   unwired is the cross-process half — a peer that frees a slab without
+   producing a frame of its own still cannot report it — so that case, and only
+   that case, still resumes on the next lifecycle intent, on the writer's
+   backoff timer, or at shutdown. This delays the **data** direction, never the
+   ACK path: ACK publication is governed by **L4**, which touches no data-lane
+   resource. A stream blocked behind it is bounded by §10.2's deadline, and a
+   connection carrying streams supplies the very lifecycle traffic that shortens
+   the wait — more so under the collapse, since ACKs now arrive on the queue
+   that wakes the set-aside intent. Wiring the cross-process half would improve
+   latency further; no bound in this section depends on it.
 
 *What would falsify this.* A burst rule whose data step blocks; an ACK path that
 allocated from the arena; a writer that enters a blocking wait with lifecycle
