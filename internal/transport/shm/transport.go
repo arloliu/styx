@@ -32,21 +32,6 @@ const (
 	faultDetailMaxBytes = 512
 )
 
-// decodeInPlaceMinBytes is the smallest payload the receive path delivers as a
-// view aliasing the inbound arena instead of as a private copy. Below it the copy
-// is delivered instead: on a short payload the copy costs less than the borrow's
-// constraints buy. Its value is zero, so every frame eligible on the other
-// grounds takes the view.
-//
-// It is deliberately not configuration. There is no public knob, no negotiated
-// field, and no environment override, because the right value is a property of
-// this transport's measured copy cost rather than of any deployment — and a
-// caller able to raise it could silently turn the borrow off everywhere. Each
-// Transport copies it into its own inPlaceMin at construction, so a test drives
-// the threshold per transport and never mutates shared state under a running
-// receive loop.
-const decodeInPlaceMinBytes uint64 = 0
-
 // consumeFunc is the transport.ViewReceiver callback the receive path hands a
 // delivered frame to. A nil consumeFunc selects the copy path instead: Recv
 // returns the frame to its caller, which outlives the slab, so nothing it carries
@@ -212,11 +197,6 @@ type Transport struct {
 	gen        shm.Generation
 	checksum   bool
 	maxPayload uint32
-	// inPlaceMin is this transport's copy of decodeInPlaceMinBytes, fixed at
-	// construction. Holding it per transport rather than reading the package
-	// constant at each decision keeps a test's threshold override off shared state,
-	// so it can never race a receive loop running on another transport.
-	inPlaceMin uint64
 	// maxRecvPayload is the largest payload_length an inbound present slab may
 	// carry: slab_size[last](inbound) − overhead (shm-abi.md §18). A received
 	// payload_length above it is a conformance fault (§9).
@@ -572,7 +552,6 @@ func newTransport(region regionHandle, layout shm.Layout, p AttachParams) (*Tran
 		gen:               gen,
 		checksum:          p.Config.Checksum,
 		maxPayload:        maxPayload,
-		inPlaceMin:        decodeInPlaceMinBytes,
 		maxRecvPayload:    slabSizeLast(layout.Arenas[inDir]) - overhead,
 	}, nil
 }
@@ -840,10 +819,10 @@ func (t *Transport) Recv(ctx context.Context) (transport.Frame, error) {
 // error is held to the same rule — a *transport.ConsumeFaultError carries text
 // rendered from what the callback produced, never the callback's own value.
 //
-// Not every frame arrives as a view. A frame carrying the CRC32C_PRESENT flag is
-// copied out and verified over that private copy, and a payload below the internal
-// in-place threshold is copied because the copy is cheaper than the borrow. The
-// frame's kind decides nothing: a streaming payload is lent like any other, and a
+// Not every frame arrives as a view: a frame carrying the CRC32C_PRESENT flag is
+// copied out and verified over that private copy. Nothing else decides it. The
+// payload's length does not, however short it is, and neither does the frame's
+// kind: a streaming payload is lent like any other, and a
 // callback that queues one for a consumer goroutine owns the copy, exactly as the
 // borrow rule above already required of it. consume cannot tell which frames were
 // lent, and correct callback code does not need to.
@@ -1333,8 +1312,8 @@ func (t *Transport) classify(d ring.Descriptor) (tk transport.FrameKind, descrip
 //
 // One case never yields a view regardless: a frame carrying CRC32C_PRESENT is
 // copied out and verified over that private copy, so that the bytes checked are
-// the bytes interpreted (§9). Nothing else keys on the frame's kind — see
-// viewEligible for why a streaming payload is borrowed like any other.
+// the bytes interpreted (§9). Nothing else keys on the frame's kind — see the
+// viewWanted check below for why a streaming payload is borrowed like any other.
 func (t *Transport) payloadBytes(d ring.Descriptor, viewWanted bool) ([]byte, error) {
 	off := uint64(d.PayloadOffset())
 	plen := uint64(d.PayloadLength())
@@ -1399,7 +1378,21 @@ func (t *Transport) payloadBytes(d ring.Descriptor, viewWanted bool) ([]byte, er
 		return payload, nil
 	}
 
-	if !viewEligible(plen, viewWanted, t.inPlaceMin) {
+	// A view is only ever safe when its lifetime is bounded, which viewWanted
+	// carries: a consume callback ends before the head advances, while a frame
+	// returned from Recv outlives the slab entirely. This is the single decision
+	// point for that choice; there is no second receive path.
+	//
+	// The frame's kind does not enter into it, streaming kinds included. A stream
+	// payload does outlive the receive loop — it is queued for a consumer goroutine
+	// — but that is the callback's problem to solve and the callback is already
+	// required to solve it: the transport.ViewReceiver contract says consume must
+	// copy or decode everything it needs and retain nothing, for every frame,
+	// because a callback is never told which frames were borrowed. Copying such a
+	// frame here would not make a forgetful callback correct; it would only add a
+	// second copy under a careful one, which is what a callback that clones what it
+	// queues already pays for.
+	if !viewWanted {
 		payload := make([]byte, plen)
 		copy(payload, slab)
 
@@ -1407,32 +1400,6 @@ func (t *Transport) payloadBytes(d ring.Descriptor, viewWanted bool) ([]byte, er
 	}
 
 	return slab, nil
-}
-
-// viewEligible reports whether a validated payload frame may be delivered as a
-// view aliasing the inbound arena rather than as a private copy. It is the single
-// decision point for that choice; there is no second receive path.
-//
-// A view is only ever safe when its lifetime is bounded, which viewWanted carries:
-// a consume callback ends before the head advances, while a frame returned from
-// Recv outlives the slab entirely. Below minBytes the copy is delivered instead,
-// since a short copy costs less than the borrow buys.
-//
-// The frame's kind does not enter into it, streaming kinds included. A stream
-// payload does outlive the receive loop — it is queued for a consumer goroutine —
-// but that is the callback's problem to solve and the callback is already required
-// to solve it: the transport.ViewReceiver contract says consume must copy or
-// decode everything it needs and retain nothing, for every frame, because a
-// callback is never told which frames were borrowed. Copying such a frame here
-// would not make a forgetful callback correct; it would only add a second copy
-// under a careful one, which is what a callback that clones what it queues
-// already pays for.
-func viewEligible(plen uint64, viewWanted bool, minBytes uint64) bool {
-	if !viewWanted {
-		return false
-	}
-
-	return plen >= minBytes
 }
 
 // descriptorOnlyFrame assembles the delivered frame for a validated CANCEL or

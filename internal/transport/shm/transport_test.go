@@ -997,7 +997,6 @@ func TestTransport_RecvViewConsume_EscalatesLiveConsumeFaultRun_ToPoisonGeneric(
 		cfg := validConfig(false)
 		cfg.Escalation = EscalationConfig{GraceWindow: time.Millisecond, ConsumeFaultRunThreshold: 3}
 		ep := newEndpoints(t, roundTripLayout(), cfg)
-		setInPlaceThreshold(ep.plugin, 0)
 		for i := range n {
 			require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
 				CallID: uint64(i + 1), Kind: transport.FrameUnaryReq, Payload: []byte("undecodable to this consumer"),
@@ -2725,14 +2724,6 @@ func TestTransport_RecvReserving_NoReserveWhenNothingConsumed(t *testing.T) {
 	require.Zero(t, reserves, "no reservation is taken when nothing is consumed")
 }
 
-// setInPlaceThreshold overrides one transport's in-place threshold so a test can
-// drive both sides of the copy/view decision. It writes that transport's own
-// field and no shared state, so it can never race a receive loop running on any
-// other transport. Call it before the transport starts receiving.
-func setInPlaceThreshold(tr *Transport, n uint64) {
-	tr.inPlaceMin = n
-}
-
 // inboundSlabAtHead returns the plugin's inbound arena bytes named by the
 // descriptor currently at its ring head, read non-destructively (the producer's
 // own ring handle) so the reader still delivers the frame. A test mutates them to
@@ -2832,7 +2823,6 @@ func publishCraftedPayload(
 func TestTransport_RecvViewConsume_DeliversArenaView_AndAdvancesOnlyAfterConsumeReturns(t *testing.T) {
 	// Given a published unary request whose slab the test can watch.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	payload := []byte("decoded straight out of the arena")
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 42, Kind: transport.FrameUnaryReq, Payload: payload}))
@@ -2870,7 +2860,6 @@ func TestTransport_RecvViewConsume_DeliversArenaView_AndAdvancesOnlyAfterConsume
 func TestTransport_RecvViewConsume_ReturnsNoFrame_SoNoAliasOutlivesTheAdvance(t *testing.T) {
 	// Given a published payload frame.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	payload := []byte("this must not travel past the advance")
 	publishCraftedPayload(t, ep, ring.KindUnaryReq, 42, payload)
 
@@ -2901,7 +2890,6 @@ func TestTransport_RecvViewConsume_ReturnsNoFrame_SoNoAliasOutlivesTheAdvance(t 
 func TestTransport_RecvViewConsume_PoisonsAndHoldsTheSlot_WhenTheConsumeReportsUndecodableBytes(t *testing.T) {
 	// Given a published payload frame whose bytes the callback blames the peer for.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	publishCraftedPayload(t, ep, ring.KindUnaryReq, 77, []byte("not a valid message"))
 	undecodable := fmt.Errorf("proto: cannot parse invalid wire-format data: %w", transport.ErrPayloadMalformed)
 
@@ -2937,7 +2925,6 @@ func TestTransport_RecvViewConsume_PoisonsAndHoldsTheSlot_WhenTheConsumeReportsU
 func TestTransport_RecvViewConsume_ContainsTheFailure_WhenConsumeReportsItsOwnError(t *testing.T) {
 	// Given two published frames, the first of which the callback declines.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 21, Kind: transport.FrameUnaryReq, Payload: []byte("no room for this one")}))
 	require.NoError(t, ep.host.Send(t.Context(), transport.Frame{CallID: 22, Kind: transport.FrameCancel}))
@@ -2978,7 +2965,6 @@ func TestTransport_RecvViewConsume_ContainsTheFailure_WhenConsumeReportsItsOwnEr
 func TestTransport_RecvViewConsume_AdvancesAndFailsTheCall_WhenConsumePanics(t *testing.T) {
 	// Given two published frames, the first of which the callback panics on.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 11, Kind: transport.FrameUnaryReq, Payload: []byte("panics on decode")}))
 	require.NoError(t, ep.host.Send(t.Context(),
@@ -3013,46 +2999,6 @@ func TestTransport_RecvViewConsume_AdvancesAndFailsTheCall_WhenConsumePanics(t *
 	require.Equal(t, transport.FrameCancel, next.Kind)
 }
 
-// Test that a payload below the in-place threshold is delivered as a private copy
-// instead of a view: below it the copy costs less than the borrow's constraints
-// buy, and the choice is one decision inside the single receive path.
-func TestTransport_RecvViewConsume_DeliversPrivateCopy_BelowTheInPlaceThreshold(t *testing.T) {
-	// Given a threshold above the payload's length.
-	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	payload := []byte("under the threshold")
-	setInPlaceThreshold(ep.plugin, uint64(len(payload))+1)
-	require.NoError(t, ep.host.Send(t.Context(),
-		transport.Frame{CallID: 3, Kind: transport.FrameUnaryReq, Payload: payload}))
-	slab := inboundSlabAtHead(t, ep)
-
-	// When the view path delivers it.
-	var aliased bool
-	var seen []byte
-	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
-		aliased = observesArenaMutation(slab, f.Payload)
-		seen = bytes.Clone(f.Payload)
-
-		return nil
-	}))
-
-	// Then the callback got the right bytes, in a copy that owes the arena nothing.
-	require.Equal(t, payload, seen)
-	require.False(t, aliased, "a payload below the threshold is delivered as a private copy")
-
-	// And a payload at the threshold takes the view, so the boundary is the length,
-	// not the transport giving up on views altogether.
-	atThreshold := append(bytes.Clone(payload), '!')
-	require.NoError(t, ep.host.Send(t.Context(),
-		transport.Frame{CallID: 4, Kind: transport.FrameUnaryReq, Payload: atThreshold}))
-	slab = inboundSlabAtHead(t, ep)
-	require.NoError(t, ep.plugin.RecvViewConsume(t.Context(), func(f transport.Frame) error {
-		aliased = observesArenaMutation(slab, f.Payload)
-
-		return nil
-	}))
-	require.True(t, aliased, "a payload at the threshold is delivered as a view")
-}
-
 // Test that the borrow does not key on the frame's kind: a streaming payload is
 // lent to a consume callback exactly as a unary one is, and both are copied when
 // the frame is returned from Recv instead.
@@ -3065,7 +3011,6 @@ func TestTransport_RecvViewConsume_DeliversPrivateCopy_BelowTheInPlaceThreshold(
 func TestTransport_RecvViewConsume_LendsStreamingPayloads_LikeAnyOther(t *testing.T) {
 	// Given a stream message and a unary request carrying identical payloads.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	payload := []byte("a stream message outlives the receive loop")
 
 	require.NoError(t, ep.host.Send(t.Context(),
@@ -3124,7 +3069,6 @@ func TestTransport_RecvViewConsume_LendsStreamingPayloads_LikeAnyOther(t *testin
 func TestTransport_RecvViewConsume_CopiesFlaggedFramesAndBorrowsUnflaggedOnes_UnderNegotiatedChecksum(t *testing.T) {
 	// Given checksum negotiated on both ends.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(true))
-	setInPlaceThreshold(ep.plugin, 0)
 	payload := []byte("verified over the copy that gets interpreted")
 
 	// When the writer publishes a frame, which always carries the flag once
@@ -3169,7 +3113,6 @@ func TestTransport_RecvViewConsume_CopiesFlaggedFramesAndBorrowsUnflaggedOnes_Un
 func TestTransport_RecvViewConsume_DetectsChecksumMismatch_BeforeAnythingIsHandedOnward(t *testing.T) {
 	// Given a published, checksummed frame whose slab is corrupted after stamping.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(true))
-	setInPlaceThreshold(ep.plugin, 0)
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 10, Kind: transport.FrameUnaryReq, Payload: []byte("corrupt me")}))
 	slab := inboundSlabAtHead(t, ep)
@@ -3196,7 +3139,6 @@ func TestTransport_RecvViewConsume_DetectsChecksumMismatch_BeforeAnythingIsHande
 func TestTransport_RecvViewConsume_DeliversOwnedStatus_ForAStatusFrame(t *testing.T) {
 	// Given a published error response carrying a status with details.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	want := &transport.FrameStatus{Code: 7, Message: "upstream refused", Details: [][]byte{[]byte("detail-one")}}
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 13, Kind: transport.FrameUnaryErr, Status: want}))
@@ -3227,7 +3169,6 @@ func TestTransport_RecvViewConsume_DeliversEmptyPayloadFrame_WhenNoSlabIsPresent
 	// Given a published data frame with no payload and no checksum negotiated, so
 	// no slab is allocated at all.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 14, Kind: transport.FrameUnaryReq}))
 	d, status := hpProducer(t, ep.region).Peek()
@@ -3256,7 +3197,6 @@ func TestTransport_RecvViewConsume_DeliversEmptyPayloadFrame_WhenNoSlabIsPresent
 func TestTransport_RecvViewConsume_NeverConsumes_WhenTeardownLandsAfterThePeek(t *testing.T) {
 	// Given a deliverable payload frame the top gate has already admitted.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	atomic.StoreUint32(ep.plugin.shutdownPtr, 0)
 	d, _ := craftPayloadFrame(t, ep, ring.KindUnaryReq, 15, []byte("never handed onward"))
 	ep.plugin.inboundRing = &shutdownOnPeekRing{d: d, shutdown: ep.plugin.shutdownPtr}
@@ -3285,7 +3225,6 @@ func TestTransport_RecvViewConsume_NeverConsumes_WhenTeardownLandsAfterThePeek(t
 func TestTransport_RecvViewConsume_CompletesTheInFlightConsume_WhenPoisonLandsDuringIt(t *testing.T) {
 	// Given a published payload frame.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	payload := []byte("poisoned while this is being decoded")
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 16, Kind: transport.FrameUnaryReq, Payload: payload}))
@@ -3322,7 +3261,6 @@ func TestTransport_RecvViewConsume_CompletesTheInFlightConsume_WhenPoisonLandsDu
 func TestTransport_RecvViewConsume_StillAdvancesAndReports_WhenConsumePanicsDuringTeardown(t *testing.T) {
 	// Given a published payload frame.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 17, Kind: transport.FrameUnaryReq, Payload: []byte("torn down mid-decode")}))
 
@@ -3351,9 +3289,8 @@ func TestTransport_RecvViewConsume_StillAdvancesAndReports_WhenConsumePanicsDuri
 // Test that Recv never hands back a view: the frame it returns outlives the slab,
 // so its payload must be a copy no matter what the view path does elsewhere.
 func TestTransport_Recv_DeliversPrivateCopy_NeverAnArenaView(t *testing.T) {
-	// Given a published payload frame and a threshold that would borrow it.
+	// Given a published payload frame the view path would otherwise borrow.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	payload := []byte("a frame Recv returns outlives its slab")
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 18, Kind: transport.FrameUnaryReq, Payload: payload}))
@@ -3401,7 +3338,6 @@ func (e *payloadHolderError) Unwrap() error { return e.sentinel }
 func TestTransport_RecvViewConsume_CarriesNoArenaAlias_WhenConsumePanicsWithThePayload(t *testing.T) {
 	// Given a published payload frame the callback panics with.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	payload := []byte("panicked with the borrowed bytes")
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 31, Kind: transport.FrameUnaryReq, Payload: payload}))
@@ -3437,7 +3373,6 @@ func TestTransport_RecvViewConsume_CarriesNoArenaAlias_WhenConsumeReturnsAnError
 	// Given a published payload frame the callback blames the peer for, in an error
 	// that captured the payload.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	payload := []byte("returned with the borrowed bytes")
 	publishCraftedPayload(t, ep, ring.KindUnaryReq, 32, payload)
 
@@ -3466,7 +3401,6 @@ func TestTransport_RecvViewConsume_CarriesNoArenaAlias_WhenConsumeReturnsAnError
 func TestTransport_RecvViewConsume_CarriesNoArenaAlias_WhenAContainedErrorHoldsThePayload(t *testing.T) {
 	// Given a published payload frame the callback declines with an error holding it.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	payload := []byte("declined with the borrowed bytes")
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 33, Kind: transport.FrameUnaryReq, Payload: payload}))
@@ -3524,7 +3458,6 @@ func TestTransport_Recv_ConformanceFaultIsNeverFrameLocal_ForAMalformedStatusSla
 
 	t.Run("through the view path", func(t *testing.T) {
 		ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-		setInPlaceThreshold(ep.plugin, 0)
 		publishCraftedPayload(t, ep, ring.KindUnaryErr, 42, []byte{0x00, 0x01})
 
 		var consumed int
@@ -3547,7 +3480,6 @@ func TestTransport_Recv_ConformanceFaultIsNeverFrameLocal_ForAMalformedStatusSla
 func TestTransport_RecvViewConsumeReserving_ReservesBeforeTheCallbackForEachFrame(t *testing.T) {
 	// Given two published frames.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 51, Kind: transport.FrameUnaryReq, Payload: []byte("first")}))
 	require.NoError(t, ep.host.Send(t.Context(),
@@ -3581,7 +3513,6 @@ func TestTransport_RecvViewConsumeReserving_ReservesBeforeTheCallbackForEachFram
 func TestTransport_RecvViewConsumeReserving_ReservesEvenWhenTheFrameIsDiscarded(t *testing.T) {
 	// Given a published frame whose callback panics.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 53, Kind: transport.FrameUnaryReq, Payload: []byte("discarded")}))
 
@@ -3605,7 +3536,6 @@ func TestTransport_RecvViewConsumeReserving_ReservesEvenWhenTheFrameIsDiscarded(
 func TestTransport_RecvViewConsumeReserving_TakesNoReservation_WhenTeardownStopsTheFrame(t *testing.T) {
 	// Given a deliverable frame the top gate already admitted.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	atomic.StoreUint32(ep.plugin.shutdownPtr, 0)
 	d, _ := craftPayloadFrame(t, ep, ring.KindUnaryReq, 54, []byte("never handed onward"))
 	ep.plugin.inboundRing = &shutdownOnPeekRing{d: d, shutdown: ep.plugin.shutdownPtr}
@@ -3669,7 +3599,6 @@ func TestTransport_Recv_ReportsWhyTheFrameDidNotDecode_OnAConformanceFault(t *te
 func TestTransport_RecvViewConsume_BoundsTheFaultDetail_WhenTheCallbackPanicsWithALargePayload(t *testing.T) {
 	// Given a published frame whose payload renders far past the detail budget.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	payload := bytes.Repeat([]byte{0xAB}, 1000)
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 62, Kind: transport.FrameUnaryReq, Payload: payload}))
@@ -3704,7 +3633,6 @@ func TestTransport_RecvViewConsume_KeepsThePeerAttribution_WhenRenderingTheReaso
 	// Given a published frame the callback blames the peer for, with a broken
 	// message method.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	publishCraftedPayload(t, ep, ring.KindUnaryReq, 63, []byte("blamed on the peer"))
 
 	// When the render of that error panics.
@@ -3728,7 +3656,6 @@ func TestTransport_RecvViewConsume_KeepsThePeerAttribution_WhenRenderingTheReaso
 func TestTransport_RecvViewConsumeReserving_StaleDiscard_TakesNoReservation(t *testing.T) {
 	// Given a stale descriptor ahead of a deliverable one.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	producer := hpProducer(t, ep.region)
 	stale := makeDesc(ring.KindUnaryReq, 71, 6)
 	stale.SetPayloadOffset(0xFFFFFFF0)
@@ -3790,7 +3717,6 @@ func (unrenderableMalformedError) Is(target error) bool {
 func TestTransport_ProtectedConsume_SurvivesAPanicValueItCannotRender(t *testing.T) {
 	// Given a published frame and a callback that panics unrenderably.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 11, Kind: transport.FrameUnaryReq, Payload: []byte("payload")}))
 
@@ -3833,7 +3759,6 @@ func TestTransport_ProtectedConsume_SurvivesAnUnrenderableMalformedReport(t *tes
 	// Given a published frame and a callback that blames the peer with an error
 	// whose reason cannot be rendered.
 	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
-	setInPlaceThreshold(ep.plugin, 0)
 	require.NoError(t, ep.host.Send(t.Context(),
 		transport.Frame{CallID: 13, Kind: transport.FrameUnaryReq, Payload: []byte("payload")}))
 

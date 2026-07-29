@@ -10,8 +10,8 @@ import (
 // Benchmark the one thing decode-before-advance changes about producing a
 // delivered frame's bytes: resolving a validated descriptor to a private copy
 // versus to a view aliasing the inbound arena. The copy and view sub-benchmarks
-// at each size are benchstat-comparable against each other, and the crossover
-// they show is what the in-place threshold is set from.
+// at each size are benchstat-comparable against each other, and what they show is
+// the cost the borrow removes at each size.
 func BenchmarkTransport_PayloadBytes_CopyVersusView(b *testing.B) {
 	for _, size := range []int{64, 1024, 4096} {
 		ep := newEndpoints(b, roundTripLayout(), validConfig(false))
