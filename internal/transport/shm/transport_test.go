@@ -1588,6 +1588,95 @@ func TestTransport_Send_ReclaimsSlabAfterNoSlabRingWrap(t *testing.T) {
 	require.Equal(t, uint64(2), f.CallID)
 }
 
+// Test that a frame delivered by this side's receive path resumes a data intent
+// this side's writer has set aside on backpressure. The delivered frame below
+// (CallID 3) is unsolicited — it is not a reply to the stuck CallID 2 and proves
+// nothing about that slab — which is the point: notePeerProgress treats any
+// inbound frame as a hint worth an early retry, not evidence tied to a specific
+// cause, so the set-aside carry is worth retrying at once instead of at the next
+// backoff-timer fire. consumeDescriptor is the only production caller that
+// raises the retry signal, so a resumeSignal wake — reported by the onStuckWake
+// hook, which names the wake arm rather than inferring it from timing — can only
+// have come from the delivery below. Without that call the carry resumes on the
+// timer alone and no resumeSignal is ever reported.
+func TestTransport_ResumesStuckDataCarry_OnFrameDeliveredFromPeer(t *testing.T) {
+	// Given ends whose 64 B class holds a single usable slab.
+	ep := newEndpoints(t, noSlabWrapLayout(), validConfig(false))
+
+	signalled := make(chan struct{}, 1)
+	// setOnStuckWake is safe to call here even though the writer is already
+	// running (Attach started it): the hook is stored behind an atomic pointer,
+	// so this install can never race run's reads at the stuck-carry wake select.
+	ep.host.outbound.setOnStuckWake(func(c resumeCause) {
+		if c != resumeSignal {
+			return
+		}
+		select {
+		case signalled <- struct{}{}:
+		default:
+		}
+	})
+	stuck := make(chan struct{}, 1)
+	ep.host.SetWriterStuckObserverForTest(func() {
+		select {
+		case stuck <- struct{}{}:
+		default:
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	small := []byte("x") // 1 byte -> the 64 B class's single usable slab
+
+	// The one usable slab is taken by a frame the plugin does not consume, so the
+	// host's head never advances and the slab is not reclaimable.
+	require.NoError(t, ep.host.Send(ctx,
+		transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: small}))
+
+	// When a second data frame is set aside on the exhausted arena.
+	sent := make(chan error, 1)
+	go func() {
+		sent <- ep.host.Send(context.Background(),
+			transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq, Payload: small})
+	}()
+	select {
+	case <-stuck:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the host writer never parked with the second data frame set aside")
+	}
+	select {
+	case <-signalled:
+		t.Fatal("a retry signal was reported before any frame was delivered from the peer")
+	default:
+	}
+
+	// And the peer sends a frame this side receives.
+	require.NoError(t, ep.plugin.Send(ctx,
+		transport.Frame{CallID: 3, Kind: transport.FrameUnaryReq, Payload: small}))
+	f, err := ep.host.Recv(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), f.CallID)
+
+	// Then the delivery signalled this side's own writer, which resumed the
+	// set-aside carry on the signal arm rather than waiting for its timer.
+	select {
+	case <-signalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a frame delivered from the peer did not resume the set-aside data carry")
+	}
+
+	// The carry is still stuck (the plugin has consumed nothing on this
+	// direction); draining the first frame frees the slab and it publishes.
+	f, err = ep.plugin.Recv(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), f.CallID)
+	require.NoError(t, recvWithin(t, sent, "the set-aside data frame never published after space freed"))
+	f, err = ep.plugin.Recv(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), f.CallID)
+}
+
 // Test that head-gated reclaim frees consumed slabs when a separate consumer
 // goroutine drains the peer end concurrently, racing the producer's post-publish
 // bookkeeping (shm-abi.md §6). An awake consumer can consume a frame and advance

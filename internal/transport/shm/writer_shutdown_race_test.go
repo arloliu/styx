@@ -351,11 +351,11 @@ func staleFireAttempt(t *testing.T) bool {
 		intervals = append(intervals, d)
 		mu.Unlock()
 	}
-	w.onStuckWake = func(c resumeCause) {
+	w.setOnStuckWake(func(c resumeCause) {
 		mu.Lock()
 		lastCause, haveCause = c, true
 		mu.Unlock()
-	}
+	})
 
 	gate := newPrePublishGate() // disarmed: exhausted retries fail before the gate
 	SetPrePublishGate(gate.hook)

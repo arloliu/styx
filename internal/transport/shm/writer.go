@@ -135,12 +135,11 @@ type writer struct {
 	// lifetime, read only by single-producer-ownership assertions.
 	started atomic.Bool
 
-	// retry wakes run to re-attempt a set-aside data intent. It is a test-only
-	// seam driven by signalRetry: production resumes a set-aside data intent on
-	// run's own backoff timer (see run's stuck-carry wake), which needs no
-	// channel because it is owned by the run goroutine alone. A signalRetry wake
-	// and a timer fire drive the same idempotent non-blocking place retry, so a
-	// test can force a resume without waiting on the timer.
+	// retry wakes run to re-attempt a set-aside data intent, raised by
+	// signalRetry. Its single slot both coalesces bursts and retains a wake
+	// raised while no carry is set aside, so no signal is lost between carries.
+	// A wake and a timer fire drive the same idempotent non-blocking place
+	// retry, so neither has to know which one the other used.
 	retry chan struct{}
 
 	mode admissionMode
@@ -215,10 +214,11 @@ type writer struct {
 	// onStuckWake is a test-only observation hook reporting which arm of the
 	// stuck-carry wake select fired (timer, signalRetry, or lifecycle), so a test
 	// can identify the wake that drove a resume and force an ordering by
-	// observation rather than by timing. It is set before start and read only by
-	// the run goroutine, so it needs no synchronization; it is nil in production,
-	// where the guarded call is a no-op.
-	onStuckWake func(resumeCause)
+	// observation rather than by timing. It is stored via atomic pointer, the same
+	// treatment as onBlock, so a test can install it before or after start without
+	// racing run's reads at wake points. It is nil in production, where the
+	// guarded call is a no-op.
+	onStuckWake atomic.Pointer[func(resumeCause)]
 
 	// closeMu guards the closed flag and, held for read across an enqueue, forms
 	// the barrier stop waits on: stop takes the write lock only after closing
@@ -339,6 +339,13 @@ func (w *writer) setOnBlock(fn func(blockSite)) {
 	w.onBlock.Store(&fn)
 }
 
+// setOnStuckWake installs the test-only stuck-wake observation hook (see the
+// onStuckWake field). Safe to call before or after start: the store is atomic,
+// so it never races run's reads at wake points.
+func (w *writer) setOnStuckWake(fn func(resumeCause)) {
+	w.onStuckWake.Store(&fn)
+}
+
 // notifyBlock reports a park to the installed observation hook, if any. It is a
 // no-op in every production build (onBlock unset), a single atomic load on the
 // cold park path.
@@ -350,10 +357,10 @@ func (w *writer) notifyBlock(s blockSite) {
 
 // reportStuckWake reports which stuck-carry wake arm fired to the installed
 // observation hook, if any. It is a no-op in every production build (onStuckWake
-// unset), a single nil check on the cold wake path.
+// unset), a single atomic load on the cold wake path.
 func (w *writer) reportStuckWake(c resumeCause) {
-	if w.onStuckWake != nil {
-		w.onStuckWake(c)
+	if fn := w.onStuckWake.Load(); fn != nil {
+		(*fn)(c)
 	}
 }
 
@@ -640,7 +647,8 @@ type resumeCause uint8
 const (
 	// resumeTimer is the self-retry timer fire arm (retry.fired).
 	resumeTimer resumeCause = iota
-	// resumeSignal is the signalRetry test-seam arm (w.retry).
+	// resumeSignal is the peer-progress signal arm (w.retry, raised by
+	// signalRetry).
 	resumeSignal
 	// resumeLifecycle is the lifecycle-intent arm (w.lifecycleQueue).
 	resumeLifecycle
@@ -709,15 +717,27 @@ func (r *retryTimer) disarm() {
 // the fourth. The writer blocks only when it has nothing to do. While a data
 // intent is stuck it neither pulls more data (which would exceed the queue
 // bound) nor blocks on data-lane progress: it waits only for a lifecycle intent,
-// a self-retry timer fire, the test retry seam, or shutdown, so lifecycle always
-// preempts the backpressure.
+// a self-retry timer fire, a peer-progress signal, or shutdown, so lifecycle
+// always preempts the backpressure.
 //
-// The self-retry timer is what resumes a stuck data intent absent other traffic.
-// The cross-process consumer→producer "space-available" wake is deliberately not
-// wired (shm-abi.md §11/§12 specify only producer→consumer wakes); instead run
-// re-attempts the set-aside carry on a bounded backoff timer it owns alone. The
-// timer is armed only while a carry is set aside and is never touched on the
-// un-backpressured path.
+// Two things resume a stuck data intent. This side's own receive path signals one
+// (notePeerProgress): any frame from the peer is a hint that it consumed what
+// caused it, so this writer's outbound slabs may now be reclaimable and the
+// carry is worth retrying at once. It is only a hint — a peer frame need not be
+// caused by anything this side sent (a fresh request, a stream chunk, and a
+// heartbeat are all unsolicited), and even a caused frame does not confirm the
+// freed slab lands in the size class this writer is waiting on — so a wrong
+// guess costs one failed retry, never more. That signal is in-process only —
+// the cross-process consumer→producer "space-available" wake is not specified
+// (shm-abi.md §11/§12 specify producer→consumer wakes only), so a peer that
+// frees space while it has nothing to send cannot report it. The self-retry
+// timer is the backstop for that general condition — no inbound frame arrives —
+// which includes a perfectly healthy, quiet peer: for example, a producer
+// streaming chunks to a consumer that replies only at end-of-stream, where the
+// producer's arena exhausts, the consumer frees the slab, and the producer
+// receives nothing until its own reply arrives. Neither side is stalled; the
+// resume still waits on the timer. It is armed only while a carry is set aside
+// and is never touched on the un-backpressured path.
 func (w *writer) run() {
 	var stuck *carry
 
@@ -820,9 +840,9 @@ func (w *writer) run() {
 				w.reportStuckWake(resumeTimer)
 				timerFired = true
 			case <-w.retry:
-				// signalRetry test seam: same idempotent place retry as a timer
-				// fire, but the armed timer keeps its existing schedule (not a
-				// timer fire, so no double-and-re-arm).
+				// Peer-progress signal (signalRetry): same idempotent place retry
+				// as a timer fire, but the armed timer keeps its existing schedule
+				// (not a timer fire, so no double-and-re-arm).
 				w.reportStuckWake(resumeSignal)
 			case <-w.shutdown:
 				// Disarm before draining: the run goroutine is exiting, so the
@@ -913,17 +933,40 @@ func (w *writer) emit(i intent) *carry {
 }
 
 // signalRetry wakes run to re-attempt a set-aside data intent immediately,
-// without waiting on the backoff timer. It is a test-only seam with no production
-// caller: production resumes a set-aside carry on run's own self-retry timer.
-// The send is non-blocking into a cap-1 coalescing channel, so it never blocks
-// the signaller, and a spurious or coalesced wake is harmless because the retry
-// is an idempotent non-blocking place; a wake that arrives while the timer is
-// armed leaves the timer's schedule untouched.
+// without waiting on the backoff timer. The send is non-blocking into a cap-1
+// coalescing channel, so it never blocks the signaller, and a spurious or
+// coalesced wake is harmless because the retry is an idempotent non-blocking
+// place; a wake that arrives while the timer is armed leaves the timer's
+// schedule untouched. A second signal arriving before the first is consumed is
+// dropped by the channel's default arm, but harmlessly: the retry re-reads
+// current state rather than replaying a queued event, so no state change goes
+// unobserved even though an individual signal can be. The channel's one slot is
+// what makes that hold even while no carry is set aside: a wake raised then is
+// retained there and consumed by the next carry that parks, so the signaller
+// needs no view of the writer's state.
 func (w *writer) signalRetry() {
 	select {
 	case w.retry <- struct{}{}:
 	default:
 	}
+}
+
+// notePeerProgress reports that this side has just consumed a frame the peer
+// produced. A frame from the peer is a hint, not a guarantee, that it consumed
+// whatever caused it: an unsolicited frame — a fresh request, a stream chunk, a
+// heartbeat — has no such cause at all, and even a caused frame does not confirm
+// that the peer's head moved past the specific slab this writer is waiting on
+// (shm-abi.md §6). notePeerProgress drives the same idempotent non-blocking
+// place retry the backoff timer drives, so a hint that proves wrong costs one
+// failed retry, and the timer stays the backstop for the condition no inbound
+// frame can report at all: a healthy, quiet peer that has freed space but has
+// nothing to send.
+//
+// It stays inside one process and touches no shared memory, so it adds no
+// cross-process wake and needs nothing from shm-abi.md §11/§12, which specify
+// producer→consumer wakes only.
+func (w *writer) notePeerProgress() {
+	w.signalRetry()
 }
 
 // place attempts to publish a data intent, building its descriptor on first call

@@ -1092,6 +1092,12 @@ func (t *Transport) consumeDescriptor(
 	// view path and the plain copy path reach it, and both can raise the faults it
 	// clears (EscalationPolicy.ObserveConsumeFault).
 	t.escalation.ObserveConsumeSuccess()
+	// This frame is a hint that the peer may have consumed what caused it and
+	// moved its head on this side's outbound ring. Tell this side's writer, so a
+	// data intent set aside on an exhausted outbound arena retries now rather
+	// than at the next backoff-timer fire (notePeerProgress) instead of waiting
+	// on a guarantee this frame cannot give.
+	t.outbound.notePeerProgress()
 
 	return f, true, nil
 }

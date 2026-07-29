@@ -37,12 +37,20 @@
 // this writer's. The writer must never spin on that backpressure while a CANCEL
 // waits (design §12), so a data intent that cannot be placed is set aside and the
 // writer returns to its lifecycle-first wait, resuming that intent on the next
-// lifecycle intent or at shutdown. A resume driven by the consumer itself freeing
-// space (signalRetry) is a deliberately-unwired seam: no production caller signals
-// it yet, because the cross-process consumer→producer "space-available" wake is
-// not specified for this milestone (shm-abi.md §11/§12 define only
-// producer→consumer wakes); a test drives it directly. The writer never busy-waits
-// and never blocks the lifecycle lane on data-lane progress.
+// lifecycle intent, on a bounded backoff timer, on a peer-progress signal, or at
+// shutdown. The peer-progress signal (notePeerProgress) is raised by this side's
+// own receive path: any inbound frame is a hint that the peer may have consumed
+// something and moved its head on this side's outbound ring, so a set-aside
+// intent is worth retrying now rather than at the next timer fire. It is only a
+// hint — an inbound frame need not be caused by anything this side sent (a
+// fresh request, a stream chunk, a heartbeat are all unsolicited), and even a
+// caused frame does not confirm the freed slab lands in the size class this
+// writer is waiting on — so a wrong guess costs one failed retry. It is also a
+// local signal only — the cross-process consumer→producer "space-available"
+// wake is not specified (shm-abi.md §11/§12 define producer→consumer wakes
+// only), so a stall neither side can report through an inbound frame still
+// resolves on the timer. The writer never busy-waits and never blocks the
+// lifecycle lane on data-lane progress.
 //
 // # Completion protocol
 //
