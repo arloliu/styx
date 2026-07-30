@@ -93,8 +93,8 @@ const (
 var errMisdelivery = errors.New("chaos: crash-window response misdelivery")
 
 // syncTailPH is the plugin->host tail word's byte offset within the sync page
-// (shm-abi.md §3). The corruption scenario reads it to locate the descriptor the
-// peer just published, mirroring internal/transport/shm/mapping.go's own
+// (shm-abi.md §3). The corruption helpers read it to locate the descriptor the
+// peer published most recently, mirroring internal/transport/shm/mapping.go's own
 // sync-word offsets (which are unexported there).
 const syncTailPH = 128
 
@@ -1087,30 +1087,77 @@ func RunCorruptDescriptor(ctx context.Context, peerBin string) (Outcome, error) 
 }
 
 // corruptLastResponseDescriptor sets a reserved flag bit on the descriptor the
-// peer published most recently in the plugin->host ring, resolved from the ring
-// span and tail word exactly as internal/transport/shm carves them. The write
-// aliases the shared mapping, so the host's next read of that slot observes the
-// corrupted field.
+// peer published most recently in the plugin->host ring. The write aliases the
+// shared mapping, so the host's next read of that slot observes the corrupted
+// field.
+//
+// It corrupts in place, which requires a peer parked before its publish
+// completes: the descriptor must still be unread when the bit is set.
+// PublishCorruptDescriptor is the variant for a region whose consumer is
+// draining continuously.
 func (s *session) corruptLastResponseDescriptor() error {
-	region := s.region.Bytes()
-	layout := s.region.Layout()
-
-	ringOff := layout.Rings[shm.PluginToHost].Offset
-	capacity := uint64(layout.RingCapacity)
-	//nolint:gosec // aliasing the mapped P->H ring span per ring.New's contract; §4 alignment guaranteed
-	slots := unsafe.Slice((*ring.Descriptor)(unsafe.Pointer(&region[ringOff])), capacity)
-
-	//nolint:gosec // resolving the P->H tail sync word; §3 guarantees 64-byte alignment
-	tailPtr := (*uint64)(unsafe.Pointer(&region[layout.SyncPageOffset+syncTailPH]))
+	slots, tailPtr := pluginToHostRing(s.region)
 	tail := atomic.LoadUint64(tailPtr)
 	if tail == 0 {
 		return errors.New("chaos: no published response descriptor to corrupt")
 	}
 
-	d := &slots[(tail-1)&(capacity-1)]
+	d := &slots[(tail-1)&(uint64(len(slots))-1)]
 	d.SetFlags(d.Flags() | corruptFlagBit)
 
 	return nil
+}
+
+// PublishCorruptDescriptor publishes a structurally invalid descriptor into a
+// live region's plugin->host ring: it copies the descriptor published most
+// recently into the next slot, sets a reserved flag bit on the copy, and stores
+// the advanced tail — the seq_cst publish ring.Push performs (shm-abi.md §8),
+// from the peer's side of the ring.
+//
+// It exists for a consumer that drains continuously, where no published
+// descriptor sits unread long enough to be altered in place. Copying a real
+// descriptor rather than synthesizing one leaves every other field — kind,
+// generation stamp, payload span — at the valid value the peer wrote, so the
+// reserved flag bit is the only thing that can make the consumer reject it.
+//
+// The peer that owns the tail word must be publishing nothing while this runs:
+// it is the sole writer of that word, and a concurrent push would either
+// overwrite the corrupt slot or race the tail store.
+func PublishCorruptDescriptor(region *shm.Region) error {
+	slots, tailPtr := pluginToHostRing(region)
+	capacity := uint64(len(slots))
+	if capacity < 2 {
+		return errors.New("chaos: a corrupt frame needs a slot beside the last published one")
+	}
+
+	tail := atomic.LoadUint64(tailPtr)
+	if tail == 0 {
+		return errors.New("chaos: no published response descriptor to copy")
+	}
+
+	slot := &slots[tail&(capacity-1)]
+	*slot = slots[(tail-1)&(capacity-1)]
+	slot.SetFlags(slot.Flags() | corruptFlagBit)
+	atomic.StoreUint64(tailPtr, tail+1)
+
+	return nil
+}
+
+// pluginToHostRing resolves a mapped region's plugin->host descriptor slots and
+// tail word, exactly as internal/transport/shm carves them. Both corruption
+// helpers above go through it, so the ABI offsets they depend on are stated once.
+func pluginToHostRing(region *shm.Region) (slots []ring.Descriptor, tail *uint64) {
+	mapped := region.Bytes()
+	layout := region.Layout()
+
+	ringOff := layout.Rings[shm.PluginToHost].Offset
+	//nolint:gosec // aliasing the mapped P->H ring span per ring.New's contract; §4 alignment guaranteed
+	slots = unsafe.Slice((*ring.Descriptor)(unsafe.Pointer(&mapped[ringOff])), uint64(layout.RingCapacity))
+
+	//nolint:gosec // resolving the P->H tail sync word; §3 guarantees 64-byte alignment
+	tail = (*uint64)(unsafe.Pointer(&mapped[layout.SyncPageOffset+syncTailPH]))
+
+	return slots, tail
 }
 
 // RunSIGSTOPWedge spawns a peer, completes a round trip to prove it is making
