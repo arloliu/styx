@@ -25,7 +25,23 @@ import (
 // arms on the same payload tier without cutting the margin to the exact
 // observed 4-byte overhead.
 var payloadSizes = []int{64, 4096, 16384, 65536, 262144, 1048512}
-var concurrencyLevels = []int{1, 8, 64, 512}
+
+// concurrencyLevels stops at 64 because that is the most the go-plugin baseline
+// can sustain, and a comparison is only as measurable as its slowest arm.
+// go-plugin gives each plugin process one gRPC connection, and grpc-go serialises
+// every frame on a connection through a single writer goroutine. Once more than a
+// hundred throttled control-buffer items queue up -- window updates, stream
+// register and cleanup, settings acks, which scale with in-flight streams -- the
+// reader throttles itself while that writer is blocked in a socket write, and
+// neither side recovers. The limit is an experimental process-wide environment
+// variable with no ServerOption or DialOption behind it, so it cannot be raised
+// from here.
+//
+// Both styx transports sustain far more than this; the ceiling is the baseline's
+// alone. Measuring above it yields a cell whose reference number cannot be
+// collected, which is worse than no cell: the hang takes the whole capture with
+// it, not just the one row.
+var concurrencyLevels = []int{1, 8, 32, 64}
 
 // compareBaseline is the uniform shape BenchmarkCompare drives every
 // implementation through, so the go-plugin fork and both Styx transports
