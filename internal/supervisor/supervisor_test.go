@@ -1244,6 +1244,296 @@ func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
 	}
 }
 
+// Test that a plugin frozen with SIGSTOP and never resumed is still killed, reaped,
+// and released. The host declares the frozen instance unhealthy, offers it the
+// graceful Shutdown its frozen peer can never answer, and once that window expires
+// force-kills and reaps it — so Stop returns within the graceful window plus a margin
+// instead of blocking forever on a process that cannot make progress. Nothing resumes
+// the child at any point (no SIGCONT, not even as a cleanup backstop), so the host's
+// own kill is the only thing that can end it. That is what separates this test from
+// the wedge-detection one above, which resumes the child before tearing it down.
+//
+// This covers the teardown the unhealthy verdict itself starts: the supervisor begins
+// tearing the instance down the moment it publishes Unhealthy, and Stop joins that
+// teardown in progress. The other order — Stop reaching a frozen plugin BEFORE any
+// unhealthy verdict trips — is a distinct path with a different bound and no crash
+// reason published, covered by the test below.
+//
+// The reaped status names which path ran: the supervisor reports a signal-terminated
+// child as the negative signal number, so -SIGKILL means the force-kill fired and the
+// single waitpid completed. Open fds and shared-memory region mappings are counted
+// separately (Region.Close closes its fd even when Munmap fails, so the fd count
+// alone cannot prove the mapping went away), and both return to their pre-spawn
+// baseline: a teardown that had to force-kill still releases everything a cooperative
+// one does.
+func TestSupervisor_KillsReapsAndStopsBoundedNoLeak_WhenPluginStaysFrozen(t *testing.T) {
+	// Given: the graceful Shutdown window every instance is given before the
+	// force-kill. It is the control protocol's reply deadline for Shutdown, not a
+	// supervisor knob, so the bounds below are derived from it rather than restated.
+	shutdownWindow := control.ReplyDeadlines[control.KindShutdown]
+	// Slack allowed on top of that window. Deliberately generous: it must hold on a
+	// loaded machine, and the property under test is that teardown terminates at all,
+	// not that it terminates promptly.
+	const stopSlack = 5 * time.Second
+
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	// Synchronize on a heartbeat the host actually received, so the instance is proven
+	// healthy before it is frozen rather than merely silent from startup.
+	gotBeat := make(chan struct{}, 1)
+	restore := supervisor.SetHeartbeatReceivedForTest(func() {
+		select {
+		case gotBeat <- struct{}{}:
+		default:
+		}
+	})
+	defer restore()
+
+	fdsBefore := testutil.CountOpenFDs(t)
+	mapsBefore := countRegionMappings(t)
+
+	const beat = 100 * time.Millisecond
+	pids := make(chan int, 8)
+	cfg := supervisor.Config{
+		Spec: lifecycle.Spec{
+			Path: fixtureReadyPlugin,
+			// Beat faster than the host's per-interval receive wait, so the plugin is
+			// healthy right up to the freeze.
+			Env: []string{"STYX_HEARTBEAT_INTERVAL_FOR_TEST=" + (beat / 4).String()},
+		},
+		// No restart: this test is about ending the frozen instance, not replacing it.
+		Restart:           supervisor.RestartPolicy{Max: 0},
+		HeartbeatInterval: beat,
+		MissedHeartbeats:  3,
+		Transport:         "shm",
+		ShmLayout:         leanShmLayout(),
+		MaxDataInflight:   32,
+		OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
+			pids <- inst.Process.PID
+
+			return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	// No separate join channel: Stop's own nil return is the signal that Run returned,
+	// and that is exactly what this test bounds.
+	go sup.Run(ctx)
+
+	requireEventOfKind(t, ch, supervisor.EventReady)
+	var pid int
+	select {
+	case pid = <-pids:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no plugin PID captured at Ready")
+	}
+	select {
+	case <-gotBeat:
+	case <-time.After(5 * time.Second):
+		t.Fatal("host received no heartbeat from a healthy shm plugin")
+	}
+
+	// When: the plugin is frozen and left that way. The backstop kills rather than
+	// resumes, so a failure below can neither leave a frozen process behind nor hand
+	// the host a cooperative exit the assertions would credit to the force-kill path.
+	var reapedByHost atomic.Bool
+	require.NoError(t, syscall.Kill(pid, syscall.SIGSTOP))
+	t.Cleanup(func() {
+		if !reapedByHost.Load() {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+
+	ev := awaitUnhealthy(t, ch)
+	require.Equal(t, supervisor.EventUnhealthy, ev.Kind)
+
+	stopCtx, cancelStop := context.WithTimeout(t.Context(), shutdownWindow+stopSlack)
+	defer cancelStop()
+	start := time.Now()
+	stopErr := sup.Stop(stopCtx)
+	elapsed := time.Since(start)
+	// Disarm the backstop only on the join, which is exactly when the reap provably
+	// completed. A Stop that expired leaves the child alive and still frozen, and the
+	// backstop is the only thing that will ever end it.
+	reapedByHost.Store(stopErr == nil)
+
+	// Then: Stop joined a returned Run (its nil error is that join signal) instead of
+	// expiring on a plugin that never moves again. The elapsed bound is asserted
+	// separately because a Stop whose deadline fires in a tie with the join still
+	// reports nil, so the error alone does not pin the timing.
+	require.NoError(t, stopErr, "teardown of a still-frozen plugin did not finish within %s", shutdownWindow+stopSlack)
+	require.LessOrEqual(t, elapsed, shutdownWindow+stopSlack,
+		"teardown of a still-frozen plugin took %s", elapsed)
+
+	// And: the frozen child was given its full graceful window before the kill.
+	// Measured from the unhealthy event, which is published immediately before the
+	// teardown that opens that window begins.
+	require.GreaterOrEqual(t, time.Since(ev.Time), shutdownWindow,
+		"the frozen plugin was killed before its graceful Shutdown window elapsed")
+
+	// And: the reap completed and reports a SIGKILLed child — the negative signal
+	// number the supervisor encodes for a signal-terminated process, which no
+	// self-chosen exit code can produce.
+	var crash *supervisor.CrashInfo
+	crashDeadline := time.After(5 * time.Second)
+	for crash == nil {
+		select {
+		case e := <-ch:
+			errors.As(e.Err, &crash)
+		case <-crashDeadline:
+			t.Fatal("no crash reason published for the frozen instance")
+		}
+	}
+	require.True(t, crash.ExitStatusKnown, "the reap of a frozen plugin must yield a known exit status")
+	require.Equal(t, -int(syscall.SIGKILL), crash.ExitStatus,
+		"a still-frozen plugin must be force-killed, not credited with its own exit")
+	require.ErrorIs(t, syscall.Kill(pid, 0), syscall.ESRCH, "the killed plugin was not reaped")
+
+	// And: everything the host held for that instance is released, force-kill or not.
+	require.Eventually(t, func() bool { return testutil.CountOpenFDs(t) <= fdsBefore },
+		2*time.Second, 20*time.Millisecond,
+		"host leaked fds tearing down a frozen plugin: before=%d after=%d", fdsBefore, testutil.CountOpenFDs(t))
+	require.Eventually(t, func() bool { return countRegionMappings(t) <= mapsBefore },
+		2*time.Second, 20*time.Millisecond,
+		"host leaked a region mapping tearing down a frozen plugin: before=%d after=%d",
+		mapsBefore, countRegionMappings(t))
+}
+
+// Test that Stop tears down a frozen plugin it reaches BEFORE any unhealthy verdict
+// trips, returning within one heartbeat interval plus the graceful Shutdown window
+// and a margin, with the child reaped and every host-side resource released. This is
+// the operator-shutdown order — a host stopping a plugin that has already wedged, but
+// that the health path has not yet given up on — and it ends the instance through a
+// different arm than the test above: the heartbeat loop is parked in a bounded receive
+// and notices the stop at its next iteration, so the shutdown request, not the health
+// verdict, is what closes the instance.
+//
+// That arm publishes no crash reason (an instance ended by Stop is not a crash), so
+// the wait status is not observable here the way it is above. What is observable is
+// that the child left the process table, and only a force-kill can have put it there:
+// a SIGSTOPped process that is never resumed cannot run its own exit path, and the
+// elapsed lower bound shows the host waited out the graceful window before killing it.
+// Whether the reap decodes as SIGKILL is asserted on the path that publishes it.
+func TestSupervisor_StopsBoundedAndReapsNoLeak_WhenFrozenPluginNotYetUnhealthy(t *testing.T) {
+	// Given: the same protocol-derived graceful window as above, plus the host's own
+	// liveness wait — the heartbeat loop is blocked in a receive bounded by that wait
+	// when the stop arrives, and only rechecks for a stop between receives.
+	shutdownWindow := control.ReplyDeadlines[control.KindShutdown]
+	const beat = 100 * time.Millisecond
+	const stopSlack = 5 * time.Second
+	stopBound := beat + shutdownWindow + stopSlack
+
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	gotBeat := make(chan struct{}, 1)
+	restore := supervisor.SetHeartbeatReceivedForTest(func() {
+		select {
+		case gotBeat <- struct{}{}:
+		default:
+		}
+	})
+	defer restore()
+
+	fdsBefore := testutil.CountOpenFDs(t)
+	mapsBefore := countRegionMappings(t)
+
+	pids := make(chan int, 8)
+	cfg := supervisor.Config{
+		Spec: lifecycle.Spec{
+			Path: fixtureReadyPlugin,
+			Env:  []string{"STYX_HEARTBEAT_INTERVAL_FOR_TEST=" + (beat / 4).String()},
+		},
+		Restart:           supervisor.RestartPolicy{Max: 0},
+		HeartbeatInterval: beat,
+		// The stop is issued immediately after the freeze, so the loop can complete at
+		// most one silent receive before it rechecks for the stop. A threshold of 3
+		// therefore cannot be reached first, and the assertion below proves it was not.
+		MissedHeartbeats: 3,
+		Transport:        "shm",
+		ShmLayout:        leanShmLayout(),
+		MaxDataInflight:  32,
+		OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
+			pids <- inst.Process.PID
+
+			return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go sup.Run(ctx)
+
+	requireEventOfKind(t, ch, supervisor.EventReady)
+	var pid int
+	select {
+	case pid = <-pids:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no plugin PID captured at Ready")
+	}
+	select {
+	case <-gotBeat:
+	case <-time.After(5 * time.Second):
+		t.Fatal("host received no heartbeat from a healthy shm plugin")
+	}
+
+	// When: the plugin is frozen and stopped straight away, with nothing resuming it.
+	var reapedByHost atomic.Bool
+	require.NoError(t, syscall.Kill(pid, syscall.SIGSTOP))
+	t.Cleanup(func() {
+		if !reapedByHost.Load() {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+
+	stopCtx, cancelStop := context.WithTimeout(t.Context(), stopBound)
+	defer cancelStop()
+	start := time.Now()
+	stopErr := sup.Stop(stopCtx)
+	elapsed := time.Since(start)
+	reapedByHost.Store(stopErr == nil)
+
+	// Then: Stop joined a returned Run within the bound its own two waits imply.
+	require.NoError(t, stopErr, "stopping a frozen plugin did not finish within %s", stopBound)
+	require.LessOrEqual(t, elapsed, stopBound, "stopping a frozen plugin took %s", elapsed)
+
+	// And: the frozen child was offered its full graceful window before being killed.
+	require.GreaterOrEqual(t, elapsed, shutdownWindow,
+		"the frozen plugin was killed before its graceful Shutdown window elapsed")
+
+	// And: the child is gone from the process table — the reap completed inside the
+	// teardown Stop just joined.
+	require.ErrorIs(t, syscall.Kill(pid, 0), syscall.ESRCH, "the stopped plugin was not reaped")
+
+	// And: the stop, not the health path, ended this instance. Run has returned by the
+	// time Stop reports nil, so every event this instance will ever publish is already
+	// queued on the subscription; draining until it goes quiet sees all of them.
+	for draining := true; draining; {
+		select {
+		case e := <-ch:
+			require.NotEqual(t, supervisor.EventUnhealthy, e.Kind,
+				"the frozen plugin was declared unhealthy before the stop reached it")
+		case <-time.After(200 * time.Millisecond):
+			draining = false
+		}
+	}
+
+	// And: everything the host held for that instance is released.
+	require.Eventually(t, func() bool { return testutil.CountOpenFDs(t) <= fdsBefore },
+		2*time.Second, 20*time.Millisecond,
+		"host leaked fds stopping a frozen plugin: before=%d after=%d", fdsBefore, testutil.CountOpenFDs(t))
+	require.Eventually(t, func() bool { return countRegionMappings(t) <= mapsBefore },
+		2*time.Second, 20*time.Millisecond,
+		"host leaked a region mapping stopping a frozen plugin: before=%d after=%d",
+		mapsBefore, countRegionMappings(t))
+}
+
 // requireCleanShmSpawn drives a fresh supervisor that spawns a plugin, attaches over
 // shm, and reaches Ready, then tears it down. Run after a failed attach, it proves the
 // failure left the process-global state (fds, region mappings) clean enough for a brand
