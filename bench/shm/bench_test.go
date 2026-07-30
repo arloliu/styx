@@ -218,6 +218,28 @@ const (
 	modeSync
 )
 
+// sendMode selects how BOTH halves of a round trip hand their payload to the
+// transport. The two are measured as separate cells because they are separate
+// code paths through the writer, not two spellings of one.
+type sendMode int
+
+const (
+	// sendWire materializes the payload as frame bytes and calls
+	// transport.Transport.Send, which copies them into the transport's own send
+	// buffer. Unary RPC falls back to this whenever fill mode is unavailable:
+	// the uds transport, status frames, the lifecycle lane, stream kinds, and a
+	// codec that cannot size the message.
+	sendWire sendMode = iota
+	// sendFill produces the payload straight into the transport's send buffer
+	// through a callback the writer goroutine runs
+	// (transport.PayloadFillSender.SendPayloadFill), saving the copy out of a
+	// materialized wire buffer and paying an abandonment handshake and a
+	// callback indirection instead. Over shm a unary call sends its request and
+	// its response this way whenever the codec can size the message, so this is
+	// the path production unary traffic takes.
+	sendFill
+)
+
 // callFunc issues one unary round trip of payload and returns the echoed
 // response (a fresh copy, safe against arena reclaim).
 type callFunc func(ctx context.Context, payload []byte) ([]byte, error)
@@ -233,9 +255,11 @@ func frameLocalRecvErr(err error) bool {
 // FrameUnaryResp carrying the same CallID and payload. It is the single
 // consumer of pluginTr.Recv and the single producer on pluginTr.Send, and
 // returns once serveCtx is done (its Recv unblocks) or a terminal transport
-// error occurs. Echoing f.Payload is safe: Send copies it into the response
-// arena before the next Recv can reuse the request slot (the difftest
-// scenarioHandler relies on the same property).
+// error occurs. Echoing f.Payload is safe because a plain Recv hands back a
+// private heap copy of the payload rather than a view into the request slab
+// (the transport borrows a slab only for RecvViewConsume, whose callback bounds
+// the borrow), so no head advance can reclaim the bytes under this send. The
+// difftest scenarioHandler relies on the same property.
 func serveEcho(serveCtx context.Context, pluginTr transport.Transport) {
 	for {
 		f, err := pluginTr.Recv(serveCtx)
@@ -256,6 +280,81 @@ func serveEcho(serveCtx context.Context, pluginTr transport.Transport) {
 	}
 }
 
+// serveEchoFill is serveEcho for a plugin answering over the fill path: the
+// response payload is produced into the transport's send buffer by a callback
+// the writer goroutine runs, instead of being handed to Send as bytes the
+// writer then copies. The plugin side of a unary call does this for every
+// response whose message the codec can size (pluginserver.go's
+// sendUnaryResponse), so a cell that fills only the request half would measure
+// neither path.
+//
+// Frame.Payload is deliberately left unset: fill mode does not read it, size
+// and the callback are the payload.
+//
+// Filling from f.Payload is safe because those bytes are not shared memory: a
+// plain Recv hands back a private heap copy, so nothing the peer or the ring head
+// does can disturb them, and the fill closure keeps them reachable for as long as
+// the callback can run. SendPayloadFill bounds that separately -- it returns only
+// once the frame's fate is decided, and the writer runs the callback before it
+// publishes -- so the callback is never still running after the send returns.
+//
+// One divergence from production, and it is unreachable rather than tolerated: a
+// send failure ends this loop, where production answers a failed fill callback
+// with an internal status reply and keeps serving (pluginserver.go's
+// sendUnaryResponse). This callback is a copy into an exact-size window with no
+// failure mode of its own, so the only errors that can arrive here are the
+// terminal transport ones the wire loop exits on too.
+func serveEchoFill(serveCtx context.Context, pluginTr transport.Transport, filler transport.PayloadFillSender) {
+	for {
+		f, err := pluginTr.Recv(serveCtx)
+		if err != nil {
+			if frameLocalRecvErr(err) {
+				continue
+			}
+
+			return
+		}
+		if f.Kind != transport.FrameUnaryReq {
+			continue
+		}
+		resp := transport.Frame{CallID: f.CallID, Kind: transport.FrameUnaryResp}
+		// One binding feeds both the declared size and the callback's bound, as
+		// production's payloadFiller.size does.
+		size := len(f.Payload)
+		if sendErr := filler.SendPayloadFill(serveCtx, resp, size, fillFrom(f.Payload, size)); sendErr != nil {
+			return
+		}
+	}
+}
+
+// fillFrom returns the payload-fill callback for src, whose declared length is
+// size: it copies src into the exact-size slab window the writer hands it and
+// fails the frame if it did not write all size bytes.
+//
+// Production's callback (payloadfill.go's newPayloadFillFunc) runs the codec's
+// MarshalTo into that window and compares the byte count the marshaler reports
+// against the size DECLARED to the transport, because the window is reused rather
+// than zeroed and any checksum is computed over it after the callback returns --
+// so a short write would ship the previous frame's residue under a valid
+// checksum. This suite has no protobuf message to marshal, so it substitutes the
+// copy a bytes-field MarshalTo reduces to, and compares against the same declared
+// size rather than against len(src): the two agree here, and re-deriving the
+// bound from the source would compare the copy to itself, checking nothing in
+// exactly the case the check exists for. It must not be made cheaper than a copy
+// either (no skipping it for an already-equal window): the copy is the work fill
+// mode moves, and eliding it would measure a path production does not have.
+//
+// The closure is built per call, as production builds one per message.
+func fillFrom(src []byte, size int) func(dst []byte) error {
+	return func(dst []byte) error {
+		if n := copy(dst, src); n != size {
+			return fmt.Errorf("shm-bench: filled %d of %d payload bytes", n, size)
+		}
+
+		return nil
+	}
+}
+
 // muxResp is one demultiplexed response delivered to a waiting caller.
 type muxResp struct {
 	payload []byte
@@ -266,6 +365,7 @@ type muxResp struct {
 // host.Recv and routes each response to the caller waiting on its CallID.
 type muxClient struct {
 	host    transport.Transport
+	filler  transport.PayloadFillSender // set for sendFill only; nil for sendWire
 	readCtx context.Context
 	next    atomic.Uint64
 	mu      sync.Mutex
@@ -325,42 +425,78 @@ func (m *muxClient) failAll(err error) {
 	}
 }
 
-func (m *muxClient) call(ctx context.Context, payload []byte) ([]byte, error) {
+// begin allocates the next CallID and registers the channel its response will
+// arrive on. Registration precedes the send so the dispatcher can never see a
+// response whose caller is not yet waiting.
+func (m *muxClient) begin() (uint64, chan muxResp) {
 	id := m.next.Add(1)
 	ch := make(chan muxResp, 1)
 	m.mu.Lock()
 	m.pending[id] = ch
 	m.mu.Unlock()
 
-	req := transport.Frame{
-		CallID: id, Kind: transport.FrameUnaryReq,
-		Service: benchService, Method: benchMethod, Payload: payload,
-	}
-	if err := m.host.Send(ctx, req); err != nil {
-		m.mu.Lock()
-		delete(m.pending, id)
-		m.mu.Unlock()
+	return id, ch
+}
 
-		return nil, err
-	}
+// drop unregisters id, for a call that can no longer receive a response.
+func (m *muxClient) drop(id uint64) {
+	m.mu.Lock()
+	delete(m.pending, id)
+	m.mu.Unlock()
+}
 
+// await waits for id's demultiplexed response. Shared by both send paths, so
+// neither can classify a response differently from the other.
+func (m *muxClient) await(ctx context.Context, id uint64, ch chan muxResp) ([]byte, error) {
 	select {
 	case r := <-ch:
 		return r.payload, r.err
 	case <-ctx.Done():
-		m.mu.Lock()
-		delete(m.pending, id)
-		m.mu.Unlock()
+		m.drop(id)
 
 		return nil, ctx.Err()
 	}
 }
 
+func (m *muxClient) call(ctx context.Context, payload []byte) ([]byte, error) {
+	id, ch := m.begin()
+	req := transport.Frame{
+		CallID: id, Kind: transport.FrameUnaryReq,
+		Service: benchService, Method: benchMethod, Payload: payload,
+	}
+	if err := m.host.Send(ctx, req); err != nil {
+		m.drop(id)
+
+		return nil, err
+	}
+
+	return m.await(ctx, id, ch)
+}
+
+// callFill is call with the request sent over the fill path (sendFill), the way
+// a unary request leaves the host in production (clientconn.go's sendRequest).
+func (m *muxClient) callFill(ctx context.Context, payload []byte) ([]byte, error) {
+	id, ch := m.begin()
+	req := transport.Frame{
+		CallID: id, Kind: transport.FrameUnaryReq,
+		Service: benchService, Method: benchMethod,
+	}
+	size := len(payload)
+	if err := m.filler.SendPayloadFill(ctx, req, size, fillFrom(payload, size)); err != nil {
+		m.drop(id)
+
+		return nil, err
+	}
+
+	return m.await(ctx, id, ch)
+}
+
 // syncClient is the host end for modeSync: no dispatcher goroutine. Valid at
 // concurrency 1 only, where exactly one call is ever outstanding.
 type syncClient struct {
-	host transport.Transport
-	next atomic.Uint64
+	host   transport.Transport
+	filler transport.PayloadFillSender // set for sendFill only; nil for sendWire
+	next   atomic.Uint64
 }
 
 func (s *syncClient) call(ctx context.Context, payload []byte) ([]byte, error) {
@@ -372,6 +508,30 @@ func (s *syncClient) call(ctx context.Context, payload []byte) ([]byte, error) {
 	if err := s.host.Send(ctx, req); err != nil {
 		return nil, err
 	}
+
+	return s.awaitResp(ctx, id)
+}
+
+// callFill is call with the request sent over the fill path (sendFill), the way
+// a unary request leaves the host in production (clientconn.go's sendRequest).
+func (s *syncClient) callFill(ctx context.Context, payload []byte) ([]byte, error) {
+	id := s.next.Add(1)
+	req := transport.Frame{
+		CallID: id, Kind: transport.FrameUnaryReq,
+		Service: benchService, Method: benchMethod,
+	}
+	size := len(payload)
+	if err := s.filler.SendPayloadFill(ctx, req, size, fillFrom(payload, size)); err != nil {
+		return nil, err
+	}
+
+	return s.awaitResp(ctx, id)
+}
+
+// awaitResp reads host.Recv inline until id's response arrives. Shared by both
+// send paths, so neither can classify a response differently from the other; the
+// response half of the round trip is identical either way.
+func (s *syncClient) awaitResp(ctx context.Context, id uint64) ([]byte, error) {
 	for {
 		f, err := s.host.Recv(ctx)
 		if err != nil {
@@ -425,17 +585,33 @@ type session struct {
 }
 
 // startSession starts the echo serve loop on pluginTr and the host-side
-// client for mode, and returns a session whose cleanup stops both, joins
-// their goroutines, then runs closeUnderlying (which closes the transports /
-// region).
+// client for mode, with both halves sending per send, and returns a session
+// whose cleanup stops both, joins their goroutines, then runs closeUnderlying
+// (which closes the transports / region).
 func startSession(
-	hostTr, pluginTr transport.Transport, mode clientMode,
+	b *testing.B, hostTr, pluginTr transport.Transport, mode clientMode, send sendMode,
 	wakeups func() uint64, closeUnderlying func(),
 ) *session {
+	b.Helper()
+
+	// Resolved on the calling goroutine, before anything starts, so a transport
+	// without the capability fails the cell here rather than nil-panicking inside
+	// the serve loop.
+	var hostFiller, pluginFiller transport.PayloadFillSender
+	if send == sendFill {
+		hostFiller = payloadFillSender(b, hostTr, "host")
+		pluginFiller = payloadFillSender(b, pluginTr, "plugin")
+	}
+
 	serveCtx, cancelServe := context.WithCancel(context.Background())
 	serveDone := make(chan struct{})
 	go func() {
 		defer close(serveDone)
+		if send == sendFill {
+			serveEchoFill(serveCtx, pluginTr, pluginFiller)
+
+			return
+		}
 		serveEcho(serveCtx, pluginTr)
 	}()
 
@@ -444,17 +620,23 @@ func startSession(
 	switch mode {
 	case modeMux:
 		readCtx, cancelRead := context.WithCancel(context.Background())
-		m := &muxClient{host: hostTr, readCtx: readCtx, pending: map[uint64]chan muxResp{}}
+		m := &muxClient{host: hostTr, filler: hostFiller, readCtx: readCtx, pending: map[uint64]chan muxResp{}}
 		readDone := make(chan struct{})
 		go func() {
 			defer close(readDone)
 			m.readLoop()
 		}()
 		call = m.call
+		if send == sendFill {
+			call = m.callFill
+		}
 		stopClient = func() { cancelRead(); <-readDone }
 	case modeSync:
-		s := &syncClient{host: hostTr}
+		s := &syncClient{host: hostTr, filler: hostFiller}
 		call = s.call
+		if send == sendFill {
+			call = s.callFill
+		}
 		stopClient = func() {} // no goroutine; the last caller Recv has already returned
 	}
 
@@ -466,6 +648,27 @@ func startSession(
 	}
 
 	return &session{call: call, wakeups: wakeups, cleanup: cleanup}
+}
+
+// payloadFillSender resolves tr's fill-mode send capability, failing the cell
+// when the transport has none. Falling back to a wire Send instead would leave a
+// cell labeled as measuring the fill path while measuring the other one.
+//
+// Resolving once per session is a deliberate departure from production, which
+// runs resolvePayloadFiller per call on both halves: two interface assertions
+// plus codec.SizedMarshaler.Size, an encoded-size traversal of the message. The
+// assertions' result is invariant for a session, and the size traversal is codec
+// work this suite has no message to do -- standing in for it would be timing
+// invented work. What the omission costs is stated where it matters, on
+// BenchmarkUnary: these cells time the transport's send paths, not a whole call.
+func payloadFillSender(b *testing.B, tr transport.Transport, side string) transport.PayloadFillSender {
+	b.Helper()
+	s, ok := tr.(transport.PayloadFillSender)
+	if !ok {
+		b.Fatalf("%s transport %T does not implement transport.PayloadFillSender", side, tr)
+	}
+
+	return s
 }
 
 // cellLayout builds a per-cell shm geometry sized so that neither direction's
@@ -528,7 +731,7 @@ func cellConfig(payload, concurrency int) shmtransport.Config {
 
 // newSHMSession builds an in-process shm pair for this cell's geometry and
 // starts its serve loop and client.
-func newSHMSession(b *testing.B, payload, concurrency int, mode clientMode) *session {
+func newSHMSession(b *testing.B, payload, concurrency int, mode clientMode, send sendMode) *session {
 	b.Helper()
 	layout := cellLayout(1, payload, concurrency)
 	pair, err := shmtest.NewInProcessPairWithLayout(layout, cellConfig(payload, concurrency))
@@ -536,13 +739,17 @@ func newSHMSession(b *testing.B, payload, concurrency int, mode clientMode) *ses
 		b.Fatalf("build shm pair (payload=%d conc=%d): %v", payload, concurrency, err)
 	}
 
-	return startSession(pair.Host, pair.Plugin, mode, pair.WakeupSyscalls, func() { _ = pair.Close() })
+	return startSession(b, pair.Host, pair.Plugin, mode, send, pair.WakeupSyscalls, func() { _ = pair.Close() })
 }
 
 // newUDSSession builds a connected uds.Transport pair from a socketpair and
 // starts its serve loop and client -- the production framework's own fallback
 // transport, driven through the identical Transport interface for a true
 // apples-to-apples comparison. It carries no eventfds, so wakeups is nil.
+//
+// Always sendWire: the uds transport does not implement
+// transport.PayloadFillSender, and its callers fall back to Send in production
+// for exactly that reason.
 func newUDSSession(b *testing.B, mode clientMode) *session {
 	b.Helper()
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
@@ -562,7 +769,8 @@ func newUDSSession(b *testing.B, mode clientMode) *session {
 		b.Fatalf("wrap plugin uds transport: %v", err)
 	}
 
-	return startSession(hostTr, pluginTr, mode, nil, func() { _ = hostTr.Close(); _ = pluginTr.Close() })
+	return startSession(b, hostTr, pluginTr, mode, sendWire, nil,
+		func() { _ = hostTr.Close(); _ = pluginTr.Close() })
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +937,31 @@ func alignUp(n, to uint32) uint32 { return (n + to - 1) / to * to }
 // production shm transport: the mux path at every concurrency, plus the
 // synchronous path at concurrency 1 (the cell the gate's absolute p50/p99 are
 // read off).
+//
+// Each of those two shapes is measured twice, once per send path, because a
+// unary call over shm does not reach the transport the way a raw Send does:
+//
+//   - production-shm / production-shm-sync hand the transport materialized
+//     payload bytes it copies into its send buffer. That is what a unary call
+//     falls back to when fill mode is unavailable, and what every non-unary
+//     frame uses.
+//   - production-shm-fill / production-shm-fill-sync produce the payload
+//     directly into the transport's send buffer on both halves of the round
+//     trip, which is the transport path a unary call over shm takes whenever
+//     the codec can size its message.
+//
+// What the pair isolates is those two send paths, and nothing wider: both arms
+// exclude the codec, so neither is a whole unary call and the delta between them
+// understates what one would see. The fill arm resolves its send capability once
+// per session, where production resolves a filler and computes an encoded size
+// per call on both halves; the wire arm reuses one prepared payload, where
+// production's fallback allocates and marshals a fresh buffer per call. The
+// excluded work is larger on the wire side, so the wire arm is the cheaper of the
+// two relative to its production counterpart.
+//
+// Their adjacency in the run order is deliberate: comparing the two send paths
+// is only meaningful within one capture, where they share a binary, a box, and a
+// moment.
 func BenchmarkUnary(b *testing.B) {
 	regime := currentRegime()
 	verifyRegime(b, regime)
@@ -737,16 +970,28 @@ func BenchmarkUnary(b *testing.B) {
 		for _, concurrency := range concurrencyLevels {
 			name := fmt.Sprintf("impl=production-shm/payload=%d/concurrency=%d", payload, concurrency)
 			b.Run(name, func(b *testing.B) {
-				sess := newSHMSession(b, payload, concurrency, modeMux)
+				sess := newSHMSession(b, payload, concurrency, modeMux, sendWire)
 				defer sess.cleanup()
 				runLatencySuite(b, "production-shm", regime, payload, concurrency, sess.call, sess.wakeups)
+			})
+			name = fmt.Sprintf("impl=production-shm-fill/payload=%d/concurrency=%d", payload, concurrency)
+			b.Run(name, func(b *testing.B) {
+				sess := newSHMSession(b, payload, concurrency, modeMux, sendFill)
+				defer sess.cleanup()
+				runLatencySuite(b, "production-shm-fill", regime, payload, concurrency, sess.call, sess.wakeups)
 			})
 		}
 		name := fmt.Sprintf("impl=production-shm-sync/payload=%d/concurrency=1", payload)
 		b.Run(name, func(b *testing.B) {
-			sess := newSHMSession(b, payload, 1, modeSync)
+			sess := newSHMSession(b, payload, 1, modeSync, sendWire)
 			defer sess.cleanup()
 			runLatencySuite(b, "production-shm-sync", regime, payload, 1, sess.call, sess.wakeups)
+		})
+		name = fmt.Sprintf("impl=production-shm-fill-sync/payload=%d/concurrency=1", payload)
+		b.Run(name, func(b *testing.B) {
+			sess := newSHMSession(b, payload, 1, modeSync, sendFill)
+			defer sess.cleanup()
+			runLatencySuite(b, "production-shm-fill-sync", regime, payload, 1, sess.call, sess.wakeups)
 		})
 	}
 }
@@ -840,7 +1085,7 @@ func BenchmarkIdleToActive(b *testing.B) {
 	const payload = 64
 	gap := event.DefaultSpinBudget * 10 // 300us: comfortably past the 30us spin budget, so no call is spin-caught
 
-	sess := newSHMSession(b, payload, 1, modeSync)
+	sess := newSHMSession(b, payload, 1, modeSync, sendWire)
 	defer sess.cleanup()
 	reqPayload := bytes.Repeat([]byte{0xA5}, payload)
 

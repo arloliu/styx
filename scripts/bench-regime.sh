@@ -22,8 +22,18 @@ regime="${1:?usage: bench-regime.sh <gomaxprocs1|gc-churn|cgroup2cpu>}"
 
 # The matrix observes the shared-memory cells under load; a few repetitions are
 # enough to surface a regime-specific pathology without a long run.
+#
+# All four shared-memory cells run: both client shapes on both send paths. A unary
+# call sends its request and its response by filling the transport's buffer
+# directly, so the fill cells are the ones a scheduler pathology in the live path
+# would show up in, and leaving them out would watch only the fallback.
+#
+# Every name is spelled out and anchored with $. `go test -bench` matches each
+# slash-separated element with an UNANCHORED regexp, so `impl=production-shm`
+# alone also selects every impl beginning with it, and `concurrency=1` would also
+# select a `concurrency=16` tier the moment one is added.
 bench_args=(./bench/shm -run='^$'
-  -bench='BenchmarkUnary/impl=(production-shm|production-shm-sync)/payload=64/concurrency=1'
+  -bench='^BenchmarkUnary$/impl=(production-shm|production-shm-fill|production-shm-sync|production-shm-fill-sync)$/payload=64$/concurrency=1$'
   -benchmem -count=3)
 
 case "$regime" in
