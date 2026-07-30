@@ -3,9 +3,19 @@ name: Benchmarks
 # The benchmark gate re-runs the shared-memory transport's small-payload cells and
 # compares their medians to the checked-in baseline, failing on an allocation
 # increase, a drop below the absolute speed floor versus gRPC-over-UDS, or a ratio
-# regression past tolerance. The scheduler-regime matrix re-runs the same cells
-# under constrained scheduling. Both are noise-sensitive and slower than the
-# per-push CI, so they run on a schedule and on demand, not on every push.
+# regression past tolerance. The baseline names which cells are compared; the
+# capture is wider than that on purpose, so a cell can be observed across runs
+# before anything is gated on it. The scheduler-regime matrix re-runs the
+# shared-memory cells of both send paths under constrained scheduling. Both are
+# noise-sensitive and slower than the per-push CI, so they run on a schedule and
+# on demand, not on every push.
+#
+# Both selections below name every cell they want and anchor each name with $.
+# `go test -bench` matches each slash-separated element of a benchmark's name with
+# an UNANCHORED regexp, so an unanchored `impl=production-shm` silently picks up
+# every impl that starts with it, and an unanchored `concurrency=1` would pick up
+# a `concurrency=16` tier the moment one is added. Anchoring keeps the recorded
+# set a decision rather than a side effect of naming.
 on:
   schedule:
     # 04:00 UTC daily, offset from the soak's 03:00.
@@ -44,7 +54,7 @@ jobs:
           # this run's rows, never a checked-in historical file.
           rm -f bench/results/shm-results-*.jsonl
           go test ./bench/shm -run='^$' \
-            -bench='Benchmark(Unary|UDS|Baselines)/impl=(production-shm|production-shm-sync|production-uds|grpc-uds)/payload=64/concurrency=1' \
+            -bench='^Benchmark(Unary|UDS|Baselines)$/impl=(production-shm|production-shm-fill|production-shm-sync|production-shm-fill-sync|production-uds|production-uds-sync|grpc-uds)$/payload=64$/concurrency=1$' \
             -benchmem -count=10
 
       - name: Compare medians to baseline (hard gate)

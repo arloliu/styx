@@ -87,7 +87,7 @@ func newTunedSHMSession(b *testing.B, payload int, ringCap, reserve, workSlabs u
 		b.Fatalf("build tuned shm pair (payload=%d C=%d R=%d slabs=%d): %v", payload, ringCap, reserve, workSlabs, err)
 	}
 
-	return startSession(pair.Host, pair.Plugin, modeMux, pair.WakeupSyscalls, func() { _ = pair.Close() })
+	return startSession(b, pair.Host, pair.Plugin, modeMux, sendWire, pair.WakeupSyscalls, func() { _ = pair.Close() })
 }
 
 // BenchmarkReserveSweep sweeps the lifecycle reserve R at a fixed C=1024 and
