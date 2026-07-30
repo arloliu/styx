@@ -52,6 +52,13 @@ import (
 // starved (e.g. under -race -count) so the plugin cannot send for several seconds;
 // matching by reason keeps that artifact from masquerading as the wedge verdict.
 //
+// It then follows the verdict through to recovery, because a classification nothing
+// acts on leaves the wedged process serving nothing forever: the instance must be
+// replaced (EventRestarting then EventReady), the successor must be a DIFFERENT
+// process answering calls the wedged one could not, and both calls the wedged
+// instance swallowed must come back with a terminal, typed error rather than hang
+// for as long as their caller waits.
+//
 // The negative test makes the opposite, stronger demand: the instance must stay
 // fully healthy across a full wedge window of its OWN host-observed heartbeat
 // progress. No public surface reports per-heartbeat progress directly, but the host
@@ -102,23 +109,48 @@ const healthyObservationWindow = (wedgeWindowBeats + 2) * time.Second
 // the dispatcher as a delivery barrier (see requireHealthyAcrossWedgeWindow).
 const heartbeatSettleBeat = 1 * time.Second
 
+// wedgeRecoveryDeadline bounds each step of the recovery that follows the wedge
+// verdict: tearing the wedged instance down, spawning and readying its successor, and
+// the swallowed calls resolving. None of that is slow here — the wedged plugin's
+// control plane is alive by construction (that is what makes this a wedge and not a
+// crash), so it acks the teardown's Shutdown and exits at once, and the whole
+// verdict-to-Ready span measures in milliseconds. The bound is sized for the worst
+// case instead: teardown's three independent budgets run in sequence — the
+// admission-close join, the goroutine join, and the shutdown reply deadline the reap
+// falls back on, 5s each — so a recovery that degenerates on every one of them still
+// completes within 15s. Doubling that leaves a loaded machine no way to fail this on
+// timing alone, while a recovery that never comes fails instead of hanging.
+const wedgeRecoveryDeadline = 30 * time.Second
+
+// wedgeBlockMessage is the request the crashy plugin's wedge mode blocks forever on.
+// It must match that fixture's own sentinel: any other message echoes, which is what
+// lets a call prove which process is serving.
+const wedgeBlockMessage = "wedge"
+
 // wedgeHost bundles the observable surfaces of a wedge-mode host: its event stream, a
-// launcher for background calls that block in the blocking Say handler, the
-// checkpoint fifo those calls rendezvous on, and the host's metrics sink.
+// launcher for background calls, the checkpoint fifo the blocking handler rendezvouses
+// on, and the host's metrics sink.
 type wedgeHost struct {
 	host   *styx.Host
 	events <-chan styx.Event
-	launch func(message string)
+	launch func(message string) <-chan error
 	fifo   string
 	sink   *captureSink
 }
 
-// newWedgeHost starts a host against the crashy plugin in its wedge mode (a Say
-// handler that rendezvouses on the fifo checkpoint, proving it was entered, then
-// blocks forever). Its event stream and metrics sink are captured before any wedge is
-// induced, so every assertion below observes from before it triggers. The launched
-// calls block forever plugin-side, so they run on a context canceled and joined in a
-// cleanup registered before any is launched — none outlives the test.
+// newWedgeHost starts a host against the crashy plugin in its wedge mode, where the
+// wedgeBlockMessage request rendezvouses on the fifo checkpoint (proving the handler
+// was entered) and then blocks forever, while every other request echoes pid-tagged so
+// a caller can tell which process served it. Its event stream and metrics sink are
+// captured before any wedge is induced, so every assertion below observes from before
+// it triggers.
+//
+// launch runs a call in the background and reports its result on the returned
+// single-slot channel, so a call the wedged instance swallows can be shown to have
+// terminated rather than merely assumed to have. Those calls block plugin-side until
+// something ends the instance, so they run on a context canceled and joined in a
+// cleanup registered before any is launched — none outlives the test, whichever way it
+// exits.
 func newWedgeHost(t *testing.T) wedgeHost {
 	t.Helper()
 
@@ -130,7 +162,7 @@ func newWedgeHost(t *testing.T) wedgeHost {
 			Name: "echo",
 			Path: crashyPluginBin,
 			Args: []string{"wedge"},
-			Env:  []string{"STYX_ECHO_CRASHY_FIFO=" + fifo},
+			Env:  []string{"STYX_ECHO_CRASHY_FIFO=" + fifo, "STYX_ECHO_PID_TAG=1"},
 			Restart: styx.RestartPolicy{
 				Max:     3,
 				Backoff: func(int) time.Duration { return 5 * time.Millisecond },
@@ -148,35 +180,67 @@ func newWedgeHost(t *testing.T) wedgeHost {
 	})
 
 	client := echopb.NewEchoClient(h.Plugin("echo"))
-	launch := func(message string) {
+	launch := func(message string) <-chan error {
+		result := make(chan error, 1)
 		wg.Go(func() {
-			_, _ = client.Say(callCtx, &echopb.SayRequest{Message: message})
+			_, err := client.Say(callCtx, &echopb.SayRequest{Message: message})
+			result <- err
 		})
+
+		return result
 	}
 
 	return wedgeHost{host: h, events: h.Events(), launch: launch, fifo: fifo, sink: sink}
 }
 
-// Test the classifier restarting a transport-wedged plugin even while a handler
-// lease is live: one handler blocks the serve loop, a second request queues behind
-// it unconsumed, and the plugin reporting frozen consume with readable inbound work
-// drives an EventUnhealthy naming the transport wedge.
-func TestWedgeClassifier_RestartOnTransportWedge_WithLiveHandlerLease(t *testing.T) {
+// Test the host recovering from a transport wedge detected while a handler lease is
+// live: one handler blocks the serve loop, a second request queues behind it
+// unconsumed, and the plugin reporting frozen consume with readable inbound work
+// drives an EventUnhealthy naming the transport wedge. That verdict is then acted on
+// — the instance is replaced (EventRestarting, EventReady), the successor is a
+// different process that serves a call the wedged one never could, and both calls the
+// wedged instance swallowed return a terminal, typed error instead of hanging.
+func TestWedgeClassifier_RestartAndRecover_OnTransportWedgeWithLiveHandlerLease(t *testing.T) {
 	wh := newWedgeHost(t)
+	client := echopb.NewEchoClient(wh.host.Plugin("echo"))
 
-	// Given: one call is dispatched and blocks the serve loop (its lease keeps
+	// Given: the pid of the instance about to wedge, taken from a call it serves
+	// normally, so a later call can show whether that same process is still serving.
+	wedgedPID, err := sayPID(t, client, "before")
+	require.NoError(t, err)
+
+	// And one call is dispatched and blocks the serve loop (its lease keeps
 	// renewing), confirmed by the fifo rendezvous — no sleep-and-hope.
-	wh.launch("blocker")
+	blocked := wh.launch(wedgeBlockMessage)
 	openFifoOrFail(t, wh.fifo)
 
 	// When: a second call queues behind the blocked one; the serve loop cannot
 	// consume it, so the plugin reports inbound work still readable with a frozen
 	// consume counter.
-	wh.launch("queued")
+	queued := wh.launch("queued")
 
-	// Then: the classifier restarts on the transport wedge, despite the live lease.
+	// Then: the classifier wedges on the transport, despite the live lease.
 	ev := awaitTransportWedge(t, wh.events, wedgeFireDeadline)
 	require.Contains(t, ev.Err.Error(), "transport-wedged")
+
+	// And the verdict is acted on rather than merely reported: the wedged instance is
+	// ended and a successor is spawned and readied.
+	awaitEventWithin(t, wh.events, styx.EventRestarting, wedgeRecoveryDeadline)
+	awaitEventWithin(t, wh.events, styx.EventReady, wedgeRecoveryDeadline)
+
+	// And the successor really is a new process, serving on the same ClientConn a call
+	// the wedged instance could never have answered — the restart is what makes the
+	// plugin usable again, so a fresh reply from the OLD pid would mean nothing
+	// restarted.
+	freshPID, err := sayPID(t, client, "after")
+	require.NoError(t, err)
+	require.NotEqual(t, wedgedPID, freshPID, "the wedge verdict must replace the wedged process")
+
+	// And neither call the wedged instance swallowed is abandoned: both return, and
+	// both name the outcome the host actually knows — the request was published, so it
+	// may already have run, which is terminal and not for the caller to retry.
+	requireOutcomeUnknown(t, blocked, "the call whose handler blocked the serve loop")
+	requireOutcomeUnknown(t, queued, "the call queued behind the blocked handler")
 }
 
 // Test the classifier staying healthy for a response owed by a still-running
@@ -198,7 +262,7 @@ func TestWedgeClassifier_StayHealthy_ForOwedResponseWithLiveLease(t *testing.T) 
 	// Given: a single long-running handler holding a live, renewing lease with no
 	// queued work behind it — the owed-response-with-live-lease case that must NOT
 	// wedge — confirmed engaged by the fifo rendezvous, no sleep-and-hope.
-	wh.launch("blocker")
+	wh.launch(wedgeBlockMessage)
 	openFifoOrFail(t, wh.fifo)
 
 	// When / Then: across a full wedge window of the instance's own adjacent heartbeat
@@ -232,6 +296,29 @@ func awaitTransportWedge(t *testing.T, ch <-chan styx.Event, timeout time.Durati
 		case <-deadline:
 			require.FailNow(t, "did not observe a transport-wedge verdict", "within=%s", timeout)
 		}
+	}
+}
+
+// requireOutcomeUnknown fails unless the call reported on result has returned with the
+// error a published-but-unanswered call gets when its instance is torn down. A call the
+// wedged plugin swallowed must not be left waiting for a process that will never answer
+// it, and the failure it gets must name the outcome as unknown: its request reached the
+// plugin, so the host cannot know whether the handler ran.
+func requireOutcomeUnknown(t *testing.T, result <-chan error, what string) {
+	t.Helper()
+
+	select {
+	case err := <-result:
+		require.Error(t, err, "%s must fail, not return a response the wedged instance never sent", what)
+		require.ErrorIs(t, err, styx.ErrOutcomeUnknown, "%s must report the outcome as unknown", what)
+		// This pins the public taxonomy, not anything the host does on this path:
+		// IsRetryable is defined to answer false for everything wrapping
+		// ErrOutcomeUnknown, which the line above has just established, so no host-side
+		// behavior can move it. It fails only if that classification is ever changed to
+		// invite a caller to reissue a call that may already have run.
+		require.False(t, styx.IsRetryable(err), "ErrOutcomeUnknown must never be classified retryable")
+	case <-time.After(wedgeRecoveryDeadline):
+		require.FailNow(t, "a call the wedged instance swallowed never returned", "call=%s", what)
 	}
 }
 
