@@ -40,7 +40,23 @@ import (
 func awaitEvent(t *testing.T, ch <-chan styx.Event, kind styx.EventKind) styx.Event {
 	t.Helper()
 
-	deadline := time.After(5 * time.Second)
+	return awaitEventWithin(t, ch, kind, awaitEventTimeout)
+}
+
+// awaitEventTimeout is awaitEvent's bound: long enough for any single lifecycle
+// transition a host makes on its own, short enough that a test waiting for one that
+// never comes fails promptly. A caller that must outwait something slower — a teardown
+// running out its own deadlines, say — calls awaitEventWithin with its own bound
+// instead of widening this one for everyone.
+const awaitEventTimeout = 5 * time.Second
+
+// awaitEventWithin is awaitEvent with a caller-chosen bound: it drains ch until it sees
+// an event of kind, discarding any other kind along the way, and fails the test once
+// timeout elapses without one.
+func awaitEventWithin(t *testing.T, ch <-chan styx.Event, kind styx.EventKind, timeout time.Duration) styx.Event {
+	t.Helper()
+
+	deadline := time.After(timeout)
 	for {
 		select {
 		case ev := <-ch:
@@ -48,7 +64,7 @@ func awaitEvent(t *testing.T, ch <-chan styx.Event, kind styx.EventKind) styx.Ev
 				return ev
 			}
 		case <-deadline:
-			require.FailNow(t, "did not observe expected event kind", "kind=%d", kind)
+			require.FailNow(t, "did not observe expected event kind", "kind=%d within=%s", kind, timeout)
 		}
 	}
 }

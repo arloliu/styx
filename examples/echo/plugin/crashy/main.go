@@ -27,13 +27,16 @@
 //     request, so the panic policy can be exercised while the restarted or
 //     still-serving instance still answers a following call.
 //   - "wedge": Say synchronizes on the checkpoint (required, to prove the
-//     handler was entered) and then blocks forever. Because a unary handler
-//     runs inline on the serve loop, a wedged one freezes the plugin's inbound
-//     consume counter; a second request queued behind it then makes the plugin
-//     report inbound work still readable, which is the transport-wedge the
-//     supervisor restarts on. With no second request the same blocked handler
-//     stays healthy — its lease keeps renewing — which is the owed-response-
-//     with-live-lease case the classifier must NOT wedge on.
+//     handler was entered) and then blocks forever, but only for the
+//     wedgeBlockMessage sentinel request; any other request echoes immediately
+//     (pid-tagged when STYX_ECHO_PID_TAG is set), so a restarted successor can
+//     be observed serving. Because a unary handler runs inline on the serve
+//     loop, a wedged one freezes the plugin's inbound consume counter; a second
+//     request queued behind it then makes the plugin report inbound work still
+//     readable, which is the transport-wedge the supervisor restarts on. With
+//     no second request the same blocked handler stays healthy — its lease keeps
+//     renewing — which is the owed-response-with-live-lease case the classifier
+//     must NOT wedge on.
 //
 // Independent of the mode, two environment switches shape hot-reload and panic
 // behavior:
@@ -69,6 +72,14 @@ import (
 // (predecessor) instance. Every other request echoes immediately, so ordinary
 // load traffic runs unaffected while the single gated call is held.
 const reloadGateMessage = "gated"
+
+// wedgeBlockMessage is the sentinel request the "wedge" mode blocks forever on.
+// Only that one request wedges the serve loop; every other request echoes, so a
+// caller can still get an answer out of a wedge-mode instance — which is how a
+// test tells a restarted successor apart from the wedged predecessor that could
+// answer nothing. A mode that blocked on every request would make the process
+// serving after a restart indistinguishable from the one before it.
+const wedgeBlockMessage = "wedge"
 
 type crashyServer struct {
 	mode string
@@ -111,11 +122,15 @@ func (s crashyServer) Say(_ context.Context, req *echopb.SayRequest) (*echopb.Sa
 			panic("styx echo test: deliberate unary handler panic")
 		}
 	case "wedge":
-		// Prove the handler was entered (the serve loop is now inside it and no
-		// longer consuming inbound frames), then block forever. Teardown reaps the
-		// process; the handler never returns on its own.
-		syncFIFO()
-		select {}
+		// The sentinel request proves the handler was entered (the serve loop is now
+		// inside it and no longer consuming inbound frames), then blocks forever.
+		// Teardown reaps the process; the handler never returns on its own. Any other
+		// request falls through and echoes, so a successor spawned after the wedged
+		// instance is torn down can be observed answering.
+		if req.GetMessage() == wedgeBlockMessage {
+			syncFIFO()
+			select {}
+		}
 	}
 
 	msg := req.GetMessage()
