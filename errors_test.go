@@ -105,3 +105,16 @@ func TestIncompatibleError_MatchesSentinel_ViaErrorsIs(t *testing.T) {
 	// When / Then
 	require.ErrorIs(t, err, ErrIncompatible)
 }
+
+// Test ConfigError rendering the package-prefixed field-and-reason message and
+// matching the ErrInvalidConfig sentinel via errors.Is
+func TestConfigError_RendersFieldAndReason_AndMatchesSentinel(t *testing.T) {
+	// Given
+	err := &ConfigError{Field: "PluginSpec.HeartbeatTimeout", Reason: "200ms is negative"}
+
+	// When / Then
+	require.Equal(t,
+		"styx: invalid configuration: PluginSpec.HeartbeatTimeout: 200ms is negative",
+		err.Error())
+	require.ErrorIs(t, err, ErrInvalidConfig)
+}

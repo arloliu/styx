@@ -100,11 +100,43 @@ func processExists(t *testing.T, name string) bool {
 	return false
 }
 
+// processFromBinaryExists reports whether any process's /proc/<pid>/exe is binPath.
+// It compares the whole path, unlike processExists: several packages build a fixture
+// called "readyplugin" into their own temp directory and `go test ./...` runs them
+// concurrently, so a base-name match cannot tell this package's spawn from another
+// package's — or from another checkout's — live process.
+func processFromBinaryExists(t *testing.T, binPath string) bool {
+	t.Helper()
+
+	entries, err := os.ReadDir("/proc")
+	require.NoError(t, err)
+
+	for _, e := range entries {
+		exe, err := os.Readlink(filepath.Join("/proc", e.Name(), "exe"))
+		if err != nil {
+			continue
+		}
+		if exe == binPath {
+			return true
+		}
+	}
+
+	return false
+}
+
 // awaitEvent drains ch until it sees an event of kind, or fails on timeout.
 func awaitEvent(t *testing.T, ch <-chan styx.Event, kind styx.EventKind) styx.Event {
 	t.Helper()
 
-	deadline := time.After(5 * time.Second)
+	return awaitEventWithin(t, ch, kind, 5*time.Second)
+}
+
+// awaitEventWithin is awaitEvent with a caller-chosen bound, for a transition whose
+// own timing budget is larger than the default wait.
+func awaitEventWithin(t *testing.T, ch <-chan styx.Event, kind styx.EventKind, within time.Duration) styx.Event {
+	t.Helper()
+
+	deadline := time.After(within)
 	for {
 		select {
 		case ev := <-ch:
@@ -169,13 +201,16 @@ func TestHost_StartStop_SpawnsReachesReadyAndReaps(t *testing.T) {
 	// Then: readiness is observed and the child is actually running.
 	ev := awaitEvent(t, h.Events(), styx.EventReady)
 	require.Equal(t, "ready", ev.Plugin)
-	require.True(t, processExists(t, "readyplugin"), "plugin process must be alive after Start")
+	require.True(t, processFromBinaryExists(t, fixtureReadyPlugin), "plugin process must be alive after Start")
 
 	// When: Stop tears it down via the normative teardown machine.
 	require.NoError(t, h.Stop(t.Context()))
 
-	// Then: the child is reaped (gone), and no fd leaked across the cycle.
-	require.Eventually(t, func() bool { return !processExists(t, "readyplugin") },
+	// Then: the child is reaped (gone), and no fd leaked across the cycle. Matched on
+	// this fixture's full path, not its base name: internal/supervisor builds a
+	// readyplugin of its own and `go test ./...` runs that package alongside this one,
+	// so a base-name match reads its live child as this test's unreaped one.
+	require.Eventually(t, func() bool { return !processFromBinaryExists(t, fixtureReadyPlugin) },
 		5*time.Second, 10*time.Millisecond, "plugin process must be reaped after Stop")
 	require.Equal(t, before, testutil.CountOpenFDs(t), "Start/Stop lifecycle leaked a file descriptor")
 }
@@ -611,4 +646,219 @@ func TestHost_ShmCrashRestart_NoMisdeliveryNoDuplicate(t *testing.T) {
 	// restores the hook after the reader joins.
 	require.Zero(t, discarded.Load(),
 		"a duplicate or late unary response was delivered across the crash-restart (misdelivery)")
+}
+
+// silentPluginHeartbeat is the plugin-side heartbeat interval every host in the
+// liveness-detection test below spawns its plugin with. It is far past any budget
+// under test, so the plugin sends its first beat and then stays genuinely silent:
+// the silence is a real unresponsive peer across the process boundary, not a
+// simulated one.
+const silentPluginHeartbeat = "1h"
+
+// defaultDetectionFloor is the soonest a PluginSpec left at its liveness defaults can
+// report a silent plugin unhealthy: three consecutive heartbeat waits, each one send
+// cadence long. A loaded machine can only push a real detection later than this,
+// never earlier, so it is a sound bound to hold a tightened configuration below.
+const defaultDetectionFloor = 3 * styx.PluginHeartbeatInterval
+
+// unhealthyVerdictBudget bounds each wait for an unhealthy verdict far above the few
+// seconds either configuration needs, so a verdict that never arrives fails the test
+// instead of hanging it, with headroom for a loaded machine.
+const unhealthyVerdictBudget = 30 * time.Second
+
+// unhealthyPlugins reports the plugin names of every EventUnhealthy already queued on
+// ch, read at one instant without blocking: what this host has reported so far.
+func unhealthyPlugins(ch <-chan styx.Event) []string {
+	var got []string
+	for {
+		select {
+		case ev := <-ch:
+			if ev.Kind == styx.EventUnhealthy {
+				got = append(got, ev.Plugin)
+			}
+		default:
+			return got
+		}
+	}
+}
+
+// Test a tightened MissedHeartbeatThreshold reporting a silent plugin unhealthy
+// sooner than a spec left at the liveness defaults structurally can, proven against
+// an identically silent plugin supervised at those defaults.
+func TestHost_ReportsUnhealthyBeforeTheDefaultBudgetCould_WhenMissedHeartbeatThresholdTightened(t *testing.T) {
+	// Given: two hosts running the same fixture, each plugin silent after its first
+	// heartbeat. One tightens the missed-heartbeat budget to a single wait; the other
+	// leaves every liveness field unset.
+	newSilentHost := func(name string, missed int) (*styx.Host, <-chan styx.Event) {
+		h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+			Name:                     name,
+			Path:                     fixtureReadyPlugin,
+			Env:                      []string{styx.HeartbeatIntervalEnv + "=" + silentPluginHeartbeat},
+			MissedHeartbeatThreshold: missed,
+		}}})
+
+		return h, h.Events()
+	}
+
+	tightened, tightenedEvents := newSilentHost("tightened", 1)
+	defaulted, defaultedEvents := newSilentHost("defaulted", 0)
+
+	// When: both reach Ready and both plugins then fall silent. Each host's clock
+	// starts BEFORE its own Start, so neither is measured against the other's
+	// schedule and every elapsed time below overstates the detection it measures --
+	// the supervisor's heartbeat loop is already running by the time Start returns.
+	// Overstating is the only safe direction here: it cannot make a tightened
+	// detection look faster than it really was, and it cannot make the default arm's
+	// elapsed fall below the floor its own three waits guarantee.
+	tightenedFrom := time.Now()
+	require.NoError(t, tightened.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, tightened.Stop(context.Background())) })
+
+	defaultedFrom := time.Now()
+	require.NoError(t, defaulted.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, defaulted.Stop(context.Background())) })
+
+	ev := awaitEventWithin(t, tightenedEvents, styx.EventUnhealthy, unhealthyVerdictBudget)
+	tightenedAfter := time.Since(tightenedFrom)
+
+	// Then: the tightened host reported the silence inside a single wait's budget,
+	// below the three waits a default spec needs at minimum...
+	require.Equal(t, "tightened", ev.Plugin)
+	require.Less(t, tightenedAfter, defaultDetectionFloor,
+		"a single-miss budget must report a silent plugin before three default waits could have elapsed")
+
+	// ...and the default-budget host has reported nothing about its equally silent
+	// plugin at that instant.
+	require.Empty(t, unhealthyPlugins(defaultedEvents),
+		"the default budget must not have reached a verdict while the tightened one already has")
+
+	// The default-budget host does reach the same verdict, no sooner than its own
+	// floor -- so the comparison above is between two identically silent plugins, not
+	// one that was never silent at all.
+	awaitEventWithin(t, defaultedEvents, styx.EventUnhealthy, unhealthyVerdictBudget)
+	require.GreaterOrEqual(t, time.Since(defaultedFrom), defaultDetectionFloor,
+		"the default budget cannot reach a verdict before its three waits have elapsed")
+}
+
+// Test Host.Start refusing a liveness setting it cannot honor with a
+// *styx.ConfigError naming the field, before any plugin process is spawned.
+func TestHost_Start_ReturnsConfigError_WhenLivenessTuningCannotBeHonored(t *testing.T) {
+	tests := []struct {
+		name           string
+		spec           styx.PluginSpec
+		field          string
+		reasonContains string
+	}{
+		{
+			name:           "heartbeat wait below the plugin's fixed send cadence",
+			spec:           styx.PluginSpec{HeartbeatTimeout: styx.PluginHeartbeatInterval - time.Millisecond},
+			field:          "PluginSpec.HeartbeatTimeout",
+			reasonContains: "heartbeat send cadence",
+		},
+		{
+			name:  "negative heartbeat wait",
+			spec:  styx.PluginSpec{HeartbeatTimeout: -time.Second},
+			field: "PluginSpec.HeartbeatTimeout",
+		},
+		{
+			name:  "negative missed-heartbeat threshold",
+			spec:  styx.PluginSpec{MissedHeartbeatThreshold: -1},
+			field: "PluginSpec.MissedHeartbeatThreshold",
+		},
+		{
+			name:  "negative wedge window",
+			spec:  styx.PluginSpec{WedgeWindow: -time.Second},
+			field: "PluginSpec.WedgeWindow",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Given
+			spec := tt.spec
+			spec.Name, spec.Path = "tuned", fixtureReadyPlugin
+			h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{spec}})
+
+			// When
+			err := h.Start(t.Context())
+
+			// Then
+			require.ErrorIs(t, err, styx.ErrInvalidConfig)
+
+			var cfgErr *styx.ConfigError
+			require.ErrorAs(t, err, &cfgErr)
+			require.Equal(t, tt.field, cfgErr.Field)
+			if tt.reasonContains != "" {
+				require.Contains(t, cfgErr.Reason, tt.reasonContains,
+					"the error must explain the constraint the value violates")
+			}
+			require.False(t, processFromBinaryExists(t, fixtureReadyPlugin),
+				"a refused configuration must not have spawned a plugin")
+			require.NoError(t, h.Stop(t.Context()))
+		})
+	}
+}
+
+// Test Host.Start accepting a HeartbeatTimeout exactly equal to the plugin's fixed
+// send cadence — the boundary the refusal is on the far side of — and supervising the
+// plugin to Ready with it.
+func TestHost_Start_AcceptsHeartbeatTimeout_AtExactlyThePluginSendCadence(t *testing.T) {
+	// Given
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+		Name:             "boundary",
+		Path:             fixtureReadyPlugin,
+		HeartbeatTimeout: styx.PluginHeartbeatInterval,
+	}}})
+
+	// When
+	err := h.Start(t.Context())
+
+	// Then: the boundary value is honored, not refused.
+	require.NoError(t, err)
+	require.NotErrorIs(t, err, styx.ErrInvalidConfig)
+
+	ev := awaitEvent(t, h.Events(), styx.EventReady)
+	require.Equal(t, "boundary", ev.Plugin)
+	require.NoError(t, h.Stop(t.Context()))
+}
+
+// Test a PluginSpec that sets no liveness tuning passing the zeros that select
+// internal/supervisor's own defaults, so an unset spec is supervised on exactly the
+// values it was before these knobs existed.
+func TestHost_SupervisorConfig_PassesZeroTuning_WhenLivenessFieldsUnset(t *testing.T) {
+	// Given
+	h := styx.NewHost(styx.HostConfig{})
+
+	// When
+	cfg := h.SupervisorConfigForTest(styx.PluginSpec{Name: "plain", Path: fixtureReadyPlugin})
+
+	// Then: zero on all three, which is what this layer sent before the fields
+	// existed and is how internal/supervisor is asked for its documented defaults.
+	require.Zero(t, cfg.HeartbeatInterval,
+		"an unset HeartbeatTimeout must not resolve a value at this layer")
+	require.Zero(t, cfg.MissedHeartbeats,
+		"an unset MissedHeartbeatThreshold must not resolve a value at this layer")
+	require.Zero(t, cfg.WedgeWindow,
+		"an unset WedgeWindow must not resolve a value at this layer")
+}
+
+// Test each public liveness knob reaching its internal counterpart on the
+// supervision configuration a Host builds for a plugin.
+func TestHost_SupervisorConfig_CarriesLivenessTuning_WhenFieldsSet(t *testing.T) {
+	// Given
+	h := styx.NewHost(styx.HostConfig{})
+
+	// When
+	cfg := h.SupervisorConfigForTest(styx.PluginSpec{
+		Name:                     "tuned",
+		Path:                     fixtureReadyPlugin,
+		HeartbeatTimeout:         4 * time.Second,
+		MissedHeartbeatThreshold: 2,
+		WedgeWindow:              11 * time.Second,
+	})
+
+	// Then
+	require.Equal(t, 4*time.Second, cfg.HeartbeatInterval)
+	require.Equal(t, 2, cfg.MissedHeartbeats)
+	require.Equal(t, 11*time.Second, cfg.WedgeWindow)
 }

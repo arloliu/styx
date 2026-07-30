@@ -55,7 +55,7 @@ mean you miss what happened while nobody was reading.
 |---|---|---|
 | `EventStarting` | A plugin instance is being spawned — first start or a restart — before its handshake completes. | never |
 | `EventReady` | An instance completed its handshake and data-plane attach and is now serving calls. Also fires (with no preceding `EventStarting`) when a `Reload` promotes its successor. | never |
-| `EventUnhealthy` | The heartbeat classifier judged a still-running instance wedged: a stalled ring consumer with queued work, or a dispatch owing a response with no running handler. | describes which wedge, as an opaque message — see [below](#eventunhealthy-err-is-not-a-typed-value) |
+| `EventUnhealthy` | An instance stopped proving it is serving: either it went silent for `MissedHeartbeatThreshold` consecutive heartbeat waits, or the heartbeat classifier judged it wedged (a stalled ring consumer with queued work, or a dispatch owing a response with no running handler). | describes which verdict, as an opaque message — see [below](#eventunhealthy-err-is-not-a-typed-value) |
 | `EventCrashed` | An instance attempt failed: a running instance exited or lost its connection, a spawned instance failed before reaching ready, or a spawn failed before any process existed. | the failure detail — often a `*PluginCrashError` |
 | `EventRestarting` | The restart policy scheduled another attempt and is backing off before spawning the replacement. The spawn itself is reported by the `EventStarting` that follows. | never |
 | `EventGaveUp` | Terminal: no further restart will happen, either because the restart budget is exhausted or because a handshake incompatibility can never be recovered by retrying. | the last failure detail |
@@ -94,14 +94,24 @@ undifferentiated "this instance is making no progress" signal; don't build
 logic that string-matches the message to tell the two wedge kinds apart,
 since that text is not a stable contract.
 
-An `EventUnhealthy` on its own is not fatal — a wedge has to persist for a
-fixed window before the supervisor restarts the instance, and today that
-window (like the heartbeat interval and missed-heartbeat count) is a
-built-in default, not a `PluginSpec` field. Treat `EventUnhealthy` as an
-early warning that usually resolves into either the instance recovering
-(no further event) or an `EventCrashed`/`EventRestarting` pair once the
-wedge window elapses — not as something to alarm on by itself in a
-low-noise way.
+An `EventUnhealthy` is a verdict already reached, not a warning that one
+may be coming. The supervisor publishes it and immediately ends the
+instance, so an `EventCrashed` carrying the same reason always follows,
+and after that either `EventRestarting`/`EventStarting` if the restart
+budget allows another attempt or `EventGaveUp` if it does not. The
+instance you were told about never goes back to serving.
+
+How long each verdict takes to reach is a `PluginSpec` field:
+`HeartbeatTimeout` and `MissedHeartbeatThreshold` bound the silence
+verdict, `WedgeWindow` the wedge one. Left unset they keep the built-in
+defaults — one second, three, and five seconds — putting a silent
+plugin's verdict about three seconds after it goes quiet, and a wedge's
+about six seconds after the stall begins. Lower
+`MissedHeartbeatThreshold` to be told sooner, or raise `HeartbeatTimeout`
+for a plugin whose thread of control legitimately pauses; see
+[Tuning liveness detection](configuration.md#tuning-liveness-detection)
+for which knob does which, why the wait has a floor, and why the wedge
+window rounds up to whole heartbeats.
 
 ## Delivery semantics
 
@@ -157,11 +167,14 @@ should trigger something your code does.
 - **`EventStarting` / `EventReady`** — routine. Most hosts don't act on
   these beyond optional debug logging; `Logger` already covers "instance
   became ready" at a diagnostic level if you need an audit trail.
-- **`EventUnhealthy`** — a leading indicator, not an action point by
-  itself. Reasonable uses: incrementing your own dashboard counter, or
-  widening a caller's timeout expectation for that plugin while it's
-  flagged. Don't treat it as "the plugin is down" — calls are still being
-  routed to it.
+- **`EventUnhealthy`** — the instance is already ending, and the
+  `EventCrashed` that follows carries the same reason. Handle it the way
+  you handle a crash, or fold it into that handling entirely: what it adds
+  over the `EventCrashed` is *why* the instance was ended (it went silent,
+  or it stopped making progress), not whether it was. If it fires for a
+  plugin that is slow rather than broken, the fix is the tuning in
+  [docs/configuration.md](configuration.md#tuning-liveness-detection), not
+  a filter on this event.
 - **`EventCrashed`** — inspect `Err` with `errors.As` for a
   `*PluginCrashError` to get `ExitStatus`/`ExitStatusKnown` and the crash
   reason. A crash alone doesn't mean the plugin is gone for good — expect
