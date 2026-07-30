@@ -1,5 +1,15 @@
 # Production Shared-Memory Transport — Benchmark Rerun Report
 
+> **This is the record of one campaign, captured 2026-07-20, and its numbers are
+> that campaign's — not the shipped code's.** For current figures, the
+> comparison against `hashicorp/go-plugin`, the cells the merge gate reads, and
+> the commands that reproduce all of them, see
+> [`docs/benchmark.md`](../../docs/benchmark.md). What remains uniquely here and
+> is still current: the process model and its trade-offs, the scheduler-regime
+> and tail analysis, the arena-reserve and size-class tuning results, the
+> region-provisioning floor, and the lean profile recommended for a device
+> gateway.
+
 **Milestone:** shared-memory transport exit gate (the design spec's milestone
 gate, `docs/specs/2026-07-16-styx-design.md` §25).
 **What this is:** the spike benchmark suite's dimension matrix (`bench/spike`,

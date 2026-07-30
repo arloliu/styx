@@ -169,10 +169,15 @@ Unix domain sockets, unary and streaming RPC, supervised plugin lifecycle
 with hot-reload — and validated by a differential test suite against the
 UDS oracle, a fault-injection (chaos) suite, and a long-running leak soak.
 
-At a 64-byte payload with one in-flight call, the measured round-trip p50 is
-2.11 µs on shared memory versus 8.15 µs on UDS
-([bench/shm/REPORT.md](bench/shm/REPORT.md)); the earlier prototype that
-first validated the premise is in
-[docs/plans/2026-07-16-m0-gate-report.md](docs/plans/2026-07-16-m0-gate-report.md).
+At a 64-byte payload with one in-flight call, a unary round trip measures a p50
+of 2.4 µs over shared memory, against 7.7 µs over Unix domain sockets and
+15.9 µs over gRPC-over-UDS. Against `hashicorp/go-plugin`, Styx over shared
+memory is faster in all 24 cells of the comparison matrix — **1.65× to 4.72×**
+on throughput, across payloads from 64 B to 1 MiB and concurrency from 1 to 64.
+
+See [docs/benchmark.md](docs/benchmark.md) for what each suite measures, how to
+reproduce every number, and which of them CI actually gates;
+[docs/performance-headroom.md](docs/performance-headroom.md) records why the
+transport is not faster still and which optimization levers remain open.
 
 For the full design, see [docs/specs/2026-07-16-styx-design.md](docs/specs/2026-07-16-styx-design.md).
