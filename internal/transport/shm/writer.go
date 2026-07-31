@@ -92,6 +92,10 @@ type carry struct {
 	// h and hasSlab record the slab this intent allocated, so the writer can
 	// index it into the reclaim handle table at publish time (shm-abi.md §6).
 	// hasSlab is false for a descriptor-only or empty-payload frame (no slab).
+	// Every rollback that returns the slab clears hasSlab, so the flag names a
+	// slab this carry still owns rather than one it used to hold: a second
+	// rollback on the same carry is then structurally impossible, not merely
+	// unreachable by the current control flow.
 	h       arena.SlabHandle
 	hasSlab bool
 	// parked and parkedClass record that this intent is set aside waiting for a
@@ -1188,6 +1192,7 @@ func (w *writer) place(c *carry) emitResult {
 	if err := w.prePublishFault(); err != nil {
 		if c.hasSlab {
 			_ = w.arena.Free(c.h)
+			c.hasSlab = false
 		}
 		w.report(c.i, err)
 
@@ -1205,6 +1210,14 @@ func (w *writer) place(c *carry) emitResult {
 			// consumer's poisonOnConformanceFault, mark included: a sender
 			// classifying this failure has to see the poison it just actuated.
 			err = markPoisoned(err)
+		}
+		// The push failed terminally, so this frame is discarded where it stands.
+		// Roll the reservation back before reporting (shm-abi.md §8): the slab was
+		// taken for a descriptor that will never reach the ring, and nothing later
+		// in this transport's life would return it.
+		if c.hasSlab {
+			_ = w.arena.Free(c.h)
+			c.hasSlab = false
 		}
 		w.report(c.i, err) // ring.ErrCorrupt or another push fault, surfaced honestly
 
@@ -1459,6 +1472,11 @@ func (w *writer) stampPayload(
 	// writer (shm-abi.md §2/§6); a disagreement is a construction bug, failed
 	// closed rather than published with a stamp the peer would discard as stale.
 	if w.gen != 0 && h.Generation != w.gen {
+		// The allocation already succeeded, so this abort owes the arena its slab
+		// back (shm-abi.md §8). The handle came from this arena and carries the
+		// arena's own generation, so the free is always valid; only the writer's
+		// stamped region generation is the one in dispute.
+		_ = w.arena.Free(h)
 		w.report(i, errGenerationMismatch)
 
 		return d, buildFailed
@@ -1795,10 +1813,22 @@ func (w *writer) poisonRingCorrupt() bool {
 // signals that run has returned. It first waits on the barrier so no enqueue is in
 // flight and none can start, making the queues a fixed set: no pending intent is
 // left to hang.
+//
+// A set-aside carry can already hold a slab: one parked on a full ring window was
+// built before its push was refused. Discarding it here is a post-allocation abort,
+// so the slab goes back (shm-abi.md §8) before the intent is reported. The queued
+// intents were never built and hold nothing. Freeing during teardown needs nothing
+// from the region: an arena free touches only process-local Go bookkeeping — the
+// class free lists, the live-sequence table, the occupancy counter — and never the
+// mapped bytes.
 func (w *writer) drainAndStop(stuck *carry) {
 	<-w.barrier
 
 	if stuck != nil {
+		if stuck.hasSlab {
+			_ = w.arena.Free(stuck.h)
+			stuck.hasSlab = false
+		}
 		w.report(stuck.i, transport.ErrClosed)
 	}
 
