@@ -12,7 +12,7 @@ BIN_DIR                 := bin
 GENERATOR_BIN           := $(BIN_DIR)/protoc-gen-go-styx
 
 .DEFAULT_GOAL := help
-.PHONY: help build test bench bench-goplugin bench-goplugin-check vet lint fmt generate tidy clean \
+.PHONY: help build test test-failpoint bench bench-goplugin bench-goplugin-check vet lint fmt generate tidy clean \
 	linter-update linter-version clean-linter-cache \
 	buf-update buf-version ci
 
@@ -30,6 +30,10 @@ test:
 	go test ./... -race -timeout=$(TEST_TIMEOUT)
 	go test -tags ringhook ./internal/ring/... -race -timeout=$(TEST_TIMEOUT)
 	go test -tags eventhook ./internal/event/... ./internal/transport/shm/... -race -timeout=$(TEST_TIMEOUT)
+
+## test-failpoint: Run the crash-window tests behind the failpoint build tag
+test-failpoint:
+	go test -tags failpoint ./internal/transport/shm -race -timeout=$(TEST_TIMEOUT)
 
 ## bench: Run the SHM spike benchmark suite (see bench/spike)
 bench:
@@ -97,5 +101,5 @@ buf-update:
 buf-version:
 	go tool $(BUF_GOMOD) buf --version
 
-## ci: Full local gate (lint, vet, test)
-ci: lint vet test bench-goplugin-check
+## ci: Full local gate (lint, vet, test, failpoint tests)
+ci: lint vet test test-failpoint bench-goplugin-check

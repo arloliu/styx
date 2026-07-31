@@ -407,6 +407,43 @@ func realArena(tb testing.TB) *arena.Arena {
 	return a
 }
 
+// peakAtFreeArena is a real arena that also records how much of itself was
+// reserved at the instant each Free was entered — before that Free takes effect,
+// so the slab on its way back is still counted.
+//
+// It gives a rollback assertion its positive control. "Occupancy came back to the
+// baseline" is equally true of a path that stopped allocating altogether, and a
+// rollback that completes before the submitting call returns leaves the test
+// goroutine no window to observe the reservation for itself: by the time it can
+// look, the slab is already back. Sampling from inside Free is that window.
+type peakAtFreeArena struct {
+	*arena.Arena
+	mu    sync.Mutex
+	peak  uint64
+	frees int
+}
+
+func (a *peakAtFreeArena) Free(h arena.SlabHandle) error {
+	a.mu.Lock()
+	if held := a.OccupancyBytes(); held > a.peak {
+		a.peak = held
+	}
+	a.frees++
+	a.mu.Unlock()
+
+	return a.Arena.Free(h)
+}
+
+// peakHeldAtFree reports the highest occupancy seen at a Free and how many Frees
+// were seen at all, so a caller can tell "the slab was held and given back" from
+// "nothing was ever allocated".
+func (a *peakAtFreeArena) peakHeldAtFree() (uint64, int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return a.peak, a.frees
+}
+
 func dataReqFrame(id uint64) transport.Frame {
 	return transport.Frame{CallID: id, Kind: transport.FrameUnaryReq}
 }
@@ -2778,7 +2815,7 @@ func TestWriter_StopWithRingFullCarry_FreesTheCarriedSlab(t *testing.T) {
 func TestWriter_TerminalPushFault_FreesTheBuiltSlab(t *testing.T) {
 	// Given a running writer over a real arena whose every push reports the
 	// corruption a peer-mangled head word produces.
-	ra := realArena(t)
+	ra := &peakAtFreeArena{Arena: realArena(t)}
 	rr := &recordRing{err: ring.ErrCorrupt}
 	tf := newTestPoisonFlag(t)
 	w := newWriterFromParts(rr, ra, 1, 1, admitBlock)
@@ -2800,6 +2837,12 @@ func TestWriter_TerminalPushFault_FreesTheBuiltSlab(t *testing.T) {
 	cause, poisoned := tf.flag.Check()
 	require.True(t, poisoned)
 	require.Equal(t, PoisonRingCorrupt, cause)
+
+	// The frame really did hold a slab when the push failed, so the equality below
+	// measures a rollback and not an allocation that never happened.
+	heldAtFree, frees := ra.peakHeldAtFree()
+	require.Positive(t, frees, "the failed push had no slab to give back: nothing was ever reserved")
+	require.Greater(t, heldAtFree, baseline, "the payload's slab must still be held when the push fails")
 	require.Equal(t, baseline, ra.OccupancyBytes(), "a terminally failed push must not strand its slab")
 }
 
@@ -2811,7 +2854,7 @@ func TestWriter_TerminalPushFault_FreesTheBuiltSlab(t *testing.T) {
 func TestWriter_GenerationMismatch_FreesTheAllocatedSlab(t *testing.T) {
 	// Given a running writer whose stamped region generation disagrees with the
 	// one the arena mints handles under.
-	ra := realArena(t) // mints handles at generation 1
+	ra := &peakAtFreeArena{Arena: realArena(t)} // mints handles at generation 1
 	rr := &recordRing{}
 	w := newWriterFromParts(rr, ra, 1, 1, admitBlock)
 	w.gen = 2
@@ -2830,6 +2873,12 @@ func TestWriter_GenerationMismatch_FreesTheAllocatedSlab(t *testing.T) {
 	// back: occupancy is exactly the baseline again.
 	require.ErrorIs(t, err, errGenerationMismatch)
 	require.Empty(t, rr.snapshot(), "a generation-mismatched build must publish no descriptor")
+
+	// The cross-check really did run after an allocation, so the equality below
+	// measures a rollback and not a build that failed before taking a slab.
+	heldAtFree, frees := ra.peakHeldAtFree()
+	require.Positive(t, frees, "the rejected build had no slab to give back: nothing was ever reserved")
+	require.Greater(t, heldAtFree, baseline, "the allocation must still be held when the cross-check rejects it")
 	require.Equal(t, baseline, ra.OccupancyBytes(), "a generation-mismatched build must not strand its slab")
 }
 

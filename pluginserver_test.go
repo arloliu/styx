@@ -1015,6 +1015,27 @@ type decliningTransport struct {
 	// fail the way a full ring under a rejecting writer fails it: before the frame
 	// is accepted, so the host never sees it.
 	refuseRefusal atomic.Bool
+	// reportAsCancel rewrites the fault this side raises to name a CANCEL rather
+	// than the UNARY_REQ the host actually published, so the serve loop's
+	// disposition is driven by a fault of a kind that must NOT be answered. A
+	// consume step can fail on any kind it takes — the frame-construction faults
+	// that produce a real decline are not specific to requests — and the fault's own
+	// kind is all the disposition reads.
+	reportAsCancel atomic.Bool
+	// parkRefusal holds the refusal's send inside the transport until release is
+	// closed, so a test can observe the serving side's state while the answer is
+	// genuinely in flight instead of after it has completed.
+	parkRefusal atomic.Bool
+	reached     chan struct{}
+	release     chan struct{}
+	// unaryErrs counts refusals handed to this transport, so a test can assert a
+	// fault the serve loop must not answer produced no answer at all.
+	unaryErrs atomic.Int64
+	// declined is signaled as the armed frame is declined. A test that issues a
+	// second call needs it: which of two concurrently-issued requests reaches the
+	// consume step first is not fixed, so without waiting here the arming could
+	// land on either one.
+	declined chan struct{}
 }
 
 func newDecliningTransport(t *testing.T, tr transport.Transport) *decliningTransport {
@@ -1027,7 +1048,11 @@ func newDecliningTransport(t *testing.T, tr transport.Transport) *decliningTrans
 	fill, ok := tr.(transport.PayloadFillSender)
 	require.True(t, ok, "the reply path must stay the production one for the calls that are not declined")
 
-	return &decliningTransport{Transport: tr, view: view, resv: resv, fill: fill}
+	return &decliningTransport{
+		Transport: tr, view: view, resv: resv, fill: fill,
+		reached: make(chan struct{}, 1), release: make(chan struct{}),
+		declined: make(chan struct{}, 1),
+	}
 }
 
 // Arm makes the next inbound unary request one this transport's consume step
@@ -1043,6 +1068,47 @@ func (d *decliningTransport) ArmPanic() { d.mode.Store(declineByPanic) }
 // before the transport accepts it, so the host never receives it.
 func (d *decliningTransport) RefuseTheRefusal() { d.refuseRefusal.Store(true) }
 
+// ArmAsCancelFrame declines the next inbound unary request and reports the fault
+// as naming a CANCEL, the kind whose call the host has already stopped waiting on
+// and which therefore must not be answered.
+func (d *decliningTransport) ArmAsCancelFrame() {
+	d.reportAsCancel.Store(true)
+	d.mode.Store(declineByError)
+}
+
+// ParkTheRefusal holds the next refusal inside the transport until ReleaseTheRefusal
+// is called, and returns the channel signaled once the send is parked there.
+func (d *decliningTransport) ParkTheRefusal() <-chan struct{} {
+	d.parkRefusal.Store(true)
+
+	return d.reached
+}
+
+// ReleaseTheRefusal lets a parked refusal complete. It is idempotent so a test can
+// register it as a cleanup and still call it inline.
+func (d *decliningTransport) ReleaseTheRefusal() {
+	if d.parkRefusal.CompareAndSwap(true, false) {
+		close(d.release)
+	}
+}
+
+// UnaryErrsSent reports how many refusals the serve loop has handed to this
+// transport.
+func (d *decliningTransport) UnaryErrsSent() int64 { return d.unaryErrs.Load() }
+
+// Declined is signaled as the armed frame is declined, so a caller can order
+// later traffic strictly behind the frame it armed.
+func (d *decliningTransport) Declined() <-chan struct{} { return d.declined }
+
+// noteDeclined records that the armed frame is being declined, without blocking
+// the consume step it runs on.
+func (d *decliningTransport) noteDeclined() {
+	select {
+	case d.declined <- struct{}{}:
+	default:
+	}
+}
+
 // verdict reports what this transport's consume step makes of f, disarming itself
 // so exactly one request is declined however many frames follow it.
 func (d *decliningTransport) verdict(f transport.Frame) error {
@@ -1050,11 +1116,13 @@ func (d *decliningTransport) verdict(f transport.Frame) error {
 		return nil
 	}
 	if d.mode.CompareAndSwap(declineByPanic, declineNone) {
+		d.noteDeclined()
 		panic(declineReason)
 	}
 	if !d.mode.CompareAndSwap(declineByError, declineNone) {
 		return nil
 	}
+	d.noteDeclined()
 
 	// Deliberately not transport.ErrPayloadMalformed: that sentinel is how a
 	// consume step blames the peer's bytes and condemns the region. This side
@@ -1063,6 +1131,16 @@ func (d *decliningTransport) verdict(f transport.Frame) error {
 }
 
 func (d *decliningTransport) Send(ctx context.Context, f transport.Frame) error {
+	if f.Kind == transport.FrameUnaryErr {
+		d.unaryErrs.Add(1)
+		if d.parkRefusal.Load() {
+			select {
+			case d.reached <- struct{}{}:
+			default:
+			}
+			<-d.release
+		}
+	}
 	if f.Kind == transport.FrameUnaryErr && d.refuseRefusal.CompareAndSwap(true, false) {
 		// The sentinel a rejecting writer returns for a frame the ring had no room
 		// for. It is pre-acceptance: nothing was published, so the host's call is
@@ -1073,26 +1151,42 @@ func (d *decliningTransport) Send(ctx context.Context, f transport.Frame) error 
 	return d.Transport.Send(ctx, f)
 }
 
+// asDeclinedKind rewrites the kind the transport recorded on a consume fault to
+// the one this transport was armed to report, leaving the call it names and the
+// detail it carries untouched. It is what lets a test drive the disposition of a
+// declined frame of a kind the host cannot be made to publish on demand.
+func (d *decliningTransport) asDeclinedKind(err error) error {
+	var fault *transport.ConsumeFaultError
+	if err == nil || !errors.As(err, &fault) || !d.reportAsCancel.CompareAndSwap(true, false) {
+		return err
+	}
+
+	return &transport.ConsumeFaultError{
+		CallID: fault.CallID, Kind: transport.FrameCancel,
+		Panicked: fault.Panicked, Detail: fault.Detail, Stack: fault.Stack,
+	}
+}
+
 func (d *decliningTransport) RecvViewConsume(ctx context.Context, consume func(transport.Frame) error) error {
-	return d.view.RecvViewConsume(ctx, func(f transport.Frame) error {
+	return d.asDeclinedKind(d.view.RecvViewConsume(ctx, func(f transport.Frame) error {
 		if err := d.verdict(f); err != nil {
 			return err
 		}
 
 		return consume(f)
-	})
+	}))
 }
 
 func (d *decliningTransport) RecvViewConsumeReserving(
 	ctx context.Context, reserve func(), consume func(transport.Frame) error,
 ) error {
-	return d.view.RecvViewConsumeReserving(ctx, reserve, func(f transport.Frame) error {
+	return d.asDeclinedKind(d.view.RecvViewConsumeReserving(ctx, reserve, func(f transport.Frame) error {
 		if err := d.verdict(f); err != nil {
 			return err
 		}
 
 		return consume(f)
-	})
+	}))
 }
 
 func (d *decliningTransport) RecvReserving(ctx context.Context, reserve func()) (transport.Frame, error) {
@@ -1214,6 +1308,110 @@ func TestPluginServer_AnswerDeclinedCall_WhenTheConsumeStepPanicked(t *testing.T
 	resp, err := client.Say(ctx, &echopb.SayRequest{Message: "hello"})
 	require.NoError(t, err)
 	require.Equal(t, "hello", resp.GetMessage())
+	requireNoOwedObligations(t, pair)
+}
+
+// Test the refusal being sent under an OPEN response obligation, observed while
+// the send is still in flight.
+//
+// The obligation is what makes a refusal that parks visible to the wedge
+// classifier. A serving side whose answer is stuck in the transport owes the host
+// a response exactly as much as one whose handler is still running, and the
+// classifier only counts obligations that were opened: without one, a session
+// wedged inside the answer looks idle — no owed response, no lease — and the host
+// keeps waiting on a plugin nothing will ever restart. Asserting after the answer
+// completed proves nothing, since a closed obligation and one never opened read
+// identically; the count has to be read while the send is parked.
+func TestPluginServer_OpenAnObligationForTheRefusal_WhileTheDeclinedAnswerIsInFlight(t *testing.T) {
+	// Given a pair armed to decline the next request and to hold the refusal inside
+	// the transport once the serve loop sends it.
+	decliner, pair := newDecliningEchoPair(t)
+	client := echopb.NewEchoClient(pair.Conn)
+	parked := decliner.ParkTheRefusal()
+	t.Cleanup(decliner.ReleaseTheRefusal) // never leave the serve loop parked on a failure
+	decliner.Arm()
+
+	// When the host calls and the plugin's refusal parks on its way out.
+	answered := make(chan error, 1)
+	go func() {
+		_, err := client.Say(t.Context(), &echopb.SayRequest{Message: "hello"})
+		answered <- err
+	}()
+
+	select {
+	case <-parked:
+	case <-time.After(declineAnswerBudget):
+		t.Fatal("the serve loop never sent a refusal for the declined request")
+	}
+
+	// Then the response the host is owed is on the books for as long as the answer
+	// is in flight.
+	require.Positive(t, pair.OpenObligations(),
+		"a refusal still in the transport is a response the host is owed, and must be visible as one")
+
+	// And releasing it discharges both the call and the obligation.
+	decliner.ReleaseTheRefusal()
+
+	var err error
+	select {
+	case err = <-answered:
+	case <-time.After(declineAnswerBudget):
+		t.Fatal("the released refusal never reached the host")
+	}
+	require.ErrorIs(t, err, styx.ErrRequestDeclined)
+	requireNoOwedObligations(t, pair)
+}
+
+// Test that only a declined REQUEST is answered: a consume fault naming any other
+// frame kind is disposed of silently.
+//
+// The filter is not an optimization. A CANCEL names a call the host has already
+// stopped waiting on, so answering it would send a refusal for a call ID whose
+// entry is gone — and a stream frame belongs to a stream its own budget reaps,
+// since no stream opens without a positive finite one. Widening the filter turns
+// the one disposition that discharges a waiting call into an unsolicited frame on
+// every discarded kind.
+func TestPluginServer_AnswerNothing_WhenTheDeclinedFrameIsNotARequest(t *testing.T) {
+	// Given a pair whose next declined frame is reported as a CANCEL rather than
+	// the request the host published.
+	decliner, pair := newDecliningEchoPair(t)
+	client := echopb.NewEchoClient(pair.Conn)
+	decliner.ArmAsCancelFrame()
+
+	// When the host calls, so that call's frame is the one declined. It is never
+	// answered — its own context is what ends it — so it runs in the background
+	// under a context this test cancels, and is joined before the pair is torn down.
+	callCtx, cancelCall := context.WithCancel(t.Context())
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		_, _ = client.Say(callCtx, &echopb.SayRequest{Message: "declined-as-cancel"})
+	}()
+	t.Cleanup(func() {
+		cancelCall()
+		<-returned
+	})
+
+	// Waiting for the decline is what makes that call the declined one: two
+	// requests issued together reach the consume step in either order, so a second
+	// call sent before this point could be the one that gets armed.
+	select {
+	case <-decliner.Declined():
+	case <-time.After(declineAnswerBudget):
+		t.Fatal("the armed request was never declined")
+	}
+
+	// And a second call completes normally. The serve loop takes one frame at a
+	// time, so its reply proves the declined frame's disposition already ran — no
+	// waiting on a window in which an answer might still appear.
+	resp, err := client.Say(t.Context(), &echopb.SayRequest{Message: "hello"})
+	require.NoError(t, err)
+	require.Equal(t, "hello", resp.GetMessage())
+
+	// Then nothing was answered, and the session serves on.
+	require.Zero(t, decliner.UnaryErrsSent(),
+		"a consume fault naming a frame kind other than a request must not be answered")
+	require.False(t, pair.ServeLoopExited(), "an unanswered fault of another kind must not end the session")
 	requireNoOwedObligations(t, pair)
 }
 

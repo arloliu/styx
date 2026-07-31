@@ -2,8 +2,10 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -287,6 +289,12 @@ func TestWedgeClassifier_RestartAndRecover_OnTransportWedgeWithLiveHandlerLease(
 	require.NoError(t, err)
 	require.NotEqual(t, wedgedPID, freshPID, "the wedge verdict must replace the wedged process")
 
+	// And the wedged process itself is gone, not merely replaced in the host's
+	// routing: a classifier that rewires callers onto a successor while leaving the
+	// old process running leaves a plugin holding its region, its descriptors and
+	// its blocked handler for the life of the host.
+	requireProcessGone(t, wedgedPID, "the wedged process outlived the instance it served")
+
 	// And neither call the wedged instance swallowed is abandoned: both return, and
 	// both name the outcome the host actually knows — the request was published, so it
 	// may already have run, which is terminal and not for the caller to retry.
@@ -350,6 +358,32 @@ func awaitTransportWedge(t *testing.T, ch <-chan styx.Event, timeout time.Durati
 			require.FailNow(t, "did not observe a transport-wedge verdict", "within=%s", timeout)
 		}
 	}
+}
+
+// requireProcessGone fails unless pid names no live process within
+// wedgeRecoveryDeadline, which the kernel reports as ESRCH from a zero-signal
+// probe.
+//
+// By the time a caller reaches this after a restart, the supervisor has already
+// ordered the reap ahead of it: internal/lifecycle's Teardown does not return
+// until the instance's process has been reaped, the supervisor runs that teardown
+// before it reports the crash that drives the restart decision, and it spawns no
+// successor until it completes — so a predecessor is never unreaped once the
+// successor's readiness has been announced. Polling rather than probing once is
+// therefore defense in depth over an ordering the supervisor guarantees, not a
+// wait for an unsynchronized event; it costs nothing when the guarantee holds and
+// fails loudly if it ever stops holding.
+//
+// The claim is deliberately one-directional: it asserts the pid IS gone, never
+// that it is still there. A pid the kernel has since handed to an unrelated
+// process therefore costs a failure here, never a false pass, so pid reuse can
+// only make this stricter than it reads.
+func requireProcessGone(t *testing.T, pid int, what string) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+	}, wedgeRecoveryDeadline, 20*time.Millisecond, "%s: pid=%d", what, pid)
 }
 
 // requireOutcomeUnknown fails unless the call reported on result has returned with the

@@ -11,6 +11,7 @@ import (
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/examples/echo/echopb"
 	"github.com/arloliu/styx/internal/shm"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/arloliu/styx/internal/transport/shm/chaos"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -71,13 +72,25 @@ const regionMemfdName = "styx-shm-region"
 // whose region carries a higher generation, and the host holds no mapping of the
 // poisoned generation afterwards.
 func TestSHMPoison_FailInFlightCallAndRestartOnFreshGeneration_OnCorruptDescriptor(t *testing.T) {
+	// Registered before the host exists and before anything subscribes to its
+	// events: tearing a poisoned region down and serving on a fresh one is exactly
+	// the path that leaks a goroutine or a descriptor of the generation it
+	// replaced. See the check's own doc comment on why it has to come first.
+	testutil.RequireNoGoroutineOrFDLeak(t)
+
 	enterFifo := mkfifo(t)
 	releaseFifo := mkfifo(t)
-	h := poisonRestartHost(t, enterFifo, releaseFifo)
+	h := newPoisonRestartHost(t, enterFifo, releaseFifo)
 	// Every event is collected rather than waited for one at a time, so the
 	// in-flight call's failure can be placed relative to the restart below instead
-	// of merely observed before it.
+	// of merely observed before it. Collection starts BEFORE the host does, so the
+	// first generation's own EventReady is recorded rather than raced: a ready count
+	// sampled below is then a baseline by construction, and cannot be one the
+	// collector simply had not drained yet.
 	events := collectEvents(h.Events())
+	require.NoError(t, h.Start(t.Context()))
+	stopHostInCleanup(t, h)
+
 	client := echopb.NewEchoClient(h.Plugin("echo"))
 
 	oldPID, err := sayPID(t, client, "probe")
@@ -88,6 +101,11 @@ func TestSHMPoison_FailInFlightCallAndRestartOnFreshGeneration_OnCorruptDescript
 	// live region then, one live region afterwards.
 	mapsWithFirstGeneration, err := countRegionMappings()
 	require.NoError(t, err)
+	// A baseline of zero would mean the name this count matches on no longer names
+	// a region, not that the host holds none — and every later comparison against
+	// it would then hold vacuously, whatever the host actually kept mapped.
+	require.Positive(t, mapsWithFirstGeneration,
+		"the live region must be found in this process's mapping table, or the count measures nothing")
 
 	// Given: a call parked inside the handler, its entry into the handler proven by
 	// the fifo rendezvous rather than assumed from a delay.
@@ -140,9 +158,11 @@ func TestSHMPoison_FailInFlightCallAndRestartOnFreshGeneration_OnCorruptDescript
 	require.Zero(t, events.count(styx.EventRestarting),
 		"the in-flight call must be failed by the teardown that lost it, before any restart is announced")
 
-	// And: the host restarts the instance.
+	// And: the host restarts the instance, announcing the teardown before it
+	// announces the successor.
 	events.await(t, styx.EventRestarting, 1, poisonRestartDeadline)
 	events.await(t, styx.EventReady, readyBefore+1, poisonRestartDeadline)
+	requireRestartingPrecedesReady(t, events, readyBefore+1)
 
 	// And: a later call succeeds on a new process, served over a region of a higher
 	// generation — a genuinely fresh region, never the poisoned one reused.
@@ -161,20 +181,24 @@ func TestSHMPoison_FailInFlightCallAndRestartOnFreshGeneration_OnCorruptDescript
 	requireRegionMappingsSettleTo(t, mapsWithFirstGeneration)
 }
 
-// poisonRestartHost starts a host over the shared-memory transport against the
-// crashy plugin's echo mode, with pid tagging so a later call reveals which
-// instance served it, and with the fifo pair that parks the single "gated" request
-// mid-handler. The restart budget lets the supervisor respawn once the region the
-// first instance served on is torn down.
+// newPoisonRestartHost builds — but does not start — a host over the shared-memory
+// transport against the crashy plugin's echo mode, with pid tagging so a later call
+// reveals which instance served it, and with the fifo pair that parks the single
+// "gated" request mid-handler. The restart budget lets the supervisor respawn once
+// the region the first instance served on is torn down.
+//
+// Starting is left to the caller so it can subscribe to Events() first and record
+// the first generation's own readiness, which a subscription taken after Start may
+// miss.
 //
 // The transport is pinned rather than negotiated: this test corrupts a shared
 // memory region, so a run that settled on the socket transport would have no
 // region to find and would fail late, on the search for one, instead of at the
 // handshake.
-func poisonRestartHost(t *testing.T, enterFifo, releaseFifo string) *styx.Host {
+func newPoisonRestartHost(t *testing.T, enterFifo, releaseFifo string) *styx.Host {
 	t.Helper()
 
-	h := styx.NewHost(styx.HostConfig{
+	return styx.NewHost(styx.HostConfig{
 		Plugins: []styx.PluginSpec{{
 			Name:      "echo",
 			Path:      crashyPluginBin,
@@ -191,10 +215,6 @@ func poisonRestartHost(t *testing.T, enterFifo, releaseFifo string) *styx.Host {
 			},
 		}},
 	})
-	require.NoError(t, h.Start(t.Context()))
-	stopHostInCleanup(t, h)
-
-	return h
 }
 
 // publishCorruptDescriptor publishes a structurally invalid descriptor into the

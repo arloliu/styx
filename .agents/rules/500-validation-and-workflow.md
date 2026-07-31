@@ -24,10 +24,11 @@ make build      # Build the protoc-gen-go-styx binary
 make vet        # go vet ./...
 make lint       # golangci-lint run (pinned version, .golangci.yml)
 make fmt        # gofmt + goimports (golangci-lint fmt)
-make test       # go test ./... -race
+make test       # go test ./... -race (plus the tagged ring/event suites)
+make test-failpoint # the crash-window tests behind the failpoint build tag
 make bench      # bench/spike benchmark suite
 make generate   # buf generate (protobuf + Styx codegen)
-make ci         # lint + vet + test
+make ci         # lint + vet + test + test-failpoint + bench-goplugin-check
 make help       # list all targets
 ```
 For fuzzing or a single package, drop to the raw toolchain:
