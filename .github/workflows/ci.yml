@@ -41,7 +41,17 @@ jobs:
           sudo unzip -o /tmp/protoc.zip -d /usr/local 'bin/protoc' 'include/*'
           protoc --version
 
-      - name: Run make ci (lint, vet, test)
+      # The crash-window tests compile only under the failpoint build tag, so
+      # nothing in the default suite covers them. Run them as their own step so
+      # a failure names the tagged suite instead of being read as an ordinary
+      # test failure. make ci runs the same target; the repeat is a test-cache
+      # hit, not a second execution.
+      - name: Run failpoint-gated crash-window tests
+        env:
+          GOFLAGS: -p=1
+        run: make test-failpoint
+
+      - name: Run make ci (lint, vet, test, failpoint tests)
         # -p=1 serializes test packages. The hosted runner has few CPUs and
         # the race-enabled suites carry ~1s liveness deadlines; packages
         # running in parallel starve each other and flake timing-sensitive
