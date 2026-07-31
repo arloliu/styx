@@ -2,6 +2,7 @@ package styx
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,6 +11,77 @@ import (
 	"github.com/arloliu/styx/observe"
 	"github.com/stretchr/testify/require"
 )
+
+// Test hostEventIsCritical agreeing with internal/supervisor's own
+// critical-event classification for every event kind the translate-at-boundary
+// layer can produce, so the "mirrors exactly" comment on hostEventIsCritical is
+// actually enforced rather than only asserted in prose.
+func TestHostEventIsCritical_MirrorsSupervisorClassification(t *testing.T) {
+	kinds := []supervisor.EventKind{
+		supervisor.EventStarting, supervisor.EventReady, supervisor.EventUnhealthy,
+		supervisor.EventCrashed, supervisor.EventRestarting, supervisor.EventGaveUp,
+	}
+	for _, k := range kinds {
+		hostKind := translateEventKind(k)
+		require.Equal(t, supervisor.IsCriticalEventKind(k), hostEventIsCritical(Event{Kind: hostKind}),
+			"hostEventIsCritical disagrees with supervisor.IsCriticalEventKind for %v (translated to %v)", k, hostKind)
+	}
+}
+
+// Test Host's fan-in critical backlog keeping one plugin's failure incident
+// from evicting a DIFFERENT plugin's still-undelivered one. Host.publish fans
+// every plugin's events into a single shared Bus, unlike internal/supervisor's
+// own EventBus, which has exactly one publisher — so the shared backlog must
+// hold a whole incident's worth of critical events for EACH configured
+// plugin, not just one incident total, or an unlucky interleaving of two
+// plugins' failures can silently drop one of them.
+func TestHost_Events_CriticalBacklogSizedPerPlugin_KeepsOnePluginsIncidentFromEvictingAnothers(t *testing.T) {
+	// Given: a host configured for two plugins, with nothing draining
+	// Events() while both publish a full failure incident — an Unhealthy
+	// verdict, the Crashed that follows it, and a terminal GaveUp — before
+	// either incident is read.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "A"}, {Name: "B"}}})
+
+	base := time.Now()
+	publishIncident := func(name string, offset int) {
+		h.publish(Event{
+			Plugin: name, Kind: EventUnhealthy, Time: base.Add(time.Duration(offset)),
+			Err: fmt.Errorf("%s: wedged", name),
+		})
+		h.publish(Event{
+			Plugin: name, Kind: EventCrashed, Time: base.Add(time.Duration(offset + 1)),
+			Err: fmt.Errorf("%s: crashed", name),
+		})
+		h.publish(Event{
+			Plugin: name, Kind: EventGaveUp, Time: base.Add(time.Duration(offset + 2)),
+			Err: fmt.Errorf("%s: gave up", name),
+		})
+	}
+	publishIncident("A", 0)
+	publishIncident("B", 10)
+
+	// When: drain whatever the host delivers.
+	got := map[string][]EventKind{}
+	timeout := time.After(300 * time.Millisecond)
+drain:
+	for {
+		select {
+		case ev := <-h.Events():
+			got[ev.Plugin] = append(got[ev.Plugin], ev.Kind)
+			require.Error(t, ev.Err, "every critical event published here carried a reason")
+		case <-timeout:
+			break drain
+		}
+	}
+
+	// Then: both plugins' full incidents survived, whole and in order — the
+	// backlog gave each configured plugin its own CriticalBufferCapacity
+	// worth of room, so plugin B's incident could not evict plugin A's, or
+	// vice versa.
+	wantKinds := []EventKind{EventUnhealthy, EventCrashed, EventGaveUp}
+	require.Equal(t, wantKinds, got["A"], "plugin A's full incident must survive alongside plugin B's")
+	require.Equal(t, wantKinds, got["B"], "plugin B's full incident must survive alongside plugin A's")
+}
 
 // Test the event relay draining a queued supervisor event onto Host.Events after
 // the stop signal, so a terminal event enqueued just before shutdown reaches the

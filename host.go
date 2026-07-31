@@ -267,14 +267,16 @@ type Host struct {
 	stopRequested bool
 	obsReleased   bool
 
-	// bus fans every plugin's relayed events into the one channel
-	// Events() exposes, using internal/supervisor.Bus's own
-	// drop-oldest-informational / coalesce-latest-critical semantics — the
-	// identical contract each plugin's own internal/supervisor.EventBus
-	// already applies one level down, now
-	// also applied to Host's fan-IN from potentially many plugins so a
-	// GaveUp from one plugin can never be silently lost behind a burst of
-	// events from others, even with an unread Events() channel.
+	// bus fans every plugin's relayed events into the one channel Events()
+	// exposes, using internal/supervisor.Bus's own drop-oldest-informational /
+	// bounded-critical-FIFO semantics — the identical contract each plugin's
+	// own internal/supervisor.EventBus already applies one level down. It is
+	// constructed in NewHost with its critical capacity sized to
+	// CriticalBufferCapacity*len(cfg.Plugins): every configured plugin gets
+	// its own whole-incident's worth of guaranteed critical-event room in the
+	// shared backlog, so one plugin's Unhealthy/Crashed/GaveUp burst cannot
+	// evict a DIFFERENT plugin's still-undelivered one. See Events()'s doc
+	// for the guarantee this sizing does, and does not, make.
 	bus    *supervisor.Bus[Event]
 	events <-chan Event
 
@@ -318,16 +320,28 @@ type pluginRuntime struct {
 }
 
 // hostCriticalEventKinds are the lifecycle-critical Host-level event
-// kinds: Crashed and GaveUp (there is no Poisoned kind in the six-symbol
-// event stream yet, see event.go). Mirrors
-// internal/supervisor.EventKind.isCritical exactly, one layer up.
+// kinds: Unhealthy, Crashed, and GaveUp (there is no Poisoned kind in the
+// six-symbol event stream yet, see types.go). Mirrors
+// internal/supervisor.EventKind.isCritical exactly, one layer up — pinned
+// against it directly by TestHostEventIsCritical_MirrorsSupervisorClassification
+// in host_relay_test.go, so the two cannot silently drift apart.
 func hostEventIsCritical(e Event) bool {
-	return e.Kind == EventCrashed || e.Kind == EventGaveUp
+	return e.Kind == EventUnhealthy || e.Kind == EventCrashed || e.Kind == EventGaveUp
 }
 
 // NewHost creates a Host from the given configuration but does not start it.
 func NewHost(cfg HostConfig) *Host {
-	bus := supervisor.NewBus(hostEventIsCritical)
+	// Host's bus fans in every configured plugin's own EventBus, each an
+	// independent publisher — unlike internal/supervisor.EventBus, which has
+	// exactly one. Its critical ring must therefore hold CriticalBufferCapacity
+	// per plugin, not just one CriticalBufferCapacity total, or one plugin's
+	// undrained incident could evict a different plugin's still-undelivered
+	// one (see supervisor.Bus's doc). The plugin count is fixed for the
+	// Host's whole life as of this call — Start only starts the configured
+	// PluginSpecs, and there is no API to add a plugin afterward — so this
+	// sizing does not need to react to anything past this point.
+	criticalCapacity := supervisor.CriticalBufferCapacity * max(len(cfg.Plugins), 1)
+	bus := supervisor.NewBus(hostEventIsCritical, criticalCapacity)
 	events, _, _ := bus.Subscribe() // never unsubscribed: this is Events()'s channel for the Host's whole life.
 
 	h := &Host{
@@ -830,17 +844,31 @@ func (h *Host) Plugin(name string) *ClientConn {
 // Events returns a channel of supervisor lifecycle events for every plugin
 // this Host manages (EventStarting/EventReady/EventUnhealthy/EventCrashed/
 // EventRestarting/EventGaveUp).
-// Delivery never blocks, even under a sustained burst with no reader: an
-// informational event drops the oldest once the reader falls behind, while
-// Crashed and GaveUp instead coalesce to the latest one.
+// Delivery never blocks, even under a sustained burst with no reader:
+// Starting/Ready/Restarting drop the oldest once the reader falls behind,
+// while Unhealthy/Crashed/GaveUp instead fill a bounded backlog holding
+// CriticalBufferCapacity's worth of critical events (currently 3: an
+// Unhealthy verdict, the Crashed that follows it, and a terminal GaveUp) for
+// EACH plugin this Host was configured with. So long as no more than that
+// many plugins have an undrained failure incident sitting in the backlog at
+// once, every one of those incidents' critical events arrives whole and in
+// order — a verdict and the outcome that followed it never split apart or
+// arrive out of order. If MORE incidents than that stack up undrained at
+// once — a flapping plugin racking up several of its own before you drain,
+// or enough distinct plugins failing together — an older, still-undelivered
+// incident's critical events can be evicted to make room, and that older
+// incident may belong to a different plugin than the one whose newer
+// incident evicted it. Reading Events() promptly keeps you well inside that
+// bound; see docs/supervisor-events.md's delivery-semantics section for the
+// full accounting.
 func (h *Host) Events() <-chan Event {
 	return h.events
 }
 
 // publish delivers e to every Events() subscriber (today, always exactly
 // one — the channel Events() itself returns) via h.bus, which applies the
-// real drop-oldest/coalesce-to-latest policy described on Events(). It
-// never blocks regardless of whether anything is reading Events().
+// real delivery policy described on Events(). It never blocks regardless of
+// whether anything is reading Events().
 func (h *Host) publish(e Event) {
 	h.bus.Publish(e)
 }

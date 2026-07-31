@@ -646,10 +646,18 @@ itself is panic-isolated: a panicking user-supplied sink or malformed plugin out
 never crash the host (a recurring `arloliu/go-plugin` fork pain point, §27 Open
 Question 2). `host.Events()` delivery
 is per-subscriber buffered and non-blocking: informational events are
-drop-oldest-with-counter; lifecycle-critical events (`Crashed`, `GaveUp`, `Poisoned`)
-coalesce to latest-state and never silently vanish. An unread subscription can never
-stall the supervisor. Observability hooks run on non-hot-path goroutines,
-panic-isolated, with documented ordering and drop policy.
+drop-oldest-with-counter; lifecycle-critical events (`Unhealthy`, `Crashed`, `GaveUp`,
+`Poisoned`) fill a bounded backlog sized to one whole failure incident's worth of
+critical events per publisher, rather than a single coalescing slot, so a verdict and
+the outcome that followed it always arrive together, in order, instead of either one
+silently vanishing on its own. `internal/supervisor.EventBus` has exactly one
+publisher (the plugin's own supervisor), so its backlog holds one incident's worth;
+`Host.Events()` fans in every configured plugin's own `EventBus`, so its backlog holds
+one incident's worth *per plugin* — only an older, already-superseded incident's
+critical events (that plugin's own earlier one, or a different plugin's) can still be
+evicted to make room for a newer one. An unread subscription can never stall the
+supervisor. Observability hooks run on non-hot-path goroutines, panic-isolated, with
+documented ordering and drop policy.
 
 ## 19. Flow Control and Backpressure
 

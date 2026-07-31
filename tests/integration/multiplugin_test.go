@@ -89,14 +89,22 @@ const (
 // restart either, because every restart is preceded by the Crashed and
 // Restarting that are forbidden here.
 //
-// Only Crashed and GaveUp are drop-proof (they coalesce to the latest one);
-// Unhealthy and Restarting are informational and drop the oldest once a
-// subscriber's backlog reaches internal/supervisor's InformationalBufferCapacity
-// of 16. So Crashed is the load-bearing forbidden kind, and the other three
-// strengthen the check only as long as nothing is dropped — which holds here,
-// where the whole incident queues at most seven informational events against
-// that capacity. A test that drove enough plugins or restarts to burst the
-// backlog could not rely on the informational kinds.
+// Crashed, GaveUp, and Unhealthy are drop-proof IN THIS TEST: Host sizes its
+// critical backlog to CriticalBufferCapacity per configured plugin (6 here,
+// for twoPluginHost's two plugins), and only plugin A ever publishes a
+// critical event in this scenario — B stays healthy throughout — so A's
+// single incident (at most 3 critical events) never comes close to filling
+// even its own share of that room, let alone contending with B's. A test
+// that drove enough simultaneously-faulting plugins, or enough undrained
+// restart cycles on one plugin, to exceed that per-plugin room could not
+// rely on the same guarantee (see docs/supervisor-events.md's
+// delivery-semantics section). Restarting is plain informational and drops
+// the oldest once a subscriber's backlog reaches internal/supervisor's
+// InformationalBufferCapacity of 16; it strengthens the check here only
+// because the whole incident queues at most seven informational events
+// against that capacity. So Crashed is the load-bearing forbidden kind, and
+// a test that drove enough plugins or restarts to burst either backlog could
+// not rely on Restarting.
 var pluginFailureKinds = []styx.EventKind{
 	styx.EventUnhealthy,
 	styx.EventCrashed,
