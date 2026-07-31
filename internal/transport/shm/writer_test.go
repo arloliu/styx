@@ -2732,6 +2732,107 @@ func TestWriter_SurvivesFillPanic_WithoutLeakingSlabOrWriter(t *testing.T) {
 	require.Equal(t, uint64(3), pushed[1].CallID())
 }
 
+// Test that a data intent set aside on a full ring window gives its reserved slab
+// back when the writer stops. Such a carry is already built, so it holds a slab
+// the shutdown drain would otherwise strand: the intent is reported once with
+// transport.ErrClosed and the arena's occupancy returns to its baseline, which is
+// shm-abi.md §8's RollbackAdmit for the one abort that shutdown itself causes.
+func TestWriter_StopWithRingFullCarry_FreesTheCarriedSlab(t *testing.T) {
+	// Given a running writer over a real arena whose ring is full for data, so a
+	// submitted data intent builds a slab and is set aside on ring.ErrFull.
+	ra := realArena(t)
+	fr := &dataFullRing{attempted: make(chan struct{}, 1)}
+	w := newWriterFromParts(fr, ra, 2, 2, admitBlock)
+	w.start()
+	t.Cleanup(w.stop)
+
+	baseline := ra.OccupancyBytes()
+
+	dataI := intent{
+		frame: transport.Frame{CallID: 7, Kind: transport.FrameUnaryReq, Payload: []byte("stuck-at-shutdown")},
+		lane:  laneData,
+		done:  make(chan error, 1),
+	}
+	w.dataQueue <- dataI
+	<-fr.attempted // the push returned ring.ErrFull: the carry is set aside, built, holding a slab
+
+	require.Greater(t, ra.OccupancyBytes(), baseline, "the set-aside carry must be holding a reserved slab")
+
+	// When the writer stops with that carry still set aside.
+	w.stop()
+
+	// Then the intent is reported closed and its slab is back: occupancy is exactly
+	// the baseline again, and nothing was published.
+	require.ErrorIs(t, recvWithin(t, dataI.done, "the carried intent was never reported"), transport.ErrClosed)
+	require.Equal(t, baseline, ra.OccupancyBytes(), "a carry discarded at shutdown must not strand its slab")
+	require.Empty(t, fr.snapshot(), "a carry discarded at shutdown must publish no descriptor")
+}
+
+// Test that a terminal Ring.Push fault gives the built carry's slab back. A
+// non-ErrFull push error is not backpressure: the frame is failed and discarded
+// where it stands, so the slab it already reserved must be returned (shm-abi.md
+// §8's RollbackAdmit) rather than stranded for the life of the transport. Unlike
+// TestWriter_PoisonsRingCorruption_OnProducerPush, which uses an empty-payload
+// frame to isolate the poison actuation, this drives a payload-bearing frame so
+// the rollback is what is under test.
+func TestWriter_TerminalPushFault_FreesTheBuiltSlab(t *testing.T) {
+	// Given a running writer over a real arena whose every push reports the
+	// corruption a peer-mangled head word produces.
+	ra := realArena(t)
+	rr := &recordRing{err: ring.ErrCorrupt}
+	tf := newTestPoisonFlag(t)
+	w := newWriterFromParts(rr, ra, 1, 1, admitBlock)
+	w.poison = tf.flag
+	w.start()
+	t.Cleanup(w.stop)
+
+	baseline := ra.OccupancyBytes()
+
+	// When a payload-bearing data frame is submitted, so its slab is reserved
+	// before the push that fails terminally.
+	err := w.submit(t.Context(), transport.Frame{
+		CallID: 3, Kind: transport.FrameUnaryReq, Payload: []byte("terminal-push-fault"),
+	}, laneData)
+
+	// Then the fault reaches the caller, the region is poisoned, and the reserved
+	// slab is back: occupancy is exactly the baseline again.
+	require.ErrorIs(t, err, ring.ErrCorrupt)
+	cause, poisoned := tf.flag.Check()
+	require.True(t, poisoned)
+	require.Equal(t, PoisonRingCorrupt, cause)
+	require.Equal(t, baseline, ra.OccupancyBytes(), "a terminally failed push must not strand its slab")
+}
+
+// Test that the generation cross-check gives back the slab it just took. The
+// check fails a build closed when the arena's handle disagrees with the region
+// generation this writer stamps — a construction bug, since production builds
+// both from the same layout page — and it runs after the allocation, so the
+// abort owes the arena its slab back (shm-abi.md §8's RollbackAdmit).
+func TestWriter_GenerationMismatch_FreesTheAllocatedSlab(t *testing.T) {
+	// Given a running writer whose stamped region generation disagrees with the
+	// one the arena mints handles under.
+	ra := realArena(t) // mints handles at generation 1
+	rr := &recordRing{}
+	w := newWriterFromParts(rr, ra, 1, 1, admitBlock)
+	w.gen = 2
+	w.start()
+	t.Cleanup(w.stop)
+
+	baseline := ra.OccupancyBytes()
+
+	// When a payload-bearing data frame is submitted, so the allocation succeeds
+	// before the cross-check rejects its handle.
+	err := w.submit(t.Context(), transport.Frame{
+		CallID: 4, Kind: transport.FrameUnaryReq, Payload: []byte("wrong-generation"),
+	}, laneData)
+
+	// Then the build fails closed, nothing publishes, and the allocated slab is
+	// back: occupancy is exactly the baseline again.
+	require.ErrorIs(t, err, errGenerationMismatch)
+	require.Empty(t, rr.snapshot(), "a generation-mismatched build must publish no descriptor")
+	require.Equal(t, baseline, ra.OccupancyBytes(), "a generation-mismatched build must not strand its slab")
+}
+
 // Test that arena backpressure still parks a fill intent BEFORE any caller code
 // runs: allocation comes first, so an exhausted arena sets the intent aside with
 // its callback untouched and its handshake word still pending — which is what
