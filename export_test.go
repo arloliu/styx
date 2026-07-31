@@ -220,6 +220,15 @@ func (h *Host) AddRuntimeForTest(name string, sup *supervisor.Supervisor) {
 	h.mu.Unlock()
 }
 
+// SupervisorConfigForTest re-exports the internal supervision configuration a Host
+// builds for spec — the exact value startOne hands to supervisor.New — so host_test
+// (external test package) can assert what the public tuning knobs actually reach,
+// including that an unset knob still passes the zero that selects
+// internal/supervisor's own default.
+func (h *Host) SupervisorConfigForTest(spec PluginSpec) supervisor.Config {
+	return h.supervisorConfig(spec, newUnavailableClientConn(spec.Name))
+}
+
 // DroppedInformationalEventCounts re-exports h.bus's informational-event
 // drop counters for host_test (external test package): it lets a test
 // assert directly that Host's own fan-in actually counted a drop under a
