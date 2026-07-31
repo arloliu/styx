@@ -14,7 +14,40 @@ import (
 // from graceful transport.ErrClosed: a poisoned region attempted no repair and
 // must be discarded whole. Recovery requires a supervisor-driven restart onto
 // a fresh region. errors.Is-compatible.
-var ErrPoisoned = errors.New("shm: region poisoned")
+//
+// It wraps transport.ErrPoisoned, the one sentinel by which a reader or serve
+// loop recognizes a data plane that desynced under it, whatever transport
+// produced it. Those loops are what turn a poison into recovery: the host's fails
+// every in-flight call and notifies the supervisor, and the plugin's ends the
+// instance rather than parking on a still-live control plane. A poison reported
+// under a sentinel of this package's own alone reaches neither, so the region
+// stays dead while the plugin keeps heartbeating on it. The wrap is
+// one-directional — matching THIS sentinel still means specifically a
+// shared-memory region, never a uds mid-frame desync.
+//
+// Its rendered text carries no wrapped-error tail, so a message built from it
+// still ends in whatever the builder appended: TeardownError's rendering names
+// the poison cause last, which is where a reader looks for it.
+var ErrPoisoned error = poisonedRegionError{}
+
+// poisonedRegionError is ErrPoisoned's type. The sentinel needs to render its own
+// text AND unwrap to the cross-transport sentinel, which neither errors.New (no
+// unwrap) nor fmt.Errorf (the wrapped error's text lands in the rendering) can
+// give it.
+type poisonedRegionError struct{}
+
+func (poisonedRegionError) Error() string { return "shm: region poisoned" }
+
+func (poisonedRegionError) Unwrap() error { return transport.ErrPoisoned }
+
+// markPoisoned marks a fault this side has just poisoned the region for, so the
+// failure classifies as a poison without losing the specific fault a caller
+// matches on. It is the same layering the uds transport applies to a frame it
+// tore mid-write, over the same sentinel, because the reader and serve loops that
+// read the answer make no distinction between transports.
+func markPoisoned(err error) error {
+	return fmt.Errorf("%w: %w", err, transport.ErrPoisoned)
+}
 
 // PoisonCause is the frozen minimal cause enum for the sync-page poison word
 // (shm-abi.md §3, offset 4480). The values are wire-visible: both sides and

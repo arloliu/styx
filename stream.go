@@ -1218,11 +1218,19 @@ func translateStreamSendErr(err error) error {
 // only for a completion, which proves the peer received the OPEN and answered it in
 // full (see resolveOpenTerminal); the other two dispositions never do.
 //
-//  1. AMBIGUOUS + poisoned (a uds mid-frame poison): the peer MAY hold the OPEN's
-//     prefix and the framing is desynced, so the teardown pair cannot be sent on the
-//     now-closed transport — the POISON ESCALATION is the teardown (§9). A later
-//     reader Recv sees only ErrClosed and would NOT re-escalate, so this escalates
-//     directly; the poisoned error is never swallowed.
+//  1. POISONED: the data plane is unusable and the connection is going away, so
+//     every stream on it terminates (stream-protocol.md §9, and §4.5's table of
+//     post-acceptance outcomes, which puts a pre-publish-gate poison and a
+//     push-time ring fault in that same row). The two transports arrive here from
+//     opposite sides of the publication boundary and the disposition is the same
+//     for both. A uds mid-frame poison means the peer MAY hold the OPEN's prefix
+//     and the framing is desynced, so no teardown pair can be sent on the
+//     now-closed transport. A shared-memory poison is caught by the pre-publish
+//     gate, so nothing was published and there is no teardown pair to owe. Either
+//     way the POISON ESCALATION is the teardown, and the outcome is terminal and
+//     not retryable — the region or the framing, not this one frame, is what
+//     failed. A later reader Recv sees only ErrClosed and would NOT re-escalate,
+//     so this escalates directly; the poisoned error is never swallowed.
 //  2. AMBIGUOUS on a live transport (an shm context error after enqueue): the writer
 //     may still publish the OPEN, so the stream is live-and-owed. Drive the
 //     locally-initiated terminal §4.5 makes it (openSendPending suppresses the

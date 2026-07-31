@@ -112,6 +112,13 @@ type Pair struct {
 	phEFD  *event.EventFD
 }
 
+// Region returns the memfd region both ends are attached to, for a caller that
+// has to reach past the transport.Transport surface to it -- reading the poison
+// word, or corrupting a descriptor the way a non-conformant peer would, neither
+// of which any transport method can do. It stays owned by the Pair: Close
+// releases it, and a caller must not close it itself.
+func (p *Pair) Region() *shm.Region { return p.region }
+
 // Close releases every resource NewInProcessPair(WithLayout) allocated: both
 // attached ends, both eventfds, then the region -- the order
 // internal/transport/shm/transport_test.go's own newEndpoints cleanup uses,

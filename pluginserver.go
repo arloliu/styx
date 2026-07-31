@@ -1388,22 +1388,24 @@ func decodeUnaryRequest(deps *serveDeps, f transport.Frame) (req rpcruntime.Requ
 	return rpcruntime.Request{Msg: msg}
 }
 
-// maxDecodeFaultBytes bounds the rendered reason a failed request decode carries
-// into its status reply, the same bound and for the same reason the transport puts
-// on a consume fault's own detail.
+// maxDecodeFaultBytes bounds the rendered reason a failed decode carries onward,
+// the same bound and for the same reason the transport puts on a consume fault's
+// own detail.
 //
-// The reason is that this text becomes a frame the plugin must be able to send. A
-// decoder free to return an error of any length could otherwise produce a status
-// reply too large to publish, whose send failure stops the serve loop — turning one
-// undecodable request into a dead session. Truncating keeps the reply sendable
-// whatever the decoder does.
+// On the plugin's request path that text becomes a frame the plugin must be able
+// to send. A decoder free to return an error of any length could otherwise produce
+// a status reply too large to publish, whose send failure stops the serve loop —
+// turning one undecodable request into a dead session. On the host's response path
+// it becomes the detail of an error a caller keeps, where a decoder that renders
+// the payload it was handed would turn a large frame into a multi-megabyte string.
+// Truncating answers both, whatever the decoder does.
 const maxDecodeFaultBytes = 512
 
-// decodeFaultText renders a decode failure into text this side owns and can send.
+// decodeFaultText renders a decode failure into bounded text this side owns.
 //
 // The clone is what makes it own the text: a decoder is free to build its error out
 // of the bytes it was handed, and a string sharing them would be read after the
-// transport reclaimed the slab behind it. The bound is what makes it sendable (see
+// transport reclaimed the slab behind it. The bound is what keeps it carryable (see
 // maxDecodeFaultBytes); like the transport's own fault detail, the cut backs off to
 // a rune start so truncation never splits a rune that was whole in the input, and
 // the elision is marked so a reader can tell a short reason from a clipped one.

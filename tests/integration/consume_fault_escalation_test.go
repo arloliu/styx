@@ -10,6 +10,7 @@ import (
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/examples/echo/echopb"
 	shmtransport "github.com/arloliu/styx/internal/transport/shm"
+	"github.com/arloliu/styx/internal/transport/shm/chaos"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -40,12 +41,12 @@ const consumeFaultRunThreshold = 4
 const faultingCallBudget = 30 * time.Second
 
 // escalationSettleBudget bounds the wait for the lifecycle events a poisoned
-// region eventually produces: the supervisor ending the instance, then respawning
-// it and completing a fresh handshake. The dominant term is a timer, not work —
-// see the note on the restart wait below — so it needs headroom for that timer
-// rather than for load. It stays well under the package timeout so an escalation
-// that never lands fails this test with its own message instead of taking the
-// whole package down with a timeout panic.
+// region produces: the supervisor ending the instance, then respawning it and
+// completing a fresh handshake. It is not a latency assertion — the spawn and
+// handshake dominate it — so it carries enough headroom for a loaded machine. It
+// stays well under the package timeout so an escalation that never lands fails
+// this test with its own message instead of taking the whole package down with a
+// timeout panic.
 const escalationSettleBudget = 15 * time.Second
 
 // decodePanicResponse is a SayResponse whose decode step panics, and nothing else.
@@ -275,37 +276,33 @@ func TestConsumeFaultRun_KeepsServingBelowTheThreshold_AndPoisonsGenericThenRest
 	// and this time the region is poisoned. The successor's readiness is counted
 	// against what this instance already published, so the first start's own
 	// EventReady cannot be mistaken for the restart's.
+	//
+	// The region is mapped into this test's own mapping BEFORE the run, because the
+	// cause has to be readable after the poison has done its work. A poison ends the
+	// connection that carried it: the read loop escalates, the supervisor tears the
+	// instance down, and both the routing and the host's mapping are gone within
+	// microseconds of the last fault. This mapping is the test's — attaching
+	// duplicates the descriptor — so it outlives all of that, and the word in it is
+	// the authority on the cause whatever happened to the connection.
+	region := openLiveRegion(t)
+	defer func() { require.NoError(t, region.Close()) }()
+
 	readyBefore := log.count(styx.EventReady)
 	requireResolvedUnknownOutcome(t, runFaults(t, conn, consumeFaultRunThreshold))
 
 	// The poison word carries the generic cause, which is the one this escalation
 	// records: this side cannot tell a peer publishing unusable bytes from its own
-	// consumer failing to take them, so it names neither. Reading it back through a
-	// call refused on the send path is deterministic here — the poison is set while
-	// the last fault is being consumed, before that fault's call is failed, so it is
-	// already set by the time runFaults returns.
-	//
-	// This reads the cause through the transport that is STILL ATTACHED, and that is
-	// what makes it deterministic today: a poisoned shared-memory region does not
-	// reach the supervisor through the data-plane fault path (see the restart wait
-	// below), so nothing has begun tearing this connection down yet and the send
-	// still reaches the poisoned region to be refused by it. Close that gap and this
-	// assertion races the teardown that would then start immediately: the routing is
-	// dropped and this call returns a bare unavailable error carrying no poison
-	// cause at all. Whoever fixes that seam must revisit this assertion — the cause
-	// then has to be read somewhere that survives the teardown.
-	_, poisonedErr := sayPID(t, client, "after-poison")
-	require.ErrorIs(t, poisonedErr, shmtransport.ErrPoisoned)
-	require.ErrorContains(t, poisonedErr,
-		shmtransport.ErrPoisoned.Error()+": "+shmtransport.PoisonGeneric.String(),
+	// consumer failing to take them, so it names neither. Reading it the moment the
+	// run returns is deterministic — the poison is set while the last fault is being
+	// consumed, before that fault's call is failed, so it is already set by then.
+	require.Equal(t, shmtransport.PoisonGeneric, chaos.ReadPoisonCause(region),
 		"the consume-fault escalation must record the generic cause, not a peer-fault one")
 
-	// The instance ends and is restarted. The budget covers a wait of seconds
-	// because the poisoned region does not reach the supervisor through the
-	// data-plane fault path: the shared-memory poison error is a different sentinel
-	// from the one the read loop's escalation check matches, so no connection-lost
-	// notification fires and the instance is instead ended by the heartbeat
-	// classifier noticing a plugin whose ring consumer has stopped.
+	// The instance ends and is restarted, on the data-plane fault path: the poisoned
+	// region's error carries the poison sentinel the read loop's escalation check
+	// matches, so that loop notifies the supervisor on its way out rather than
+	// leaving the instance to the heartbeat classifier. The budget stays generous
+	// because the respawn and its fresh handshake follow.
 	log.await(t, styx.EventRestarting, 1, escalationSettleBudget)
 	log.await(t, styx.EventReady, readyBefore+1, escalationSettleBudget)
 

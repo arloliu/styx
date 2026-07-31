@@ -23,29 +23,40 @@ import (
 // region of a running host, followed all the way to a successor instance serving
 // on a fresh region.
 //
-// What fails the in-flight call is worth stating exactly, because it is not the
-// read loop that detected the corruption. That loop exits without escalating: its
-// poison escalation matches the transport package's poison sentinel, which the
-// shared-memory transport's conformance faults do not carry, so the escalation
-// never fires on this path. Recovery comes instead from the supervisor, whose
-// liveness classification observes the stalled data plane the poison left behind
-// and ends the instance; the unknown outcome the caller sees is that teardown's
-// FailInFlight, several seconds later.
+// Which side's recovery this measures is worth stating exactly, because the
+// corrupt descriptor is published into the PLUGIN-to-host ring and both sides
+// then meet it. The host's read loop receives the conformance fault and escalates
+// on its way out. The plugin's serve loop independently observes the region it
+// poisoned, ends its instance, and exits non-zero, which the supervisor reaps into
+// the teardown that fails whatever calls remain. Either alone recovers this
+// scenario, so the wall-clock evidence below cannot separate them: killing the
+// host's classification leaves everything here passing at the same runtime,
+// because the plugin's exit still carries the recovery. What this test pins is
+// therefore the composite, and specifically the plugin-side half — the exit and
+// the reap — since that is the arm nothing else here can substitute for.
 //
-// So this pins the recovery the host actually performs today, and the runtime is
-// part of the evidence: about nine seconds, nearly all of it that classification
-// delay. Should the read loop's escalation ever start firing here, this test keeps
-// passing and its runtime collapses to milliseconds — the cheapest available
-// signal that the escalation is live. Every wait is bounded well above the
-// classification delay and gated on an observed event or result rather than on
-// elapsed time, so a step that stalls fails the assertion that named it instead of
-// hanging the suite.
+// The host-side arm is guarded where it can be isolated, in the root package's
+// TestRunReadLoop_TransportPoison_EscalatesToOwner: it is the one test that fails
+// when the read loop's poison classification is made unreachable.
+//
+// Every wait is gated on an observed event or result rather than on elapsed time,
+// so a step that stalls fails the assertion that named it instead of hanging the
+// suite.
 
-// poisonRestartDeadline bounds every wait in this test. It is far above the
-// several seconds the host takes to classify the stalled data plane a poisoned
-// region leaves behind, so a step that never completes fails its own assertion
-// with room to spare on a loaded machine.
+// poisonRestartDeadline bounds every wait in this test except the in-flight
+// call's. It is far above the several seconds the host takes to classify a
+// stalled data plane, so a step that never completes fails its own assertion with
+// room to spare on a loaded machine.
 const poisonRestartDeadline = 30 * time.Second
+
+// poisonTeardownBudget bounds the in-flight call. Reaching it costs a poisoned
+// plugin exiting, the supervisor reaping it, and that teardown failing the calls
+// left over — process-lifecycle work, no timer anywhere in it. It sits far below
+// the several seconds the liveness classifier needs to reach a plugin that has
+// stopped making progress but is still running, so a regression that left recovery
+// to that classifier fails here instead of passing slowly. The margin above the
+// teardown itself is wide enough for a loaded machine.
+const poisonTeardownBudget = 3 * time.Second
 
 // regionMemfdName is the name the host gives every region memfd, which is what
 // makes a region identifiable both among this process's open descriptors and in
@@ -63,7 +74,10 @@ func TestSHMPoison_FailInFlightCallAndRestartOnFreshGeneration_OnCorruptDescript
 	enterFifo := mkfifo(t)
 	releaseFifo := mkfifo(t)
 	h := poisonRestartHost(t, enterFifo, releaseFifo)
-	events := h.Events()
+	// Every event is collected rather than waited for one at a time, so the
+	// in-flight call's failure can be placed relative to the restart below instead
+	// of merely observed before it.
+	events := collectEvents(h.Events())
 	client := echopb.NewEchoClient(h.Plugin("echo"))
 
 	oldPID, err := sayPID(t, client, "probe")
@@ -95,6 +109,10 @@ func TestSHMPoison_FailInFlightCallAndRestartOnFreshGeneration_OnCorruptDescript
 	// plugin->host ring, and the parked handler is then released so that its own
 	// response is what wakes the host's consumer — onto the corrupt descriptor
 	// queued ahead of it.
+	// The successor's readiness is counted against what this instance already
+	// published, so the first start's own EventReady cannot be mistaken for the
+	// restart's however early the collector picked it up.
+	readyBefore := events.count(styx.EventReady)
 	firstGeneration := publishCorruptDescriptor(t)
 	openFifoOrFail(t, releaseFifo)
 
@@ -110,13 +128,21 @@ func TestSHMPoison_FailInFlightCallAndRestartOnFreshGeneration_OnCorruptDescript
 			"a dispatched call lost with a torn-down region has an unknown outcome")
 		require.NotErrorIs(t, sayErr, styx.ErrPluginUnavailable,
 			"a call the peer had already begun must not be reported as never dispatched")
-	case <-time.After(poisonRestartDeadline):
-		t.Fatal("the call in flight when the region was poisoned never returned")
+	case <-time.After(poisonTeardownBudget):
+		t.Fatal("the poisoned instance never died and was reaped, so its in-flight call was never failed")
 	}
 
+	// And: it was failed by the teardown, not by anything the restart brought with
+	// it. The supervisor completes an instance's teardown before it publishes that a
+	// restart is coming, so a call still unresolved at that point was not failed by
+	// the step that owes it — it was left for something later, which for a call
+	// submitted without a deadline can be nothing at all.
+	require.Zero(t, events.count(styx.EventRestarting),
+		"the in-flight call must be failed by the teardown that lost it, before any restart is announced")
+
 	// And: the host restarts the instance.
-	awaitEventWithin(t, events, styx.EventRestarting, poisonRestartDeadline)
-	awaitEventWithin(t, events, styx.EventReady, poisonRestartDeadline)
+	events.await(t, styx.EventRestarting, 1, poisonRestartDeadline)
+	events.await(t, styx.EventReady, readyBefore+1, poisonRestartDeadline)
 
 	// And: a later call succeeds on a new process, served over a region of a higher
 	// generation — a genuinely fresh region, never the poisoned one reused.

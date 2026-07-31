@@ -1057,11 +1057,12 @@ func (w *writer) emitLifecycle(i intent) {
 
 	seq := w.publishSeq()
 	if err := w.ring.Push(d); err != nil {
-		if errors.Is(err, ring.ErrCorrupt) {
+		if errors.Is(err, ring.ErrCorrupt) && w.poisonRingCorrupt() {
 			// depth > capacity on producer admission MUST poison
 			// POISON_RING_CORRUPT (shm-abi.md §8/§9) -- symmetric to the
-			// consumer's poisonOnConformanceFault.
-			w.poisonRingCorrupt()
+			// consumer's poisonOnConformanceFault, mark included: a sender
+			// classifying this failure has to see the poison it just actuated.
+			err = markPoisoned(err)
 		}
 		w.report(i, err)
 
@@ -1198,11 +1199,12 @@ func (w *writer) place(c *carry) emitResult {
 		if errors.Is(err, ring.ErrFull) {
 			return emitStuck
 		}
-		if errors.Is(err, ring.ErrCorrupt) {
+		if errors.Is(err, ring.ErrCorrupt) && w.poisonRingCorrupt() {
 			// depth > capacity on producer admission MUST poison
 			// POISON_RING_CORRUPT (shm-abi.md §8/§9) -- symmetric to the
-			// consumer's poisonOnConformanceFault.
-			w.poisonRingCorrupt()
+			// consumer's poisonOnConformanceFault, mark included: a sender
+			// classifying this failure has to see the poison it just actuated.
+			err = markPoisoned(err)
 		}
 		w.report(c.i, err) // ring.ErrCorrupt or another push fault, surfaced honestly
 
@@ -1773,12 +1775,19 @@ func (w *writer) reclaim(maxReconcile uint64) {
 // poisonRingCorrupt actuates POISON_RING_CORRUPT (shm-abi.md §8/§9): a ring
 // depth exceeding capacity or a reclaim-reconcile distance exceeding its
 // call-site bound (capacity leading, capacity+1 post-push), from either a
-// Ring.Push/Peek report or reclaim's own bound check. A no-op when poison is
-// nil (isolated unit tests that build a writer with no attached region).
-func (w *writer) poisonRingCorrupt() {
-	if w.poison != nil {
-		w.poison.Set(PoisonRingCorrupt)
+// Ring.Push/Peek report or reclaim's own bound check.
+//
+// It reports whether it actuated, which is false only when poison is nil
+// (isolated unit tests that build a writer with no attached region). A caller
+// marking its failure as a poison needs that answer rather than assuming it: a
+// writer with no region poisoned nothing and must not claim it did.
+func (w *writer) poisonRingCorrupt() bool {
+	if w.poison == nil {
+		return false
 	}
+	w.poison.Set(PoisonRingCorrupt)
+
+	return true
 }
 
 // drainAndStop reports transport.ErrClosed to every intent still pending at
