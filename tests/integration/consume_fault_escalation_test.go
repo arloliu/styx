@@ -9,6 +9,7 @@ import (
 
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/examples/echo/echopb"
+	"github.com/arloliu/styx/internal/testutil"
 	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 	"github.com/arloliu/styx/internal/transport/shm/chaos"
 	"github.com/stretchr/testify/require"
@@ -135,6 +136,50 @@ func (l *eventLog) count(kind styx.EventKind) int {
 	return n
 }
 
+// indexOfNth reports where the nth recorded event of kind sits in the arrival
+// order the log preserves, and whether that many have been recorded at all.
+//
+// Position is what count cannot give: two kinds both reaching their expected
+// counts says nothing about which arrived first, so an order inversion between
+// them is invisible to any number of count-based waits.
+func (l *eventLog) indexOfNth(kind styx.EventKind, n int) (int, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	seen := 0
+	for i, ev := range l.seen {
+		if ev.Kind != kind {
+			continue
+		}
+		seen++
+		if seen == n {
+			return i, true
+		}
+	}
+
+	return 0, false
+}
+
+// requireRestartingPrecedesReady fails unless the instance's teardown was
+// announced before its successor was announced ready: the nthReady-th EventReady
+// must sit LATER in the recorded order than the first EventRestarting.
+//
+// The order is the part a caller depends on. EventRestarting is what tells an
+// application holding a ClientConn that the instance behind it is gone; a Ready
+// published ahead of it would invite that caller to treat the connection as
+// serving during the window the teardown had not yet been announced. Counts alone
+// are satisfied either way, so this is asserted from the log's preserved order.
+func requireRestartingPrecedesReady(t *testing.T, log *eventLog, nthReady int) {
+	t.Helper()
+
+	restartingAt, ok := log.indexOfNth(styx.EventRestarting, 1)
+	require.True(t, ok, "the teardown was never announced")
+	readyAt, ok := log.indexOfNth(styx.EventReady, nthReady)
+	require.True(t, ok, "the successor's readiness was never announced")
+	require.Less(t, restartingAt, readyAt,
+		"the teardown must be announced before the successor is ready, never after it")
+}
+
 // await blocks until at least want events of kind have been recorded, or fails the
 // test at budget.
 func (l *eventLog) await(t *testing.T, kind styx.EventKind, want int, budget time.Duration) {
@@ -218,6 +263,12 @@ func requireResolvedUnknownOutcome(t *testing.T, errs []error) {
 // error rather than stranding it, ending the instance, and restarting onto a fresh
 // one that serves again.
 func TestConsumeFaultRun_KeepsServingBelowTheThreshold_AndPoisonsGenericThenRestartsOnceAtIt(t *testing.T) {
+	// Registered before the host is built and before anything subscribes to its
+	// events: the escalation's teardown-and-respawn is exactly the path that leaks
+	// a goroutine or a descriptor of the instance it replaced. See the check's own
+	// doc comment on why it has to come first.
+	testutil.RequireNoGoroutineOrFDLeak(t)
+
 	h := styx.NewHost(styx.HostConfig{
 		Plugins: []styx.PluginSpec{{
 			Name: "echo",
@@ -305,6 +356,7 @@ func TestConsumeFaultRun_KeepsServingBelowTheThreshold_AndPoisonsGenericThenRest
 	// because the respawn and its fresh handshake follow.
 	log.await(t, styx.EventRestarting, 1, escalationSettleBudget)
 	log.await(t, styx.EventReady, readyBefore+1, escalationSettleBudget)
+	requireRestartingPrecedesReady(t, log, readyBefore+1)
 
 	// The host serves again, on a different process and therefore a fresh region.
 	// One attempt, no retry: the successor's client routing is stored and its
