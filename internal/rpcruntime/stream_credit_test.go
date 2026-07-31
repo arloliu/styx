@@ -2,6 +2,8 @@ package rpcruntime
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,6 +38,10 @@ import (
 //   - arena exhaustion mid-stream costs the stream no credit and no sequence
 //     number: every message publishes, in order, and the window returns to
 //     exactly N once acknowledged (stream-protocol.md §4.5);
+//   - a send that was ACCEPTED gets neither back when it goes wrong afterwards —
+//     an abandoning caller and an unclassified transport error alike leave the
+//     unit spent and the sequence consumed, because acceptance is final (§4.5)
+//     and a returned sequence is one a later message could reuse (§3.3);
 //   - one STREAM_MSG consumes exactly one unit whatever its payload size, and a
 //     STREAM_CLOSE consumes none (§4.4);
 //   - a cumulative STREAM_ACK returns exactly the units it acknowledges and can
@@ -211,6 +217,163 @@ func TestStream_SendMsg_ArenaExhaustion_CostsNoCreditOrSequence(t *testing.T) {
 	}))
 	require.Equal(t, uint64(creditWindow), windowRoom(t, s.sendCredit, uint64(creditWindow)),
 		"a cumulative ACK for every send restores the whole granted window (§4.5)")
+}
+
+// drainStreamMsgSeqs reads frames off tr until it has collected want STREAM_MSGs
+// and returns their sequence numbers in arrival order. Frames of other kinds are
+// skipped rather than treated as an error: a terminated stream's own teardown
+// frames take priority on the lifecycle lane, so they can interleave with the data
+// this is counting.
+func drainStreamMsgSeqs(ctx context.Context, tr transport.Transport, want int) ([]uint64, error) {
+	seqs := make([]uint64, 0, want)
+	for len(seqs) < want {
+		f, err := tr.Recv(ctx)
+		if err != nil {
+			return seqs, err
+		}
+		if f.Kind == transport.FrameStreamMsg {
+			seqs = append(seqs, f.Control)
+		}
+	}
+
+	return seqs, nil
+}
+
+// Test that a send the transport already ACCEPTED keeps its credit unit and its
+// sequence number when its caller walks away: the writer has the payload set aside
+// on an exhausted arena, the caller's context is canceled while it sits there, and
+// the runtime rolls back neither (stream-protocol.md §4.5).
+//
+// The sequence is the reason this matters. The set-aside frame publishes on a
+// later writer turn carrying the number it was bound to, whatever its caller did
+// in the meantime, so handing that number back would let a following message be
+// sent under a sequence the peer may already have seen — which the receiver reads
+// as a gap or a duplicate rather than as a fresh message (§3.3). The credit unit
+// goes with it: the stream is terminal from the cancellation, so the unit is moot,
+// and returning it would only admit a send on a stream that has none.
+func TestStream_SendMsg_AbandonedAfterAcceptance_KeepsItsCreditAndSequence(t *testing.T) {
+	// Given a stream on a real shared-memory region whose outbound 64-byte class
+	// holds three slabs, with all three spent on messages the peer has not read.
+	pair, err := shmtest.NewInProcessPairWithLayout(creditArenaLayout(), shmtransport.Config{
+		MaxInflight: 56, MaxPayload: 4092, DataQueueDepth: 8, LifecycleQueueDepth: 8,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pair.Close() })
+
+	tbl := NewStreamTable(8, pair.Host)
+	t.Cleanup(func() { _ = tbl.Close() })
+	s, err := tbl.Open(1, ClientStream, StreamConfig{Credits: creditWindow, Deadline: time.Minute})
+	require.NoError(t, err)
+	require.True(t, s.Publish())
+
+	const filled = 3
+	for range filled {
+		require.NoError(t, s.SendMsg(t.Context(), []byte("payload8")))
+	}
+
+	// When one more send is admitted — its unit reserved and its sequence bound —
+	// and the writer parks it on the exhausted class, its caller abandons it.
+	abandonCtx, abandon := context.WithCancel(t.Context())
+	defer abandon()
+	abandoned := make(chan error, 1)
+	go func() { abandoned <- s.SendMsg(abandonCtx, []byte("payload8")) }()
+
+	requireArenaSetAside(t, pair.Host)
+	abandon()
+
+	var sendErr error
+	select {
+	case sendErr = <-abandoned:
+	case <-time.After(creditWait):
+		require.FailNow(t, "the abandoned send never returned to its caller")
+	}
+	require.ErrorIs(t, sendErr, context.Canceled)
+
+	// Then the stream is terminal — a post-admission context error is, whatever the
+	// writer still holds (§4.5) — and neither the unit nor the number came back.
+	oc, terminal := s.Outcome()
+	require.True(t, terminal, "a post-admission context error is terminal for the stream (§4.5)")
+	require.Equal(t, OutcomeCanceled, oc.Code)
+
+	require.Equal(t, uint64(filled+1), s.sendSeq.Load(),
+		"an accepted send's sequence stays consumed: returning it would let the next message reuse it (§3.3)")
+	require.Equal(t, uint64(creditWindow)-(filled+1), windowRoom(t, s.sendCredit, uint64(creditWindow)),
+		"an accepted send's credit unit is never returned (§4.5)")
+
+	// And the frame really was accepted, not merely queued: it publishes on a later
+	// writer turn under the very sequence the caller abandoned, which is the frame
+	// a rolled-back number would have collided with.
+	ctx, cancel := context.WithTimeout(t.Context(), creditWait)
+	defer cancel()
+	seqs, err := drainStreamMsgSeqs(ctx, pair.Plugin, filled+1)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2, 3, 4}, seqs,
+		"the abandoned send publishes anyway, under the sequence it was bound to (§4.5)")
+}
+
+// Test that a send failing with an error the transport does NOT class as
+// pre-acceptance keeps its credit unit and its sequence number, and that the next
+// send takes the following number rather than reusing the abandoned one
+// (stream-protocol.md §4.5).
+//
+// Only the three pre-write sentinels prove a frame never reached the peer. §4.5
+// makes rollback lawful if and only if the transport rejected the frame before
+// accepting it, so an error that proves nothing leaves the unit spent and the
+// number consumed — the resolution that cannot corrupt the sequence.
+//
+// What the stream DOES on such an error is a narrower claim. §4.5's terminal rule
+// is written for a context error after admission and says nothing about this case,
+// and its outcome table does not contemplate a frame that quietly fails to publish
+// on a surviving stream at all — a state only a transport double can manufacture.
+// So the assertion below records what this code path does today, not a rule the
+// spec imposes; it is here because a live stream is what lets the next send expose
+// a reissued sequence number directly instead of leaving it to be inferred.
+func TestStream_SendMsg_UnclassifiedError_KeepsItsCreditAndSequence(t *testing.T) {
+	// Given a live stream whose second send fails with an error saying nothing
+	// about whether the frame reached the peer.
+	const grant uint32 = 4
+	_, s, rt := newTestStream(t, StreamConfig{Credits: grant, Deadline: time.Second})
+
+	errLostTrack := errors.New("transport double: the frame's fate is unknown")
+	var msgs atomic.Int64
+	rt.fail = func(f transport.Frame) error {
+		if f.Kind == transport.FrameStreamMsg && msgs.Add(1) == 2 {
+			return errLostTrack
+		}
+
+		return nil
+	}
+
+	// When two messages are sent, the second one failing that way.
+	require.NoError(t, s.SendMsg(t.Context(), []byte("first")))
+	require.ErrorIs(t, s.SendMsg(t.Context(), []byte("maybe-accepted")), errLostTrack)
+
+	// Then the stream is still live, which is this path's behavior today rather
+	// than a rule §4.5 states, and is what keeps the accounting below observable
+	// through a further send.
+	_, terminal := s.Outcome()
+	require.False(t, terminal, "an unclassified send error leaves the stream live, so a further send can be made")
+
+	require.Equal(t, uint64(grant)-2, windowRoom(t, s.sendCredit, uint64(grant)),
+		"a send that may have been accepted does not return its credit unit (§4.5)")
+
+	// And the sequence it bound is never handed out twice: the next send takes the
+	// following number, leaving the abandoned one consumed.
+	//
+	// The gap that leaves in the recorded numbers is the double's own doing — it
+	// records only the frames it did not fail, while the production writer would
+	// publish the frame it was handed. So 2's ABSENCE here proves nothing and is
+	// asserted only to fix the shape; what is under test is that 2 is never
+	// REISSUED, which a rollback would show as the third send carrying it.
+	require.NoError(t, s.SendMsg(t.Context(), []byte("third")))
+	seqs := make([]uint64, 0, 2)
+	for _, f := range rt.frames() {
+		if f.Kind == transport.FrameStreamMsg {
+			seqs = append(seqs, f.Control)
+		}
+	}
+	require.Equal(t, []uint64{1, 3}, seqs,
+		"the sequence a possibly-accepted send bound is never reissued to a later message (§4.5)")
 }
 
 // Test the send window's arithmetic over a full cycle: each STREAM_MSG consumes
