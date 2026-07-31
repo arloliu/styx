@@ -168,6 +168,20 @@ geometry can actually carry at once:
   backpressure later under load. Turning it on is a way to certify a geometry
   up front instead of discovering its limits in production.
 
+A running host tells you when its ladder is too small for the workload, and
+which rung. Every payload a connection cannot publish because its size class
+has no free slab is counted as `styx.arena.setaside.count` on the configured
+`Metrics` sink, labeled with the `slab_size` of the class that stalled it, and
+counted again as `styx.arena.resumed.count` when it gets a slab and goes on.
+Set-asides that stay at zero mean callers always find a free slab on arrival;
+set-asides that climb mean callers are waiting on each other's slabs, and the
+label names the class to widen — raise that class's `SlabCount`, or add a
+class between it and the one below so payloads stop being served from a class
+far larger than they need. This is what `StrictCapacity` certifies up front,
+reported continuously instead: the counters see a class that exhausts and
+refills between two samples, which the sampled `styx.arena.utilization` gauge
+cannot.
+
 For the exact wire-level rules these numbers satisfy — the bounds on
 `RingCapacity`, the layout of a size class, and how `MaxDataInflight` is
 carried between host and plugin — see

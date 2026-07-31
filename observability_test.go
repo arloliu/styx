@@ -31,12 +31,13 @@ type countingSink struct {
 	mu        sync.Mutex
 	latency   int
 	counters  map[string]int64
+	labeled   map[string]int64
 	gauges    map[string]float64
 	maxWakeup float64
 }
 
 func newCountingSink() *countingSink {
-	return &countingSink{counters: map[string]int64{}, gauges: map[string]float64{}}
+	return &countingSink{counters: map[string]int64{}, labeled: map[string]int64{}, gauges: map[string]float64{}}
 }
 
 func (s *countingSink) ObserveLatency(metric string, _ time.Duration, _ ...observe.Label) {
@@ -47,10 +48,23 @@ func (s *countingSink) ObserveLatency(metric string, _ time.Duration, _ ...obser
 	}
 }
 
-func (s *countingSink) IncrCounter(metric string, delta int64, _ ...observe.Label) {
+func (s *countingSink) IncrCounter(metric string, delta int64, labels ...observe.Label) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.counters[metric] += delta
+	s.labeled[metricKey(metric, labels)] += delta
+}
+
+// metricKey identifies one counter series — a metric together with the exact
+// labels it was recorded under — so a test can assert per-class counts rather
+// than a total that cannot say which class stalled.
+func metricKey(metric string, labels []observe.Label) string {
+	key := metric
+	for _, l := range labels {
+		key += "|" + l.Key + "=" + l.Value
+	}
+
+	return key
 }
 
 func (s *countingSink) SetGauge(metric string, value float64, _ ...observe.Label) {
@@ -74,6 +88,14 @@ func (s *countingSink) counter(metric string) int64 {
 	defer s.mu.Unlock()
 
 	return s.counters[metric]
+}
+
+// labeledCounter returns the total recorded for one metric under exactly labels.
+func (s *countingSink) labeledCounter(metric string, labels ...observe.Label) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.labeled[metricKey(metric, labels)]
 }
 
 func (s *countingSink) latencyCount() int {
@@ -445,6 +467,9 @@ type capTransport struct {
 	sent     atomic.Uint64
 	received atomic.Uint64
 	faults   atomic.Uint64
+	// carries is the per-class arena stall snapshot ArenaCarries reports, replaced
+	// wholesale between reporter calls so a test scripts an exact class series.
+	carries atomic.Pointer[[]transport.ArenaCarry]
 }
 
 func (*capTransport) Send(context.Context, transport.Frame) error { return nil }
@@ -461,6 +486,17 @@ func (t *capTransport) BackpressureEdges() uint64   { return t.edges.Load() }
 func (t *capTransport) BytesSent() uint64           { return t.sent.Load() }
 func (t *capTransport) BytesReceived() uint64       { return t.received.Load() }
 func (t *capTransport) ConsumeFaults() uint64       { return t.faults.Load() }
+
+func (t *capTransport) ArenaCarries() []transport.ArenaCarry {
+	if p := t.carries.Load(); p != nil {
+		return *p
+	}
+
+	return nil
+}
+
+// setCarries replaces the arena stall snapshot the transport reports.
+func (t *capTransport) setCarries(c ...transport.ArenaCarry) { t.carries.Store(&c) }
 
 // udsShapedTransport is a fake Transport exposing only byte counting, like the uds
 // transport: none of the shared-memory reporter capabilities. The reporter must
@@ -994,5 +1030,114 @@ func TestMetricsReporter_ConsumeFaults_ReachTheSink(t *testing.T) {
 		// Then the plugin's sink sees them, unlabeled (the plugin has no name).
 		require.Eventually(t, func() bool { return sink.counter(observe.MetricConsumeFault) == 7 },
 			time.Second, 5*time.Millisecond)
+	})
+}
+
+// Test that per-size-class arena stalls reach an operator's MetricsSink, on both
+// sides, each class's counts labeled with the class that stalled, and that the
+// uds-shaped transport emits nothing.
+//
+// This is the signal the sampled arena-utilization gauge cannot carry: a class
+// that exhausts and refills between two samples stalls real calls while every
+// sample shows room. So the assertions are per class and on deltas — a total
+// cannot say which class is undersized, and a re-reported cumulative count would
+// invent stalls that never happened.
+func TestMetricsReporter_ArenaCarries_ReachTheSinkPerClass(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	const smallClass = "4096"
+	const largeClass = "1048576"
+	plugin := observe.Label{Key: labelPlugin, Value: "echo"}
+	small := observe.Label{Key: labelSlabSize, Value: smallClass}
+	large := observe.Label{Key: labelSlabSize, Value: largeClass}
+
+	t.Run("the host reporter submits per-class deltas", func(t *testing.T) {
+		sink := newCountingSink()
+		cc := &ClientConn{name: "echo", metrics: newMetricsDispatcher(sink, 64)}
+		go cc.metrics.Run(ctx)
+
+		// Given a transport whose small class has stalled three payloads and released
+		// one, while its large class has stalled none.
+		tr := &capTransport{}
+		tr.setCarries(
+			transport.ArenaCarry{SlabSize: 4096, SetAside: 3, Resumed: 1},
+			transport.ArenaCarry{SlabSize: 1 << 20},
+		)
+
+		// When the reporter samples it.
+		last := cc.reportArenaCarries(cc.metrics, tr, nil)
+
+		// Then the sink sees both counts against the class that stalled, and nothing
+		// at all against the class that did not.
+		require.Len(t, last, 2)
+		require.Eventually(t, func() bool {
+			return sink.labeledCounter(observe.MetricArenaSetAside, plugin, small) == 3 &&
+				sink.labeledCounter(observe.MetricArenaResumed, plugin, small) == 1
+		}, time.Second, 5*time.Millisecond)
+		require.Zero(t, sink.labeledCounter(observe.MetricArenaSetAside, plugin, large),
+			"a class that never stalled must not be reported as stalling")
+
+		// And a second sample with no new stalls submits nothing.
+		before := sink.counter(observe.MetricArenaSetAside)
+		last = cc.reportArenaCarries(cc.metrics, tr, last)
+		drainMarker(t, cc.metrics, sink)
+		require.Equal(t, before, sink.counter(observe.MetricArenaSetAside))
+
+		// And a later stall on the OTHER class is added as that class's delta, which is
+		// what tells an operator which rung of the ladder is undersized.
+		tr.setCarries(
+			transport.ArenaCarry{SlabSize: 4096, SetAside: 3, Resumed: 1},
+			transport.ArenaCarry{SlabSize: 1 << 20, SetAside: 2, Resumed: 2},
+		)
+		cc.reportArenaCarries(cc.metrics, tr, last)
+		require.Eventually(t, func() bool {
+			return sink.labeledCounter(observe.MetricArenaSetAside, plugin, large) == 2 &&
+				sink.labeledCounter(observe.MetricArenaResumed, plugin, large) == 2
+		}, time.Second, 5*time.Millisecond)
+		require.EqualValues(t, 3, sink.labeledCounter(observe.MetricArenaSetAside, plugin, small),
+			"the class with no new stalls keeps its earlier total")
+	})
+
+	t.Run("a transport without the capability emits nothing", func(t *testing.T) {
+		sink := newCountingSink()
+		cc := &ClientConn{name: "echo", metrics: newMetricsDispatcher(sink, 64)}
+		go cc.metrics.Run(ctx)
+
+		// Given the uds-shaped transport, which has no arena at all.
+		baseline := []transport.ArenaCarry{{SlabSize: 4096, SetAside: 5}}
+		last := cc.reportArenaCarries(cc.metrics, udsShapedTransport{}, baseline)
+
+		// Then the baseline is untouched and no value is fabricated.
+		require.Equal(t, baseline, last, "an absent capability leaves the baseline unchanged")
+		drainMarker(t, cc.metrics, sink)
+		require.Zero(t, sink.counter(observe.MetricArenaSetAside))
+		require.Zero(t, sink.counter(observe.MetricArenaResumed))
+	})
+
+	t.Run("the plugin reporter submits them too", func(t *testing.T) {
+		sink := newCountingSink()
+		srv := NewPluginServer(PluginServerConfig{})
+		srv.metrics = newMetricsDispatcher(sink, 64)
+		srv.metricsInterval = 5 * time.Millisecond
+		go srv.metrics.Run(ctx)
+
+		// Given a plugin-side transport whose own outbound class has stalled. The two
+		// sides count independently: each has its own class table and its own free
+		// lists, so a direction undersized on one side shows the climb only there.
+		tr := &capTransport{}
+		tr.setCarries(transport.ArenaCarry{SlabSize: 1 << 20, SetAside: 4, Resumed: 4})
+
+		// When the plugin's own reporter loop runs.
+		loopCtx, stop := context.WithCancel(ctx)
+		defer stop()
+		go srv.runMetricsReporter(loopCtx, tr)
+
+		// Then the plugin's sink sees them under the class label alone (the plugin has
+		// no name of its own).
+		require.Eventually(t, func() bool {
+			return sink.labeledCounter(observe.MetricArenaSetAside, large) == 4 &&
+				sink.labeledCounter(observe.MetricArenaResumed, large) == 4
+		}, time.Second, 5*time.Millisecond)
 	})
 }

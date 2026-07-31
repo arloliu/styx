@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -1468,14 +1469,19 @@ func decodedFrame(d ring.Descriptor, tk transport.FrameKind, payload []byte) (tr
 // storedLen — the class the producer's allocator must have served it from
 // (shm-abi.md §6, no cross-class fallback). ok is false when no class is large
 // enough. classes are ascending by slab_size.
+//
+// The rule itself is arena.SelectClass, the allocator's own: this consumer-side
+// check exists to reject an inbound descriptor whose payload offset does not name
+// a slab of the class its stored length must have come from, and it can only do
+// that if it selects the class exactly as the producer did. storedLen is widened
+// from untrusted wire fields, so a value past the uint32 a slab_size can express
+// fits no class at all, which is the same answer a scan would give.
 func servingClass(classes []shm.SizeClass, storedLen uint64) (int, bool) {
-	for i := range classes {
-		if uint64(classes[i].SlabSize) >= storedLen {
-			return i, true
-		}
+	if storedLen > math.MaxUint32 {
+		return 0, false
 	}
 
-	return 0, false
+	return arena.SelectClass(classes, uint32(storedLen))
 }
 
 // slabInClass reports whether off names a whole aligned slab, holding

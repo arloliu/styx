@@ -637,6 +637,43 @@ type ConsumeFaultCounter interface {
 	ConsumeFaults() uint64
 }
 
+// ArenaCarry is one outbound size class's arena-exhaustion stall counts.
+// SlabSize identifies the class; the two counts are cumulative and monotonic
+// within one transport instance, so a decrease signals a fresh transport after a
+// restart.
+type ArenaCarry struct {
+	// SlabSize is the class's slab size in bytes, its identity in the arena's
+	// ascending class table.
+	SlabSize uint32
+	// SetAside counts payloads parked because this class had no free slab at
+	// publish time. It counts stalls, not retries: a parked payload is counted
+	// once, however many times it re-probes for space before it proceeds.
+	SetAside uint64
+	// Resumed counts parked payloads that later obtained a slab from this class,
+	// counted at the allocation that freed them rather than when they finished, so
+	// a payload that gets its slab and then waits on something else is already
+	// counted here.
+	// SetAside minus Resumed is what is waiting for a slab right now, plus every
+	// payload that ended while still waiting for one — a shutdown, a caller's
+	// abandonment, or a build that failed terminally after the wait began.
+	Resumed uint64
+}
+
+// ArenaCarryCounter is an optional Transport capability exposing, per outbound
+// size class, how often a payload could not be published because that class had
+// no free slab, and how often such a payload later got one.
+//
+// It reports a transient condition a sampled occupancy gauge cannot: a class that
+// exhausts and refills between two samples stalls real calls while every sample
+// shows room. Only the shared-memory transport allocates from an arena; uds omits
+// this capability.
+type ArenaCarryCounter interface {
+	// ArenaCarries reports the per-class counts as a cheap snapshot, in the
+	// arena's ascending class order. It returns nil when the transport has no
+	// arena to report on.
+	ArenaCarries() []ArenaCarry
+}
+
 // checkImplementedKind returns nil for the nine implemented kinds (unary
 // request/response/error, cancel, and five stream kinds) and ErrUnimplementedFrameKind
 // for any out-of-range byte. Stream kinds are checked explicitly to ensure removing

@@ -15,7 +15,8 @@ import "time"
 // so no value is reported and none is fabricated.
 // The shared-memory transport implements the backpressure-edge capability
 // (zero until reject mode is negotiated), along with ring depth, arena
-// utilization, wakeup syscalls, and consume faults.
+// utilization, arena set-asides and resumes, wakeup syscalls, and consume
+// faults.
 const (
 	// MetricRPCLatency is the wall-clock duration of one host-side unary call,
 	// observed as a latency distribution.
@@ -26,6 +27,28 @@ const (
 	// MetricArenaUtilization is the shared-memory arena's occupied byte count,
 	// reported as a gauge (shared-memory transport only).
 	MetricArenaUtilization = "styx.arena.utilization"
+	// MetricArenaSetAside counts payloads a connection could not publish because
+	// their shared-memory size class had no free slab, so the payload was parked
+	// until one freed. It carries a slab_size label naming the class, and counts
+	// stalls rather than retries: one parked payload counts once, however long it
+	// waits.
+	//
+	// It is the arena counterpart of MetricBackpressureEvent, which counts a
+	// different mechanism (a full send queue rejecting a call outright), and it
+	// reports what MetricArenaUtilization structurally cannot: that gauge is
+	// sampled, so a class that exhausts and refills between two samples stalls
+	// real calls while every sample shows room.
+	// Shared-memory transport only; the uds transport has no arena.
+	MetricArenaSetAside = "styx.arena.setaside.count"
+	// MetricArenaResumed counts parked payloads that later obtained a slab from
+	// the class that stalled them, under the same slab_size label as
+	// MetricArenaSetAside. It is counted at the allocation that frees the payload,
+	// not when the call finishes.
+	// Set-asides minus resumes is what is waiting for a slab right now, plus every
+	// payload that ended while still waiting for one — a shutdown, a caller's
+	// cancellation, or a message that could not be encoded.
+	// Shared-memory transport only.
+	MetricArenaResumed = "styx.arena.resumed.count"
 	// MetricBackpressureEvent counts transitions into transport backpressure.
 	// Each transition is one edge where a connection begins rejecting sends
 	// after accepting them; consecutive rejections count as one transition,

@@ -188,7 +188,7 @@ func (a *Arena) Alloc(size uint32) (SlabHandle, []byte, error) {
 		return SlabHandle{}, nil, ErrZeroLength
 	}
 
-	ci, ok := selectClass(a.classes, size)
+	ci, ok := SelectClass(a.classes, size)
 	if !ok {
 		return SlabHandle{}, nil, fmt.Errorf("arena: payload %d bytes: %w", size, ErrTooLarge)
 	}
@@ -281,6 +281,31 @@ func (a *Arena) Free(h SlabHandle) error {
 // reporter to read concurrently with the single writer's Alloc/Free.
 func (a *Arena) OccupancyBytes() uint64 {
 	return a.occupancy.Load()
+}
+
+// ClassSlabSizes returns this arena's slab sizes in ascending class order, one
+// per size class, as a fresh copy the caller may keep (shm-abi.md §2). It is the
+// arena's own class identity, so a reporter labelling per-class signals names the
+// same classes the allocator serves from rather than re-deriving them from a
+// geometry it was configured with.
+func (a *Arena) ClassSlabSizes() []uint32 {
+	out := make([]uint32, len(a.classes))
+	for i := range a.classes {
+		out[i] = a.classes[i].SlabSize
+	}
+
+	return out
+}
+
+// ServingClass returns the index of the class that would serve a stored length of
+// size — the smallest class whose slab_size covers it (shm-abi.md §6) — and
+// whether any class can. It runs SelectClass over this arena's own class table,
+// the same call Alloc makes, so a caller attributing an exhausted allocation to a
+// class never restates the rule and cannot drift from it. Index 0 with true for
+// size 0 is the pure geometry answer; Alloc itself rejects a zero request as
+// "no slab" before selecting.
+func (a *Arena) ServingClass(size uint32) (int, bool) {
+	return SelectClass(a.classes, size)
 }
 
 // Validate reports whether h names a currently live slab with a matching

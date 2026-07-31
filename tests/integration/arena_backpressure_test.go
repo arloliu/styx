@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/examples/echo/echopb"
+	"github.com/arloliu/styx/observe"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -56,6 +58,13 @@ const (
 	// without the rounds this test barely touches the path it is named for.
 	backpressureRounds = 25
 
+	// backpressureMetricsInterval is the host reporter's cadence for this test. The
+	// stall counters are cumulative and lose nothing between ticks, so the cadence
+	// only decides how soon the report arrives, not what it says; it is short so the
+	// assertion on it settles well inside its own wait rather than after the
+	// one-second default.
+	backpressureMetricsInterval = 20 * time.Millisecond
+
 	// backpressureCallBudget is the per-call deadline, and the only bound this test
 	// places on time. It discriminates a wedged data lane — a call that never
 	// completes fails here instead of hanging the suite — and deliberately nothing
@@ -88,6 +97,47 @@ func backpressureServingClass(t *testing.T, n uint32) styx.ShmSizeClass {
 	t.Fatalf("no default-geometry size class can serve %d bytes", n)
 
 	return styx.ShmSizeClass{}
+}
+
+// arenaStallSink records the per-size-class arena set-aside counts a host reports:
+// payloads it could not publish because their class had no free slab. It keys them
+// by the class's slab size, taken from the metric's own label, so the test asserts
+// which class stalled rather than that something somewhere did. It is safe for the
+// metrics dispatcher goroutine to write while the test reads under the mutex.
+type arenaStallSink struct {
+	mu       sync.Mutex
+	setAside map[string]int64
+}
+
+func newArenaStallSink() *arenaStallSink {
+	return &arenaStallSink{setAside: map[string]int64{}}
+}
+
+func (s *arenaStallSink) ObserveLatency(string, time.Duration, ...observe.Label) {}
+
+func (s *arenaStallSink) SetGauge(string, float64, ...observe.Label) {}
+
+func (s *arenaStallSink) IncrCounter(metric string, delta int64, labels ...observe.Label) {
+	if metric != observe.MetricArenaSetAside {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range labels {
+		if l.Key == "slab_size" {
+			s.setAside[l.Value] += delta
+		}
+	}
+}
+
+// setAsideFor returns how many payloads the host has reported setting aside on the
+// class with this slab size.
+func (s *arenaStallSink) setAsideFor(slabSize uint32) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.setAside[strconv.FormatUint(uint64(slabSize), 10)]
 }
 
 // fillBackpressurePayload writes a pattern unique to one caller's one round into
@@ -123,7 +173,10 @@ func describeBackpressurePayload(buf []byte) string {
 // backpressures, and the lean-profile workload runs at a concurrency its geometry is
 // certified to serve.
 //
-// This is a liveness and payload-integrity guard for the reclaim wait. It does not
+// This is a liveness and payload-integrity guard for the reclaim wait. The wait
+// itself is not assumed: the host's own per-class set-aside counter is asserted
+// non-zero for the serving class at the end, so the regime the geometry above
+// predicts is confirmed by the runtime rather than only derived. It does not
 // discriminate the peer-progress wake from the self-retry timer: with the timer
 // alone this workload still completes, because under steady saturation the ladder
 // never climbs far from its 100 microsecond floor.
@@ -170,7 +223,10 @@ func TestDefaultGeometryShm_CompletesEveryCall_WhenArenaBackpressures(t *testing
 	require.ErrorContains(t, strictErr, fmt.Sprintf("slab_size %d", backpressureServingSlabSize))
 	require.ErrorContains(t, strictErr, fmt.Sprintf("has %d usable slabs", backpressureClassSlabs))
 
+	sink := newArenaStallSink()
 	h := styx.NewHost(styx.HostConfig{
+		Metrics:         sink,
+		MetricsInterval: backpressureMetricsInterval,
 		Plugins: []styx.PluginSpec{{
 			Name:      "echo",
 			Path:      echoPluginBin,
@@ -220,4 +276,15 @@ func TestDefaultGeometryShm_CompletesEveryCall_WhenArenaBackpressures(t *testing
 	for i := range backpressureInFlight {
 		require.NoErrorf(t, errs[i], "caller %d under arena backpressure", i)
 	}
+
+	// And the host reported the regime this workload ran in: publishes found the
+	// serving class exhausted and parked their payloads there. The geometry above
+	// says this workload MUST reach that state; this is the runtime's own report
+	// that it DID. A change that leaves the class roomy enough to serve every
+	// caller on arrival — a wider ladder, a smaller payload, fewer callers — leaves
+	// this at zero and fails here, rather than quietly turning a backpressure test
+	// into a plain round-trip test.
+	require.Eventually(t, func() bool { return sink.setAsideFor(serving.SlabSize) > 0 },
+		10*time.Second, 20*time.Millisecond,
+		"the host must report payloads set aside on the %d-byte class this workload saturates", serving.SlabSize)
 }

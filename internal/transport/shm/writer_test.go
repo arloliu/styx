@@ -163,6 +163,21 @@ func (a *switchArena) Alloc(size uint32) (arena.SlabHandle, []byte, error) {
 	return arena.SlabHandle{Offset: 128, Length: size, Generation: 1, Sequence: 1}, a.slab, nil
 }
 
+// switchArenaSlabSize is the single size class switchArena models. A real arena
+// names its classes so a stall can be attributed to one; this double names one
+// class covering every payload these tests send.
+const switchArenaSlabSize = 4096
+
+func (a *switchArena) ClassSlabSizes() []uint32 { return []uint32{switchArenaSlabSize} }
+
+func (a *switchArena) ServingClass(size uint32) (int, bool) {
+	if size > switchArenaSlabSize {
+		return 0, false
+	}
+
+	return 0, true
+}
+
 // reExhaust returns the arena to the exhausted state so a test can drive a
 // SECOND data intent into the stuck carry after a first one has been placed,
 // exercising the self-retry backoff's per-carry reset.
@@ -584,6 +599,127 @@ func TestWriter_ResumesStuckData_OnRetrySignal(t *testing.T) {
 	require.Len(t, pushed, 1)
 	require.Equal(t, ring.KindUnaryReq, pushed[0].Kind())
 	require.Equal(t, uint64(7), pushed[0].CallID())
+}
+
+// Test that the writer counts an arena-exhaustion stall against the size class
+// that stalled it — once per parked payload, however many times that payload
+// re-probes for space — and counts the resume against the same class once the
+// payload obtains its slab.
+//
+// This is the report that makes a transient exhaustion visible at all: the arena
+// occupancy gauge is sampled, so a class that exhausts and refills between two
+// samples stalls real calls while every sample shows room.
+func TestWriter_CountsArenaSetAsideAndResume_AgainstTheStalledClass(t *testing.T) {
+	// Given a running writer whose arena starts exhausted, so a payload-bearing data
+	// intent is set aside, and whose counters start clean.
+	rr := &recordRing{}
+	sa := &switchArena{allocated: make(chan struct{}, 1)}
+	w := newWriterFromParts(rr, sa, 2, 2, admitBlock)
+	w.start()
+	t.Cleanup(w.stop)
+
+	require.Equal(t, []transport.ArenaCarry{{SlabSize: switchArenaSlabSize}}, w.arenaCarries(),
+		"a writer that has stalled nothing reports its classes with zero counts")
+
+	dataI := intent{
+		frame: transport.Frame{CallID: 21, Kind: transport.FrameUnaryReq, Payload: []byte("stalled")},
+		lane:  laneData,
+		done:  make(chan error, 1),
+	}
+	w.dataQueue <- dataI
+
+	// Wait until the intent is provably stuck (its first Alloc failed).
+	<-sa.allocated
+
+	// Then the stall is counted against the class, and no resume is claimed for a
+	// payload still parked.
+	require.Eventually(t, func() bool {
+		c := w.arenaCarries()[0]
+
+		return c.SetAside == 1 && c.Resumed == 0
+	}, testTimeout, time.Millisecond, "the parked payload's stall was never counted")
+
+	// And it stays a single count however many times the parked payload re-probes
+	// for space: this counts stalls, not retries.
+	for range 2 {
+		select {
+		case <-sa.allocated:
+		case <-time.After(testTimeout):
+			t.Fatal("the parked payload never re-probed the exhausted class")
+		}
+	}
+	require.EqualValues(t, 1, w.arenaCarries()[0].SetAside, "a re-probe is not a new stall")
+
+	// When space frees and the writer retries.
+	sa.release()
+	w.signalRetry()
+
+	// Then the payload publishes and its resume is counted against the same class.
+	require.NoError(t, recvWithin(t, dataI.done, "stuck data never resumed after space freed"))
+	require.Eventually(t, func() bool {
+		c := w.arenaCarries()[0]
+
+		return c.SetAside == 1 && c.Resumed == 1
+	}, testTimeout, time.Millisecond, "the resumed payload was never counted")
+}
+
+// Test that a parked payload is counted as resumed the moment its class frees a
+// slab, even when the frame then waits on a full ring window and is disposed of by
+// shutdown without ever publishing.
+//
+// The two counters describe the ARENA's stalls, so their difference must mean
+// "waiting for a slab". A frame holding the slab it asked for is not waiting for
+// one, whatever else it is waiting for, and counting the resume only when the
+// frame finally left the writer would put every such frame in that difference and
+// misreport the class as still starving.
+func TestWriter_CountsArenaResume_WhenTheSlabIsObtainedButTheRingStaysFull(t *testing.T) {
+	// Given a running writer over a ring that rejects every data push, and an arena
+	// that starts exhausted so the intent parks on the class first.
+	fr := &dataFullRing{attempted: make(chan struct{}, 1)}
+	sa := &switchArena{allocated: make(chan struct{}, 1)}
+	w := newWriterFromParts(fr, sa, 2, 2, admitBlock)
+	w.start()
+	t.Cleanup(w.stop)
+
+	dataI := intent{
+		frame: transport.Frame{CallID: 31, Kind: transport.FrameUnaryReq, Payload: []byte("parked then ring-full")},
+		lane:  laneData,
+		done:  make(chan error, 1),
+	}
+	w.dataQueue <- dataI
+
+	// Wait until the intent is provably parked on the exhausted class.
+	<-sa.allocated
+	require.Eventually(t, func() bool {
+		c := w.arenaCarries()[0]
+
+		return c.SetAside == 1 && c.Resumed == 0
+	}, testTimeout, time.Millisecond, "the parked payload's stall was never counted")
+
+	// When the class frees a slab: the build succeeds, and the frame moves on to
+	// wait for a ring window instead of publishing.
+	sa.release()
+	w.signalRetry()
+	select {
+	case <-fr.attempted:
+	case <-time.After(testTimeout):
+		t.Fatal("the resumed payload never reached the ring")
+	}
+
+	// Then the arena stall is closed out as a resume, and stays a single one
+	// however long the full ring keeps the carry.
+	require.Eventually(t, func() bool {
+		c := w.arenaCarries()[0]
+
+		return c.SetAside == 1 && c.Resumed == 1
+	}, testTimeout, time.Millisecond, "obtaining a slab was never counted as a resume")
+
+	// And the shutdown that disposes of the still-carried frame reports it closed
+	// and leaves the counts alone: the payload is not left looking like one that
+	// died waiting for a slab.
+	w.stop()
+	require.ErrorIs(t, recvWithin(t, dataI.done, "the carried intent was never reported"), transport.ErrClosed)
+	require.Equal(t, []transport.ArenaCarry{{SlabSize: switchArenaSlabSize, SetAside: 1, Resumed: 1}}, w.arenaCarries())
 }
 
 // awaitStuckWake drains the causes the onStuckWake hook reports until want
