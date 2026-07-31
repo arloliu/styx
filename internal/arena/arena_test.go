@@ -121,6 +121,40 @@ func TestArena_Alloc_ReturnsErrExhausted_WhenSizeClassFull(t *testing.T) {
 	require.Len(t, buf2, 4096)
 }
 
+// Test that ServingClass names the class Alloc actually serves a stored length
+// from, at each class boundary and past the largest class, and that
+// ClassSlabSizes hands back the class table in ascending order as a copy the
+// caller cannot use to mutate the arena.
+func TestArena_ServingClass_AgreesWithAllocAcrossClassBoundaries(t *testing.T) {
+	// Given
+	a := newTestArena(t)
+
+	// When / Then: for every length, the reported class is the one the allocation
+	// lands in, so a caller attributing an exhausted allocation to a class can never
+	// name a different class than the allocator chose.
+	for _, size := range []uint32{1, 64, 65, 256, 257, 4096} {
+		ci, ok := a.ServingClass(size)
+		require.True(t, ok, "size %d must be servable", size)
+
+		h, _, err := a.Alloc(size)
+		require.NoError(t, err, "size %d", size)
+		require.EqualValues(t, ci, h.class, "size %d: the reported class must be the one Alloc served", size)
+	}
+
+	// And a length no class can hold is reported as unservable, the same answer
+	// Alloc gives it.
+	_, ok := a.ServingClass(4097)
+	require.False(t, ok)
+	_, _, err := a.Alloc(4097)
+	require.ErrorIs(t, err, ErrTooLarge)
+
+	// And the class table is reported in ascending order, as a copy.
+	sizes := a.ClassSlabSizes()
+	require.Equal(t, []uint32{64, 256, 4096}, sizes)
+	sizes[0] = 999
+	require.Equal(t, []uint32{64, 256, 4096}, a.ClassSlabSizes(), "the returned table must not alias the arena's")
+}
+
 // Test that Alloc(0) is refused with ErrZeroLength and hands back no slab. A slab
 // is allocated iff stored_length != 0 (shm-abi.md §5); a zero request maps to
 // "no slab" (payload_offset == 0, alloc_seq == 0), so serving it a nonzero-offset

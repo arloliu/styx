@@ -8,7 +8,7 @@ import (
 	"github.com/arloliu/styx/internal/shm"
 )
 
-// Test that selectClass picks the smallest class whose slab_size covers the
+// Test that SelectClass picks the smallest class whose slab_size covers the
 // request, with no cross-class fallback, and reports no fit when the request
 // exceeds the largest class (shm-abi.md §6).
 func TestSizeClass_SelectsSmallestFittingClass(t *testing.T) {
@@ -37,7 +37,7 @@ func TestSizeClass_SelectsSmallestFittingClass(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// When
-			idx, ok := selectClass(classes, tc.size)
+			idx, ok := SelectClass(classes, tc.size)
 
 			// Then
 			require.Equal(t, tc.wantOK, ok, "fit for size %d", tc.size)

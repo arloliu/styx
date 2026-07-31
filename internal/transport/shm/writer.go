@@ -45,6 +45,11 @@ type payloadArena interface {
 var (
 	_ descriptorRing = (*ring.Ring)(nil)
 	_ payloadArena   = (*arena.Arena)(nil)
+	// The production arena must keep satisfying arenaClasses: the wiring that
+	// enables per-class stall counting is a type assertion that fails soft, so
+	// without this a signature drift would silently disable the counters in every
+	// production writer rather than fail the build.
+	_ arenaClasses = (*arena.Arena)(nil)
 )
 
 // emitResult reports whether an emit attempt fully resolved an intent or left a
@@ -89,6 +94,44 @@ type carry struct {
 	// hasSlab is false for a descriptor-only or empty-payload frame (no slab).
 	h       arena.SlabHandle
 	hasSlab bool
+	// parked and parkedClass record that this intent is set aside waiting for a
+	// slab of an exhausted size class, and which class, so the stall is counted
+	// once however many times the carry re-probes for space, and its resume is
+	// counted against the class that stalled it. A carry set aside on a full ring
+	// window is not parked in this sense: it is waiting for a descriptor slot
+	// while already holding the slab it allocated, so the arena is not what
+	// stalled it.
+	parked      bool
+	parkedClass int
+}
+
+// arenaClasses is the writer's view of its outbound arena's size-class table:
+// the classes' identities, and the allocator's own answer for which class serves
+// a given stored length. The exhaustion counters need both — one to label a
+// class, one to attribute an exhausted allocation to it — and taking them from
+// the arena rather than restating the selection rule here keeps the attribution
+// from drifting away from what Alloc actually did (shm-abi.md §6).
+//
+// It is optional: an arena double in an isolated test need not model classes, and
+// a writer over one simply reports no per-class counts. Production always wires a
+// real *arena.Arena, which implements it.
+type arenaClasses interface {
+	ClassSlabSizes() []uint32
+	ServingClass(size uint32) (int, bool)
+}
+
+// noClass is the "no size class" index: the stored length fits no class, or the
+// arena cannot name its classes at all.
+const noClass = -1
+
+// classStall counts one outbound size class's arena-exhaustion stalls. Only the
+// single run goroutine advances the counters, so they add no lock to the writer;
+// they are atomic so a cold-path reporter reads a consistent snapshot without
+// contending with the data path (the same discipline as framesSent/bytesSent).
+type classStall struct {
+	slabSize uint32
+	setAside atomic.Uint64
+	resumed  atomic.Uint64
 }
 
 // slabRef records, per ring sequence, the slab a published descriptor
@@ -195,6 +238,25 @@ type writer struct {
 	// synchronization; it is reset at the top of every build.
 	pendingSlab slabRef
 
+	// classes and classStalls are the arena-exhaustion stall accounting: the
+	// arena's serving-class lookup, and one stall counter pair per size class,
+	// index-aligned with the arena's ascending class table. Both are nil when the
+	// arena cannot name its classes (isolated unit-test doubles), which disables
+	// the accounting entirely rather than attributing stalls to a class the
+	// allocator never chose.
+	classes     arenaClasses
+	classStalls []classStall
+
+	// exhaustedClass threads the size class an allocation found exhausted out of
+	// stampPayload to place, which counts the park against it. It is meaningful
+	// ONLY on the build that just returned buildStuck: that status arises at
+	// exactly one site, the ErrExhausted branch that writes this field, so a
+	// reader reached through it always sees this build's class and never a stale
+	// one. It is deliberately not reset per build — a reset would put a store on
+	// the path of every frame to serve a field only the exhausted path reads.
+	// Touched only by the single run goroutine, the same discipline as pendingSlab.
+	exhaustedClass int
+
 	// onBlock is a test-only observation hook: when set, run calls it with the
 	// blockSite immediately before parking on a wake select, so a test can prove
 	// run reached a specific state before delivering a burst without racing. It
@@ -274,7 +336,7 @@ func newWriterFromParts(r descriptorRing, a payloadArena, dataDepth, lifecycleDe
 		panic("shm: newWriter lifecycleDepth must be positive")
 	}
 
-	return &writer{
+	w := &writer{
 		ring:           r,
 		arena:          a,
 		dataQueue:      make(chan intent, dataDepth),
@@ -285,6 +347,32 @@ func newWriterFromParts(r descriptorRing, a payloadArena, dataDepth, lifecycleDe
 		retry:          make(chan struct{}, 1),
 		mode:           mode,
 		signal:         func() {}, // no-op until wired; production overrides via newRegionWriter
+		exhaustedClass: noClass,
+	}
+	w.wireClassStalls(a)
+
+	return w
+}
+
+// wireClassStalls arms the per-class arena-exhaustion accounting when the arena
+// can name its own classes, sizing one counter pair per class so the counting
+// path never allocates and never looks a class up by size. An arena that cannot
+// leaves both fields nil and the accounting off.
+func (w *writer) wireClassStalls(a payloadArena) {
+	ac, ok := a.(arenaClasses)
+	if !ok {
+		return
+	}
+
+	sizes := ac.ClassSlabSizes()
+	if len(sizes) == 0 {
+		return
+	}
+
+	w.classes = ac
+	w.classStalls = make([]classStall, len(sizes))
+	for i := range sizes {
+		w.classStalls[i].slabSize = sizes[i]
 	}
 }
 
@@ -585,6 +673,75 @@ func (w *writer) enqueue(ctx context.Context, i intent, l lane) error {
 // admission decision that produces a transition is made.
 func (w *writer) backpressureEdges() uint64 {
 	return w.edgeCount.Load()
+}
+
+// arenaCarries reports, per outbound size class, how many payloads this writer
+// set aside because the class had no free slab and how many of those later got
+// one (transport.ArenaCarryCounter). It is a cold-path snapshot for the periodic
+// reporter: it allocates its own result and reads each counter atomically, never
+// contending with the run goroutine that advances them. It returns nil for a
+// writer whose arena cannot name its classes.
+func (w *writer) arenaCarries() []transport.ArenaCarry {
+	if len(w.classStalls) == 0 {
+		return nil
+	}
+
+	out := make([]transport.ArenaCarry, len(w.classStalls))
+	for i := range w.classStalls {
+		out[i] = transport.ArenaCarry{
+			SlabSize: w.classStalls[i].slabSize,
+			SetAside: w.classStalls[i].setAside.Load(),
+			Resumed:  w.classStalls[i].resumed.Load(),
+		}
+	}
+
+	return out
+}
+
+// noteArenaSetAside counts a data intent parked because its size class had no
+// free slab, and records the class on the carry so its resume is counted against
+// the same one. It counts a stall, not a retry: a carry already parked is counted
+// once, however many times it re-probes for space.
+//
+// It is called only from the buildStuck path, which arises at exactly one site —
+// the allocation that reported ErrExhausted — so w.exhaustedClass names this
+// intent's class. There is no cost on the path of a frame that publishes.
+func (w *writer) noteArenaSetAside(c *carry) {
+	if c.parked || len(w.classStalls) == 0 {
+		return
+	}
+
+	ci := w.exhaustedClass
+	if ci < 0 || ci >= len(w.classStalls) {
+		return
+	}
+
+	c.parked = true
+	c.parkedClass = ci
+	w.classStalls[ci].setAside.Add(1)
+}
+
+// noteArenaResume counts a parked payload that has just obtained a slab from the
+// class that stalled it, and clears the park so a carry that goes on to wait for
+// a ring window cannot be counted a second time.
+//
+// It is called from the single site where an allocation has just succeeded — the
+// build that produced this carry's descriptor — so a resume means the class freed
+// a slab for this payload, not merely that the carry left the writer's hands. A
+// carry that parks and then ends without ever allocating (a caller's abandonment,
+// a terminal build failure, a shutdown) is not reported as a resume, which is what
+// keeps the difference between the two counters meaningful. A parked carry always
+// rebuilds through the allocating path: it parks on an exhausted class, which only
+// a payload-bearing frame can reach, and its intent does not change while parked.
+//
+// A frame that never parked pays one never-taken branch here.
+func (w *writer) noteArenaResume(c *carry) {
+	if !c.parked {
+		return
+	}
+
+	c.parked = false
+	w.classStalls[c.parkedClass].resumed.Add(1)
 }
 
 // framesSentCount and bytesSentCount report this writer's cumulative outbound
@@ -1002,12 +1159,15 @@ func (w *writer) place(c *carry) emitResult {
 		case buildFailed:
 			return emitDone
 		case buildStuck:
+			w.noteArenaSetAside(c)
+
 			return emitStuck
 		case buildOK:
 			c.d = d
 			c.built = true
 			c.h = w.pendingSlab.h
 			c.hasSlab = w.pendingSlab.present
+			w.noteArenaResume(c)
 		}
 	}
 
@@ -1279,6 +1439,13 @@ func (w *writer) stampPayload(
 			// Typed backpressure: nothing was allocated and, for a fill intent, the
 			// state word is untouched — so a set-aside fill intent stays abandonable
 			// by its caller, which is exactly when cancellation responsiveness matters.
+			//
+			// Record which class was exhausted for the stall accounting place does.
+			// This is the only site that produces buildStuck, which is what makes the
+			// field unambiguous there (see exhaustedClass).
+			//nolint:gosec // storedLen was bounded above, far below math.MaxUint32
+			w.exhaustedClass = w.stalledClassFor(uint32(storedLen))
+
 			return d, buildStuck
 		}
 		w.report(i, err) // ErrTooLarge: payload exceeds the largest size class
@@ -1333,6 +1500,24 @@ func (w *writer) stampPayload(
 	w.pendingSlab = slabRef{h: h, present: true}
 
 	return d, buildOK
+}
+
+// stalledClassFor returns the index of the size class that would serve a stored
+// length of size, asking the arena rather than restating its selection rule, or
+// noClass when the arena cannot name its classes or none can serve the length.
+// It runs only on the exhausted-allocation path, where the answer names the class
+// that stalled the payload.
+func (w *writer) stalledClassFor(size uint32) int {
+	if w.classes == nil {
+		return noClass
+	}
+
+	ci, ok := w.classes.ServingClass(size)
+	if !ok {
+		return noClass
+	}
+
+	return ci
 }
 
 // fillSlab runs a fill intent's caller-supplied marshal callback over window,

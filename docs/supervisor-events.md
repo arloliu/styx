@@ -157,6 +157,33 @@ picking the wrong one for a given job is a common mistake:
   others), for dashboards and alerting rules built on rates and thresholds
   rather than individual transitions.
 
+Two of those counters report shared-memory *arena* stalls, and they are the
+only signal that a call waited on the region's shape rather than on the
+plugin. Both carry a `slab_size` label naming the size class they are about,
+and both are reported per side — the host reports the classes its own sends
+allocate from, the plugin the classes its replies allocate from:
+
+- **`styx.arena.setaside.count`** — a publish found that class exhausted (no
+  free slab) and parked the payload until one freed. It counts stalls, not
+  retries: one parked payload counts once, however long it waits and however
+  many times it re-probes for space.
+- **`styx.arena.resumed.count`** — a parked payload obtained a slab from the
+  class that stalled it. It is counted the moment the slab is obtained, not
+  when the call finishes, so set-asides minus resumes is what is waiting for a
+  slab right now, plus every payload that ended while still waiting for one —
+  a shutdown, a caller's cancellation, or a message that could not be encoded.
+  In steady state the two counters track each other closely; a persistent gap
+  is payloads dying in the wait, not slow ones.
+
+These are not the same signal as `styx.backpressure.count`, which counts a
+different mechanism entirely (a full send queue rejecting a call outright),
+and they report what `styx.arena.utilization` structurally cannot: that gauge
+is sampled, so a class that exhausts and refills between two samples stalls
+real calls while every sample shows room. A steady climb in set-asides is a
+geometry that is too small for the load — see
+[docs/configuration.md](configuration.md#shared-memory-geometry) for what to
+do about it.
+
 A typical host configures all three: `Logger` and `Metrics` for passive
 observability, and a small `Events()` consumer for the handful of
 transitions — usually just `EventGaveUp`, sometimes `EventCrashed` — that

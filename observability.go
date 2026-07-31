@@ -3,6 +3,7 @@ package styx
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"time"
 
@@ -15,6 +16,11 @@ import (
 // labelPlugin is the metric label key carrying a plugin's name, so one host's
 // single MetricsSink can distinguish the signals of the plugins it supervises.
 const labelPlugin = "plugin"
+
+// labelSlabSize is the metric label key carrying a shared-memory size class's
+// slab size in bytes, so a per-class signal names which class it is about. It is
+// the class's identity in the arena's ascending class table (shm-abi.md §2).
+const labelSlabSize = "slab_size"
 
 // metricsBufferSize bounds each MetricsSink dispatcher's pending-event queue.
 // Beyond it the dispatcher drops oldest (counted), so a slow sink never stalls a
@@ -104,9 +110,10 @@ func (c *ClientConn) recordAbandoned(m *observeq.Dispatcher[observe.MetricsSink]
 
 // runMetricsReporter is the per-plugin cold reporter goroutine: at each interval
 // it sources the throughput and shared-memory gauges from the live transport's
-// own counting capabilities — bytes moved as a counter delta, and (when the
-// transport exposes them) arena occupancy, ring depth, and eventfd wakeup rate as
-// gauges. The uds transport exposes only byte counting, so over uds only bytes
+// own counting capabilities — bytes moved and per-size-class arena stalls as
+// counter deltas, and (when the transport exposes them) arena occupancy, ring
+// depth, and eventfd wakeup rate as gauges.
+// The uds transport exposes only byte counting, so over uds only bytes
 // moved is emitted; the shared-memory-only gauges have no uds source and no value
 // is fabricated for them. It returns when ctx is done.
 func (c *ClientConn) runMetricsReporter(
@@ -129,6 +136,7 @@ func (c *ClientConn) runMetricsReporter(
 	var lastFaults uint64
 	var lastWakeups uint64
 	var haveWakeups bool
+	var lastCarries []transport.ArenaCarry
 	for {
 		select {
 		case <-ctx.Done():
@@ -150,10 +158,12 @@ func (c *ClientConn) runMetricsReporter(
 				// difference against the predecessor's unrelated counter.
 				lastTr, lastBytes, lastEdges, lastWakeups, haveWakeups = tr, 0, 0, 0, false
 				lastFaults = 0
+				lastCarries = nil
 			}
 			lastBytes = c.reportBytesMoved(m, tr, lastBytes)
 			lastEdges = c.reportBackpressureEdges(m, tr, lastEdges)
 			lastFaults = c.reportConsumeFaults(m, tr, lastFaults)
+			lastCarries = c.reportArenaCarries(m, tr, lastCarries)
 			c.reportArenaOccupancy(m, tr)
 			c.reportRingDepth(m, tr)
 			lastWakeups, haveWakeups = c.reportWakeupRate(m, tr, lastWakeups, haveWakeups, interval)
@@ -229,6 +239,91 @@ func (c *ClientConn) reportConsumeFaults(
 	})
 
 	return cur
+}
+
+// reportArenaCarries submits the per-interval deltas of the live transport's
+// per-size-class arena stall counts — payloads set aside because their class had
+// no free slab, and parked payloads that later got one — and returns the new
+// baseline. Each class's counts carry a slab_size label naming it, and a class
+// with nothing new to report submits nothing. The uds transport has no arena and
+// omits the capability, so nothing is reported over it.
+//
+// It is reported rather than left to the arena-utilization gauge because that
+// gauge is sampled: a class that exhausts and refills between two samples stalls
+// real calls while every sample shows room. These counts are advanced at the
+// stall itself, so the reporter's cadence cannot hide one.
+func (c *ClientConn) reportArenaCarries(
+	m *observeq.Dispatcher[observe.MetricsSink], tr transport.Transport, last []transport.ArenaCarry,
+) []transport.ArenaCarry {
+	ac, ok := tr.(transport.ArenaCarryCounter)
+	if !ok {
+		return last
+	}
+
+	cur := ac.ArenaCarries()
+	if len(cur) == 0 {
+		return last // nothing to report on; keep the baseline rather than reset it to zero
+	}
+
+	name := c.name
+	for i := range cur {
+		setAside, resumed := arenaCarryDelta(cur, last, i)
+		if setAside == 0 && resumed == 0 {
+			continue
+		}
+		class := formatSlabSize(cur[i].SlabSize)
+		m.Submit(func(s observe.MetricsSink) {
+			submitArenaCarry(s, setAside, resumed,
+				observe.Label{Key: labelPlugin, Value: name},
+				observe.Label{Key: labelSlabSize, Value: class})
+		})
+	}
+
+	return cur
+}
+
+// arenaCarryDelta returns class i's set-aside and resume counts since the
+// baseline. A baseline that does not cover the class, or covers a different class
+// at that index (a fresh transport with another geometry), counts the class from
+// zero rather than differencing two unrelated counters.
+func arenaCarryDelta(cur, last []transport.ArenaCarry, i int) (setAside uint64, resumed uint64) {
+	c := cur[i]
+	if i >= len(last) || last[i].SlabSize != c.SlabSize {
+		return c.SetAside, c.Resumed
+	}
+
+	return counterDelta(c.SetAside, last[i].SetAside), counterDelta(c.Resumed, last[i].Resumed)
+}
+
+// counterDelta returns cur - last for a cumulative counter, treating a decrease
+// as a counter that restarted from zero and counting cur itself. A monotonic
+// counter read from one transport instance never decreases, so this is a
+// belt-and-braces guard, not a path the healthy reporter takes.
+func counterDelta(cur, last uint64) uint64 {
+	if cur < last {
+		return cur
+	}
+
+	return cur - last
+}
+
+// formatSlabSize renders a size class's slab size as its label value.
+func formatSlabSize(slabSize uint32) string {
+	return strconv.FormatUint(uint64(slabSize), 10)
+}
+
+// submitArenaCarry records one size class's non-zero stall counts on the sink
+// under labels. It runs inside a dispatcher submission, so it must only call the
+// sink.
+func submitArenaCarry(s observe.MetricsSink, setAside uint64, resumed uint64, labels ...observe.Label) {
+	if setAside != 0 {
+		//nolint:gosec // cumulative stall count; a per-interval delta never overflows int64.
+		s.IncrCounter(observe.MetricArenaSetAside, int64(setAside), labels...)
+	}
+	if resumed != 0 {
+		//nolint:gosec // cumulative resume count; a per-interval delta never overflows int64.
+		s.IncrCounter(observe.MetricArenaResumed, int64(resumed), labels...)
+	}
 }
 
 // liveTransport returns the live connection generation's transport, or nil when
@@ -341,8 +436,9 @@ func (c *ClientConn) reportWakeupRate(
 
 // runMetricsReporter is the plugin-side cold reporter goroutine. It reports the
 // shared-memory signals the live transport exposes: arena occupancy, ring depth,
-// and eventfd wakeup rate as gauges, and backpressure edges and consume faults as
-// per-interval counter deltas. The uds serve-path transport exposes none of them,
+// and eventfd wakeup rate as gauges, and backpressure edges, consume faults, and
+// per-size-class arena stalls as per-interval counter deltas.
+// The uds serve-path transport exposes none of them,
 // so nothing is reported over it (no value is fabricated). The plugin has no name
 // of its own, so plugin-side signals carry no plugin label. It returns when ctx is
 // done. Only started when s.metrics is non-nil.
@@ -360,9 +456,11 @@ func (s *PluginServer) runMetricsReporter(ctx context.Context, tr transport.Tran
 	ec, haveEdges := tr.(transport.BackpressureEdgeCounter)
 	wc, haveWakeups := tr.(transport.WakeupSyscallCounter)
 	cf, haveFaults := tr.(transport.ConsumeFaultCounter)
+	ca, haveCarries := tr.(transport.ArenaCarryCounter)
 	var lastEdges uint64
 	var lastFaults uint64
 	var lastWakeups uint64
+	var lastCarries []transport.ArenaCarry
 	var haveBaseline bool
 	for {
 		select {
@@ -401,6 +499,9 @@ func (s *PluginServer) runMetricsReporter(ctx context.Context, tr transport.Tran
 					lastFaults = cur // establish or re-establish (after a reset) the baseline.
 				}
 			}
+			if haveCarries {
+				lastCarries = s.reportArenaCarries(ca, lastCarries)
+			}
 			if haveWakeups {
 				cur := wc.WakeupSyscalls()
 				if !haveBaseline || cur < lastWakeups {
@@ -414,6 +515,38 @@ func (s *PluginServer) runMetricsReporter(ctx context.Context, tr transport.Tran
 			}
 		}
 	}
+}
+
+// reportArenaCarries submits the per-interval deltas of the plugin's outbound
+// per-size-class arena stall counts and returns the new baseline, the plugin-side
+// counterpart of the host's reporter of the same name. Each class's counts carry
+// a slab_size label naming it; the plugin has no name of its own, so they carry
+// no plugin label.
+//
+// The two sides' counts are not redundant: each side counts only the payloads IT
+// could not place, and the two directions have independent class tables and
+// independent free lists (shm-abi.md §6). A geometry undersized in one direction
+// shows the climb on that side alone.
+func (s *PluginServer) reportArenaCarries(
+	ac transport.ArenaCarryCounter, last []transport.ArenaCarry,
+) []transport.ArenaCarry {
+	cur := ac.ArenaCarries()
+	if len(cur) == 0 {
+		return last // nothing to report on; keep the baseline rather than reset it to zero
+	}
+
+	for i := range cur {
+		setAside, resumed := arenaCarryDelta(cur, last, i)
+		if setAside == 0 && resumed == 0 {
+			continue
+		}
+		class := formatSlabSize(cur[i].SlabSize)
+		s.metrics.Submit(func(sink observe.MetricsSink) {
+			submitArenaCarry(sink, setAside, resumed, observe.Label{Key: labelSlabSize, Value: class})
+		})
+	}
+
+	return cur
 }
 
 // restartHook returns the supervisor's restart-decision observability callback for
