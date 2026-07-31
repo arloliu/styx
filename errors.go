@@ -209,6 +209,17 @@ var (
 	// on a retried Stop). It is a lifecycle/framework error, not a per-call one,
 	// so IsRetryable does not classify it.
 	ErrPluginStopping = errors.New("styx: plugin still stopping")
+	// ErrHostStopped reports that Start was called on a Host whose Stop already
+	// completed its teardown. A Host is single-use: that teardown releases the
+	// background workers the Host owns for its whole life — the observability
+	// dispatchers and the Events() subscription — and none of them is rebuilt, so a
+	// plugin started afterward would run with its lifecycle events going nowhere
+	// and no metrics or logs reported. Build a new Host instead; a caller that
+	// reconnects by rebuilding one is the case this protects. A Stop that returned
+	// early, or one whose plugin has not finished stopping, has not completed a
+	// teardown and does not trigger this. It is a lifecycle/framework error, not a
+	// per-call one, so IsRetryable does not classify it.
+	ErrHostStopped = errors.New("styx: host stopped")
 	// ErrStreamAlreadyClosed reports that a stream recorded a completed outcome at a
 	// point where its STREAM_OPEN provably never reached the peer, so there is no
 	// usable stream and no peer result to return. A completion the peer actually

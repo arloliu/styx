@@ -14,36 +14,29 @@ import (
 // framework's own bookkeeping and, potentially, other tests still unwinding.
 const (
 	// goroutineSettleSlack is how far above baseline the goroutine count may sit and
-	// still count as settled. It is 1, and that 1 has a specific, known cause, not a
-	// margin for generic noise: styx.NewHost subscribes to its own top-level event
-	// bus once, in NewHost, and never unsubscribes — host.go documents that
-	// subscription as living for "the Host's whole life," so its forwarder goroutine
-	// (internal/supervisor's busSubscriber.forward) outlives Host.Stop and is only
-	// reclaimed when the Host itself is garbage. Every test here that constructs
-	// exactly one styx.Host therefore has exactly one such goroutine that this check
-	// must not flag, and slack 0 flags it on every single run — it is not
-	// intermittent. Slack 1 was verified stable (0 failures) across the full
-	// instrumented suite at -race -count=3, run both alone and with two of the
-	// suites running at once for added scheduler contention; slack 0 was verified
-	// UNSTABLE the same way — not flaky, but a deterministic failure on every run,
-	// for the reason above.
+	// still count as settled. It is 0: every goroutine a test starts, directly or
+	// through the machinery it drives, must be gone by the time that test's own
+	// teardown has finished, so a SINGLE leaked goroutine fails the check — the
+	// smallest leak there is, and the size a per-Host or per-subscription leak
+	// arrives in. There is no tolerated per-test goroutine: styx.NewHost's own
+	// subscription to its top-level event bus (the one Events() hands out) is ended
+	// by Host.Stop, so its forwarder goroutine belongs to the Host and not to the
+	// process. Slack 0 was verified stable (0 failures) across the full instrumented
+	// suite at -race -count=3.
 	//
-	// IMPORTANT: this is also the exact size of leak this check CANNOT see beyond
-	// the known one. A second genuine leak of exactly 1 goroutine that never grows
-	// further would settle inside the band and pass. It catches a leak that keeps
-	// growing (each call, each restart) or that is larger than 1 in one shot, not a
-	// second, independent single-goroutine leak indistinguishable from the one this
-	// slack already exists to tolerate.
-	goroutineSettleSlack = 1
+	// Raising this back above 0 would blind the check to a leak of exactly that
+	// size: a goroutine leaked once per test, never growing, settles inside the band
+	// and passes. Fix the leak instead; a slack of 1 is one whole per-Host leak's
+	// worth of cover.
+	goroutineSettleSlack = 0
 
 	// goroutineSettleSamples is how many consecutive polls must land at or below
 	// baseline+slack before the count is accepted as settled. A sustained leak — a
 	// count that stays above baseline+slack for the whole settleMaxWait window — can
 	// never assemble goroutineSettleSamples consecutive passing samples, so it always
-	// runs out the window and fails; a count at or below baseline+slack on any given
-	// sample, including one inflated by a leak no bigger than the slack itself, DOES
-	// count toward this streak, because the check cannot distinguish "settled" from
-	// "leaked exactly as much as the slack tolerates" — see goroutineSettleSlack.
+	// runs out the window and fails. Consecutive samples, rather than a single final
+	// one, are what separate a goroutine still unwinding right after teardown from
+	// one that is not going to exit at all.
 	goroutineSettleSamples = 5
 
 	// settlePoll is the interval between samples, shared by the goroutine and fd
@@ -83,8 +76,12 @@ const (
 // supervisor); a leaked shared-memory region mapping; retained/growing heap; a
 // goroutine that happens to exit only because an earlier-registered cleanup (e.g.
 // Host.Stop) already ran before this one — this check proves nothing leaked past
-// THAT teardown, not that nothing misbehaved before it; and any leak sized at or
-// below goroutineSettleSlack that never grows further (see its doc comment).
+// THAT teardown, not that nothing misbehaved before it; and a goroutine that
+// leaked but is offset by an unrelated one exiting late, since this is a net
+// count, not a per-goroutine identity check. What it DOES see, at
+// goroutineSettleSlack of 0, is a single goroutine that outlives the test that
+// started it — including one leaked once per host, per subscription, or per call
+// without ever growing further.
 //
 // The registered cleanup polls at a fixed cadence and requires goroutineSettleSamples
 // consecutive samples at or below baseline+slack before treating the count as
@@ -127,11 +124,12 @@ func RequireNoGoroutineLeak(tb testing.TB) {
 // fails first: this uses tb.Errorf internally, not tb.Fatalf, so a goroutine failure
 // does not abort the cleanup before the fd count is sampled and asserted.
 //
-// The fd dimension requires the count to return to AT OR BELOW the baseline, no
-// slack: unlike the goroutine count, which shares the process with runtime
-// bookkeeping and an earlier test's own goroutines still unwinding, this process's
-// open descriptors are this test's alone to account for once its host has stopped,
-// so there is no legitimate reason for the net count to sit above baseline.
+// Both dimensions require the count to return to AT OR BELOW the baseline: this
+// test's descriptors and its goroutines are alike its own to account for once its
+// host has stopped, so neither has a legitimate reason to sit above baseline. The
+// two differ only in how long they are given to get there — a goroutine may still
+// be unwinding when the fd it held is already closed — which the shared settle
+// loop's consecutive-sample requirement covers for both.
 func RequireNoGoroutineOrFDLeak(tb testing.TB) {
 	tb.Helper()
 

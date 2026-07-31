@@ -55,7 +55,15 @@ func run() error {
 	if err := host.Start(ctx); err != nil {
 		return fmt.Errorf("start: %w", err)
 	}
-	defer func() { _ = host.Stop(ctx) }()
+	// Stop gets a context with fresh budget rather than the one the work above ran
+	// under: a Stop handed an already-canceled or expired context returns without
+	// tearing anything down.
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer stopCancel()
+
+		_ = host.Stop(stopCtx)
+	}()
 
 	client := echopb.NewEchoStreamClient(host.Plugin("echo"))
 

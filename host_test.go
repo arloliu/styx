@@ -416,6 +416,108 @@ func TestHost_Events_DeliversLatestGaveUp_AfterBurst_WithWedgedReader(t *testing
 	require.Positive(t, dropped[0], "expected the informational burst to be counted as dropped")
 }
 
+// Test a completed Host.Stop leaving no event-forwarder goroutine behind, across
+// several hosts constructed and stopped in turn. NewHost subscribes the host's own
+// event bus to feed Events(), which spawns one forwarder goroutine per host; a
+// process that builds a host per reconnect, or a test binary that builds one per
+// test, accumulates one of those for every host whose Stop does not end that
+// subscription. Several hosts in turn, rather than one, so that a release which
+// only ever reaches the most recent host still leaves a count the check sees.
+func TestHost_Stop_LeavesNoEventForwarderBehind_AcrossRepeatedHosts(t *testing.T) {
+	testutil.RequireNoGoroutineLeak(t) // registered before the first host: see its doc comment on ordering.
+
+	for range 3 {
+		h := styx.NewHost(styx.HostConfig{})
+		require.NoError(t, h.Start(t.Context()))
+		require.NoError(t, h.Stop(context.Background()))
+	}
+}
+
+// Test Host.Events() closing once Stop has completed the host's teardown, so a
+// consumer ranging over it in its own goroutine — the pattern the documentation
+// and examples use — ends with the host instead of blocking forever on a channel
+// nothing will write again.
+func TestHost_Events_ChannelClosed_AfterStopCompletes(t *testing.T) {
+	// Given: a host with a consumer ranging Events() the way a real host does.
+	h := styx.NewHost(styx.HostConfig{})
+	ranged := make(chan struct{})
+	go func() {
+		defer close(ranged)
+		for range h.Events() { //nolint:revive // draining until the stream ends is the point.
+		}
+	}()
+
+	// When
+	require.NoError(t, h.Stop(context.Background()))
+
+	// Then: the range ends, because the channel is closed rather than merely idle.
+	select {
+	case <-ranged:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Events() was not closed by Stop: a ranging consumer never returned")
+	}
+
+	_, ok := <-h.Events()
+	require.False(t, ok, "Events() must stay closed after Stop, not deliver again")
+}
+
+// Test a Stop handed an already-canceled context tearing nothing down — leaving
+// Events() open, since nothing was torn down to end it — and a later Stop with a
+// usable context still completing that teardown and closing the stream. Reusing
+// the context the host ran under is the easy mistake (a signal.NotifyContext is
+// canceled at exactly shutdown time), and the recovery from it is a second Stop,
+// not a new Host.
+func TestHost_Stop_TearsNothingDownOnCanceledContext_AndALaterStopStillCloses(t *testing.T) {
+	// Given: a host and a context that is already canceled.
+	h := styx.NewHost(styx.HostConfig{})
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// When
+	err := h.Stop(canceled)
+
+	// Then: Stop reports the context and ends the events stream not at all.
+	require.ErrorIs(t, err, context.Canceled)
+	select {
+	case _, ok := <-h.Events():
+		require.Fail(t, "Events() must stay live after a Stop that tore nothing down",
+			"channel closed=%v", !ok)
+	default:
+	}
+
+	// When: a Stop with budget follows.
+	require.NoError(t, h.Stop(context.Background()))
+
+	// Then: that one completes the teardown and closes the stream.
+	_, ok := <-h.Events()
+	require.False(t, ok, "a Stop with a usable context must complete the teardown and close Events()")
+}
+
+// Test Start refusing a host whose Stop already completed its teardown. That
+// teardown ends the Events() subscription and the observability workers for good,
+// so a plugin started afterward would report its lifecycle nowhere; a caller that
+// reconnects builds a new Host instead.
+func TestHost_Start_RejectsHostWhoseStopCompleted(t *testing.T) {
+	// Given: a host that has been stopped.
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{Name: "ready", Path: fixtureReadyPlugin}}})
+	require.NoError(t, h.Start(t.Context()))
+	require.NoError(t, h.Stop(context.Background()))
+
+	// When
+	err := h.Start(context.Background())
+
+	// Then: the start is refused as a stopped host, and nothing is running under it.
+	require.ErrorIs(t, err, styx.ErrHostStopped)
+	require.ErrorIs(t, h.Plugin("ready").Invoke(t.Context(), "svc", "M", nil, nil), styx.ErrPluginUnavailable)
+}
+
+// Test the zero Host surviving Stop. It owns no subscription, no workers, and no
+// runtimes, so its teardown has nothing to release — and must say so rather than
+// dereferencing what NewHost would have set.
+func TestHost_Stop_OnZeroValueHost_IsANoOp(t *testing.T) {
+	require.NoError(t, (&styx.Host{}).Stop(context.Background()))
+}
+
 // TestExternalGeometryFixture_Compiles builds the external-module fixture under
 // testdata/externalgeometry, which imports the public styx module from OUTSIDE it
 // and configures every public shared-memory geometry form (ShmGeometry, the
