@@ -1116,23 +1116,41 @@ exists to produce. On the **request** direction it is not. The call a discarded
 request names lives in the *peer's* table, and no local terminal reaches it; the
 only act that discharges its dependency is answering the peer with an error
 status — which the paragraph above already classes as an **acceptance**, to be
-reported consumed. So a request-receiving consumer that can answer MUST accept
-rather than decline, and a request it genuinely could not take is declined for
-the parts of the disposition it can still perform (count the fault, advance the
-head, do not poison). A consumer that declines a request has not failed to meet
-this rule; there is nothing on this side for the rule to name.
+reported consumed. So a request-receiving consumer that can answer normally MUST
+accept rather than decline, and a request it genuinely could not take is declined
+for the parts of the disposition it can still perform (count the fault, advance
+the head, do not poison) — and then answered, by the rule below.
 
-That leaves the peer's call to whatever budget its descriptor carried, and §4
-defines `budget_ns = 0` as **no deadline** — a caller that issued the call with no
-deadline of its own publishes zero, and a peer that arms its expiry from that
-budget arms nothing. So a declined request whose descriptor carried a zero budget
-strands the peer's call with nothing to reap it, on a connection this arm
-deliberately keeps healthy. That is a **known gap in this arm, not a property of
-it**: closing it requires the request-receiving side to be able to answer a frame
-it never dispatched, which this section does not yet give it. Until it does, a
-consumer on this direction SHOULD treat declining as a last resort and answer
-wherever it can, and MUST NOT be read as having discharged the peer's dependency
-merely by advancing the head.
+**A declined request MUST be answered (`0xFFFFFF09`).** Advancing the head is not
+the whole of what a declined request owes. §4 defines `budget_ns = 0` as **no
+deadline** — a caller that issued the call with no deadline of its own publishes
+zero, and a peer that arms its expiry from that budget arms nothing — so a
+declined request whose descriptor carried a zero budget would otherwise leave the
+peer's call with nothing to reap it, on a connection this arm deliberately keeps
+healthy. A consumer that declines or faults on an inbound `UNARY_REQ` therefore
+MUST answer it, before it takes the next frame, with a `UNARY_ERR` naming that
+`call_id` and carrying the status below.
+
+The answer is performable in exactly the case that needs it, which is why this is
+a rule and not an aspiration: it consumes only the descriptor's `call_id`, which a
+consumer holds whether or not it could read, decode, or dispatch the payload.
+
+The reply is a refusal, not a result. Nothing was dispatched, so no handler ran and
+the request had no effect — which is what makes the outcome **retryable**, and what
+separates it from a status a handler produced.
+
+| Code | Name | Meaning on the wire | Reconstructed by the receiver as |
+|---|---|---|---|
+| `0xFFFFFF09` | `StatusCodeRequestDeclined` | The receiving side **declined an inbound unary request** before dispatch — either consumer-owned arm above, a consume step that failed for a reason of its own or panicked on a frame it had already taken. No handler ran and the request had no effect. | `styx.ErrRequestDeclined` (retryable) |
+
+The allocation is **additive inside an already-reserved range**, and reserves
+nothing new: `internal/rpcruntime/table.go` declares every status code at or above
+`StatusCodeReservedMin` (`0xFFFFFF01`) framework-owned and never a valid
+application code, and the `styx` package clamps an application status landing in
+that range down to `StatusCodeInternal` before it goes on the wire, so a handler
+cannot impersonate this refusal. No schema element moves and no version pairing is
+made incompatible, so `layout_version` does not bump (§19): what a peer observes
+is confined to a failure path this side already owns.
 
 **The advance MUST survive the panic.** "The head still advances after a panic"
 is only a real rule if the implementation cannot skip it while unwinding, so the
@@ -1187,8 +1205,9 @@ func Consume():
             consume_faults += 1                     // diagnostic counter (§16); MAY escalate at a documented threshold
             AdvanceHead()                           // the slot was consumed either way; never strand it
             fail_call(d.call_id)                    // fail fast; a silent discard strands the caller to its deadline
-                                                    // response direction only: the call is local there. On the request
-                                                    // direction it names the PEER's call and is a no-op (see above).
+                                                    // response direction: the call is local there, so fail it. On the
+                                                    // request direction it names the PEER's call, so answer instead —
+                                                    // UNARY_ERR carrying 0xFFFFFF09 (see above).
             return
     else:
         value = empty                               // no slab (§5)

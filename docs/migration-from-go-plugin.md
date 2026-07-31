@@ -224,6 +224,10 @@ a fresh attempt is safe:
   context was canceled.
 - `ErrBackpressure` — the shared-memory ring or arena had no room for the send
   (retryable). See the provisioning note below for what "retryable" costs.
+- `ErrRequestDeclined` — the plugin took the request off the wire but could not
+  turn it into anything it could dispatch, so it answered with a refusal instead
+  of leaving the call unanswered (retryable: no handler ran, so a fresh attempt
+  repeats no side effect).
 - A `*Status` — an application-level error your handler returned, with a code and
   message, round-tripped as a typed value.
 - `*PluginPanicError` — a handler panicked. A unary caller receives it directly;
