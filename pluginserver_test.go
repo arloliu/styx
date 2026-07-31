@@ -12,6 +12,8 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/arloliu/styx"
+	"github.com/arloliu/styx/codec"
+	"github.com/arloliu/styx/examples/echo/echopb"
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/control/controlpb"
 	"github.com/arloliu/styx/internal/lifecycle"
@@ -965,6 +967,307 @@ func TestPluginServer_ServeLoopKeepsServing_OnAConsumeFault(t *testing.T) {
 
 	done, _ = styx.DisposeRecvErrForTest(transport.ErrClosed)
 	require.True(t, done, "a closed transport still ends the loop")
+}
+
+// declineReason is what the serving side's receive step fails with once a test
+// arms it. It travels the whole way back — rendered into the transport's consume
+// fault, carried as the refusal's status message, surfaced on the host's error —
+// so asserting on it proves the terminal came from the declined frame rather than
+// from some other outcome the call could have reached.
+const declineReason = "styx test: the serving side cannot take this request"
+
+// declineAnswerBudget bounds the wait for a declined call's answer. It is not a
+// latency assertion: the answer is one round trip over an in-process region. It
+// exists so a call that is never answered fails its test with that message
+// instead of hanging until the package timeout — which is exactly the failure
+// under guard, since a call issued with no deadline has nothing else to end it.
+const declineAnswerBudget = 30 * time.Second
+
+// The ways a test arms decliningTransport to fail one inbound unary request,
+// matching the two consumer-owned arms a real consume step can take: a step that
+// reports it could not take the frame, and one that panics on it. The transport's
+// own fault barrier renders the second into a fault marked as a panic, which is
+// how a production decline actually arrives — nothing in this framework returns
+// the first from the serve loop's callback.
+const (
+	declineNone int32 = iota
+	declineByError
+	declineByPanic
+)
+
+// decliningTransport is a plugin-side transport that declines the next inbound
+// unary request once armed, the way a real consume step declines one: the wrapped
+// transport still builds the frame, validates its descriptor, renders the fault
+// this side owns, and advances the ring head past it. Only the consume callback's
+// verdict changes.
+//
+// Interposing is the only way in. The serve loop's own callback is written to
+// answer every failure it can reach — an unregistered service, an unknown method,
+// a payload the codec rejects or panics on — so nothing a host can publish makes
+// it decline.
+type decliningTransport struct {
+	transport.Transport
+	view transport.ViewReceiver
+	resv transport.ReservingReceiver
+	fill transport.PayloadFillSender
+	mode atomic.Int32
+	// refuseRefusal makes the refusal the serve loop sends for a declined request
+	// fail the way a full ring under a rejecting writer fails it: before the frame
+	// is accepted, so the host never sees it.
+	refuseRefusal atomic.Bool
+}
+
+func newDecliningTransport(t *testing.T, tr transport.Transport) *decliningTransport {
+	t.Helper()
+
+	view, ok := tr.(transport.ViewReceiver)
+	require.True(t, ok, "the serve loop only runs a consume callback on a transport that lends frames")
+	resv, ok := tr.(transport.ReservingReceiver)
+	require.True(t, ok, "the shared-memory transport reserves on every receive")
+	fill, ok := tr.(transport.PayloadFillSender)
+	require.True(t, ok, "the reply path must stay the production one for the calls that are not declined")
+
+	return &decliningTransport{Transport: tr, view: view, resv: resv, fill: fill}
+}
+
+// Arm makes the next inbound unary request one this transport's consume step
+// reports it could not take.
+func (d *decliningTransport) Arm() { d.mode.Store(declineByError) }
+
+// ArmPanic makes the next inbound unary request one this transport's consume step
+// panics on, which the transport's own barrier renders into the fault a real
+// decline carries.
+func (d *decliningTransport) ArmPanic() { d.mode.Store(declineByPanic) }
+
+// RefuseTheRefusal makes the serve loop's answer to the declined request fail
+// before the transport accepts it, so the host never receives it.
+func (d *decliningTransport) RefuseTheRefusal() { d.refuseRefusal.Store(true) }
+
+// verdict reports what this transport's consume step makes of f, disarming itself
+// so exactly one request is declined however many frames follow it.
+func (d *decliningTransport) verdict(f transport.Frame) error {
+	if f.Kind != transport.FrameUnaryReq {
+		return nil
+	}
+	if d.mode.CompareAndSwap(declineByPanic, declineNone) {
+		panic(declineReason)
+	}
+	if !d.mode.CompareAndSwap(declineByError, declineNone) {
+		return nil
+	}
+
+	// Deliberately not transport.ErrPayloadMalformed: that sentinel is how a
+	// consume step blames the peer's bytes and condemns the region. This side
+	// blames nothing, which is what makes it a decline (shm-abi.md §9).
+	return errors.New(declineReason)
+}
+
+func (d *decliningTransport) Send(ctx context.Context, f transport.Frame) error {
+	if f.Kind == transport.FrameUnaryErr && d.refuseRefusal.CompareAndSwap(true, false) {
+		// The sentinel a rejecting writer returns for a frame the ring had no room
+		// for. It is pre-acceptance: nothing was published, so the host's call is
+		// left exactly as the discard alone would have left it.
+		return transport.ErrBackpressure
+	}
+
+	return d.Transport.Send(ctx, f)
+}
+
+func (d *decliningTransport) RecvViewConsume(ctx context.Context, consume func(transport.Frame) error) error {
+	return d.view.RecvViewConsume(ctx, func(f transport.Frame) error {
+		if err := d.verdict(f); err != nil {
+			return err
+		}
+
+		return consume(f)
+	})
+}
+
+func (d *decliningTransport) RecvViewConsumeReserving(
+	ctx context.Context, reserve func(), consume func(transport.Frame) error,
+) error {
+	return d.view.RecvViewConsumeReserving(ctx, reserve, func(f transport.Frame) error {
+		if err := d.verdict(f); err != nil {
+			return err
+		}
+
+		return consume(f)
+	})
+}
+
+func (d *decliningTransport) RecvReserving(ctx context.Context, reserve func()) (transport.Frame, error) {
+	return d.resv.RecvReserving(ctx, reserve)
+}
+
+func (d *decliningTransport) SendPayloadFill(
+	ctx context.Context, f transport.Frame, size int, fill func(dst []byte) error,
+) error {
+	return d.fill.SendPayloadFill(ctx, f, size, fill)
+}
+
+// newDecliningEchoPair wires a generated Echo client to a generated Echo server
+// over a real in-process shared-memory pair whose serving side can be armed to
+// decline one inbound request.
+func newDecliningEchoPair(t *testing.T) (*decliningTransport, styx.SHMPairForTest) {
+	t.Helper()
+
+	srv := styx.NewPluginServer(styx.PluginServerConfig{})
+	echopb.RegisterEchoServer(srv, blobEcho{})
+
+	var decliner *decliningTransport
+	pair, err := styx.InProcessSHMPairWrappedForTest(srv, codec.Proto{},
+		func(tr transport.Transport) transport.Transport {
+			decliner = newDecliningTransport(t, tr)
+
+			return decliner
+		})
+	require.NoError(t, err)
+	t.Cleanup(pair.Stop)
+
+	return decliner, pair
+}
+
+// Test a request the plugin declines terminating its caller's call, for a call
+// issued with NO deadline — the case nothing else can end.
+//
+// A declined frame is discarded in the receive step, before dispatch, so the call
+// it names exists only in the host's table where no plugin-side terminal reaches
+// it, and shm-abi.md §4 lets its budget ride the wire as zero (no deadline), so
+// the plugin arms no expiry from it either. The plugin's refusal is the only thing
+// that ends the wait.
+func TestPluginServer_AnswerDeclinedCall_WhenTheCallCarriesNoDeadline(t *testing.T) {
+	// Given a real host/plugin shared-memory pair whose serving side declines the
+	// next inbound unary request.
+	decliner, pair := newDecliningEchoPair(t)
+	client := echopb.NewEchoClient(pair.Conn)
+	decliner.Arm()
+
+	// When the host calls under a context carrying no deadline of its own.
+	ctx := t.Context()
+	_, hasDeadline := ctx.Deadline()
+	require.False(t, hasDeadline, "the call under test must carry no deadline, or its own timer could reap it")
+
+	answered := make(chan error, 1)
+	go func() {
+		_, err := client.Say(ctx, &echopb.SayRequest{Message: "hello"})
+		answered <- err
+	}()
+
+	// Then the call terminates on the plugin's refusal.
+	var err error
+	select {
+	case err = <-answered:
+	case <-time.After(declineAnswerBudget):
+		t.Fatal("a deadline-less declined call never resolved; nothing but the plugin's answer can end it")
+	}
+
+	require.ErrorIs(t, err, styx.ErrRequestDeclined)
+	require.ErrorContains(t, err, declineReason, "the refusal must carry the reason the receive step gave")
+	require.True(t, styx.IsRetryable(err), "no handler ran, so reissuing the call repeats no effect")
+
+	// And the connection is untouched: one declined frame costs one call.
+	require.False(t, pair.ServeLoopExited(), "declining one frame must not end the serving session")
+
+	resp, err := client.Say(ctx, &echopb.SayRequest{Message: "hello"})
+	require.NoError(t, err)
+	require.Equal(t, "hello", resp.GetMessage())
+	requireNoOwedObligations(t, pair)
+}
+
+// Test the answer covering the arm a production decline actually arrives on: a
+// consume step that PANICKED on a frame it had already taken. The transport's own
+// barrier turns that panic into the fault the serve loop disposes of, marked as a
+// panic rather than a returned error, and the host's call depends on the answer
+// exactly as much either way.
+func TestPluginServer_AnswerDeclinedCall_WhenTheConsumeStepPanicked(t *testing.T) {
+	// Given a pair whose serving side panics on the next inbound unary request.
+	decliner, pair := newDecliningEchoPair(t)
+	client := echopb.NewEchoClient(pair.Conn)
+	decliner.ArmPanic()
+
+	// When the host calls under a context carrying no deadline of its own.
+	ctx := t.Context()
+	_, hasDeadline := ctx.Deadline()
+	require.False(t, hasDeadline, "the call under test must carry no deadline, or its own timer could reap it")
+
+	answered := make(chan error, 1)
+	go func() {
+		_, err := client.Say(ctx, &echopb.SayRequest{Message: "hello"})
+		answered <- err
+	}()
+
+	// Then the call terminates on the refusal, carrying the rendered panic value.
+	var err error
+	select {
+	case err = <-answered:
+	case <-time.After(declineAnswerBudget):
+		t.Fatal("a deadline-less call whose consume step panicked never resolved")
+	}
+
+	require.ErrorIs(t, err, styx.ErrRequestDeclined)
+	require.ErrorContains(t, err, declineReason, "the refusal must carry the rendered panic value")
+	require.True(t, styx.IsRetryable(err), "no handler ran, so reissuing the call repeats no effect")
+
+	// And a contained panic costs one call, not the session.
+	require.False(t, pair.ServeLoopExited(), "the barrier contains the panic; the session serves on")
+
+	resp, err := client.Say(ctx, &echopb.SayRequest{Message: "hello"})
+	require.NoError(t, err)
+	require.Equal(t, "hello", resp.GetMessage())
+	requireNoOwedObligations(t, pair)
+}
+
+// Test the serving session ending when the refusal itself cannot be sent.
+//
+// A refusal the transport rejects before accepting it — a full ring under a
+// rejecting writer, or a frame above the geometry-derived max_payload — publishes
+// nothing, so the host's call is left exactly where a silent discard would have
+// left it: waiting on a connection that is still healthy, with no deadline to reap
+// it. Continuing to serve is what would make that wait permanent, so the session
+// ends instead and the host's teardown fails the call.
+func TestPluginServer_EndTheSession_WhenTheDeclinedCallsRefusalCannotBeSent(t *testing.T) {
+	// Given a pair armed to decline the next request AND to reject the refusal the
+	// serve loop answers it with.
+	decliner, pair := newDecliningEchoPair(t)
+	client := echopb.NewEchoClient(pair.Conn)
+	decliner.Arm()
+	decliner.RefuseTheRefusal()
+
+	// When the host calls with no deadline of its own.
+	ctx := t.Context()
+	go func() { _, _ = client.Say(ctx, &echopb.SayRequest{Message: "hello"}) }()
+
+	// Then the serving session ends rather than serving on with a call nothing can
+	// reap. The call's own terminal is the teardown's to deliver, which this
+	// in-process harness does not perform for it — what is asserted here is the
+	// decision that leads to it.
+	require.Eventually(t, pair.ServeLoopExited, declineAnswerBudget, time.Millisecond,
+		"a refusal that never reached the transport leaves the call stranded; the session must not serve on")
+}
+
+// Test a declined call carrying a deadline terminating on the refusal rather than
+// on its own timer. The answer removes the wait for every declined call, not only
+// the deadline-less one: a caller that set a generous deadline would otherwise pay
+// all of it for a frame the plugin discarded before dispatch.
+func TestPluginServer_AnswerDeclinedCall_WhenTheCallCarriesADeadline(t *testing.T) {
+	// Given the same pair, armed to decline.
+	decliner, pair := newDecliningEchoPair(t)
+	client := echopb.NewEchoClient(pair.Conn)
+	decliner.Arm()
+
+	// When the host calls under a deadline far longer than a round trip, so the
+	// answer and the expiry are told apart by which error arrives.
+	ctx, cancel := context.WithTimeout(t.Context(), declineAnswerBudget)
+	defer cancel()
+
+	_, err := client.Say(ctx, &echopb.SayRequest{Message: "hello"})
+
+	// Then the terminal is the refusal, and not the deadline the call would have
+	// waited out before the plugin answered.
+	require.ErrorIs(t, err, styx.ErrRequestDeclined)
+	require.NotErrorIs(t, err, styx.ErrDeadlineExceeded)
+	require.True(t, styx.IsRetryable(err))
+	require.False(t, pair.ServeLoopExited())
 }
 
 // Test that the plugin-side consume-fault teardown threshold actually reaches the
