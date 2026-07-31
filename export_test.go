@@ -103,9 +103,32 @@ type SHMPairForTest struct {
 // Stop closes both ends and the region, and joins the serve loop, in the order
 // runServing's own teardown uses.
 func InProcessSHMPairForTest(s *PluginServer, cdc codec.Codec) (SHMPairForTest, error) {
+	return InProcessSHMPairWrappedForTest(s, cdc, nil)
+}
+
+// InProcessSHMPairWrappedForTest is InProcessSHMPairForTest with the plugin end
+// handed to wrapPlugin (when non-nil) before the serve loop receives through it,
+// so a test can interpose on the serving side's own receive path while both ends
+// stay real: a real region, a real host client, real descriptors and slabs.
+//
+// It exists for the dispositions the serve loop owes a frame it could not take.
+// Those cannot be reached by anything a peer sends — every way a request can fail
+// to prepare is carried to dispatch and answered — so the only way to drive one is
+// for the receive step itself to fail, which is what a wrapper around the consume
+// callback produces. The transport under the wrapper still does everything it
+// would have: it validates the descriptor, builds the fault, and advances the ring
+// head past the frame.
+func InProcessSHMPairWrappedForTest(
+	s *PluginServer, cdc codec.Codec, wrapPlugin func(transport.Transport) transport.Transport,
+) (SHMPairForTest, error) {
 	pair, err := shmtest.NewInProcessPair(firstGeneration, shmtest.DefaultConfig())
 	if err != nil {
 		return SHMPairForTest{}, err
+	}
+
+	pluginTr := pair.Plugin
+	if wrapPlugin != nil {
+		pluginTr = wrapPlugin(pluginTr)
 	}
 
 	leases := rpcruntime.NewLeaseTable()
@@ -120,7 +143,7 @@ func InProcessSHMPairForTest(s *PluginServer, cdc codec.Codec) (SHMPairForTest, 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = runServeLoop(context.Background(), pair.Plugin, cdc, dispatcher, nil, nil, nil)
+		_ = runServeLoop(context.Background(), pluginTr, cdc, dispatcher, nil, nil, nil)
 	}()
 
 	exited := func() bool {

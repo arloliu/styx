@@ -1136,27 +1136,24 @@ func disposeRecvErr(err error) (done bool, loopErr error) {
 		// synchronized, so skip this frame and keep serving rather than silently
 		// killing an otherwise-healthy serving loop.
 		//
-		// Skipping is the whole disposition here, unlike the client read loop, which
-		// also fails the call a consume fault names. This loop receives REQUESTS, so
-		// the call the descriptor names lives in the host's table and no local
-		// terminal can reach it. The only local act that would discharge the host's
-		// dependency is answering the peer with an error status — and a consumer that
-		// can answer has accepted the frame rather than declined it, so it never
-		// reaches this branch at all (shm-abi.md §9).
+		// Skipping is only the loop-exit half of the disposition, and it is not the
+		// whole of it. This loop receives REQUESTS, so the call a consume fault names
+		// lives in the host's table and no local terminal can reach it; the one act
+		// that discharges the host's dependency is answering the peer with an error
+		// status, which answerDeclinedRequest does before this decision is read
+		// (shm-abi.md §9).
 		//
-		// This side's consume callback is written so that it always can. Every way
+		// This side's consume callback is written to answer wherever it can. Every way
 		// preparing a request can fail — an unregistered service, an unknown method,
 		// a payload the codec rejects, a codec that panics on it — is carried out of
 		// the callback as an accepted frame that dispatch answers with a status, so
 		// none of them declines and none of them reaches here. What can still reach
 		// here is a fault inside the transport's own frame construction, or a panic
 		// in framework code outside the prepared decode: both are bugs on this side
-		// rather than conditions a peer's traffic produces, and neither leaves a
-		// route to answer. A host call discarded that way is left to whatever budget
-		// its descriptor carried, which §4 permits to be zero (no deadline) — so it
-		// waits on a connection this branch deliberately keeps healthy. That residue
-		// is the price of keeping the loop alive through a bug, not a disposition
-		// this side chooses for a request it could have answered.
+		// rather than conditions a peer's traffic produces. Neither yields a request
+		// to dispatch, but both leave the descriptor's call ID, which is all the
+		// refusal needs — so the host's call terminates on the fault instead of
+		// waiting out a budget §4 permits to be zero (no deadline).
 		return false, nil
 	}
 	if errors.Is(err, transport.ErrPoisoned) {
@@ -1169,6 +1166,63 @@ func disposeRecvErr(err error) (done bool, loopErr error) {
 	}
 
 	return true, nil // peer close / ErrClosed / ctx: not a self-initiated poison
+}
+
+// answerDeclinedRequest answers the host's call when this side took an inbound
+// UNARY_REQ out of the ring and then could not turn it into anything dispatch
+// could see — the two consumer-owned arms of shm-abi.md §9, a consume step that
+// declined the frame or panicked on it.
+//
+// Advancing the head is not the whole of what such a frame owes. The call the
+// descriptor names lives in the HOST's table, where no local terminal reaches it,
+// and §4 permits its budget to be zero — a caller that issued the call with no
+// deadline of its own — so a discard alone leaves it waiting on a connection this
+// disposition deliberately keeps healthy. The refusal is what ends that wait, and
+// it needs nothing the fault destroyed: the call ID is carried on the fault
+// itself, so a request that never decoded is still answerable.
+//
+// Any other Recv error is left alone, and so is any other frame kind. Only a
+// consume fault names a call at all, and among the kinds this loop receives only a
+// UNARY_REQ names a host call still waiting for a reply: a CANCEL names one the
+// host has already stopped waiting on, and a discarded STREAM_* frame belongs to a
+// stream its own budget reaps, since a stream cannot be opened without a positive
+// finite one.
+//
+// A refusal that does not reach the transport ends the session, and returns
+// done=true to say so. This is the same classification a dispatched reply's send
+// failure takes, for the same reason: every way that send can fail leaves the
+// host's call with no answer, and a pre-acceptance refusal — a full ring under a
+// rejecting writer (ErrBackpressure), or a frame above the geometry-derived
+// max_payload (ErrPayloadTooLarge) — is the case that would otherwise reinstate
+// exactly the wait this function exists to end, on a connection kept healthy and a
+// call nothing else reaps. Ending the session converts it into a teardown the host
+// sees, which fails the call. A poison is reported as one so the supervisor
+// restarts the instance; every other failure is the quiet exit a peer close or a
+// done context takes.
+func answerDeclinedRequest(ctx context.Context, deps *serveDeps, err error) (done bool, loopErr error) {
+	var fault *transport.ConsumeFaultError
+	if !errors.As(err, &fault) || fault.Kind != transport.FrameUnaryReq {
+		return false, nil
+	}
+
+	// The obligation spans the send for the same reason a dispatched reply's does:
+	// a refusal whose send parks is a response the host is still owed, and the
+	// wedge classifier can only see one that was opened.
+	deps.d.OpenObligation(fault.CallID)
+	defer deps.d.CloseObligation(fault.CallID)
+
+	serr := deps.tr.Send(ctx, rpcruntime.DeclinedStatusFrame(fault.CallID, fault.Detail))
+	if serr == nil {
+		return false, nil
+	}
+	if errors.Is(serr, transport.ErrPoisoned) {
+		// A partially-written refusal desynced the data plane: fail the instance so
+		// the supervisor restarts it, rather than reading the poison as a benign peer
+		// close (design §9's poison teardown).
+		return true, errServeLoopPoisoned
+	}
+
+	return true, nil // peer close / ErrClosed / ctx / a refusal the ring would not take
 }
 
 func serveOneFrame(ctx context.Context, deps *serveDeps) (done bool, loopErr error) {
@@ -1185,6 +1239,10 @@ func serveOneFrame(ctx context.Context, deps *serveDeps) (done bool, loopErr err
 	}()
 
 	if err := receiveOneFrame(ctx, deps); err != nil {
+		if sendDone, sendErr := answerDeclinedRequest(ctx, deps, err); sendDone {
+			return sendDone, sendErr
+		}
+
 		return disposeRecvErr(err)
 	}
 	f, req := deps.frame, deps.req

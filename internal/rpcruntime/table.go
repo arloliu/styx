@@ -92,6 +92,17 @@ const (
 	// like the *PluginPanicError it reconstructs to.
 	StatusCodeHandlerPanic uint32 = 0xFFFFFF08
 
+	// StatusCodeRequestDeclined marks the refusal a serving side sends for an
+	// inbound unary request its receive path could not take at all — a frame it
+	// declined, or faulted on, before anything was dispatched (shm-abi.md §9).
+	// Answering is the only act that reaches such a call: it lives in the peer's
+	// table, so no local terminal touches it, and a request published with no
+	// deadline has nothing to reap it on a connection the decline deliberately
+	// keeps healthy. The styx package reconstructs it as ErrRequestDeclined. No
+	// handler ran and the request had no effect, so it is retryable, exactly like
+	// the sentinel it reconstructs to.
+	StatusCodeRequestDeclined uint32 = 0xFFFFFF09
+
 	// StatusCodeReservedMin is the lowest framework-reserved status code: any
 	// Status.Code at or above it is framework-owned and never a valid
 	// application code. The styx package clamps an application Status whose

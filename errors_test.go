@@ -29,8 +29,14 @@ func TestIsRetryable_ClassifiesTaxonomy(t *testing.T) {
 			statusFromRPC(&rpcruntime.Status{Code: rpcruntime.StatusCodeHandlerPanic, Message: "boom"}),
 			false,
 		},
+		{
+			"declined request reconstructed from the wire",
+			statusFromRPC(&rpcruntime.Status{Code: rpcruntime.StatusCodeRequestDeclined, Message: "no capacity"}),
+			true,
+		},
 		{"plugin unavailable", ErrPluginUnavailable, true},
 		{"drained", ErrDrained, true},
+		{"request declined", ErrRequestDeclined, true},
 		{"backpressure", ErrBackpressure, true},
 		{"incompatible", ErrIncompatible, false},
 		{"deadline exceeded", ErrDeadlineExceeded, false},
@@ -51,6 +57,30 @@ func TestIsRetryable_ClassifiesTaxonomy(t *testing.T) {
 			require.Equal(t, tc.retryable, got)
 		})
 	}
+}
+
+// Test statusFromRPC reconstructing ErrRequestDeclined from the declined code
+func TestStatusFromRPC_ReconstructsErrRequestDeclined_FromDeclinedCode(t *testing.T) {
+	// Given the refusal a serving side sends for a request its receive path could
+	// not take, carrying the reason that path rendered.
+	s := &rpcruntime.Status{Code: rpcruntime.StatusCodeRequestDeclined, Message: "no capacity"}
+
+	// When the host reconstructs the caller-visible error.
+	err := statusFromRPC(s)
+
+	// Then it is the sentinel and it keeps the reason. It is deliberately NOT an
+	// application status: a reserved code that fell through to the application arm
+	// would surface as a *Status nobody can match a sentinel against.
+	require.ErrorIs(t, err, ErrRequestDeclined)
+	require.ErrorContains(t, err, "no capacity")
+
+	var status *Status
+	require.NotErrorAs(t, err, &status)
+
+	// And a refusal that carries no reason is the bare sentinel, not an error
+	// rendering an empty one.
+	require.Equal(t, ErrRequestDeclined,
+		statusFromRPC(&rpcruntime.Status{Code: rpcruntime.StatusCodeRequestDeclined}))
 }
 
 // Test a plugin panic classifying non-retryable regardless of the ContinueAfterPanic setting

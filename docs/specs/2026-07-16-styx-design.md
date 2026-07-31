@@ -598,7 +598,8 @@ Three disjoint classes, distinguishable with `errors.As`/`errors.Is`:
   executed). Retryable-ness is explicit (`styx.IsRetryable(err)`):
   `ErrOutcomeUnknown` is never automatically retryable; crash-before-dispatch is.
 - **Framework errors** — `ErrIncompatible`, `ErrDeadlineExceeded`, `ErrCanceled`,
-  `ErrBackpressure`, `ErrPoisoned`, `ErrServiceNotFound`, `ErrMethodNotFound`.
+  `ErrBackpressure`, `ErrRequestDeclined`, `ErrPoisoned`, `ErrServiceNotFound`,
+  `ErrMethodNotFound`.
 
 This taxonomy is what lets the device gateway map "critical device fault → fast shutdown" versus
 "transient → retry/restart" without string matching.
