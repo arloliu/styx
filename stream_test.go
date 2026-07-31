@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1220,6 +1221,80 @@ func TestOnStreamOpen_OpenAccepting_DefersWatcherUntilPublish(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("the pre-Publish seam never ran")
 	}
+}
+
+// A STREAM_OPEN arriving while the accept side already holds S_max live streams is
+// refused on the wire, not dropped and not hung: the accept path answers it with a
+// rejection STREAM_ERR carrying the transient backpressure status, runs no handler,
+// and creates no stream state for the refused call ID (stream-protocol.md §4.7,
+// §7.4, §9.1). The status matters as much as the refusal — backpressure tells the
+// opener to retry, while the incompatible status the other refusals carry tells it
+// not to.
+func TestOnStreamOpen_AtCapacity_RefusedWithBackpressureStatus(t *testing.T) {
+	// Given: an accept server filled to S_max with live streams whose handlers block.
+	tr := newRecordingSendTransport()
+	block := make(chan struct{})
+	var handlerRuns atomic.Int32
+	handlers := map[streamKey]streamHandlerReg{
+		{service: fnv64a("s"), method: fnv64a("m")}: {
+			shape: rpcruntime.ClientStreaming,
+			handler: func(*Stream) error {
+				handlerRuns.Add(1)
+				<-block
+
+				return nil
+			},
+		},
+	}
+	srv := newStreamServer(tr, handlers, codec.Proto{}, rpcruntime.NewLeaseTable())
+	t.Cleanup(func() {
+		close(block)
+		_ = tr.Close()
+		srv.teardown(ErrPluginUnavailable)
+	})
+
+	open := func(callID uint64) transport.Frame {
+		return transport.Frame{
+			CallID:  callID,
+			Kind:    transport.FrameStreamOpen,
+			Service: fnv64a("s"),
+			Method:  fnv64a("m"),
+			Budget:  time.Minute,
+			Control: 4,
+		}
+	}
+	for id := range uint64(maxOpenStreams) {
+		require.NoError(t, srv.onStreamOpen(open(id+1)))
+	}
+	require.Equal(t, maxOpenStreams, srv.plane.streams.Len(), "the table must be at S_max before the refusal")
+	// Every admitted handler runs on its own goroutine, so wait for all of them to
+	// be counted before the refusal — otherwise a still-starting handler could be
+	// mistaken for one the refused open launched.
+	require.Eventually(t, func() bool { return handlerRuns.Load() == int32(maxOpenStreams) },
+		3*time.Second, time.Millisecond, "the admitted handlers never all started")
+
+	// When: one more STREAM_OPEN arrives.
+	const refusedID uint64 = maxOpenStreams + 1
+	require.NoError(t, srv.onStreamOpen(open(refusedID)),
+		"an open at S_max is ordinary backpressure, never a conformance violation the reader poisons on")
+
+	// Then: it is answered with a rejection STREAM_ERR carrying the backpressure status.
+	require.Eventually(t, func() bool {
+		for _, fr := range tr.sent() {
+			if fr.CallID == refusedID && fr.Kind == transport.FrameStreamErr {
+				return fr.Status != nil && fr.Status.Code == rpcruntime.StatusCodeStreamBackpressure
+			}
+		}
+
+		return false
+	}, 3*time.Second, time.Millisecond,
+		"an open refused at S_max must reach the opener as a backpressure STREAM_ERR (§4.7, §9.1)")
+
+	// And: no stream state and no handler exist for the refused call ID.
+	_, live := srv.plane.streams.Lookup(refusedID)
+	require.False(t, live, "a refused open creates no stream state (§7.4)")
+	require.Equal(t, maxOpenStreams, srv.plane.streams.Len())
+	require.Equal(t, int32(maxOpenStreams), handlerRuns.Load(), "the refused open must not run a handler")
 }
 
 // A STREAM_OPEN the transport ACCEPTS (Send returns nil) yields a live stream; when a

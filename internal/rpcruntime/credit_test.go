@@ -38,6 +38,21 @@ func TestCreditCounter_Release_ReturnsUnit(t *testing.T) {
 	require.True(t, c.reserve(), "release must return the pre-acceptance reservation (stream-protocol.md §4.5)")
 }
 
+// Test that a rollback with nothing reserved manufactures no credit. available is
+// granted - (sent - acked) over unsigned counters, so a release that drove sent
+// below zero would not clamp the window at the grant — it would wrap it to an
+// astronomical value and let the sender exceed N without bound
+// (stream-protocol.md §4.5).
+func TestCreditCounter_Release_ManufacturesNoCredit_WhenUnpaired(t *testing.T) {
+	c := newCreditCounter(1)
+	require.True(t, c.reserve())
+
+	c.release() // pairs with the reservation above
+	c.release() // nothing left to roll back
+
+	require.Equal(t, uint64(1), windowRoom(t, c, 1), "an unpaired rollback must not widen the window")
+}
+
 // Test that the ack threshold A is ceil(N/2) of the granted N, per
 // stream-protocol.md §4.2/§4.6 — 8 at N=16, 2 at N=4, 1 at N=1.
 func TestCreditCounter_AckThreshold_IsCeilHalfOfGrant(t *testing.T) {
