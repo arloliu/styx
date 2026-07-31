@@ -54,6 +54,47 @@ failure incidents pile up undrained at once across every plugin the `Host`
 manages — see [Delivery semantics](#delivery-semantics) for exactly how
 much headroom that gives you before it can happen.
 
+`Stop` ends the subscription: once it has finished tearing the host down,
+the channel is **closed**, so the `for ... range` loop above returns and
+its goroutine exits with the `Host` — you don't need to signal it yourself,
+and a `Host` you build per reconnect leaves no consumer goroutine behind.
+Before it closes the channel, `Stop` waits briefly for you to take what the
+shutdown itself published, so a failure incident reported moments before it
+still arrives whole at a consumer that is still reading. That is the whole
+reason to keep reading until `Stop` returns: closing is the end of the
+stream, not a pause, and an event nobody took by then is not delivered. A
+receive on the closed channel yields the zero `Event` with `ok == false`
+rather than another event, so if you consume with a bare `<-host.Events()`
+inside a `select` instead of ranging, check that `ok` — otherwise your loop
+spins on zero values after `Stop`.
+
+Two cases leave the channel open, both because no teardown has completed:
+
+- **A `Stop` whose context expired** before some plugin's supervisor joined.
+  That plugin's teardown finishes later, and the channel stays open and
+  carries its remaining events until it does.
+- **A `Stop` given a context that was already canceled or expired when it
+  was called**, which returns that context's error immediately and tears
+  nothing down — no plugin reaped, no channel closed, and a `for ... range`
+  consumer waiting forever. This is easy to hit by reusing the context you
+  started with, especially one from `signal.NotifyContext`, which is
+  canceled at exactly the moment you want to shut down. Give `Stop` a
+  context with its own budget:
+
+  ```go
+  stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+  defer cancel()
+  _ = host.Stop(stopCtx)
+  ```
+
+  A later `Stop` with a usable context still completes the teardown and
+  closes the channel, so this is recoverable — but only if something calls
+  one.
+
+A `Host` is single-use. Once a `Stop` has completed the teardown, `Start`
+rejects with `ErrHostStopped` rather than running plugins whose events
+would go nowhere; build a new `Host` to reconnect.
+
 ## The six event kinds
 
 | Kind | Fires when | `Err` |
@@ -250,6 +291,5 @@ should trigger something your code does.
   source of truth if this guide and the code ever disagree.
 - [docs/migration-from-go-plugin.md](migration-from-go-plugin.md#lifecycle-liveness-shutdown-and-kill) —
   how this replaces go-plugin's manual `Ping()`/`Kill()` model.
-- [`examples/echo/host/main.go`](../examples/echo/host/main.go) and
-  [`examples/hot-reload/`](../examples/hot-reload/) — runnable hosts that
-  read `Events()`.
+- [`examples/echo/host/main.go`](../examples/echo/host/main.go) — a runnable
+  host that reads `Events()`.

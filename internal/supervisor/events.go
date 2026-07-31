@@ -168,6 +168,13 @@ func NewBus[T any](isCritical func(T) bool, criticalCapacity int) *Bus[T] {
 // Calling the returned unsubscribe func more than once is safe (subsequent calls are no-ops).
 // quiesced reports whether nothing is queued or in flight for this subscriber;
 // a caller about to unsubscribe can use it to drain first so no queued event is discarded.
+//
+// Unsubscribing ends the subscription and closes the returned channel, so a
+// receiver ranging over it sees the end of the stream. It does not wait for a
+// receiver to collect what is still queued: an event queued at that moment is
+// delivered only if a receiver is already waiting to take it (see forward). Every
+// subscription therefore needs an unsubscribe to release its forwarder goroutine —
+// one that is never called keeps that goroutine alive for the process's life.
 func (b *Bus[T]) Subscribe() (<-chan T, func(), func() bool) {
 	s := &busSubscriber[T]{
 		critRing: make([]T, b.criticalCapacity),
@@ -312,10 +319,20 @@ func (s *busSubscriber[T]) clearSending() {
 	s.mu.Unlock()
 }
 
-// forward is the sole writer to s.ch.
+// forward is the sole writer to s.ch and the only closer of it.
 // It drains s's queue one event at a time, blocking on the send (never on Publish),
-// until the unsubscribe func closes s.done.
+// until the unsubscribe func closes s.done — then it closes s.ch, so a receiver
+// ranging over the channel ends with the subscription instead of blocking forever
+// on a channel nothing will ever write to again.
+//
+// Unsubscribing ends the subscription immediately rather than waiting for a
+// receiver that may never come back for what is still queued: an event queued
+// when s.done closes is delivered only if a receiver is already waiting to take
+// it, and dropped otherwise. A caller that must not lose a queued event drains
+// until quiesced reports the subscription idle, then unsubscribes.
 func (s *busSubscriber[T]) forward() {
+	defer close(s.ch)
+
 	for {
 		ev, ok := s.next()
 		if !ok {
@@ -323,6 +340,8 @@ func (s *busSubscriber[T]) forward() {
 			case <-s.wake:
 				continue
 			case <-s.done:
+				s.handOffToWaitingReceiver()
+
 				return
 			}
 		}
@@ -331,7 +350,46 @@ func (s *busSubscriber[T]) forward() {
 		case s.ch <- ev:
 			s.clearSending()
 		case <-s.done:
-			s.clearSending()
+			if s.tryHandOff(ev) {
+				s.handOffToWaitingReceiver()
+			}
+
+			return
+		}
+	}
+}
+
+// tryHandOff makes one attempt to deliver ev that cannot block, so it succeeds
+// only if a receiver is already waiting for it. Reports whether it delivered.
+func (s *busSubscriber[T]) tryHandOff(ev T) bool {
+	select {
+	case s.ch <- ev:
+		s.clearSending()
+
+		return true
+	default:
+		s.clearSending()
+
+		return false
+	}
+}
+
+// handOffToWaitingReceiver hands still-queued events to a receiver already waiting
+// for them, in forward's own priority order, and stops at the first one no receiver
+// is waiting for.
+//
+// It rescues rather than guarantees: unsubscribing does not wait for a receiver to
+// come back for what is queued (see forward), so this only covers the case where a
+// receiver is sitting right there to take an event and an unsubscribe races it —
+// both of forward's selects then have two ready cases, and select picks between
+// them at random, which would otherwise discard that event on a coin flip.
+func (s *busSubscriber[T]) handOffToWaitingReceiver() {
+	for {
+		ev, ok := s.next()
+		if !ok {
+			return
+		}
+		if !s.tryHandOff(ev) {
 			return
 		}
 	}
@@ -354,7 +412,8 @@ func NewEventBus() *EventBus {
 // Subscribe registers a new receiver channel and returns it, an unsubscribe func,
 // and a quiesced probe.
 // Buffering is handled internally via the two bounded rings (informational and
-// critical), not by the channel itself. See Bus.Subscribe for details.
+// critical), not by the channel itself. Unsubscribing closes the returned channel
+// and releases the subscription's forwarder goroutine. See Bus.Subscribe for details.
 func (b *EventBus) Subscribe() (<-chan Event, func(), func() bool) {
 	return b.bus.Subscribe()
 }

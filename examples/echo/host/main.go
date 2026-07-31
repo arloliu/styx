@@ -49,7 +49,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "start:", err)
 		os.Exit(1)
 	}
-	defer func() { _ = host.Stop(ctx) }()
+	// Stop gets its own context with fresh budget rather than the one Start ran
+	// under: that one may already be canceled or expired by shutdown time (it is
+	// here, if the work above outlasts it, and in a real host whose context comes
+	// from signal.NotifyContext it is canceled precisely when it is time to stop).
+	// A Stop handed an already-done context returns without tearing anything down —
+	// no plugin reaped, and Events() left open for its consumer forever.
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+
+		_ = host.Stop(stopCtx)
+	}()
 
 	client := echopb.NewEchoClient(host.Plugin("echo"))
 

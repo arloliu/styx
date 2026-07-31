@@ -3,10 +3,13 @@ package supervisor_test
 import (
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/arloliu/styx/internal/supervisor"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -267,8 +270,9 @@ func TestEventBus_DeliversToEverySubscriber_Independently(t *testing.T) {
 	}
 }
 
-// Test EventBus not delivering further events to an unsubscribed subscriber
-func TestEventBus_StopsDelivering_AfterUnsubscribe(t *testing.T) {
+// Test EventBus closing an unsubscribed subscriber's channel instead of delivering
+// to it again, so a receiver ranging over it ends with the subscription.
+func TestEventBus_ClosesChannelAndStopsDelivering_AfterUnsubscribe(t *testing.T) {
 	// Given
 	bus := supervisor.NewEventBus()
 	ch, unsub, _ := bus.Subscribe()
@@ -277,12 +281,118 @@ func TestEventBus_StopsDelivering_AfterUnsubscribe(t *testing.T) {
 	unsub()
 	bus.Publish(supervisor.Event{Kind: supervisor.EventReady, Time: time.Now()})
 
-	// Then: the channel is not sent to again (either closed or simply idle).
+	// Then: the channel ends rather than delivering the event published after the
+	// unsubscribe, and it stays ended.
 	select {
 	case ev, ok := <-ch:
 		require.False(t, ok, "unexpected event delivered after unsubscribe: %+v", ev)
-	case <-time.After(100 * time.Millisecond):
-		// No delivery observed — also acceptable if unsub leaves ch open but idle.
+	case <-time.After(5 * time.Second):
+		t.Fatal("unsubscribe left the channel open: a receiver ranging over it would never return")
+	}
+
+	_, ok := <-ch
+	require.False(t, ok, "an unsubscribed subscriber's channel must stay closed")
+}
+
+// received is one parkedReceiver result: the event, and whether the channel
+// delivered it at all rather than closing first.
+type received struct {
+	ev supervisor.Event
+	ok bool
+}
+
+// parkedReceiver takes one event from ch and reports what it got. It is a named
+// function, not a closure, so awaitParkedInChannelReceive can find it in a stack
+// dump.
+func parkedReceiver(ch <-chan supervisor.Event, out chan<- received) {
+	ev, ok := <-ch
+	out <- received{ev: ev, ok: ok}
+}
+
+// awaitParkedInChannelReceive blocks until some goroutine whose stack names fn is
+// parked in a channel receive. Every goroutine's dump carries its scheduler state
+// ("chan receive"), so this establishes that the receiver really is waiting —
+// the precondition the rescue path is about — instead of sleeping and hoping.
+func awaitParkedInChannelReceive(t *testing.T, fn string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		buf := make([]byte, 1<<16)
+		for {
+			n := runtime.Stack(buf, true)
+			if n < len(buf) {
+				buf = buf[:n]
+
+				break
+			}
+			buf = make([]byte, 2*len(buf))
+		}
+
+		for _, g := range strings.Split(string(buf), "\n\ngoroutine ") {
+			header, _, _ := strings.Cut(g, "\n")
+			if strings.Contains(header, "[chan receive") && strings.Contains(g, fn) {
+				return
+			}
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("no goroutine running %s ever parked in a channel receive", fn)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Test an event a receiver is already waiting for surviving the unsubscribe that
+// races it. The unsubscribe and the pending receive become ready at the same
+// instant, and a select picks between two ready cases at random, so the event
+// would be discarded on a coin flip — with someone sitting right there to take it
+// — unless the forwarder makes a second, non-blocking handoff attempt on its way
+// out.
+// Delivery must hold on every one of the repeats below, not on average: each is
+// its own subscription and its own parked receiver, and each resolves one of the
+// two coin flips, so a forwarder that dropped the event whenever the flip went to
+// the unsubscribe would lose one within a few rounds.
+func TestBus_Unsubscribe_HandsOffToAReceiverAlreadyWaiting(t *testing.T) {
+	for range 20 {
+		// Given: a subscription with a receiver parked on it, proven parked.
+		bus := supervisor.NewEventBus()
+		ch, unsub, _ := bus.Subscribe()
+
+		out := make(chan received, 1)
+		go parkedReceiver(ch, out)
+		awaitParkedInChannelReceive(t, "parkedReceiver")
+
+		// When: an event is published and the subscription ends immediately behind
+		// it, leaving the forwarder a ready done case alongside the ready send
+		// however it is scheduled.
+		want := supervisor.Event{Kind: supervisor.EventGaveUp, Time: time.Now()}
+		bus.Publish(want)
+		unsub()
+
+		// Then: the waiting receiver got the event rather than an ended stream.
+		select {
+		case got := <-out:
+			require.True(t, got.ok, "the waiting receiver saw the channel close instead of taking the queued event")
+			require.Equal(t, want.Kind, got.ev.Kind)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the waiting receiver never returned")
+		}
+	}
+}
+
+// Test unsubscribing releasing the subscription's forwarder goroutine, so a
+// process that subscribes repeatedly — one Bus subscription per host, per
+// supervisor, per test — does not accumulate one forwarder per subscription for
+// its whole life.
+func TestBus_Unsubscribe_ReleasesForwarderGoroutine(t *testing.T) {
+	testutil.RequireNoGoroutineLeak(t) // registered before the first Subscribe: see its doc comment on ordering.
+
+	for range 3 {
+		bus := supervisor.NewEventBus()
+		_, unsub, _ := bus.Subscribe()
+		bus.Publish(supervisor.Event{Kind: supervisor.EventReady, Time: time.Now()})
+		unsub()
 	}
 }
 

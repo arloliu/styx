@@ -2,6 +2,7 @@ package styx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -81,6 +82,47 @@ drain:
 	wantKinds := []EventKind{EventUnhealthy, EventCrashed, EventGaveUp}
 	require.Equal(t, wantKinds, got["A"], "plugin A's full incident must survive alongside plugin B's")
 	require.Equal(t, wantKinds, got["B"], "plugin B's full incident must survive alongside plugin A's")
+}
+
+// Test a whole failure incident published as the host shuts down reaching a
+// consumer that is still draining Events() across Stop. Stop ends the Events()
+// subscription, which is what keeps its forwarder goroutine from outliving the
+// Host — but a plugin's teardown drain publishes an incident's last critical
+// events microseconds before that, so ending the subscription without waiting for
+// the consumer to take them would split the incident and lose the GaveUp, the one
+// event worth alerting on. The consumer here reads exactly as the documentation
+// says to: from its own goroutine, until Stop returns.
+func TestHostStop_DeliversWholeIncidentPublishedBeforeIt_ToAConsumerStillDraining(t *testing.T) {
+	// Given: a host and a consumer ranging Events() for as long as the stream lasts.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
+
+	var got []EventKind
+	consumed := make(chan struct{})
+	go func() {
+		defer close(consumed)
+		for ev := range h.Events() {
+			got = append(got, ev.Kind)
+		}
+	}()
+
+	// When: a full incident — the verdict, the crash that followed it, and the
+	// terminal give-up — is published, and the host is stopped right behind it.
+	now := time.Now()
+	h.publish(Event{Plugin: "p", Kind: EventUnhealthy, Time: now, Err: errors.New("p: wedged")})
+	h.publish(Event{Plugin: "p", Kind: EventCrashed, Time: now.Add(1), Err: errors.New("p: crashed")})
+	h.publish(Event{Plugin: "p", Kind: EventGaveUp, Time: now.Add(2), Err: errors.New("p: gave up")})
+
+	require.NoError(t, h.Stop(context.Background()))
+
+	// Then: the consumer's range ends with the host, having received the incident
+	// whole and in order rather than truncated by the teardown.
+	select {
+	case <-consumed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Events() was not closed by Stop: the consumer never returned")
+	}
+	require.Equal(t, []EventKind{EventUnhealthy, EventCrashed, EventGaveUp}, got,
+		"the incident published before Stop must reach a still-draining consumer whole")
 }
 
 // Test the event relay draining a queued supervisor event onto Host.Events after

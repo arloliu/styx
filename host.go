@@ -259,13 +259,14 @@ type Host struct {
 	// supervisors never race for one name. An entry clears when the runtime's
 	// deferred teardown completes (a watcher after Run exits, or a retried Stop).
 	stopping map[string]struct{}
-	// stopRequested latches true on the first Stop. It gates the deferred
-	// observability release: the workers are torn down only after Stop has been
-	// asked to and no runtime is still awaiting its join. obsReleased makes that
-	// release happen exactly once whether Stop's own tail or the last deferred
-	// watcher reaches it first.
-	stopRequested bool
-	obsReleased   bool
+	// stopRequested latches true on the first Stop. It gates the deferred release
+	// of the host's background workers — the observability dispatchers and the
+	// Events() forwarder: they are torn down only after Stop has been asked to and
+	// no runtime is still awaiting its join. workersReleased makes that release
+	// happen exactly once whether Stop's own tail or the last deferred watcher
+	// reaches it first.
+	stopRequested   bool
+	workersReleased bool
 
 	// bus fans every plugin's relayed events into the one channel Events()
 	// exposes, using internal/supervisor.Bus's own drop-oldest-informational /
@@ -277,8 +278,20 @@ type Host struct {
 	// shared backlog, so one plugin's Unhealthy/Crashed/GaveUp burst cannot
 	// evict a DIFFERENT plugin's still-undelivered one. See Events()'s doc
 	// for the guarantee this sizing does, and does not, make.
-	bus    *supervisor.Bus[Event]
-	events <-chan Event
+	//
+	// eventsUnsub ends that one subscription, closing the Events() channel and
+	// releasing its forwarder goroutine. It runs once the host's teardown is
+	// complete (see maybeReleaseWorkers), which is why Events() is a stream with
+	// an end rather than a channel that outlives every Host ever built.
+	// eventsQuiesced reports that subscription idle — nothing queued, nothing in
+	// flight. The channel is unbuffered, so idle means a consumer has actually
+	// received every event published so far, not merely that they left the queue.
+	// maybeReleaseWorkers waits for it before unsubscribing, so ending the stream
+	// does not cut a failure incident in half.
+	bus            *supervisor.Bus[Event]
+	events         <-chan Event
+	eventsUnsub    func()
+	eventsQuiesced func() bool
 
 	// metricsDisp is the shared MetricsSink dispatcher, or nil when no sink is
 	// configured — the host-wide enabled gate. logDisp is the Logger dispatcher, or
@@ -342,13 +355,18 @@ func NewHost(cfg HostConfig) *Host {
 	// sizing does not need to react to anything past this point.
 	criticalCapacity := supervisor.CriticalBufferCapacity * max(len(cfg.Plugins), 1)
 	bus := supervisor.NewBus(hostEventIsCritical, criticalCapacity)
-	events, _, _ := bus.Subscribe() // never unsubscribed: this is Events()'s channel for the Host's whole life.
+	// This one subscription is Events()'s channel. It lives until the host's
+	// teardown finishes, which then ends it (maybeReleaseWorkers) — the
+	// subscription's forwarder goroutine belongs to this Host, not to the process.
+	events, unsubEvents, eventsQuiesced := bus.Subscribe()
 
 	h := &Host{
 		cfg:             cfg,
 		plugins:         make(map[string]*ClientConn),
 		bus:             bus,
 		events:          events,
+		eventsUnsub:     unsubEvents,
+		eventsQuiesced:  eventsQuiesced,
 		metricsInterval: resolveMetricsInterval(cfg.MetricsInterval),
 	}
 
@@ -386,6 +404,11 @@ func NewHost(cfg HostConfig) *Host {
 // are reported via Events.
 // A single plugin's failure does not abort the others; Start's returned error
 // is the combined (errors.Join) set of any that failed.
+//
+// A Host is single-use. Once a Stop has completed the host's teardown, Start
+// rejects with ErrHostStopped and spawns nothing: that teardown ended the
+// Events() subscription and the observability workers for good, so a plugin
+// started afterward would report its lifecycle nowhere. Build a new Host.
 func (h *Host) Start(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -393,6 +416,10 @@ func (h *Host) Start(ctx context.Context) error {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	if h.workersReleased {
+		return fmt.Errorf("styx: start: %w", ErrHostStopped)
+	}
 
 	var errs []error
 	for _, spec := range h.cfg.Plugins {
@@ -632,7 +659,12 @@ func (h *Host) relayEvents(
 
 // drainOnStop relays whatever the subscription still holds before its caller
 // discards it, so a terminal Unhealthy/Restarting published by a heartbeat in
-// flight just before shutdown still reaches Host.Events(). stopRelay is only
+// flight just before shutdown is published onto Host.Events()'s bus instead of
+// being thrown away with the subscription. Whether a consumer then receives it is
+// the second half of the story: the host's teardown waits a bounded time for one
+// to take what these drains published before ending the subscription (see
+// maybeReleaseWorkers), so a consumer still reading gets it and one that stopped
+// reading does not. stopRelay is only
 // closed after the plugin's Supervisor.Stop has returned, which waits for its
 // Run goroutine — the sole publisher onto this bus — to exit; no further event
 // can therefore be enqueued here. The first Ready/GaveUp outcome was reported
@@ -668,8 +700,10 @@ func (h *Host) drainOnStop(name string, events <-chan supervisor.Event, quiesced
 // runtime — its relay stays subscribed and its client mapping stays absent
 // (Plugin reports it unavailable). The retained runtime's teardown completes
 // automatically once its Run finally exits, via a detached watcher or a retried
-// Stop, whichever happens first. Observability workers are released only after
-// the last such runtime is gone.
+// Stop, whichever happens first. The host's own background workers — the
+// observability dispatchers and the Events() forwarder — are released only after
+// the last such runtime is gone, so Events() stays open while one is still
+// stopping; see maybeReleaseWorkers for what ending it means for a reader.
 func (h *Host) Stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -721,10 +755,10 @@ func (h *Host) Stop(ctx context.Context) error {
 		h.retainUnjoined(unjoined)
 	}
 
-	// Release the observability workers once no runtime is still awaiting its
+	// Release the host's background workers once no runtime is still awaiting its
 	// join. With everything joined this fires here; with runtimes still stopping
 	// it is deferred to the last watcher (or retried Stop) that clears them.
-	h.maybeReleaseObservability()
+	h.maybeReleaseWorkers()
 
 	return errors.Join(errs...)
 }
@@ -732,9 +766,9 @@ func (h *Host) Stop(ctx context.Context) error {
 // completeTeardown tears one runtime's relay and subscription down exactly once
 // — closing stopRelay, draining, and unsubscribing — whether a retried Stop or
 // the deferred join watcher reaches it first, and drops the runtime from the
-// host's live and stopping sets. It never releases the observability workers
-// itself: the caller decides when via maybeReleaseObservability, so a multi-
-// plugin Stop releases only after its last runtime is done.
+// host's live and stopping sets. It never releases the host's background workers
+// itself: the caller decides when via maybeReleaseWorkers, so a multi-plugin Stop
+// releases only after its last runtime is done.
 func (h *Host) completeTeardown(rt *pluginRuntime) {
 	rt.teardownOnce.Do(func() {
 		close(rt.stopRelay)
@@ -779,35 +813,95 @@ func (h *Host) retainUnjoined(unjoined []*pluginRuntime) {
 
 // watchJoin starts (at most once per runtime) a detached goroutine that waits for
 // a retained plugin's Supervisor.Run to finally join, then completes the teardown
-// the expired Stop deferred and releases the observability workers if this was
-// the last runtime a Stop was still awaiting.
+// the expired Stop deferred and releases the host's background workers if this
+// was the last runtime a Stop was still awaiting.
 func (h *Host) watchJoin(rt *pluginRuntime) {
 	rt.watchOnce.Do(func() {
 		go func() {
 			<-rt.sup.Done()
 			h.completeTeardown(rt)
-			h.maybeReleaseObservability()
+			h.maybeReleaseWorkers()
 		}()
 	})
 }
 
-// maybeReleaseObservability stops the metrics and log dispatchers and every
-// per-plugin reporter, then joins them, but only once Stop has been requested and
-// no runtime is still awaiting its join. It runs the release exactly once. A
-// no-op when neither a sink nor a logger was configured (obsCancel stays nil).
-// The join is bounded: a user sink or logger call wedged inside a dispatcher can
-// never stall past obsShutdownBound (see joinBounded).
-func (h *Host) maybeReleaseObservability() {
+// maybeReleaseWorkers ends every background worker the Host itself owns — the
+// metrics and log dispatchers with their per-plugin reporters, and the Events()
+// subscription's forwarder — but only once Stop has been requested and no runtime
+// is still awaiting its join. It runs the release exactly once, so a Host leaves
+// none of them running after its teardown, however many Hosts a process builds.
+// The observability half is a no-op when neither a sink nor a logger was
+// configured (obsCancel stays nil); its join is bounded, so a user sink or logger
+// call wedged inside a dispatcher can never stall past obsShutdownBound (see
+// joinBounded).
+//
+// The Events() subscription is ended last, so the event stream stays open for
+// every earlier step of the teardown. By the time it is ended, each plugin's relay
+// has already drained its subscription onto the bus and unsubscribed
+// (completeTeardown), so nothing can publish another event — and the release first
+// waits, for at most eventsDrainBound, for a consumer to take what those drains
+// published. A consumer reading Events() until Stop returns therefore still
+// receives a failure incident published moments before shutdown, whole; one that
+// is not reading costs that bound and loses what it never took. Events() documents
+// both halves.
+func (h *Host) maybeReleaseWorkers() {
 	h.mu.Lock()
-	release := h.stopRequested && len(h.stopping) == 0 && !h.obsReleased
+	release := h.stopRequested && len(h.stopping) == 0 && !h.workersReleased
 	if release {
-		h.obsReleased = true
+		h.workersReleased = true
 	}
 	h.mu.Unlock()
 
-	if release && h.obsCancel != nil {
+	if !release {
+		return
+	}
+
+	if h.obsCancel != nil {
 		h.obsCancel()
 		joinBounded(&h.obsWG, obsShutdownBound)
+	}
+
+	// A Host built by NewHost always has both; the zero Host has neither, and Stop
+	// on it is a no-op rather than a panic.
+	if h.eventsUnsub != nil {
+		waitEventsQuiesced(h.eventsQuiesced, eventsDrainBound)
+		h.eventsUnsub()
+	}
+}
+
+// eventsDrainBound bounds the wait for a consumer to take what the teardown
+// published before Events() is ended. It is generous against what the wait
+// actually covers — a handful of events handed to a consumer that is already
+// draining, which costs microseconds — and is paid in full only by a Host whose
+// Events() nothing reads, where there is nothing to wait for and no consumer to
+// notice the delay. It is a var, not a const, only so a test can shorten it.
+// Package-internal; never reassigned in production.
+var eventsDrainBound = 250 * time.Millisecond
+
+// eventsDrainPoll is how often that wait rechecks the subscription. Short enough
+// that a consumer draining normally adds no measurable time to Stop, long enough
+// that the wait is not a spin.
+const eventsDrainPoll = 200 * time.Microsecond
+
+// waitEventsQuiesced waits until the Events() subscription has nothing queued and
+// nothing in flight, for at most bound.
+//
+// Quiesced is the bus's own signal that no event is left undelivered, and on an
+// unbuffered channel that means a consumer received each one. A consumer reading
+// Events() as documented — until Stop returns — reaches it within microseconds of
+// the last relay drain, so the whole of a failure incident published just before
+// shutdown arrives before the subscription ends rather than being cut in half by
+// it. A Host whose Events() nobody reads never quiesces at all: waiting for a
+// consumer that does not exist would make Stop unbounded, so the bound expires and
+// the caller ends the subscription regardless.
+func waitEventsQuiesced(quiesced func() bool, bound time.Duration) {
+	deadline := time.Now().Add(bound)
+	for !quiesced() {
+		if !time.Now().Before(deadline) {
+			return
+		}
+
+		time.Sleep(eventsDrainPoll)
 	}
 }
 
@@ -858,8 +952,28 @@ func (h *Host) Plugin(name string) *ClientConn {
 // or enough distinct plugins failing together — an older, still-undelivered
 // incident's critical events can be evicted to make room, and that older
 // incident may belong to a different plugin than the one whose newer
-// incident evicted it. Reading Events() promptly keeps you well inside that
-// bound; see docs/supervisor-events.md's delivery-semantics section for the
+// incident evicted it. Reading Events() promptly — from its own goroutine, from
+// before Start until Stop returns — keeps you well inside that bound.
+//
+// The channel is the same one for the Host's whole life and is CLOSED once Stop
+// has completed the host's teardown, so a `for ev := range host.Events()` loop
+// ends with the Host instead of blocking forever. Before closing it, Stop waits
+// a bounded time for a reader to take what the shutdown itself published, so a
+// failure incident reported moments before it still arrives whole at a reader
+// that is still draining — the reason to keep reading until Stop returns.
+// Closing is the end of the stream: an event nobody took by then is not
+// delivered, and a receive after the close yields the zero Event with ok=false,
+// never another event.
+//
+// Two cases leave the channel open, both because no teardown completed: a Stop
+// whose context expired before some plugin's supervisor joined (that plugin's
+// teardown finishes later, and the channel carries its remaining events until it
+// does), and a Stop handed a context that was already canceled or expired, which
+// returns that context's error without tearing anything down. Give Stop a
+// context with its own budget rather than the one the work ran under; a later
+// Stop with a usable context still completes the teardown and closes the
+// channel. Once one has, the Host is done: Start rejects with ErrHostStopped.
+// See docs/supervisor-events.md's delivery-semantics section for the
 // full accounting.
 func (h *Host) Events() <-chan Event {
 	return h.events
