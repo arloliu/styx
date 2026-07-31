@@ -9,6 +9,7 @@ import (
 
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/examples/echo/echopb"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/arloliu/styx/observe"
 	"github.com/stretchr/testify/require"
 )
@@ -201,6 +202,7 @@ func newWedgeHost(t *testing.T) wedgeHost {
 // different process that serves a call the wedged one never could, and both calls the
 // wedged instance swallowed return a terminal, typed error instead of hanging.
 func TestWedgeClassifier_RestartAndRecover_OnTransportWedgeWithLiveHandlerLease(t *testing.T) {
+	testutil.RequireNoGoroutineOrFDLeak(t) // registered before the host starts: see its doc comment on ordering.
 	wh := newWedgeHost(t)
 	client := echopb.NewEchoClient(wh.host.Plugin("echo"))
 
@@ -257,6 +259,7 @@ func TestWedgeClassifier_RestartAndRecover_OnTransportWedgeWithLiveHandlerLease(
 // those adjacent samples would have accumulated and fired within the window, and zero
 // unhealthy and zero restart events prove it did not.
 func TestWedgeClassifier_StayHealthy_ForOwedResponseWithLiveLease(t *testing.T) {
+	testutil.RequireNoGoroutineOrFDLeak(t) // registered before the host starts: see its doc comment on ordering.
 	wh := newWedgeHost(t)
 
 	// Given: a single long-running handler holding a live, renewing lease with no
