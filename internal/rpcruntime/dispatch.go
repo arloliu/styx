@@ -366,6 +366,19 @@ func InternalStatusFrame(f transport.Frame, message string) transport.Frame {
 	return statusFrame(f, &Status{Code: StatusCodeInternal, Message: message})
 }
 
+// DeclinedStatusFrame builds the FrameUnaryErr refusal a receive path owes for an
+// inbound unary request it could not take at all (shm-abi.md §9). The frame was
+// discarded before dispatch, so nothing local will ever answer callID and only
+// this reply keeps the peer's call from waiting on a connection the decline
+// deliberately leaves healthy. reason is the receive path's own rendered detail.
+//
+// Only the call ID is echoed. A declined frame yields no request to read the
+// service and method out of, and the peer routes a response purely on CallID.
+func DeclinedStatusFrame(callID uint64, reason string) transport.Frame {
+	return statusFrame(transport.Frame{CallID: callID},
+		&Status{Code: StatusCodeRequestDeclined, Message: reason})
+}
+
 // statusEnvelope wraps statusFrame's result: a status reply carries its body in
 // the frame and never a response message.
 func statusEnvelope(f transport.Frame, s *Status) ResponseEnvelope {

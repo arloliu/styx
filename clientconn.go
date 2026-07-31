@@ -233,7 +233,8 @@ func decodeResponseErr(err error) error {
 // agnostic, owned by internal/rpcruntime to avoid an import cycle — see
 // its own doc) into the styx error a caller sees. A framework-reserved code
 // reconstructs its exact sentinel so errors.Is works:
-// ErrServiceNotFound / ErrMethodNotFound for the not-found codes, and a
+// ErrServiceNotFound / ErrMethodNotFound for the not-found codes,
+// ErrRequestDeclined for a request the peer's receive path could not take, and a
 // *styx.Status{CodeInternal} for a plugin-side dispatch fault. Every other
 // code is an application error surfaced as *styx.Status, with Details
 // round-tripped through proto.Unmarshal since the wire carries each as a
@@ -246,6 +247,16 @@ func statusFromRPC(s *rpcruntime.Status) error {
 		return ErrMethodNotFound
 	case rpcruntime.StatusCodeInternal:
 		return &Status{Code: CodeInternal, Message: s.Message}
+	case rpcruntime.StatusCodeRequestDeclined:
+		// The plugin took the request off the wire, could not turn it into anything
+		// it could dispatch, and answered rather than leaving the call unanswered.
+		// The reason is the plugin's own rendered fault detail; it rides a wrapped
+		// sentinel so errors.Is still matches and IsRetryable still classifies it.
+		if s.Message == "" {
+			return ErrRequestDeclined
+		}
+
+		return fmt.Errorf("styx: invoke: %s: %w", s.Message, ErrRequestDeclined)
 	case rpcruntime.StatusCodeHandlerPanic:
 		// The plugin recovered a handler panic and replied with the outcome so
 		// this call terminates with a plugin fault rather than vanishing. Only
@@ -789,13 +800,11 @@ func isFrameLocalRecvErr(err error) bool {
 // takes Table's ordinary late-frame discard and changes nothing.
 //
 // The obligation binds only where the named call is local, which is the response
-// direction. A loop receiving requests cannot perform it, because the call the
-// descriptor names lives in the peer's table. §9 routes a request such a loop CAN
-// answer to an acceptance, so it never reaches here — but a request it could not
-// take at all leaves the peer's call to whatever budget its descriptor carried,
-// and a peer that issued the call with no deadline published zero. Nothing reaps
-// that call. The request direction is not covered by this function and is not
-// covered anywhere else either.
+// direction. A loop receiving requests discharges it differently, because the call
+// the descriptor names lives in the peer's table: §9 routes a request such a loop
+// CAN answer to an acceptance, and a request it could not take at all is answered
+// with a declined status instead (answerDeclinedRequest, on the plugin's serve
+// loop). This function covers the response direction only.
 func failCallOnDiscardedFrame(table *rpcruntime.Table, err error) {
 	var fault *transport.ConsumeFaultError
 	if !errors.As(err, &fault) {

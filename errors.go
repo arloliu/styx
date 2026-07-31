@@ -166,6 +166,11 @@ var (
 	// ErrDrained reports that a call was refused at a hot-reload's admission
 	// cutoff, before it was ever submitted. It is retryable.
 	ErrDrained = errors.New("styx: plugin draining")
+	// ErrRequestDeclined reports that the plugin took the request off the wire
+	// and could not turn it into anything it was able to dispatch, so it answered
+	// with a refusal rather than leaving the call unanswered (shm-abi.md §9). No
+	// handler ran and the request had no effect, so it is retryable.
+	ErrRequestDeclined = errors.New("styx: request declined")
 	// ErrOutcomeUnknown reports that a call's request may or may not have
 	// reached the plugin before a crash or teardown, so its side effects (if
 	// any) are unknown. It is not retryable — reissuing the call could repeat
@@ -238,8 +243,11 @@ var (
 // safely retry by issuing a new call. It returns false for
 // ErrOutcomeUnknown and anything wrapping it; for a *PluginCrashError it
 // returns the value of Dispatched negated; true for ErrPluginUnavailable,
-// ErrDrained, and ErrBackpressure (transient, caller can wait or the
-// supervisor will restart); false for everything else, including a nil
+// ErrDrained, and ErrBackpressure (transient: the caller can wait, or the
+// supervisor will restart); true for ErrRequestDeclined, which is not transient
+// but is safe — no handler ran, so a fresh attempt repeats no effect, though a
+// decline with a deterministic cause answers the same way again and a caller
+// that reissues it immediately will spin; false for everything else, including a nil
 // error, an application *Status, PluginPanicError, ErrIncompatible,
 // ErrDeadlineExceeded, ErrCanceled, ErrPoisoned, ErrServiceNotFound, and
 // ErrMethodNotFound.
@@ -256,7 +264,8 @@ func IsRetryable(err error) bool {
 	switch {
 	case errors.Is(err, ErrPluginUnavailable),
 		errors.Is(err, ErrDrained),
-		errors.Is(err, ErrBackpressure):
+		errors.Is(err, ErrBackpressure),
+		errors.Is(err, ErrRequestDeclined):
 		return true
 	default:
 		return false

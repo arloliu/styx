@@ -174,13 +174,14 @@ var ErrPayloadMalformed = errors.New("transport: payload does not decode")
 // a reader that only skips leaves that call with no answer and, if it was
 // submitted without a deadline, nothing to reap it. Recovering the fault with
 // errors.As and failing that call is what turns the discard back into a fail-fast.
-// The obligation binds only where the named call is local, which is the response
-// direction. On the request direction the call lives in the peer's table, and a
-// reader there has no way to reach it: shm-abi.md §9 routes a request the consumer
-// CAN answer to an acceptance instead, but a request it could not take at all
-// leaves the peer's call to whatever budget its descriptor carried — which may be
-// zero, meaning no deadline, and therefore nothing that ends the wait. That gap is
-// open on the request direction, not closed.
+// The obligation takes a different form on each direction. On the response
+// direction the named call is local, so failing it is what turns the discard back
+// into a fail-fast. On the request direction the call lives in the peer's table:
+// shm-abi.md §9 routes a request the consumer CAN answer to an acceptance, and a
+// request it could not take at all is answered with the declined status, which is
+// the only act that reaches a call this side does not hold. Either way the reader
+// owes the named call an outcome — a budget the descriptor may carry as zero
+// (no deadline) would otherwise never end the wait.
 func IsFrameLocalRecvErr(err error) bool {
 	return errors.Is(err, ErrMalformedStatusFrame) ||
 		errors.Is(err, ErrUnimplementedFrameKind) ||
