@@ -1130,6 +1130,9 @@ func (s *Stream) notifySend() {
 // deadline, or a post-admission Send context error), and is the sole gate on
 // emitting the CANCEL+STREAM_ERR pair (§9.1).
 func (s *Stream) terminate(oc StreamOutcome, teardownCode uint32, locallyInitiated bool, from ...int32) bool {
+	if s.tbl.beforeTerminalCAS != nil {
+		s.tbl.beforeTerminalCAS(oc.Code, from)
+	}
 	// stateMu is held ONLY across the phase CAS and the discriminant store — the
 	// minimal commit that must be atomic with Dispatch's live-check (§8.1 level 2).
 	// Once the CAS lands, the live-vs-terminal decision is committed, so the lock

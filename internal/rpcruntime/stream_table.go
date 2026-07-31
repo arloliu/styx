@@ -121,6 +121,35 @@ type StreamTable struct {
 	// obligation assertion on this rather than on the transport recording the Send,
 	// which returns before the close-or-skip decision runs.
 	afterEmitAccounting func()
+	// beforeTerminalCAS runs at the head of every terminal transition routed
+	// through Stream.terminate, before the stream's state lock is taken and before
+	// the phase CAS, carrying the outcome that transition is attempting and the
+	// live phases it will attempt the CAS from. It holds one contender in the exact
+	// window stream-protocol.md §7.1 arbitrates, so a test can decide which of two
+	// racing terminal events wins instead of leaving it to timing, with the loser
+	// genuinely in flight at the moment the winner lands.
+	//
+	// It fires for EVERY caller of terminate, not only the locally-initiated ones:
+	// a local cancel, a deadline, a CloseSend that observed both half-closes, and
+	// the connection teardown fan-out (FailAll), which is not locally initiated and
+	// makes TWO calls per stream — one from SUBMITTED, then one from PUBLISHED. The
+	// from argument is what tells those two apart.
+	//
+	// Two terminal paths bypass it, because neither routes through terminate:
+	// TerminateHandlerError, and every inbound-observed termination, which
+	// terminates through terminateLocked under the lock Dispatch already holds.
+	// Use beforeDispatchLock for the inbound side.
+	//
+	// It is set on the table before any stream is opened, so the deadline watcher —
+	// which a client-side Open starts inside admission — never reads it
+	// concurrently with the write.
+	beforeTerminalCAS func(code StreamOutcomeCode, from []int32)
+	// beforeDispatchLock runs inside Dispatch after the call ID resolves to a
+	// stream and before that stream's state lock is taken: the frame is past
+	// stream-protocol.md §8.1 level 1 and has not yet reached the level-2
+	// live-check. Holding a frame there lets a test land a terminal transition in
+	// the level-2 window the inbound frame is about to enter.
+	beforeDispatchLock func(f transport.Frame)
 }
 
 // emitJob is one queued data-lane STREAM_ERR for the connection emitter to
@@ -408,6 +437,9 @@ func (t *StreamTable) Dispatch(f transport.Frame) error {
 	// and counted with all stream state left unchanged. Without this lock a
 	// terminal CAS could land between the live-check and the mutation, delivering
 	// or replenishing on an already-terminal stream.
+	if t.beforeDispatchLock != nil {
+		t.beforeDispatchLock(f)
+	}
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 
