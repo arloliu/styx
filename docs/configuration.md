@@ -32,6 +32,9 @@ to a reasonable value:
 | `Geometry`          | zero value (selects `GeometryDefault()`) | The shape of the shared-memory region, when the shared-memory transport is used. See [Shared-memory geometry](#shared-memory-geometry). |
 | `MaxDataInflight`   | `0` (derived from `Geometry`) | The peak number of concurrent data calls this host admits. |
 | `StrictCapacity`    | `false`        | Opts into an extra, up-front capacity check described in [Shared-memory geometry](#shared-memory-geometry). |
+| `HeartbeatTimeout`  | `0` (one second) | How long the host waits for the plugin's next heartbeat before counting a miss. See [Tuning liveness detection](#tuning-liveness-detection). |
+| `MissedHeartbeatThreshold` | `0` (three) | How many consecutive missed heartbeats declare the instance unhealthy. |
+| `WedgeWindow`       | `0` (five seconds) | How long a stalled data plane must keep stalling before the instance is declared unhealthy for it. |
 
 `PluginServerConfig`, passed to `NewPluginServer` on the plugin side, mirrors
 this with plugin-local knobs: `Metrics`, `MetricsInterval`, `ContinueAfterPanic`
@@ -169,6 +172,91 @@ For the exact wire-level rules these numbers satisfy — the bounds on
 `RingCapacity`, the layout of a size class, and how `MaxDataInflight` is
 carried between host and plugin — see
 [`docs/specs/shm-abi.md`](specs/shm-abi.md) §1, §2, §6, and §18.
+
+## Tuning liveness detection
+
+A `Host` decides one of its plugins has stopped serving in two independent
+ways, and `PluginSpec` has knobs for both.
+
+**Silence.** The plugin sends a heartbeat at a fixed cadence — one second,
+exposed as `styx.PluginHeartbeatInterval` — that neither side configures and
+the handshake does not negotiate. The host waits `HeartbeatTimeout` for each
+one and counts a miss when that wait expires; `MissedHeartbeatThreshold`
+consecutive misses declare the instance unhealthy and end it, so the restart
+policy runs. Any heartbeat that does arrive resets the running count, so the
+threshold bounds a *run* of silence, not a lifetime total. At the defaults
+that is three one-second waits: about three seconds from a plugin going
+quiet — deadlocked, starved, stopped — to the `EventUnhealthy` reporting it.
+
+**No progress.** A wedged plugin keeps heartbeating perfectly, so no silence
+budget would ever catch it. The heartbeats themselves carry the plugin's
+data-plane progress, and `WedgeWindow` is how long a stall in that progress —
+a ring consumer with queued work it never consumes, a response owed with no
+handler running — must persist before the instance is declared unhealthy for
+it.
+
+That window is not measured in host time. It is converted to a number of the
+plugin's own consecutive heartbeats, dividing by the closest spacing the
+plugin's sender will admit between two beats — seven eighths of
+`styx.PluginHeartbeatInterval`, or 875 ms — and rounding up:
+
+```
+beats = ceil(WedgeWindow / 875ms)
+```
+
+The stall has to span that many consecutive heartbeats, so the default five
+seconds is `ceil(5000/875)` = 6 beats: about six seconds of real stall at the
+one-second send cadence. Every value rounds up to a whole beat, and the bands
+are wider than they look — anything from 876 ms through 1.75 s costs two
+beats. Measuring on the plugin's clock rather than the host's is deliberate: a
+host that dequeues heartbeats slowly cannot stretch a short stall into a
+wedge, and one draining a backlog cannot mask a real one.
+
+To detect a dead plugin *faster*, lower `MissedHeartbeatThreshold`:
+
+```go
+styx.PluginSpec{
+    Name:                     "sampler",
+    Path:                     "/opt/plugins/sampler",
+    MissedHeartbeatThreshold: 1, // a verdict after one missed wait, not three
+}
+```
+
+Do not reach for `HeartbeatTimeout` to do that job — it cannot go below
+`styx.PluginHeartbeatInterval`, and `Start` refuses a shorter value outright:
+
+```go
+host := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+    Name:             "sampler",
+    Path:             "/opt/plugins/sampler",
+    HeartbeatTimeout: 200 * time.Millisecond, // below the send cadence
+}}})
+
+err := host.Start(ctx)
+// errors.Is(err, styx.ErrInvalidConfig) is true; errors.As recovers a
+// *styx.ConfigError whose Field is "PluginSpec.HeartbeatTimeout".
+```
+
+`HeartbeatTimeout` is the host's *wait*, not the plugin's send cadence, and
+the host learns nothing between beats. A wait shorter than the interval those
+beats are sent at expires on a plugin that is answering perfectly, and the
+missed count climbs toward its threshold with nothing wrong — so the value is
+refused rather than silently clamped, which would leave the host supervising
+on numbers nobody chose and nobody can see.
+
+Lengthening `HeartbeatTimeout` is the other direction, and the one a slow peer
+needs: a plugin that blocks on a serial link or a device read can legitimately
+go quiet for longer than a second, and restarting it for that is worse than
+noticing its death late. Raise the wait (and, if the pauses are long, the
+threshold too) to buy that distinction, and pay for it in detection latency.
+
+All three fields are optional, and zero on any of them selects its default —
+a `PluginSpec` that sets none is supervised exactly as it was before these
+knobs existed. A *negative* value on any of the three is refused, which is
+not a blanket rule of this API: what a negative means is field-dependent
+here, so read the field. `HostConfig.MetricsInterval` quietly takes its
+default from one, and `ConsumeFaultRunThreshold` gives one a meaning of its
+own (it stands that side's escalation down).
 
 ## Observing what a Host is doing
 

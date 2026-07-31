@@ -144,7 +144,65 @@ type PluginSpec struct {
 	// unconsumable frame tears the region down, and the threshold needs to stay
 	// well clear of the inbound queue depths it is meant to outlast.
 	ConsumeFaultRunThreshold int
+
+	// HeartbeatTimeout is how long this Host waits for the plugin's next heartbeat
+	// before counting a miss. MissedHeartbeatThreshold consecutive misses declare the
+	// instance unhealthy and end it, so the two together decide how fast a plugin
+	// that has gone silent -- deadlocked, starved, stopped -- is detected: at the
+	// defaults, three waits of one second each.
+	//
+	// It is this Host's WAIT, not the plugin's send cadence. A plugin sends a
+	// heartbeat every PluginHeartbeatInterval, fixed and not negotiated, so a wait
+	// shorter than that cadence expires on a perfectly healthy plugin nearly every
+	// interval and the missed count reaches its threshold with nothing wrong. Start
+	// refuses such a value with a *ConfigError rather than clamping it.
+	//
+	// Zero selects the default, which equals the send cadence. Lengthen it for a
+	// plugin whose thread of control legitimately pauses -- a slow serial link, a
+	// blocking device read -- and pay for that in detection latency. Detection
+	// cannot be pushed below one send cadence by shortening this: the evidence
+	// arrives no faster than the plugin sends it. Lower MissedHeartbeatThreshold
+	// instead.
+	HeartbeatTimeout time.Duration
+
+	// MissedHeartbeatThreshold is how many consecutive missed heartbeats declare this
+	// plugin's instance unhealthy. Any received heartbeat resets the running count,
+	// so it bounds a RUN of silence, not a lifetime total.
+	//
+	// Zero selects the default (three). This is the knob to move to detect a dead
+	// plugin faster, since HeartbeatTimeout cannot go below the send cadence. What it
+	// spends is the margin that absorbs an ordinary late beat: at 1, one heartbeat
+	// delayed past HeartbeatTimeout ends the instance, so tighten it only when the
+	// plugin's cadence is not routinely jittered by the machine it runs on.
+	MissedHeartbeatThreshold int
+
+	// WedgeWindow is how long a plugin must keep reporting a stalled data plane -- a
+	// ring consumer making no progress with work queued, or a response owed with no
+	// handler running -- before the instance is declared unhealthy for it. This is
+	// the progress-based half of liveness, separate from the missed-heartbeat half: a
+	// wedged plugin keeps heartbeating, so no missed-heartbeat budget ever catches it.
+	//
+	// The window is not measured in host time. It is converted to a count of the
+	// plugin's own heartbeat sequence increments, and the stall must span that many
+	// consecutive beats. The divisor is the closest spacing the plugin's sender will
+	// admit between two beats -- seven eighths of PluginHeartbeatInterval, 875ms --
+	// so the count is ceil(WedgeWindow / 875ms) and every configured window rounds UP
+	// to a whole beat. The default five seconds is six beats, about six seconds of
+	// real stall at the one-second send cadence; anything from 876ms through 1.75s
+	// costs two beats, not one. Zero selects the default (five seconds).
+	WedgeWindow time.Duration
 }
+
+// PluginHeartbeatInterval is the fixed cadence at which a plugin sends heartbeats to
+// its Host. It is not negotiated and neither side can configure it: both derive it
+// from this one value.
+//
+// It is the floor for PluginSpec.HeartbeatTimeout, and the reason a floor exists at
+// all -- a Host learns a plugin is alive only when a heartbeat arrives, so a wait
+// shorter than the cadence those heartbeats are sent at expires on a healthy plugin.
+// It is also the granularity of PluginSpec.WedgeWindow, which is measured in
+// heartbeat sends rather than in host time.
+const PluginHeartbeatInterval = supervisor.DefaultHeartbeatInterval
 
 // ConsumeFaultEscalationDisabled switches off the consume-fault teardown for the
 // side it is assigned to -- PluginSpec.ConsumeFaultRunThreshold for this Host,
@@ -338,6 +396,12 @@ func (h *Host) Start(ctx context.Context) error {
 // records its pluginRuntime for Stop; on any failure it leaves no
 // goroutine, subscription, or running Supervisor behind.
 func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
+	// A liveness setting that cannot be honored is refused before anything is
+	// spawned, so no process, handshake, or lifecycle event ever exists for it.
+	if err := validateLivenessTuning(spec); err != nil {
+		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, err)
+	}
+
 	// Reject a name whose prior instance has not finished stopping: its
 	// supervisor did not join before an earlier Stop's deadline and may still be
 	// publishing on its retained relay. Spawning a second instance here would let
@@ -361,32 +425,7 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	cc := newUnavailableClientConn(spec.Name)
 	cc.metrics = h.metricsDisp
 	bus := supervisor.NewEventBus()
-	cfg := supervisor.Config{
-		Spec:             lifecycle.Spec{Path: spec.Path, Args: spec.Args, Env: spec.Env},
-		Restart:          spec.Restart,
-		Services:         toControlServiceRequirements(spec.Services),
-		RequireStreaming: spec.RequireStreaming,
-		// The public default (empty Transport) is "auto": offer the shared-memory
-		// transport, preferred, with a uds fallback. The host authors geometry
-		// (converted from the public ShmGeometry) and selects peak concurrency and
-		// the optional STRICT certification.
-		Transport:       string(resolveTransport(spec.Transport)),
-		ShmLayout:       spec.Geometry.toLayout(),
-		MaxDataInflight: spec.MaxDataInflight,
-		StrictCapacity:  spec.StrictCapacity,
-
-		ConsumeFaultRunThreshold: spec.ConsumeFaultRunThreshold,
-		OnHeartbeatMiss:          h.heartbeatMissHook(spec.Name),
-		OnRestart:                h.restartHook(spec.Name),
-		OnReloadDropped:          h.reloadDroppedHook(spec.Name),
-		// The reload transaction drives the SAME admission gate a caller's
-		// Invoke checks, so a cutoff a reload begins is the cutoff Invoke
-		// observes. internal/supervisor never names *ClientConn; it holds only
-		// this pointer into cc's own gate.
-		Admission: &cc.admission,
-		OnReady:   func(inst supervisor.Instance) supervisor.ReadyHooks { return wireConnState(cc, inst) },
-	}
-	sup := supervisor.New(cfg, bus)
+	sup := supervisor.New(h.supervisorConfig(spec, cc), bus)
 
 	events, unsub, quiesced := bus.Subscribe()
 	stopRelay := make(chan struct{})
@@ -440,6 +479,90 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 			defer h.obsWG.Done()
 			cc.runMetricsReporter(h.obsCtx, h.metricsDisp, h.metricsInterval)
 		}()
+	}
+
+	return nil
+}
+
+// supervisorConfig builds one plugin's internal supervision configuration: spec's
+// public knobs translated to their internal counterparts, plus the hooks binding
+// this Host's observability and cc's routing into the supervisor.
+//
+// The liveness-tuning fields are passed through unresolved. A zero there is the
+// caller's "use the default", and internal/supervisor applies it, so each default
+// has exactly one definition and this layer cannot drift from it.
+func (h *Host) supervisorConfig(spec PluginSpec, cc *ClientConn) supervisor.Config {
+	return supervisor.Config{
+		Spec:             lifecycle.Spec{Path: spec.Path, Args: spec.Args, Env: spec.Env},
+		Restart:          spec.Restart,
+		Services:         toControlServiceRequirements(spec.Services),
+		RequireStreaming: spec.RequireStreaming,
+		// The public default (empty Transport) is "auto": offer the shared-memory
+		// transport, preferred, with a uds fallback. The host authors geometry
+		// (converted from the public ShmGeometry) and selects peak concurrency and
+		// the optional STRICT certification.
+		Transport:       string(resolveTransport(spec.Transport)),
+		ShmLayout:       spec.Geometry.toLayout(),
+		MaxDataInflight: spec.MaxDataInflight,
+		StrictCapacity:  spec.StrictCapacity,
+
+		// The names differ on purpose: both sides mean the host's own wait for the
+		// next heartbeat, but "Interval" reads publicly as the plugin's send cadence,
+		// which this is emphatically not and which no Host may set.
+		HeartbeatInterval: spec.HeartbeatTimeout,
+		MissedHeartbeats:  spec.MissedHeartbeatThreshold,
+		WedgeWindow:       spec.WedgeWindow,
+
+		ConsumeFaultRunThreshold: spec.ConsumeFaultRunThreshold,
+		OnHeartbeatMiss:          h.heartbeatMissHook(spec.Name),
+		OnRestart:                h.restartHook(spec.Name),
+		OnReloadDropped:          h.reloadDroppedHook(spec.Name),
+		// The reload transaction drives the SAME admission gate a caller's
+		// Invoke checks, so a cutoff a reload begins is the cutoff Invoke
+		// observes. internal/supervisor never names *ClientConn; it holds only
+		// this pointer into cc's own gate.
+		Admission: &cc.admission,
+		OnReady:   func(inst supervisor.Instance) supervisor.ReadyHooks { return wireConnState(cc, inst) },
+	}
+}
+
+// validateLivenessTuning refuses a liveness-detection setting that cannot be
+// honored. A negative duration or count has no meaning, and a heartbeat wait
+// shorter than the plugin's fixed send cadence counts misses against a plugin that
+// is answering perfectly.
+//
+// Zero is never an error here: it is how each of these fields asks for its default,
+// so an unset spec passes unchanged.
+func validateLivenessTuning(spec PluginSpec) error {
+	switch {
+	case spec.HeartbeatTimeout < 0:
+		return &ConfigError{
+			Field:  "PluginSpec.HeartbeatTimeout",
+			Reason: fmt.Sprintf("%s is negative; leave it zero for the default", spec.HeartbeatTimeout),
+		}
+
+	case spec.HeartbeatTimeout > 0 && spec.HeartbeatTimeout < PluginHeartbeatInterval:
+		return &ConfigError{
+			Field: "PluginSpec.HeartbeatTimeout",
+			Reason: fmt.Sprintf(
+				"%s is shorter than the plugin's fixed %s heartbeat send cadence, so a healthy plugin "+
+					"would be counted late on nearly every wait; lower MissedHeartbeatThreshold to "+
+					"detect a dead plugin sooner",
+				spec.HeartbeatTimeout, PluginHeartbeatInterval),
+		}
+
+	case spec.MissedHeartbeatThreshold < 0:
+		return &ConfigError{
+			Field: "PluginSpec.MissedHeartbeatThreshold",
+			Reason: fmt.Sprintf("%d is negative; leave it zero for the default",
+				spec.MissedHeartbeatThreshold),
+		}
+
+	case spec.WedgeWindow < 0:
+		return &ConfigError{
+			Field:  "PluginSpec.WedgeWindow",
+			Reason: fmt.Sprintf("%s is negative; leave it zero for the default", spec.WedgeWindow),
+		}
 	}
 
 	return nil

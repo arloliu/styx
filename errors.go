@@ -131,6 +131,32 @@ type HandshakeOffer struct {
 	Services []ServiceRequirement
 }
 
+// ConfigError reports a configuration field whose value cannot be honored.
+// It is detected before anything is spawned, so a plugin that fails this way never
+// had a process, a handshake, or a lifecycle event.
+// errors.Is(err, ErrInvalidConfig) matches any *ConfigError;
+// errors.As(err, &configErr) recovers which field and why it was refused.
+//
+// The value is refused rather than silently clamped: a clamp would leave the Host
+// supervising on numbers the caller never chose and never sees.
+type ConfigError struct {
+	// Field names the offending configuration field, as written on the public
+	// struct (e.g. "PluginSpec.HeartbeatTimeout").
+	Field string
+	// Reason states why the value cannot be honored, in terms of the constraint
+	// it violates rather than the internals enforcing it.
+	Reason string
+}
+
+func (e *ConfigError) Error() string {
+	return fmt.Sprintf("styx: invalid configuration: %s: %s", e.Field, e.Reason)
+}
+
+// Is reports whether target is ErrInvalidConfig.
+func (e *ConfigError) Is(target error) bool {
+	return target == ErrInvalidConfig
+}
+
 var (
 	// ErrPluginUnavailable reports that a call was not admitted because no live
 	// instance is routed for the named plugin — it isn't running, its prior
@@ -149,6 +175,11 @@ var (
 	// ErrIncompatible) matches any *IncompatibleError; errors.As recovers the
 	// structured detail (see IncompatibleError).
 	ErrIncompatible = errors.New("styx: incompatible handshake")
+	// ErrInvalidConfig reports a configuration value that cannot be honored,
+	// refused by Start before any process is spawned. errors.Is(err,
+	// ErrInvalidConfig) matches any *ConfigError; errors.As recovers the
+	// structured detail (see ConfigError).
+	ErrInvalidConfig = errors.New("styx: invalid configuration")
 	// ErrDeadlineExceeded reports that the call's context deadline elapsed
 	// before a terminal outcome arrived.
 	ErrDeadlineExceeded = errors.New("styx: deadline exceeded")
