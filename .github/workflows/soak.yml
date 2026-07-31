@@ -4,6 +4,20 @@ name: Soak
 # hours and asserts that fds, goroutines, forced-GC heap, and mapped shared
 # memory regions all return to baseline. It is far too long for the per-push CI,
 # so it runs on a schedule and on demand.
+#
+# TestReloadDrainUnderLoad and the TestDefect_* meta-tests only ever run at the
+# per-push CI's 60s default scale (via `make test`'s plain `go test ./...`),
+# never at this workflow's larger scale, so this job runs them explicitly too:
+#   - TestReloadDrainUnderLoad: proves a successful hot-reload drains every
+#     accepted call with no ErrOutcomeUnknown. It derives its drain window from
+#     the same STYX_SOAK_DURATION input as TestSoak, capped at 15s per
+#     transport, so running it at this workflow's scale costs well under a
+#     minute, not hours.
+#   - The TestDefect_* meta-tests: they prove the leak/accounting checks used
+#     above actually catch a real injected defect, by injecting one and
+#     asserting the check fails. Their value is running once against this
+#     build, not running long, so they run at their own default scale with no
+#     STYX_SOAK_DURATION override.
 on:
   schedule:
     # 03:00 UTC daily.
@@ -26,10 +40,13 @@ jobs:
   soak:
     name: soak
     runs-on: ubuntu-latest
-    # The job ceiling sits comfortably above the 4h soak plus build and cooldown.
-    # Slightly above go test's -timeout=5h so a hang hits Go's timeout first
-    # (goroutine dump) rather than the runner's hard kill.
-    timeout-minutes: 310
+    # The job ceiling covers the 5h soak -timeout plus the worst case of the
+    # four steps that now run before it (checkout, Go setup — each with a cold
+    # compile of the test binary and the crashy plugin — the defect meta-tests'
+    # own -timeout=2m, and the reload-drain step's own -timeout=5m) plus
+    # cooldown. Slightly above go test's -timeout=5h so a hang hits Go's timeout
+    # first (goroutine dump) rather than the runner's hard kill.
+    timeout-minutes: 320
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -44,10 +61,35 @@ jobs:
             .linter.go.sum
             .buf.go.sum
 
+      - name: Run soak defect meta-tests
+        # Injects one real defect per resource class and asserts the corresponding
+        # leak/accounting check fails on it — proof the checks TestSoak relies on
+        # actually detect something, not just that they always pass. No
+        # STYX_SOAK_DURATION override: these do not scale with duration, and
+        # running them once per build is the whole point.
+        #
+        # Prefix match, not an enumeration: the two ways this selection can be
+        # wrong are not symmetric. A future TestDefect_* left out of an
+        # enumeration is silent — it just never runs at this gate, which is the
+        # exact gap this step exists to close. Matching too much is loud instead
+        # — it blows this step's -timeout=2m and the job fails.
+        run: go test ./tests/soak -run '^TestDefect_' -race -count=1 -v -timeout=2m
+
+      - name: Run reload-drain under load at scheduled scale
+        env:
+          # Same input as the main soak run below, so the drain window scales
+          # the same way (and hits the same 15s-per-transport cap).
+          STYX_SOAK_DURATION: ${{ github.event.inputs.duration || '4h' }}
+        # -timeout=5m is itself the backstop for the "minutes, not hours" claim
+        # above: if TestReloadDrainUnderLoad's drain-window cap is ever removed
+        # or raised, this step times out and fails loudly instead of quietly
+        # scaling to hours.
+        run: go test ./tests/soak -run '^TestReloadDrainUnderLoad$' -race -count=1 -v -timeout=5m
+
       - name: Run soak
         env:
           # Default to 4h; a manual run may override via the workflow input.
           STYX_SOAK_DURATION: ${{ github.event.inputs.duration || '4h' }}
         # The -timeout is set well above the soak duration so the settle loops and
         # teardown always complete inside the go test budget.
-        run: go test ./tests/soak -run TestSoak -race -count=1 -v -timeout=5h
+        run: go test ./tests/soak -run '^TestSoak$' -race -count=1 -v -timeout=5h
