@@ -74,13 +74,20 @@ var ErrMalformedStatusFrame = errors.New("transport: malformed status frame body
 // returns when the peer closes its end of the connection.
 var ErrClosed = errors.New("transport: closed")
 
-// ErrPoisoned wraps the error from a Send/Recv that aborted mid-frame and
-// permanently desynchronized the connection.
-// This occurs when a partial frame reached the wire before failure (context
-// done, socket error, or invalid declared length). The underlying error is
-// preserved so callers can errors.Is-check against the root cause. Both the
-// reader and writer can observe this to distinguish a self-inflicted desync
-// (requiring supervisor teardown/restart) from a benign peer close.
+// ErrPoisoned wraps the error from a Send/Recv on a data plane that is
+// permanently unusable and was not repaired: the connection must be discarded
+// whole and its instance restarted.
+// A uds transport reaches that state by aborting mid-frame — a partial frame
+// reached the wire (context done, socket error, or invalid declared length) and
+// framing is desynchronized from there on. A shared-memory transport reaches it
+// through the region poison word, whether this side actuated it on a conformance
+// fault or the peer did.
+// The underlying error is preserved so callers can errors.Is-check against the
+// root cause. This is the one sentinel every reader loop and serve loop
+// classifies that state by, and it is what distinguishes a self-inflicted or
+// peer-inflicted desync — requiring supervisor teardown/restart — from a benign
+// peer close, so a transport that poisons without reporting it here escalates
+// nothing.
 var ErrPoisoned = errors.New("transport: poisoned")
 
 // ErrBackpressure is returned by Send when the submission queue is full and the
@@ -335,12 +342,20 @@ type ReservingReceiver interface {
 	RecvReserving(ctx context.Context, reserve func()) (Frame, error)
 }
 
-// ConsumeFaultError reports that a ViewReceiver's consume callback failed on a
-// frame the transport had already accepted, without blaming the peer for it.
-// Two things produce it: a callback that panicked, and a callback that returned
-// an error not wrapping ErrPayloadMalformed. Either way the receiving side owns
-// the fault, so the transport releases the frame's buffer, delivers nothing, and
-// stays usable.
+// ConsumeFaultError reports that the receiving side's own consume step failed on
+// a frame already accepted off the wire or the ring, without blaming the peer for
+// it. The consume step is everything this side does with a frame it has taken:
+// building it, decoding it, and handing it to a ViewReceiver's consume callback
+// where there is one (shm-abi.md §9's protected_consume).
+//
+// A consume callback that panicked or returned an error not wrapping
+// ErrPayloadMalformed produces it, and so does a panic in the transport's own
+// frame construction on the plain Recv path, where no callback exists at all. A
+// reader loop that receives frames the ordinary way and installs the same barrier
+// over its own handling produces it too. Hence the wording here names the step
+// rather than the callback: two of the three cannot have had one. Either way the
+// receiving side owns the fault, so the frame's buffer is released, nothing is
+// delivered, and the connection stays usable.
 //
 // CallID names the call the discarded frame belonged to so the caller can fail
 // that call immediately. Dropping the frame silently instead would leave a caller
@@ -363,22 +378,24 @@ type ConsumeFaultError struct {
 	// false when it returned an error the transport did not attribute to the peer.
 	Panicked bool
 	// Detail is the panic value or the returned error rendered as text, captured
-	// while the frame's memory was still valid. It is text, never the callback's own
-	// value, so nothing here can reference a buffer the transport has since released.
+	// while the frame's memory was still valid. It is text, never the failing code's
+	// own value, so nothing here can reference a buffer the transport has since
+	// released. It says only what went wrong: Panicked already says how, so a
+	// producer that repeated it there would render it twice.
 	Detail string
-	// Stack is the callback's stack, captured inside the recover that stopped it.
-	// It is nil when the callback returned an error rather than panicking.
+	// Stack is the stack of the code that panicked, captured inside the recover that
+	// stopped it. It is nil when the fault was a returned error rather than a panic.
 	Stack []byte
 }
 
-// Error reports how the callback failed, on which call, and with what.
+// Error reports how the consume step failed, on which call, and with what.
 func (e *ConsumeFaultError) Error() string {
 	how := "returned an error"
 	if e.Panicked {
 		how = "panicked"
 	}
 
-	return fmt.Sprintf("transport: consume callback %s on call %d (kind %d): %s", how, e.CallID, e.Kind, e.Detail)
+	return fmt.Sprintf("transport: consume step %s on call %d (kind %d): %s", how, e.CallID, e.Kind, e.Detail)
 }
 
 // Unwrap reports ErrConsumeFault, so a caller matches the class with errors.Is

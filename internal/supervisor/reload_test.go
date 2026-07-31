@@ -510,6 +510,83 @@ func TestSupervisor_NotifyConnLost_TearsDownAndRestarts(t *testing.T) {
 	}
 }
 
+// Test the same escalation reaching the routing layer over the wiring a real
+// spawn builds: Config.OnReady is the supervisor's only seam into that layer, and
+// the NotifyConnLost it is handed there is the callback the read loop actually
+// holds. The test above drives the notifier through the spawn seam a test
+// substitutes, which reaches the callback without ever constructing the Instance
+// that carries it — so a defect in what OnReady is handed survives it. This
+// spawns a real plugin and escalates through the field that instance was given.
+func TestSupervisor_NotifyConnLostHandedToOnReady_TearsDownAndRestarts(t *testing.T) {
+	// Given a real plugin instance, with the notifier its promotion handed the
+	// routing layer captured as the routing layer would hold it.
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	// The plugin sends heartbeats far faster than the host's liveness wait, so it
+	// stays provably healthy on the control plane for the whole test. That is what
+	// makes the escalation the only thing that can end it: a plugin the liveness
+	// classifier could end on its own would restart here whether or not the
+	// notifier the routing layer was handed does anything.
+	const pluginCadence = 20 * time.Millisecond
+	notifyCh := make(chan func(), 4)
+	cfg := supervisor.Config{
+		Spec: lifecycle.Spec{
+			Path: fixtureReadyPlugin,
+			Env:  []string{"STYX_HEARTBEAT_INTERVAL_FOR_TEST=" + pluginCadence.String()},
+		},
+		Restart: supervisor.RestartPolicy{Max: 2, Backoff: func(int) time.Duration { return 5 * time.Millisecond }},
+		// Short, so the heartbeat loop rechecks the escalated fault promptly; the
+		// loop only looks between bounded control receives.
+		HeartbeatInterval: 100 * time.Millisecond,
+		OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
+			notifyCh <- inst.NotifyConnLost
+
+			return supervisor.ReadyHooks{}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	requireEventOfKind(t, ch, supervisor.EventReady)
+	var notify func()
+	select {
+	case notify = <-notifyCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the promoted instance handed the routing layer no NotifyConnLost")
+	}
+	require.NotNil(t, notify, "a promoted instance must always carry a way to escalate a data-plane fault")
+
+	// The instance is left alone for several liveness windows first, so the restart
+	// below is attributable to the escalation and not to a plugin that was dying
+	// anyway.
+	select {
+	case ev := <-ch:
+		require.FailNow(t, "a healthy instance ended before anything escalated a fault",
+			"kind=%d err=%v", ev.Kind, ev.Err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// When the routing layer escalates a data-plane fault through it.
+	notify()
+
+	// Then the instance ends and the policy restarts it.
+	requireEventOfKind(t, ch, supervisor.EventRestarting)
+	requireEventOfKind(t, ch, supervisor.EventReady)
+
+	require.NoError(t, sup.Stop(t.Context()))
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Stop")
+	}
+}
+
 // Test a reload promoting the successor, keeping the supervisor supervising the
 // new instance, reaping the old, and leaving the ownership CAS intact.
 func TestSupervisor_Reload_PromotesSuccessorAndKeepsSupervising(t *testing.T) {

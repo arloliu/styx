@@ -785,9 +785,11 @@ func (t *Transport) ReadableNow() bool {
 // next deliverable frame (shm-abi.md §9/§11). It discards stale-generation
 // descriptors without reading their slab (§15) and distinguishes a poisoned
 // region (ErrPoisoned) from graceful shutdown (transport.ErrClosed, §16). A
-// conformance fault poisons the region and is returned as its own typed error,
-// not ErrPoisoned; the specific fault is more informative to this caller. A
-// later Send/Recv observes ErrPoisoned instead.
+// conformance fault poisons the region and is returned as its own typed error
+// rather than ErrPoisoned, the specific fault being more informative to this
+// caller; it is marked as a poison all the same, so a reader loop classifying by
+// transport.ErrPoisoned sees one either way. A later Send/Recv observes
+// ErrPoisoned instead.
 //
 // It holds the closing gate's read side for its whole call: the waiter and
 // drain read region-mapped memory (ring, arena, park-state, poison/shutdown
@@ -1249,18 +1251,24 @@ func (t *Transport) teardownError() error {
 // poisonOnConformanceFault actuates the §16 poison(cause) helper for a
 // detected conformance fault before returning it to the Recv caller, so a
 // poisoned region also stops the peer, not just this side (shm-abi.md §16).
-// err is returned unchanged in every case: the specific fault
-// (errRingCorrupt, errBadFrame, errChecksum) is more informative to this
-// caller than ErrPoisoned, which a later Send/Recv call observes instead.
-// transport.ErrClosed and errGenerationMismatch are not in the fault->cause
-// table, so they pass through without poisoning (a generation mismatch is the
-// canonical discard-not-poison case, §15/§16).
+// The specific fault (errRingCorrupt, errBadFrame, errChecksum) is kept, being
+// more informative to this caller than the poison alone, and marked as a poison
+// on top of it: the caller's reader loop classifies a poisoned data plane by that
+// mark and nothing else, so a fault returned bare reads to it as an ordinary
+// close and escalates nothing (see markPoisoned).
+//
+// transport.ErrClosed, errGenerationMismatch, and a consume fault this side owns
+// are not in the fault->cause table, so they pass through un-poisoned AND
+// unmarked — a generation mismatch is the canonical discard-not-poison case
+// (§15/§16), and a consume fault is frame-local on a region that keeps serving.
 func (t *Transport) poisonOnConformanceFault(err error) error {
-	if cause, ok := faultToPoisonCause(err); ok {
-		t.poison.Set(cause)
+	cause, ok := faultToPoisonCause(err)
+	if !ok {
+		return err
 	}
+	t.poison.Set(cause)
 
-	return err
+	return markPoisoned(err)
 }
 
 // classify validates a peeked, live-generation descriptor against the shm-abi.md

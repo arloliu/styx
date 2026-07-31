@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/arloliu/styx/internal/event"
+	"github.com/arloliu/styx/internal/transport"
 )
 
 // testPoisonFlag bundles a PoisonFlag under test with direct access to its
@@ -207,4 +208,35 @@ func TestFaultToPoison_MapsEachConformanceFaultToItsCause(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Test ErrPoisoned classifying as the cross-transport poison sentinel while
+// rendering its own text unchanged. The classification is what a host read loop
+// and a plugin serve loop act on — neither knows this package's sentinel, so a
+// poison that does not carry transport.ErrPoisoned escalates nothing and leaves
+// the plugin heartbeating on a dead region. The rendering is what keeps
+// TeardownError's message ending in the poison cause, where a reader looks for it.
+func TestErrPoisoned_ClassifiesAsTheTransportPoison_AndRendersItsOwnTextOnly(t *testing.T) {
+	// Given a poisoned region.
+	p := newTestPoisonFlag(t)
+	p.flag.Set(PoisonGeneric)
+
+	// When its teardown error is taken.
+	teardown := p.flag.TeardownError()
+
+	// Then it is the poison every reader loop recognizes, without becoming
+	// indistinguishable from a uds mid-frame desync in the other direction.
+	require.ErrorIs(t, ErrPoisoned, transport.ErrPoisoned)
+	require.ErrorIs(t, teardown, ErrPoisoned)
+	require.ErrorIs(t, teardown, transport.ErrPoisoned)
+	require.NotErrorIs(t, transport.ErrPoisoned, ErrPoisoned,
+		"a uds mid-frame desync must never match this region-specific sentinel")
+
+	// And a graceful shutdown is still the other thing entirely.
+	require.NotErrorIs(t, transport.ErrClosed, transport.ErrPoisoned)
+
+	// And the rendering names the region and then the cause, with nothing of the
+	// wrapped sentinel between them.
+	require.Equal(t, "shm: region poisoned", ErrPoisoned.Error())
+	require.Equal(t, "shm: region poisoned: generic", teardown.Error())
 }

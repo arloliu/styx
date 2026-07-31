@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/observeq"
+	"github.com/arloliu/styx/internal/panics"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/transport"
 	"github.com/arloliu/styx/observe"
@@ -421,7 +423,7 @@ func runReadLoop(state *connState) {
 		} else {
 			var f transport.Frame
 			if f, err = state.tr.Recv(context.Background()); err == nil {
-				fault = state.handleInboundFrame(f, false)
+				fault, err = state.handleInboundFrameProtected(f)
 			}
 		}
 
@@ -454,6 +456,61 @@ func runReadLoop(state *connState) {
 			return
 		}
 	}
+}
+
+// handleInboundFrameProtected is handleInboundFrame behind a fault barrier, for
+// the receive path that has none of its own.
+//
+// A frame handled inside a consume callback already runs behind one: the
+// transport installs it around the whole copy-or-decode step and turns a panic
+// there into a *transport.ConsumeFaultError naming the call, because the
+// callback's caller owes a ring-head advance it could not pay while unwinding
+// (shm-abi.md §9). A frame received the ordinary way runs on this goroutine with
+// nothing between it and the process. The code that panics is the same code
+// either way — a codec decoding bytes the peer chose, or a response factory a
+// caller supplied — so without this the reachable outcome of one defective
+// decoder is a dead host process on one path and one failed call on the other.
+//
+// The contained panic is reported as the fault it is: this side destroyed a frame
+// it had already taken, blaming nobody's bytes for it, which is exactly what
+// *transport.ConsumeFaultError says. The loop's frame-local handling then fails
+// the call the frame named and keeps serving, the same disposition that error
+// gets when a transport raises it.
+//
+// Nothing is escalated beyond that one call, and on this path nothing currently
+// would be however long the fault persists. A shared-memory region does answer a
+// sustained run of consume faults by poisoning itself at a documented threshold
+// (EscalationPolicy.ObserveConsumeFault), but that counter sees only faults the
+// transport raised inside its own barrier — a panic contained here happens after
+// Recv has already returned and is invisible to it. So a decoder that panics on
+// every response fails call after call here indefinitely: each one terminally, as
+// ErrOutcomeUnknown, never retryable, and never reaching the supervisor. Every
+// call is answered rather than stranded, which is why this is a gap and not a
+// hang, but the same defect over a region eventually restarts the plugin and here
+// it never does. A run rule for this path belongs beside the region's, as one
+// rule, not as a second differently-tuned copy of it.
+//
+// The panic value is rendered to bounded text and dropped, never carried out.
+// Rendering is what keeps the panicking code's own value out of an error a caller
+// keeps indefinitely, and the bound is what keeps a decoder that panics with the
+// payload it was handed from turning a large frame into a multi-megabyte string
+// inside it. Unlike the transport's barrier this one guards no borrow: every
+// transport that reaches this path has already handed over a private copy of the
+// payload.
+func (state *connState) handleInboundFrameProtected(f transport.Frame) (fault inboundFault, err error) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		fault = inboundNoFault
+		err = &transport.ConsumeFaultError{
+			CallID: f.CallID, Kind: f.Kind, Panicked: true,
+			Detail: decodeFaultText(panics.Text(r)), Stack: debug.Stack(),
+		}
+	}()
+
+	return state.handleInboundFrame(f, false), nil
 }
 
 // handleInboundFrame routes one inbound frame to the half of this generation that

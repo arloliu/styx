@@ -7,10 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	internalshm "github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/transport"
 	shmtransport "github.com/arloliu/styx/internal/transport/shm"
+	"github.com/arloliu/styx/internal/transport/shm/chaos"
 	"github.com/arloliu/styx/internal/transport/shm/shmtest"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -480,4 +482,84 @@ func BenchmarkStreamDrainProbe_StreamingActive(b *testing.B) {
 		p.drainOwed = true
 		p.probeDrain()
 	}
+}
+
+// Test that opening a stream on a poisoned shared-memory region reports the
+// poison and escalates it, rather than reporting a retryable send failure.
+//
+// Every part of that is load-bearing. The region refuses the STREAM_OPEN at its
+// pre-publish gate, so nothing was published and no teardown pair is owed to the
+// peer; but the reason it refused is that the data plane is gone, which ends every
+// stream on the region rather than just this one send (stream-protocol.md §9, and
+// §4.5's table of post-acceptance outcomes, which puts a pre-publish-gate poison
+// in the every-stream-terminates row). Reporting it as an ordinary pre-acceptance
+// rejection would hand the caller a retryable error for a connection that cannot
+// carry a retry, and would escalate nothing — leaving the supervisor unaware of a
+// region only it can replace. The open's own escalation is the only one available:
+// a poison already closed the data plane, so no later reader Recv re-reports it.
+func TestOpenStream_ReportsPoisonAndEscalates_OnPoisonedRegion(t *testing.T) {
+	// Given: a real region, poisoned the way production poisons one — this side's
+	// consumer rejecting a non-conformant descriptor and actuating the poison — not
+	// by a test writing the word.
+	pair, err := shmtest.NewInProcessPair(firstGeneration, shmtest.DefaultConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pair.Close() })
+
+	// A conformant frame first: the corruption below copies the descriptor published
+	// most recently, so there has to be one.
+	require.NoError(t, pair.Plugin.Send(t.Context(), transport.Frame{
+		CallID: 1, Kind: transport.FrameUnaryResp, Payload: []byte("first"),
+	}))
+	_, err = pair.Host.Recv(t.Context())
+	require.NoError(t, err)
+
+	require.NoError(t, chaos.PublishCorruptDescriptor(pair.Region()))
+	_, err = pair.Host.Recv(t.Context())
+	require.ErrorIs(t, err, transport.ErrPoisoned, "the consumer must report the region poison it actuated")
+	require.Equal(t, shmtransport.PoisonBadFrame, chaos.ReadPoisonCause(pair.Region()))
+
+	// And: a connection over that region holding an in-flight unary call, wired to
+	// observe the escalation. No read loop runs, so the open's own escalation is the
+	// only thing that could produce either effect asserted below.
+	table := rpcruntime.NewTable(firstGeneration)
+	callID, wait := table.Submit(context.Background(), time.Minute)
+	require.True(t, table.Publish(callID))
+
+	var notified atomic.Bool
+	cc := &ClientConn{name: "p"}
+	state := &connState{
+		table:          table,
+		tr:             pair.Host,
+		codec:          codec.Proto{},
+		streams:        newStreamPlane(pair.Host),
+		notifyConnLost: func() { notified.Store(true) },
+		readLoopDone:   make(chan struct{}),
+	}
+	close(state.readLoopDone) // no read loop: this test drives the open path alone
+	cc.state.Store(state)
+	cc.admission.Open()
+	t.Cleanup(func() { state.streams.stopFatalWatch() })
+
+	// When: a stream is opened on it.
+	st, openErr := cc.OpenStream(t.Context(), "echo.Echo", "Collect")
+
+	// Then: the caller is told the region is poisoned, and told not to retry.
+	require.Nil(t, st, "a poisoned region yields no usable stream")
+	require.ErrorIs(t, openErr, ErrPoisoned)
+	require.False(t, IsRetryable(openErr),
+		"a poisoned region cannot carry a retry; the instance has to be replaced")
+
+	// And: the supervisor hears about it, since only a restart replaces the region.
+	require.True(t, notified.Load(),
+		"a poison observed on the open path must escalate; no reader Recv will re-report it")
+
+	// And: the in-flight unary call is failed rather than left waiting out its
+	// deadline on a connection that is going away.
+	result, waitErr := wait(context.Background())
+	require.NoError(t, waitErr, "the in-flight call was left waiting on a poisoned region")
+	require.ErrorIs(t, result.Err, ErrOutcomeUnknown)
+
+	// And: the stream's admission slot is released, not held until its deadline.
+	require.Equal(t, 0, state.streams.streams.Len(),
+		"an open refused by the region frees its admission slot immediately")
 }

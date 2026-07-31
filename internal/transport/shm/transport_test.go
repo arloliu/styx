@@ -816,9 +816,12 @@ func TestTransport_Recv_RejectsConformanceFaults(t *testing.T) {
 
 // Test that Recv actuates the region poison on a detected conformance fault
 // (shm-abi.md §16: detection and actuation are no longer separate concerns,
-// this package owns both): the returned error is still the specific fault
-// (more informative to this caller than ErrPoisoned), but the region is left
-// poisoned with the mapped cause so both sides stop, not just this call.
+// this package owns both), and reports it as one: the returned error is still
+// the specific fault, which is more informative to this caller, and it also
+// carries transport.ErrPoisoned, which is the only thing a reader loop
+// classifies a dead data plane by — a fault returned without it reads there as
+// an ordinary close and escalates nothing. The region is left poisoned with the
+// mapped cause so both sides stop, not just this call.
 func TestTransport_Recv_ActuatesPoison_OnConformanceFault(t *testing.T) {
 	t.Run("ring corruption poisons with POISON_RING_CORRUPT", func(t *testing.T) {
 		ep := newEndpoints(t, roundTripLayout(), validConfig(false))
@@ -828,6 +831,7 @@ func TestTransport_Recv_ActuatesPoison_OnConformanceFault(t *testing.T) {
 
 		_, err := ep.plugin.Recv(t.Context())
 		require.ErrorIs(t, err, errRingCorrupt)
+		require.ErrorIs(t, err, transport.ErrPoisoned)
 
 		cause, poisoned := ep.plugin.poison.Check()
 		require.True(t, poisoned)
@@ -841,6 +845,7 @@ func TestTransport_Recv_ActuatesPoison_OnConformanceFault(t *testing.T) {
 
 		_, err := ep.plugin.Recv(t.Context())
 		require.ErrorIs(t, err, errBadFrame)
+		require.ErrorIs(t, err, transport.ErrPoisoned)
 
 		cause, poisoned := ep.plugin.poison.Check()
 		require.True(t, poisoned)
@@ -859,6 +864,7 @@ func TestTransport_Recv_ActuatesPoison_OnConformanceFault(t *testing.T) {
 
 		_, err := ep.plugin.Recv(t.Context())
 		require.ErrorIs(t, err, errChecksum)
+		require.ErrorIs(t, err, transport.ErrPoisoned)
 
 		cause, poisoned := ep.plugin.poison.Check()
 		require.True(t, poisoned)

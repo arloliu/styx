@@ -98,6 +98,11 @@ var errMisdelivery = errors.New("chaos: crash-window response misdelivery")
 // sync-word offsets (which are unexported there).
 const syncTailPH = 128
 
+// syncPoison is the poison word's byte offset within the sync page (shm-abi.md
+// §3, region offset 4480), the same word both sides of a region CAS a cause into.
+// ReadPoisonCause reads it, from the same mirrored-offset position as syncTailPH.
+const syncPoison = 384
+
 // corruptFlagBit is a reserved descriptor flag bit outside allowed_flags: the
 // consumer's classify rejects any bit it did not negotiate as a bad-frame
 // conformance fault (shm-abi.md §5), which is exactly the structural corruption
@@ -1141,6 +1146,26 @@ func PublishCorruptDescriptor(region *shm.Region) error {
 	atomic.StoreUint64(tailPtr, tail+1)
 
 	return nil
+}
+
+// ReadPoisonCause reports the cause recorded in a mapped region's poison word,
+// or PoisonNone while the region is healthy (shm-abi.md §3/§16). The load is
+// seq_cst, matching the CAS both sides perform on that word.
+//
+// It reads the region rather than a transport, which is what makes it usable
+// after the poison has done its work: the escalation a poison triggers tears the
+// connection down, so by the time a test can observe the restart there may be no
+// attached transport left to ask. A mapping of the region outlives that — the
+// caller holds its own, taken by duplicating the descriptor — and the word in it
+// is the authority on the cause either way.
+func ReadPoisonCause(region *shm.Region) shmtransport.PoisonCause {
+	mapped := region.Bytes()
+	layout := region.Layout()
+
+	//nolint:gosec // resolving the shared poison sync word; §3 guarantees 64-byte alignment
+	word := (*uint32)(unsafe.Pointer(&mapped[layout.SyncPageOffset+syncPoison]))
+
+	return shmtransport.PoisonCause(atomic.LoadUint32(word))
 }
 
 // pluginToHostRing resolves a mapped region's plugin->host descriptor slots and

@@ -73,9 +73,10 @@ type FakeInstance struct {
 	Teardown func(ctx context.Context, shutdownDeadline time.Duration) (*os.ProcessState, error)
 
 	// CaptureNotify, if set, is called during promote with the instance's real
-	// NotifyConnLost closure — the same one the production promote hands the routing
-	// layer. A test uses it to drive a data-plane fault escalation and observe the
-	// heartbeat loop tear the instance down, exactly as the routing layer would.
+	// NotifyConnLost — the very func the production promote hands the routing
+	// layer, not a stand-in built to behave like it. A test uses it to drive a
+	// data-plane fault escalation and observe the heartbeat loop tear the instance
+	// down, exactly as the routing layer would.
 	CaptureNotify func(notifyConnLost func())
 }
 
@@ -104,10 +105,10 @@ func (s *Supervisor) SetSpawnForTest(f FakeSpawn) {
 		}
 		li.promote = func() ReadyHooks {
 			if fake.CaptureNotify != nil {
-				// Mirror the production promote: hand out a NotifyConnLost that closes
-				// this instance's connLost channel, so the heartbeat loop observes a
-				// routing-layer-escalated data-plane fault and ends the instance.
-				fake.CaptureNotify(func() { li.connLostOnce.Do(func() { close(li.connLost) }) })
+				// The production notifier itself, not a stand-in for it: this is the
+				// same func the production promote puts in Instance.NotifyConnLost, so
+				// a test driving it drives what the routing layer really calls.
+				fake.CaptureNotify(li.notifyConnLost)
 			}
 
 			return fake.Promote()

@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -296,6 +297,117 @@ func TestRunReadLoop_FailsOnlyTheNamedCall_WhenAConsumeFaultArrives(t *testing.T
 	require.ErrorIs(t, otherErr, context.DeadlineExceeded,
 		"a call the discarded frame did not name must still be waiting")
 	require.True(t, table.Cancel(otherID), "the untouched call is still live in the table")
+}
+
+// oneFrameTransport delivers a single inbound frame and then blocks until closed.
+// It offers no view capability, so a read loop over it receives that frame the
+// ordinary way — the path every frame takes when the transport cannot lend its
+// memory, or when the negotiated codec cannot decode out of borrowed bytes.
+type oneFrameTransport struct {
+	frame     transport.Frame
+	delivered atomic.Bool
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newOneFrameTransport(f transport.Frame) *oneFrameTransport {
+	return &oneFrameTransport{frame: f, closed: make(chan struct{})}
+}
+
+func (o *oneFrameTransport) Send(context.Context, transport.Frame) error { return nil }
+
+func (o *oneFrameTransport) Recv(ctx context.Context) (transport.Frame, error) {
+	if o.delivered.CompareAndSwap(false, true) {
+		return o.frame, nil
+	}
+	select {
+	case <-o.closed:
+		return transport.Frame{}, transport.ErrClosed
+	case <-ctx.Done():
+		return transport.Frame{}, ctx.Err()
+	}
+}
+
+func (o *oneFrameTransport) Close() error {
+	o.closeOnce.Do(func() { close(o.closed) })
+
+	return nil
+}
+
+// decodePanicResponse is a response message whose decode step panics, and nothing
+// else. It stands in for a decoder defect — a hand-written or generated
+// UnmarshalVT indexing past its input — which is the class of codec panic a
+// receive path has to contain rather than propagate, because the bytes it decodes
+// are the peer's choice and the goroutine it runs on belongs to the host.
+type decodePanicResponse struct {
+	inner *wrapperspb.StringValue
+}
+
+func (r *decodePanicResponse) Reset() { r.inner.Reset() }
+
+func (r *decodePanicResponse) String() string { return r.inner.String() }
+
+func (r *decodePanicResponse) ProtoReflect() protoreflect.Message { return r.inner.ProtoReflect() }
+
+// UnmarshalVT panics instead of decoding. It is the fast path codec.Proto selects
+// for a message type offering it, so the codec never reaches the reflective
+// decode.
+func (r *decodePanicResponse) UnmarshalVT([]byte) error {
+	panic("styx test: deliberate response-decode panic")
+}
+
+// Test a response decode that panics on the ordinary (non-view) receive path being
+// contained as a fault of this side's own: the call the frame named is failed with
+// an unknown outcome carrying the panic, and the connection keeps serving. An
+// escaping panic would take the whole host process down over one bad decoder,
+// where the same decoder behind a borrowed view is contained by the transport's
+// consume barrier (shm-abi.md §9).
+func TestRunReadLoop_FailsTheNamedCallAndKeepsServing_WhenANonViewResponseDecodePanics(t *testing.T) {
+	// Given a published call whose response factory builds a message that panics
+	// when decoded, submitted with a ZERO budget so it arms no deadline timer and
+	// nothing but the read loop can ever end its wait.
+	table := rpcruntime.NewTable(firstGeneration)
+	callID, wait := table.SubmitDecoding(t.Context(), 0, func() proto.Message {
+		return &decodePanicResponse{inner: &wrapperspb.StringValue{}}
+	})
+	require.True(t, table.Publish(callID))
+
+	tr := newOneFrameTransport(transport.Frame{
+		Kind: transport.FrameUnaryResp, CallID: callID, Payload: []byte("response bytes"),
+	})
+	state := &connState{
+		table:        table,
+		tr:           tr,
+		codec:        codec.Proto{},
+		readLoopDone: make(chan struct{}),
+	}
+	go func() { defer close(state.readLoopDone); runReadLoop(state) }()
+	t.Cleanup(func() {
+		_ = tr.Close()
+		<-state.readLoopDone
+	})
+
+	// When the read loop receives that call's response and decodes it.
+	waitCtx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	result, waitErr := wait(waitCtx)
+
+	// Then the call terminated as an unknown outcome — the peer answered and this
+	// side destroyed the answer, so the handler ran and its effects stand — and the
+	// panic reaches the caller as text.
+	require.NoError(t, waitErr, "the call was left waiting on a response whose decode panicked")
+	require.ErrorIs(t, result.Err, ErrOutcomeUnknown)
+	require.ErrorIs(t, result.Err, transport.ErrConsumeFault,
+		"a decode panic is this side's own consume fault, not the peer's bytes")
+	require.Contains(t, result.Err.Error(), "deliberate response-decode panic")
+
+	// And the connection is untouched: the fault is this side's and frame-local, so
+	// the reader keeps serving rather than tearing down a healthy connection.
+	select {
+	case <-state.readLoopDone:
+		t.Fatal("the read loop exited on a decode panic it should have contained")
+	case <-time.After(100 * time.Millisecond):
+	}
 }
 
 // Test statusFromHandlerErr clamping an application Status whose Code lands

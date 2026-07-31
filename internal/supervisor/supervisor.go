@@ -679,6 +679,26 @@ type liveInstance struct {
 	teardown func(ctx context.Context, shutdownDeadline time.Duration) (*os.ProcessState, error)
 }
 
+// notifyConnLost is what the routing layer is handed as Instance.NotifyConnLost:
+// it ends this instance by closing connLost, so the heartbeat loop stops
+// supervising it and Run's teardown/restart path takes over. The control plane
+// cannot observe a data-plane-only death on its own, so without this call a
+// poisoned region leaves a plugin that still answers heartbeats supervised as
+// healthy.
+//
+// It fires once and is a no-op after that, which is a requirement rather than a
+// convenience: a single fault reaches it from more than one place — the read
+// loop's exit escalation and the stream engine's own, both idempotent by design —
+// and a second close of connLost would panic.
+//
+// It is a method on the instance rather than a closure built where the instance
+// is promoted, so that this behavior has one definition. It is handed out from
+// two places, and a copy at either of them is a copy that can drift from the
+// other while both keep compiling.
+func (li *liveInstance) notifyConnLost() {
+	li.connLostOnce.Do(func() { close(li.connLost) })
+}
+
 // runOneInstance spawns, handshakes, and (if attach succeeds) serves one instance
 // until it ends by handshake/attach failure, detected crash (EOF on control conn),
 // missed heartbeats, Classify-wedged verdict, ctx cancellation, or Stop().
@@ -800,8 +820,7 @@ func (s *Supervisor) newLiveInstance(
 			Process: proc, ControlConn: conn, Transport: tr, Generation: generation, Streaming: streaming,
 			// The routing layer calls this to escalate a data-plane fault the
 			// control-watching heartbeat loop cannot see.
-			// Closing connLost ends this instance so Run's teardown/restart path runs.
-			NotifyConnLost: func() { li.connLostOnce.Do(func() { close(li.connLost) }) },
+			NotifyConnLost: li.notifyConnLost,
 		})
 	}
 	li.teardown = func(tctx context.Context, shutdownDeadline time.Duration) (*os.ProcessState, error) {

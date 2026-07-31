@@ -194,10 +194,19 @@ func isCanceled(err error) bool {
 // its context error first and the framework maps that returned error to a status.
 //
 // ErrPoisoned is accepted only on uds: a uds STREAM_OPEN torn mid-write can leave
-// a partial descriptor the host rejects and poisons. On shm the producer publishes
-// the complete descriptor before the tail store and consumers read only after
-// observing that store, so a poisoned shm outcome is a conformance defect that must
-// surface as unexpected, never be accepted. ErrStreamAlreadyClosed is not accepted
+// a partial descriptor the host rejects and poisons. On shm a poisoned outcome is
+// a conformance defect that must surface as unexpected, never be accepted, and
+// this workload can reach none of the causes that would produce one legitimately.
+// A torn descriptor cannot occur: the producer publishes the complete descriptor
+// before the tail store and consumers read only after observing that store. A
+// consume-fault run cannot: this workload decodes ordinary echo responses with the
+// ordinary codec, and no call here uses a decoder that fails. A stale-generation
+// escalation cannot either, and that one is worth stating because the kill and
+// reload loops below churn generations continuously: it needs a writer still
+// stamping an old generation into a region whose generation has moved on, and no
+// spawn on either path reuses a region — a crash restart and a reload successor
+// each attach a freshly created one, so no writer ever outlives its region's
+// generation. ErrStreamAlreadyClosed is not accepted
 // on either transport: a completion the peer produced is handed back as a live,
 // drainable stream rather than an error, so the sentinel names only a completed
 // outcome recorded where the STREAM_OPEN never reached the peer — a
