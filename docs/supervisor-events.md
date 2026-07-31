@@ -47,7 +47,12 @@ invoked under an internal lock and not something you re-subscribe to per
 plugin. Start reading it before or right after `Start`, and keep reading
 until `Stop` returns; a slow or absent reader does not block the
 supervisor (see [Delivery semantics](#delivery-semantics)), but it does
-mean you miss what happened while nobody was reading.
+mean you miss what happened while nobody was reading: an `EventStarting`,
+`EventReady`, or intermediate `EventRestarting` for certain, and even an
+`EventUnhealthy`, `EventCrashed`, or `EventGaveUp` if enough distinct
+failure incidents pile up undrained at once across every plugin the `Host`
+manages — see [Delivery semantics](#delivery-semantics) for exactly how
+much headroom that gives you before it can happen.
 
 ## The six event kinds
 
@@ -117,16 +122,32 @@ window rounds up to whole heartbeats.
 
 `Events()` never blocks the supervisor, no matter how the channel is read:
 
-- **Informational** kinds (`Starting`, `Ready`, `Unhealthy`, `Restarting`)
-  are queued per-subscriber in a small bounded buffer; once it's full, a new
-  one displaces the oldest queued informational event rather than blocking
-  or growing without limit. If your reader falls far enough behind, you can
-  miss an `EventStarting` or an intermediate `EventUnhealthy`.
-- **Critical** kinds (`Crashed`, `GaveUp`) instead coalesce to a single
-  latest-value slot: a burst of crashes can collapse into just the last one
-  reported, but a critical event is never silently dropped the way an
-  informational one can be — there is always at least the most recent one
-  waiting for you.
+- **Informational** kinds (`Starting`, `Ready`, `Restarting`) are queued
+  per-subscriber in a small bounded buffer; once it's full, a new one
+  displaces the oldest queued informational event rather than blocking or
+  growing without limit. If your reader falls far enough behind, you can
+  miss an `EventStarting`, an `EventReady`, or an intermediate
+  `EventRestarting`.
+- **Critical** kinds (`Unhealthy`, `Crashed`, `GaveUp`) instead fill a
+  separate bounded backlog sized to one whole failure incident's worth of
+  critical events — an `EventUnhealthy` verdict, the `EventCrashed` that
+  always follows it, and the terminal `EventGaveUp` if the restart budget is
+  exhausted — **per plugin the `Host` is configured with**. A single
+  plugin's own supervisor never shares that room with any other plugin, so
+  draining the backlog always yields the most recent incident's critical
+  events whole and in the order they were published: an `EventUnhealthy`
+  and the `EventCrashed`/`EventGaveUp` that followed it never arrive out of
+  order or with one of the pair missing. That guarantee holds
+  unconditionally only so long as no more than one undrained incident per
+  configured plugin is sitting in the backlog at once. If MORE incidents
+  than that stack up — one plugin flapping through several failures before
+  you drain, or enough distinct plugins failing together — an older,
+  already-superseded incident's critical events can still be displaced to
+  make room for a newer one, and that older incident can belong to a
+  *different* plugin than the one whose newer incident displaced it. Reading
+  `Events()` promptly keeps you well inside that bound in ordinary
+  operation; a `Host` under sustained multi-plugin failure with no reader is
+  the scenario where it matters.
 
 There is currently no public counter for how many informational events
 were dropped, so you cannot detect a falling-behind reader from the
@@ -134,8 +155,8 @@ were dropped, so you cannot detect a falling-behind reader from the
 from a dedicated goroutine that does nothing slow inline (dispatch to your
 own buffered queue or worker pool if your handling — writing to a
 database, paging a human — can be slow), treat `Starting`/`Ready`/
-`Restarting` as best-effort telemetry, and rely on `Crashed`/`GaveUp` for
-anything you must not miss.
+`Restarting` as best-effort telemetry, and rely on `Unhealthy`/`Crashed`/
+`GaveUp` for anything you must not miss.
 
 ## Events, Logger, and MetricsSink are three different jobs
 
@@ -198,7 +219,7 @@ should trigger something your code does.
 
 ## Further reading
 
-- [`event.go`](../event.go) — the exact `EventKind`/`Event` godoc, the
+- [`types.go`](../types.go) — the exact `EventKind`/`Event` godoc, the
   source of truth if this guide and the code ever disagree.
 - [docs/migration-from-go-plugin.md](migration-from-go-plugin.md#lifecycle-liveness-shutdown-and-kill) —
   how this replaces go-plugin's manual `Ping()`/`Kill()` model.

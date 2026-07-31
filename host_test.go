@@ -376,12 +376,17 @@ func TestHost_Events_DeliversLatestGaveUp_AfterBurst_WithWedgedReader(t *testing
 	// Given: enough plugins that each immediately fail to handshake and
 	// give up (the zero-value RestartPolicy allows no restarts) that their
 	// Starting events alone exceed Host's informational buffer capacity — a
-	// genuine drop-forcing burst, not just the critical coalescing. Only
-	// Starting is informational here; each plugin's Crashed and GaveUp are
-	// lifecycle-CRITICAL (hostEventIsCritical), so they coalesce to the
-	// latest rather than ever dropping — which is exactly the property this
-	// test relies on for the GaveUp assertion below. Host.Events() is not
-	// read at all until after Start returns.
+	// genuine drop-forcing burst for the informational ring. Only Starting is
+	// informational here; each plugin's Crashed and GaveUp are
+	// lifecycle-CRITICAL (hostEventIsCritical) and land in Host's critical
+	// backlog, which NewHost sizes to CriticalBufferCapacity per configured
+	// plugin (60 here) — comfortably above the 40 critical events (Crashed
+	// and GaveUp, one pair per plugin) this burst actually publishes, so none
+	// of them are dropped. This test only proves a GaveUp is observable after
+	// the burst; it does not exercise the critical backlog's own bound — see
+	// TestHost_Events_CriticalBacklogSizedPerPlugin_KeepsOnePluginsIncidentFromEvictingAnothers
+	// in host_relay_test.go for that. Host.Events() is not read at all until
+	// after Start returns.
 	const pluginCount = 20 // 1 informational event each (Starting) > InformationalBufferCapacity (16)
 	specs := make([]styx.PluginSpec, pluginCount)
 	names := make(map[string]bool, pluginCount)

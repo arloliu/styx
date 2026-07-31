@@ -12,6 +12,24 @@ import (
 // blocking or growing the backlog unbounded.
 const InformationalBufferCapacity = 16
 
+// CriticalBufferCapacity bounds one supervisor's own EventBus critical-event
+// backlog, per subscriber. It is sized to the most critical events a single
+// failure incident can ever publish: an optional EventUnhealthy verdict,
+// the EventCrashed that always follows it, and an optional terminal
+// EventGaveUp (see supervisor.go's Run/publish call sites). At that size,
+// draining a full backlog always yields the most recent incident's
+// critical events whole and in order, even if an older, undelivered
+// incident's events had to be dropped to make room — a later incident's
+// own publishes can only evict an earlier incident's leftovers, never one
+// another. Widening the set of critical kinds, or letting one incident
+// publish more than three of them, would need this raised to match.
+//
+// A Bus fanning in MORE THAN ONE publisher — as styx.Host's does, one
+// EventBus per plugin all landing in a single subscriber-side backlog — must
+// size its own critical capacity larger than this; see NewBus's doc. This
+// constant is the per-publisher unit that a multi-publisher Bus multiplies.
+const CriticalBufferCapacity = 3
+
 // EventKind enumerates the supervisor lifecycle event stream.
 // Order and values intentionally mirror the public styx.EventKind
 // so the translate-at-boundary conversion is a trivial mapping.
@@ -29,11 +47,21 @@ const (
 )
 
 // isCritical reports whether kind is lifecycle-critical.
-// Critical events (Crashed/GaveUp) coalesce-to-latest and are never silently dropped.
-// Informational events (Starting/Ready/Unhealthy/Restarting) use bounded buffers
-// with drop-oldest semantics.
+// Critical events (Unhealthy/Crashed/GaveUp) use a small bounded FIFO that
+// retains the latest failure incident's events whole, in order, rather than
+// ever silently dropping one of them. Informational events (Starting/Ready/
+// Restarting) use a larger bounded buffer with plain drop-oldest semantics.
 func (k EventKind) isCritical() bool {
-	return k == EventCrashed || k == EventGaveUp
+	return k == EventUnhealthy || k == EventCrashed || k == EventGaveUp
+}
+
+// IsCriticalEventKind reports whether kind is lifecycle-critical, exactly as
+// EventKind.isCritical does. Exported so styx.hostEventIsCritical — the
+// mirrored classification one layer up, over the public styx.EventKind —
+// can be tested against this one directly instead of by hand-comparison,
+// so the two classifications cannot silently drift apart.
+func IsCriticalEventKind(k EventKind) bool {
+	return k.isCritical()
 }
 
 // Event is one supervisor lifecycle notification for a plugin instance.
@@ -48,17 +76,29 @@ type Event struct {
 // Bus is the generic engine behind EventBus: a non-blocking, bounded,
 // per-subscriber fan-out with two delivery classes.
 // Informational entries use a bounded ring buffer with drop-oldest-and-count semantics.
-// Critical entries occupy a single "latest critical" slot per subscriber
-// that a newer critical entry overwrites rather than ever being silently dropped.
+// Critical entries use a second, separately-sized bounded ring that also drops
+// oldest on overflow, but is sized so a single publisher's one failure
+// incident's worth of critical events always survives together rather than
+// any one of them ever being silently dropped in isolation.
 //
 // It is exported generically — not just for Event — because styx.Host
 // needs identical semantics for its own fan-in of every plugin's events
 // onto Host.Events(): lifecycle-critical events must never vanish silently.
-// This is a legitimate minimal reuse rather than duplication.
+// This is a legitimate minimal reuse rather than duplication, but the fan-in
+// shape means Host's Bus is NOT a single-publisher Bus: many plugins, each
+// running their own EventBus, all land their critical events in the same
+// Host-side subscriber backlog. NewBus's criticalCapacity parameter exists
+// for exactly this: a single-publisher Bus (internal/supervisor.EventBus)
+// passes CriticalBufferCapacity; a fan-in Bus over N publishers must pass
+// at least N*CriticalBufferCapacity, or one publisher's undrained incident
+// can evict a DIFFERENT publisher's still-undelivered one — a guarantee
+// this type does not enforce on the caller's behalf, because it has no way
+// to know how many distinct publishers will ever call Publish.
 type Bus[T any] struct {
-	mu         sync.Mutex
-	subs       map[*busSubscriber[T]]struct{}
-	isCritical func(T) bool
+	mu               sync.Mutex
+	subs             map[*busSubscriber[T]]struct{}
+	isCritical       func(T) bool
+	criticalCapacity int
 }
 
 // busSubscriber holds one Subscribe call's delivery state.
@@ -68,11 +108,13 @@ type Bus[T any] struct {
 //
 // The forwarder actively pulls from the queue as soon as anything is enqueued,
 // so at most one event is checked out for delivery (blocked mid-send on ch) at a time.
-// A pathological interleaving can therefore let one extra informational event
-// survive beyond InformationalBufferCapacity — the event the forwarder had
+// A pathological interleaving can therefore let one extra event of either
+// class survive beyond its ring's capacity — the event the forwarder had
 // already dequeued before a later Publish call would have dropped it.
-// This does not violate the contract; it means at most
-// InformationalBufferCapacity+1 events survive a sustained backlog.
+// This does not violate either ring's contract; it means at most one more
+// than the ring's capacity — InformationalBufferCapacity for the
+// informational ring, or the Bus's criticalCapacity for the critical one —
+// survives a sustained backlog.
 type busSubscriber[T any] struct {
 	mu sync.Mutex
 
@@ -80,8 +122,13 @@ type busSubscriber[T any] struct {
 	ringHead int
 	ringLen  int
 
-	hasCritical bool
-	critical    T
+	// critRing is sized to the owning Bus's criticalCapacity at Subscribe
+	// time (len(critRing) is that capacity) rather than a fixed array,
+	// because a fan-in Bus over several publishers needs a larger critical
+	// backlog than a single-publisher one — see Bus's doc.
+	critRing []T
+	critHead int
+	critLen  int
 
 	droppedInformational uint64
 
@@ -97,9 +144,23 @@ type busSubscriber[T any] struct {
 }
 
 // NewBus creates an empty Bus.
-// isCritical classifies each published value; nil treats every value as informational.
-func NewBus[T any](isCritical func(T) bool) *Bus[T] {
-	return &Bus[T]{subs: make(map[*busSubscriber[T]]struct{}), isCritical: isCritical}
+// isCritical classifies each published value; nil treats every value as
+// informational. criticalCapacity sizes every subscriber's critical ring —
+// pass CriticalBufferCapacity for a Bus with exactly one publisher, or
+// (number of publishers)*CriticalBufferCapacity for a Bus that fans in more
+// than one, so no publisher's undrained incident can evict another
+// publisher's still-undelivered one (see Bus's doc). NewBus panics if
+// criticalCapacity is not positive: a Bus that publishes any critical value
+// through a zero-capacity ring would drop it on arrival, silently
+// reintroducing the exact failure this type exists to prevent.
+func NewBus[T any](isCritical func(T) bool, criticalCapacity int) *Bus[T] {
+	if criticalCapacity < 1 {
+		panic("supervisor: NewBus: criticalCapacity must be at least 1")
+	}
+
+	return &Bus[T]{
+		subs: make(map[*busSubscriber[T]]struct{}), isCritical: isCritical, criticalCapacity: criticalCapacity,
+	}
 }
 
 // Subscribe registers a new receiver channel and returns it, an unsubscribe func,
@@ -109,9 +170,10 @@ func NewBus[T any](isCritical func(T) bool) *Bus[T] {
 // a caller about to unsubscribe can use it to drain first so no queued event is discarded.
 func (b *Bus[T]) Subscribe() (<-chan T, func(), func() bool) {
 	s := &busSubscriber[T]{
-		ch:   make(chan T),
-		wake: make(chan struct{}, 1),
-		done: make(chan struct{}),
+		critRing: make([]T, b.criticalCapacity),
+		ch:       make(chan T),
+		wake:     make(chan struct{}, 1),
+		done:     make(chan struct{}),
 	}
 
 	b.mu.Lock()
@@ -134,14 +196,15 @@ func (b *Bus[T]) Subscribe() (<-chan T, func(), func() bool) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
-		return !s.hasCritical && s.ringLen == 0 && !s.sending
+		return s.critLen == 0 && s.ringLen == 0 && !s.sending
 	}
 
 	return s.ch, unsub, quiesced
 }
 
-// Publish delivers ev to every current subscriber per the drop-oldest
-// and coalesce-to-latest rules.
+// Publish delivers ev to every current subscriber per its class's drop-oldest
+// rule — the informational ring or the critical ring, sized differently but
+// governed the same way (see Bus's doc).
 // Publish never blocks regardless of subscriber read behavior: it only mutates
 // a subscriber's mutex-protected queue and performs a non-blocking wake signal.
 func (b *Bus[T]) Publish(ev T) {
@@ -181,8 +244,18 @@ func (b *Bus[T]) DroppedInformationalCounts() []uint64 {
 func (s *busSubscriber[T]) enqueue(ev T, critical bool) {
 	s.mu.Lock()
 	if critical {
-		s.hasCritical = true
-		s.critical = ev // a newer critical event overwrites, never queues twice.
+		if s.critLen == len(s.critRing) {
+			// Drop the oldest queued critical event to make room. Because
+			// CriticalBufferCapacity covers one whole incident's worth of
+			// critical events, this only ever discards a stale, already-
+			// superseded incident's leftovers, never an event from the
+			// incident currently being reported.
+			s.critHead = (s.critHead + 1) % len(s.critRing)
+			s.critLen--
+		}
+		idx := (s.critHead + s.critLen) % len(s.critRing)
+		s.critRing[idx] = ev
+		s.critLen++
 	} else {
 		if s.ringLen == len(s.ring) {
 			// Drop the oldest queued informational event, counted.
@@ -203,15 +276,16 @@ func (s *busSubscriber[T]) enqueue(ev T, critical bool) {
 }
 
 // next pops the highest-priority pending event.
-// Critical events have priority over informational events; informational events
-// are FIFO. Reports ok=false if nothing is queued.
+// Critical events have priority over informational events and are themselves
+// FIFO; informational events are FIFO too. Reports ok=false if nothing is queued.
 func (s *busSubscriber[T]) next() (T, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.hasCritical {
-		ev := s.critical
-		s.hasCritical = false
+	if s.critLen > 0 {
+		ev := s.critRing[s.critHead]
+		s.critHead = (s.critHead + 1) % len(s.critRing)
+		s.critLen--
 		s.sending = true
 
 		return ev, true
@@ -265,26 +339,28 @@ func (s *busSubscriber[T]) forward() {
 
 // EventBus fans one supervisor's events out to every subscriber non-blockingly.
 // It is a thin Event-specific wrapper around the generic Bus.
-// See Bus's doc for the full drop-oldest and coalesce-to-latest semantics.
+// See Bus's doc for the full informational and critical delivery semantics.
 type EventBus struct {
 	bus *Bus[Event]
 }
 
-// NewEventBus creates an empty EventBus for publishing and subscribing to events.
+// NewEventBus creates an empty EventBus for publishing and subscribing to
+// events. It is a single-publisher Bus (one supervisor, its own Run
+// goroutine), so its critical ring is sized to exactly CriticalBufferCapacity.
 func NewEventBus() *EventBus {
-	return &EventBus{bus: NewBus(func(e Event) bool { return e.Kind.isCritical() })}
+	return &EventBus{bus: NewBus(func(e Event) bool { return e.Kind.isCritical() }, CriticalBufferCapacity)}
 }
 
 // Subscribe registers a new receiver channel and returns it, an unsubscribe func,
 // and a quiesced probe.
-// Buffering is handled internally via bounded ring buffer and critical-event slot,
-// not by the channel itself. See Bus.Subscribe for details.
+// Buffering is handled internally via the two bounded rings (informational and
+// critical), not by the channel itself. See Bus.Subscribe for details.
 func (b *EventBus) Subscribe() (<-chan Event, func(), func() bool) {
 	return b.bus.Subscribe()
 }
 
-// Publish delivers ev to every current subscriber per the drop-oldest
-// and coalesce-to-latest rules.
+// Publish delivers ev to every current subscriber per its class's drop-oldest
+// rule (see Bus's doc).
 // Publish never blocks regardless of subscriber read behavior.
 func (b *EventBus) Publish(ev Event) {
 	b.bus.Publish(ev)
