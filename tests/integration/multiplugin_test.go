@@ -11,6 +11,7 @@ import (
 
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/examples/echo/echopb"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -160,6 +161,8 @@ func twoPluginHost(t *testing.T, aEnv ...string) *styx.Host {
 // SIGKILLed with a call parked inside its handler. The sibling's own Starting
 // and Ready events do name it — what no event names it for is a fault.
 func TestMultiPlugin_SiblingServesEveryCallAndOnlyTheKilledIsReportedInTrouble_WhenOneIsKilledMidCall(t *testing.T) {
+	testutil.RequireNoGoroutineOrFDLeak(t) // registered before the host starts: see its doc comment on ordering.
+
 	// Given: one host running two plugins as two processes.
 	enterFifo := mkfifo(t)
 	releaseFifo := mkfifo(t)
@@ -293,6 +296,8 @@ func TestMultiPlugin_SiblingServesEveryCallAndOnlyTheKilledIsReportedInTrouble_W
 // default suite, where a bound tight enough to catch it would fail on load
 // instead.
 func TestMultiPlugin_SiblingKeepsServingWithinBaselineLatency_WhileAnotherPluginsHandlerIsBlocked(t *testing.T) {
+	testutil.RequireNoGoroutineOrFDLeak(t) // registered before the host starts: see its doc comment on ordering.
+
 	// Given: one host running two plugins, and the sibling's own latency floor
 	// measured on this machine, on this run, with the other plugin healthy and
 	// idle — the only baseline worth comparing against.

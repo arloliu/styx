@@ -6,6 +6,7 @@ import (
 
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/examples/echo/echopb"
+	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -65,6 +66,7 @@ func panicHost(t *testing.T, continueAfterPanic bool, extraEnv ...string) (<-cha
 // Test the default policy returning a PluginPanicError for the panicking call,
 // then restarting the instance so a following call succeeds on a fresh process.
 func TestPanicPolicy_ReturnPanicErrorThenRestart_OnHandlerPanic(t *testing.T) {
+	testutil.RequireNoGoroutineOrFDLeak(t) // registered before the host starts: see its doc comment on ordering.
 	events, conn := panicHost(t, false)
 	client := echopb.NewEchoClient(conn)
 
@@ -92,6 +94,7 @@ func TestPanicPolicy_ReturnPanicErrorThenRestart_OnHandlerPanic(t *testing.T) {
 // the panicking call but keeping the SAME instance serving the next call, with no
 // restart.
 func TestPanicPolicy_ContinueSameInstance_WhenContinueAfterPanicOptedIn(t *testing.T) {
+	testutil.RequireNoGoroutineOrFDLeak(t) // registered before the host starts: see its doc comment on ordering.
 	events, conn := panicHost(t, true)
 	client := echopb.NewEchoClient(conn)
 
@@ -115,6 +118,7 @@ func TestPanicPolicy_ContinueSameInstance_WhenContinueAfterPanicOptedIn(t *testi
 // policy is used so the panic's terminal frame reliably reaches the caller instead
 // of racing a teardown, which the frozen protocol permits to drop it.
 func TestPanicPolicy_StreamPanicTerminatesStream_AndContinueKeepsInstance(t *testing.T) {
+	testutil.RequireNoGoroutineOrFDLeak(t) // registered before the host starts: see its doc comment on ordering.
 	events, conn := panicHost(t, true, "STYX_ECHO_STREAM=panic")
 	client := echopb.NewEchoClient(conn)
 	streamClient := echopb.NewEchoStreamClient(conn)

@@ -1267,6 +1267,14 @@ func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
 // baseline: a teardown that had to force-kill still releases everything a cooperative
 // one does.
 func TestSupervisor_KillsReapsAndStopsBoundedNoLeak_WhenPluginStaysFrozen(t *testing.T) {
+	// Goroutine dimension, registered before ANYTHING below spawns one — including
+	// the event bus's own forward() goroutine from Subscribe just below. Baselining
+	// after Subscribe would fold forward() into the baseline itself, so a broken
+	// unsub that left it running would be invisible to this check; baselining here
+	// means unsub (deferred next) must actually have stopped it by the time this
+	// cleanup runs, or the count will show it.
+	testutil.RequireNoGoroutineLeak(t)
+
 	// Given: the graceful Shutdown window every instance is given before the
 	// force-kill. It is the control protocol's reply deadline for Shutdown, not a
 	// supervisor knob, so the bounds below are derived from it rather than restated.
@@ -1419,6 +1427,14 @@ func TestSupervisor_KillsReapsAndStopsBoundedNoLeak_WhenPluginStaysFrozen(t *tes
 // elapsed lower bound shows the host waited out the graceful window before killing it.
 // Whether the reap decodes as SIGKILL is asserted on the path that publishes it.
 func TestSupervisor_StopsBoundedAndReapsNoLeak_WhenFrozenPluginNotYetUnhealthy(t *testing.T) {
+	// Goroutine dimension, registered before ANYTHING below spawns one — including
+	// the event bus's own forward() goroutine from Subscribe just below. Baselining
+	// after Subscribe would fold forward() into the baseline itself, so a broken
+	// unsub that left it running would be invisible to this check; baselining here
+	// means unsub (deferred next) must actually have stopped it by the time this
+	// cleanup runs, or the count will show it.
+	testutil.RequireNoGoroutineLeak(t)
+
 	// Given: the same protocol-derived graceful window as above, plus the host's own
 	// liveness wait — the heartbeat loop is blocked in a receive bounded by that wait
 	// when the stop arrives, and only rechecks for a stop between receives.
