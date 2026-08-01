@@ -1112,22 +1112,35 @@ func (c *ClientConn) invokeCore(
 // because transport.PayloadFillSender's abandonment handshake makes a context
 // error proof that the frame was never published.
 //
-// It returns the raw send error ONLY for the two failure classes a fill send can
-// prove were never published, having already terminated the call locally with the
-// terminal that fits each; the caller returns translateSendFailure of it and never
-// waits for a response, since none can arrive:
+// It returns the raw send error ONLY for the failure classes that prove the
+// request was never published, having already terminated the call locally with
+// the terminal that fits each; the caller returns translateSendFailure of it and
+// never waits for a response, since none can arrive. None of these classes is a
+// blanket promise the CALL is safe to retry — only that the OUTCOME is known:
+// the call never happened, and the connection is clean.
 //
 //   - transport.ErrPayloadFillFailed — this message could not be encoded. The
 //     transport discarded the frame and released its buffer, so the call is
-//     provably not dispatched and terminates REJECTED, the retryable
+//     provably not dispatched and terminates REJECTED, the known-failed
 //     not-dispatched class, rather than being reported as an unknown outcome.
 //   - a context error — the caller's own cancel or deadline won the abandonment
-//     handshake. The call terminates CANCELED or DEADLINE to match what the
-//     caller sees, and no CANCEL frame is owed for a request the peer never saw
-//     (Table's terminals touch no transport).
+//     handshake (fill send only). The call terminates CANCELED or DEADLINE to
+//     match what the caller sees, and no CANCEL frame is owed for a request the
+//     peer never saw (Table's terminals touch no transport).
+//   - transport.NeverPublished(sendErr) — the same pre-acceptance sentinel set
+//     the streaming path rolls back credit for (stream-protocol.md §4.5): an
+//     oversize payload, an unimplemented frame kind, or shm reject-mode
+//     backpressure. Each one is detected and returned before any byte reaches
+//     the wire or the arena, on either send shape, so it is exactly as provably
+//     not-dispatched as a marshal failure and terminates REJECTED. Only the
+//     backpressure member is actually retryable (transient capacity); an
+//     oversize payload or an unimplemented frame kind fails the identical way
+//     on a retry, so translateSendFailure maps only backpressure to the public,
+//     retryable styx.ErrBackpressure.
 //
-// Every other send failure keeps the unknown-outcome classification and surfaces
-// through the response wait, exactly as before.
+// Every other send failure — a partial write, or an error none of the above
+// recognizes — leaves acceptance genuinely unknown and keeps the unknown-outcome
+// classification, surfacing through the response wait exactly as before.
 //
 // The split reads the error classes directly rather than asking
 // transport.AcceptanceClassifier: that classifier sees only the error and must
@@ -1171,11 +1184,27 @@ func sendRequest(
 		}
 	}
 
-	// Backpressure transitions are counted inside the transport, at the
-	// admission decision point where they can be ordered structurally, and
-	// sampled by the periodic reporter (transport.BackpressureEdgeCounter) —
-	// not classified here, where nothing orders a completion with the
-	// admission decision that produced it.
+	// A send transport.NeverPublished proves is a pre-admission failure like a
+	// marshal error, not an ambiguous outcome, regardless of which send shape
+	// produced it: uds proves this with ErrPayloadTooLarge before writing a
+	// byte, and shm's SendPayloadFill proves it the same way before any byte
+	// reaches the wire or the arena. Reject it as known-failed and
+	// not-dispatched, same as the fill-callback case above —
+	// translateSendFailure decides separately which of these causes is
+	// actually safe to retry. ErrBackpressure transitions are still counted
+	// inside the transport, at the admission decision point where they can be
+	// ordered structurally, and sampled by the periodic reporter
+	// (transport.BackpressureEdgeCounter); rejecting the call here does not
+	// duplicate or replace that counting.
+	if transport.NeverPublished(sendErr) {
+		state.table.Reject(callID, fmt.Errorf("styx: invoke: send request: %w", sendErr))
+
+		return sendErr
+	}
+
+	// Every other send failure — a partial write, or an error none of the above
+	// recognizes — leaves acceptance genuinely unknown: nothing here can order a
+	// completion with the admission decision that produced it.
 	cause := fmt.Errorf("styx: invoke: send request: %w: %w", sendErr, ErrOutcomeUnknown)
 	state.table.OutcomeUnknown(callID, cause)
 
@@ -1184,16 +1213,37 @@ func sendRequest(
 
 // translateSendFailure maps a request send that sendRequest proved was never
 // published to the error the caller sees. A context error is the caller's own
-// cancel or deadline; anything else reaching here is a payload-fill failure,
-// reported with the same wording the marshal-then-send path uses for its own
-// marshal failure, because it is the same fault in the same place — encoding this
-// request — differing only in which buffer it was encoding into.
+// cancel or deadline. transport.ErrPayloadFillFailed is reported with the same
+// wording the marshal-then-send path uses for its own marshal failure, because
+// it is the same fault in the same place — encoding this request — differing
+// only in which buffer it was encoding into.
+//
+// transport.ErrBackpressure is mapped to the public, documented-retryable
+// styx.ErrBackpressure, mirroring the streaming path's identical mapping
+// (translateStreamSendErr). It is the one member of transport.NeverPublished's
+// set that is actually retryable: the capacity that was full may free up,
+// unlike an oversize payload or an unimplemented frame kind, which fail the
+// identical way again. Production shm writers admit by blocking rather than
+// rejecting (shm.newRegionWriter's admitBlock), so this branch is not live in
+// production today; the mapping exists for a reject-mode writer and for
+// parity with the streaming path, which already has one.
+//
+// Everything else reaching here — an oversize payload or an unimplemented
+// frame kind — is known-failed and not-dispatched but not retryable in the
+// same sense: the connection is clean and the outcome is known, but an
+// identical retry fails identically. It is reported as a send failure rather
+// than a marshal one, since nothing about encoding this message was at fault.
 func translateSendFailure(err error) error {
-	if isContextErr(err) {
+	switch {
+	case isContextErr(err):
 		return translateCtxErr(err)
+	case errors.Is(err, transport.ErrPayloadFillFailed):
+		return fmt.Errorf("styx: invoke: marshal request: %w", err)
+	case errors.Is(err, transport.ErrBackpressure):
+		return fmt.Errorf("styx: invoke: send request: %w: %w", err, ErrBackpressure)
+	default:
+		return fmt.Errorf("styx: invoke: send request: %w", err)
 	}
-
-	return fmt.Errorf("styx: invoke: marshal request: %w", err)
 }
 
 // isContextErr reports whether err is (or wraps) one of the two context
