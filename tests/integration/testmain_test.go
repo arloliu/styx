@@ -19,17 +19,21 @@ import (
 // styx/host_test.go's and internal/supervisor/supervisor_test.go's own
 // build-once-per-package fixture pattern) rather than per test: examples/echo's
 // plugin, host, and crashy-plugin twin; examples/streaming's host;
-// examples/hot-reload's plugin and host; and examples/slow-handler's plugin and
+// examples/hot-reload's plugin and host; examples/slow-handler's plugin and
+// host; and examples/device-gateway's reference plugin, faulty-plugin twin, and
 // host.
 var (
-	echoPluginBin        string
-	echoHostBin          string
-	crashyPluginBin      string
-	streamingHostBin     string
-	hotReloadPluginBin   string
-	hotReloadHostBin     string
-	slowHandlerPluginBin string
-	slowHandlerHostBin   string
+	echoPluginBin          string
+	echoHostBin            string
+	crashyPluginBin        string
+	streamingHostBin       string
+	hotReloadPluginBin     string
+	hotReloadHostBin       string
+	slowHandlerPluginBin   string
+	slowHandlerHostBin     string
+	deviceGatewayPluginBin string
+	deviceGatewayFaultyBin string
+	deviceGatewayHostBin   string
 )
 
 // TestMain builds the example binaries once via `go build` into a temp
@@ -64,6 +68,15 @@ func TestMain(m *testing.M) {
 
 	slowHandlerHostBin = filepath.Join(dir, "slow-handler-host")
 	buildOrPanic(slowHandlerHostBin, "../../examples/slow-handler/host")
+
+	deviceGatewayPluginBin = filepath.Join(dir, "device-gateway-plugin")
+	buildOrPanic(deviceGatewayPluginBin, "../../examples/device-gateway/plugin")
+
+	deviceGatewayFaultyBin = filepath.Join(dir, "device-gateway-faulty-plugin")
+	buildOrPanic(deviceGatewayFaultyBin, "../../examples/device-gateway/plugin/faulty")
+
+	deviceGatewayHostBin = filepath.Join(dir, "device-gateway-host")
+	buildOrPanic(deviceGatewayHostBin, "../../examples/device-gateway/host")
 
 	m.Run()
 	_ = os.RemoveAll(dir)

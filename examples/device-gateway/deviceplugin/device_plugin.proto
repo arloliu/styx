@@ -1,0 +1,156 @@
+syntax = "proto3";
+package deviceplugin;
+option go_package = "github.com/arloliu/styx/examples/device-gateway/deviceplugin";
+
+// DevicePlugin is the lifecycle contract a device gateway's plugins already
+// implement in production today, over a different plugin framework,
+// redefined here as an ordinary Styx service to prove the migration path.
+// It covers exactly the control-plane methods every plugin's real host
+// invokes as part of bringing a device up, running it, and taking it down:
+// Init, reading its identity back (Metadata), propagating a log-level
+// change (SetLogLevel), Start, Pause, Stop, reconfiguring it in place
+// (HotReload), carrying its runtime state across a restart
+// (SaveRuntimeState, LoadRuntimeState), and reading its metrics
+// (CollectMetrics).
+//
+// It deliberately excludes: point-in-time status/capability/identity
+// queries (State, Attributes, String, Type, Protocol, LogLevel),
+// per-channel data-plane teardown (RemoveChannel), the six
+// request/response/shadow message-channel RPCs (data-plane traffic
+// specific to each device driver's own protocol, not shared lifecycle
+// surface), and pre-Init configuration validation (ValidateDeviceProps).
+// See docs/device-gateway-integration.md for the full scope statement
+// and the source evidence behind each exclusion.
+//
+// Every method is unary. The real contract this mirrors has no streaming
+// RPC anywhere in its control surface; its one streaming RPC delivers
+// data-plane message traffic, which this service does not carry.
+service DevicePlugin {
+  // Init configures a fresh instance from opaque, plugin-defined
+  // configuration bytes plus structured metrics configuration. It must be
+  // called before every other method except Init itself — in particular,
+  // before LoadRuntimeState: a device's runtime state has nowhere to land
+  // until Init has constructed it. Calling Init again on a running instance
+  // reconfigures it; it does not restart anything Start already brought up.
+  rpc Init(InitRequest) returns (Empty);
+
+  // Metadata returns the instance's identity: its device type, its own
+  // driver version, the wire protocol version it speaks, and the framework
+  // version it was built against. The real contract calls this immediately
+  // after Init succeeds, as part of the same startup step, and the version
+  // it returns is what a later SaveRuntimeState snapshot's device version
+  // is stamped with — this contract does the same.
+  rpc Metadata(Empty) returns (MetadataResponse);
+
+  // SetLogLevel changes the running instance's log verbosity. Called once
+  // as part of startup (immediately after Init) and again whenever the
+  // host's own configuration changes the level at runtime.
+  rpc SetLogLevel(LogLevelRequest) returns (Empty);
+
+  // Start brings the initialized device up. Init must already have
+  // succeeded, and — if there is a snapshot to restore — LoadRuntimeState
+  // must have already run.
+  rpc Start(Empty) returns (Empty);
+
+  // Stop takes the device down. It is not assumed to follow a successful
+  // Start — Stop may be the only lifecycle call an instance ever sees if
+  // the device it manages never came up cleanly.
+  rpc Stop(Empty) returns (Empty);
+
+  // Pause suspends a running instance without a full Stop.
+  rpc Pause(Empty) returns (Empty);
+
+  // HotReload applies replacement configuration to a running instance
+  // without a process restart. DryRun validates the configuration without
+  // applying it, so a caller can check acceptability before committing.
+  rpc HotReload(HotReloadRequest) returns (Empty);
+
+  // LoadRuntimeState restores a previously exported snapshot into a fresh
+  // instance, after Init and before Start. It carries a device's own
+  // runtime state across a plugin restart or version upgrade, independently
+  // of Styx's built-in hot-reload state handoff (RegisterStateSaver /
+  // RegisterStateRestorer), which exists for a different purpose:
+  // surviving an in-place Host.Reload of the plugin process, not restoring
+  // a device's business state on demand.
+  rpc LoadRuntimeState(RuntimeState) returns (Empty);
+
+  // SaveRuntimeState exports the instance's current runtime state as a
+  // single opaque blob, for the host to persist and later hand to a fresh
+  // instance via LoadRuntimeState. It is not chunked — the whole state
+  // crosses in one call, matching the real contract's own shape. The real
+  // contract's host calls this after Stop, while the instance is still
+  // alive (Stop only stops the device; the process isn't killed until
+  // afterward), and this contract preserves that ordering.
+  rpc SaveRuntimeState(Empty) returns (RuntimeState);
+
+  // CollectMetrics returns the instance's current metric snapshot, pulled
+  // by the host on demand rather than pushed by the plugin.
+  rpc CollectMetrics(Empty) returns (MetricsSnapshot);
+}
+
+message Empty {}
+
+// MetricConfig is the structured metrics configuration Init carries,
+// matching the real contract's own message shape field for field.
+message MetricConfig {
+  string namespace = 1;
+  map<string, string> const_labels = 2;
+  bool enabled = 3;
+}
+
+// InitRequest carries a device's configuration. device_config is opaque to
+// Styx and to this contract — its shape is whatever the plugin and the host
+// application agree on (JSON, another protobuf message, anything), matching
+// the real contract's own opaque-bytes convention. metric_config is
+// structured, also matching the real contract.
+message InitRequest {
+  bytes device_config = 1;
+  MetricConfig metric_config = 2;
+}
+
+// MetadataResponse is the instance's identity. host_version is a generic
+// rename of the real contract's own field, which names the field after that
+// specific gateway; the meaning is the same — the framework/build version
+// the plugin was validated against. This contract omits the real
+// response's nested capability-attributes sub-message, since Attributes is
+// separately out of scope (see the service comment above): a caller
+// wanting capability flags would call a future Attributes RPC, not parse
+// them out of Metadata.
+message MetadataResponse {
+  string type = 1;
+  string version = 2;
+  uint64 protocol_version = 3;
+  string host_version = 4;
+}
+
+// LogLevelRequest names the level to switch to, e.g. "debug", "info",
+// "warn", "error", "fatal" — a plain string in both contracts, not an enum.
+message LogLevelRequest {
+  string level = 1;
+}
+
+// HotReloadRequest carries a device's replacement configuration.
+message HotReloadRequest {
+  bytes device_config = 1;
+  bool dry_run = 2;
+}
+
+// RuntimeState is a single opaque snapshot of a device's runtime state.
+// device_version matches the real contract exactly: the device driver's own
+// version string (the same value Metadata.version returns), not a snapshot
+// format number. snapshot_format_version is an addition beyond the real
+// contract — this pilot's own envelope-version guard for how the opaque
+// state bytes are encoded, layered on top of (not replacing) device_version.
+message RuntimeState {
+  string device_version = 1;
+  bytes state = 2;
+  uint32 snapshot_format_version = 3;
+}
+
+// MetricsSnapshot carries the plugin's metrics as a list of opaque,
+// pre-serialized entries. The real contract's plugins serialize a Prometheus
+// MetricFamily into each one; this contract does not require that shape —
+// interpreting the bytes is the host application's job, same as it is today.
+message MetricsSnapshot {
+  repeated bytes metric_families = 1;
+}

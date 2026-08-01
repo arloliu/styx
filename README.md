@@ -130,9 +130,13 @@ func main() {
 
 More runnable examples are under [`examples/`](examples/): host-side streaming
 of all three shapes ([`examples/streaming/`](examples/streaming/)), a
-state-preserving hot-reload ([`examples/hot-reload/`](examples/hot-reload/)), and
+state-preserving hot-reload ([`examples/hot-reload/`](examples/hot-reload/)),
 a handler slow enough to backpressure its caller, with the counters that name it
-([`examples/slow-handler/`](examples/slow-handler/)).
+([`examples/slow-handler/`](examples/slow-handler/)), and a real consumer's
+device-plugin lifecycle contract defined as an ordinary Styx service
+([`examples/device-gateway/`](examples/device-gateway/); see
+[docs/device-gateway-integration.md](docs/device-gateway-integration.md)
+for the full contract).
 Coming from `hashicorp/go-plugin`? See
 [docs/migration-from-go-plugin.md](docs/migration-from-go-plugin.md).
 
