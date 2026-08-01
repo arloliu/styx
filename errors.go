@@ -43,7 +43,8 @@ const (
 )
 
 // PluginCrashError reports that a plugin process exited unexpectedly.
-// It appears only in Host.Events() event errors, never as a per-call error.
+// It appears in Host.Events() event errors and as a failed Start's returned
+// error, never as a per-call error.
 // Per-call errors are ErrPluginUnavailable (crash detected before request
 // publish, retryable) or ErrOutcomeUnknown (crash detected after publish,
 // outcome unknown, not retryable).
@@ -58,6 +59,16 @@ type PluginCrashError struct {
 	ExitStatus      int
 	ExitStatusKnown bool
 	Reason          string
+
+	// StderrTail holds the plugin's last captured stderr lines, oldest first,
+	// the same lines Reason's "; stderr: ..." suffix already embeds as one
+	// pipe-joined string -- this is that content, structured, for a caller
+	// that wants to log or inspect it without re-parsing Reason.
+	// Bounded by the supervisor's rolling tail window, so it holds only the
+	// most recent lines, not the plugin's whole stderr history.
+	// Nil when no stderr was captured (e.g. a crash before the process
+	// spawned).
+	StderrTail []string
 
 	// Dispatched is always false in PluginCrashError by design. A single crash
 	// event covers the whole plugin—potentially many in-flight calls with

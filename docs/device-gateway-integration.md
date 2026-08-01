@@ -292,11 +292,9 @@ section scopes, not code this pilot ships:
   faulted, or when every sandboxed device is faulted. A shim needs to
   translate `Host.Events()` (`EventCrashed`, `EventGaveUp`, `EventRestarting`)
   into that same aggregate signal.
-- **stderr routing.** The real gateway routes plugin stderr/logs through an
-  hclog-compatible adapter into its own structured logger. Styx doesn't
-  prescribe a logging integration; a shim needs to decide where a spawned
-  plugin's stderr goes in production (structured log sink, tail-on-crash
-  buffer, or both).
+- **stderr routing.** The real gateway routes plugin stderr/logs through an hclog-compatible adapter into its own structured logger.
+  `PluginSpec.Stdio` gives a shim a live line-by-line feed of a plugin's stdout/stderr to adapt into that hclog-compatible sink; `PluginCrashError.StderrTail` separately carries the bounded crash-reason tail once a plugin has already gone down.
+  Styx still doesn't prescribe the logging integration itself — only where the lines and the tail come from.
 - **Config-driven `PluginSpec` construction.** The real gateway resolves a
   device's package (binary path, version, hash) through its own package
   store/fetcher before ever calling into the plugin framework — deliberately

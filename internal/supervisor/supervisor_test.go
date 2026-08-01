@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -268,7 +269,7 @@ func TestSupervisor_RestartsPerPolicy_ThenEmitsGaveUp_WhenMaxExceeded(t *testing
 	require.Error(t, last.Err)
 
 	var crashedCount, restartingCount int
-	var sawStderrTail bool
+	var sawStderrTail, sawStructuredTail bool
 	for _, ev := range seen {
 		//exhaustive:ignore -- only Crashed/Restarting are tallied here; every
 		// other kind is irrelevant to this assertion.
@@ -277,6 +278,13 @@ func TestSupervisor_RestartsPerPolicy_ThenEmitsGaveUp_WhenMaxExceeded(t *testing
 			crashedCount++
 			if ev.Err != nil && strings.Contains(ev.Err.Error(), "simulated crash") {
 				sawStderrTail = true
+			}
+			// The same line Reason's "; stderr: ..." suffix embeds must also be
+			// readable off CrashInfo.StderrTail directly, not only by parsing
+			// the flattened message.
+			var ci *supervisor.CrashInfo
+			if errors.As(ev.Err, &ci) && slices.Contains(ci.StderrTail, "crashplugin: simulated crash") {
+				sawStructuredTail = true
 			}
 		case supervisor.EventRestarting:
 			restartingCount++
@@ -289,6 +297,8 @@ func TestSupervisor_RestartsPerPolicy_ThenEmitsGaveUp_WhenMaxExceeded(t *testing
 	require.LessOrEqual(t, restartingCount, maxRestarts, "Restarting must never exceed the policy's Max")
 	require.GreaterOrEqual(t, restartingCount, 1, "expected at least one Restarting event before GaveUp")
 	require.True(t, sawStderrTail, "expected the fixture's captured stderr line in a crash reason")
+	require.True(t, sawStructuredTail,
+		"expected the fixture's captured stderr line in CrashInfo.StderrTail, matching Reason's embedded line")
 
 	select {
 	case <-runDone:

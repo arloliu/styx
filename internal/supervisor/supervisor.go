@@ -335,6 +335,17 @@ type Config struct {
 	// The zero value falls back to lifecycle.DefaultPhaseDeadlines.
 	ReloadDeadlines lifecycle.PhaseDeadlines
 
+	// Stdio optionally receives every stdout/stderr line this instance's
+	// captured process writes, live, in addition to (never instead of) the
+	// crash-reason stderr tail newLiveInstance always captures on its own.
+	// It runs on capture's own per-stream delivery goroutines, not the
+	// heartbeat loop, so unlike the hooks below it may take as long as it
+	// needs -- StdioCapture's own bounded-queue drop policy protects the
+	// plugin from a slow Stdio, not this package's caller.
+	// The styx layer sets it from a public PluginSpec option.
+	// nil (the default) disables it: only the crash tail captures stdio.
+	Stdio Sink
+
 	// OnHeartbeatMiss is called once per missed heartbeat interval.
 	// Called before the running missed count is checked against MissedHeartbeats.
 	// It is an optional observability seam owned by this package with no dependency
@@ -789,7 +800,8 @@ func (s *Supervisor) newLiveInstance(
 	conn := control.NewConn(proc.ControlFD, generation)
 
 	stderrTail := newTailSink(stderrTailLines)
-	capture := NewStdioCapture(proc.Stdout, proc.Stderr, stderrTail, maxCapturedLineBytes, capturedBufferLines)
+	sink := newSpawnSink(stderrTail, s.cfg.Stdio)
+	capture := NewStdioCapture(proc.Stdout, proc.Stderr, sink, maxCapturedLineBytes, capturedBufferLines)
 	captureCtx, cancelCapture := context.WithCancel(lifeCtx)
 	captureDone := make(chan struct{})
 	go func() { defer close(captureDone); capture.Run(captureCtx) }()
@@ -1597,8 +1609,42 @@ func (s *tailSink) tail() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if len(s.lines) == 0 {
+		return nil
+	}
+
 	out := make([]string, len(s.lines))
 	copy(out, s.lines)
 
 	return out
+}
+
+// fanOutSink delivers each line to first, then second, in that order.
+//
+// deliverLine recovers a panic around its whole call into a Sink (see that
+// method's doc), so a panic in second unwinds out of this WriteLine call too
+// -- but only after first has already returned, so a panicking second can
+// never stop first from receiving the line. This is what lets newSpawnSink
+// put the crash-reason tail in first and a caller-supplied Sink in second:
+// the tail's own delivery cannot be lost to a bad user Sink.
+type fanOutSink struct {
+	first, second Sink
+}
+
+func (s *fanOutSink) WriteLine(stream string, line []byte) {
+	s.first.WriteLine(stream, line)
+	s.second.WriteLine(stream, line)
+}
+
+// newSpawnSink composes the crash-reason tail sink with an optional
+// caller-supplied Sink for one spawned instance, tail first (see
+// fanOutSink's doc for why the order matters). A nil user sink is the
+// common case (Config.Stdio unset) and skips the fan-out entirely, so the
+// unconfigured path costs nothing extra.
+func newSpawnSink(tail *tailSink, user Sink) Sink {
+	if user == nil {
+		return tail
+	}
+
+	return &fanOutSink{first: tail, second: user}
 }

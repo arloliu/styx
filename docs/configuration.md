@@ -25,6 +25,7 @@ to a reasonable value:
 |---------------------|----------------|---------|
 | `Args`, `Env`       | none           | Extra command-line arguments and environment variables for the spawned process. |
 | `Restart`           | zero `RestartPolicy` | How many times, and with what backoff, a crashed instance is respawned. |
+| `Stdio`             | `nil` (disabled) | Live line-by-line delivery of the plugin's stdout/stderr. See [Observing what a Host is doing](#observing-what-a-host-is-doing). |
 | `BinarySHA256`      | `nil` (no pinning) | When set, `Start` verifies the plugin binary's SHA-256 hash before spawning it, and refuses to start on a mismatch. |
 | `Services`          | `nil` (no requirement) | The version range this host requires from each service it intends to call. Normally set from a generated `<Service>Requirement()` value, not written by hand. |
 | `RequireStreaming`  | `false`        | Set when the host's generated client calls a streaming method, so a plugin that cannot stream fails at startup instead of at the first streaming call. |
@@ -380,3 +381,7 @@ lifecycle transitions. See
 to react to what it reports, and
 [docs/plugin-lifecycle.md](plugin-lifecycle.md) for what graceful shutdown,
 crash/restart, and hot-reload actually do underneath those signals.
+
+`PluginSpec.Stdio` is separate from all of that: it delivers a plugin's raw stdout/stderr live, line by line, whether or not the plugin ever crashes.
+Set it to see output a crash tail would never carry — a third-party library writing to stderr directly, or a runtime fault printed before the plugin's own logger initializes.
+A crashed instance's *last* captured stderr lines are still available separately, both flattened into `PluginCrashError.Reason` and structured on `PluginCrashError.StderrTail`, regardless of whether `Stdio` is set.

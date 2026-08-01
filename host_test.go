@@ -367,6 +367,141 @@ func TestHost_Start_ReturnsError_WhenBinaryDoesNotHandshake(t *testing.T) {
 	var crashErr *styx.PluginCrashError
 	require.ErrorAs(t, err, &crashErr)
 	require.Equal(t, "nohandshake", crashErr.Plugin)
+
+	// And: no stderr was ever captured, so StderrTail is nil, not a non-nil
+	// empty slice -- a caller can tell "nothing captured" from "captured an
+	// empty tail" with a plain nil check.
+	require.Nil(t, crashErr.StderrTail)
+}
+
+// Test Host.Start's *styx.PluginCrashError carrying the plugin's captured
+// stderr as a structured StderrTail, alongside the same content Reason's
+// "; stderr: ..." suffix already embeds -- proving the crash tail survives
+// translation into the public error, not just internal/supervisor's own
+// CrashInfo one layer down.
+func TestHost_Start_CarriesStderrTail_MatchingReasonSuffix(t *testing.T) {
+	// Given: a plugin that writes one deterministic line to stderr and exits
+	// before ever attempting the handshake -- the same pre-handshake crash
+	// shape as TestHost_Start_ReturnsError_WhenBinaryDoesNotHandshake above,
+	// plus real stderr content for the crash tail to capture.
+	const marker = "styx-stdio-sink-test: crash-tail marker"
+	before := testutil.CountOpenFDs(t)
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{
+			Name: "crashwithstderr",
+			Path: "/bin/sh",
+			Args: []string{"-c", "echo '" + marker + "' 1>&2; exit 1"},
+		}},
+	})
+
+	// When
+	err := h.Start(t.Context())
+
+	// Then: Start reports the failure and left no fd (or zombie) behind, same
+	// as the plain-crash case.
+	require.Error(t, err)
+	require.Equal(t, before, testutil.CountOpenFDs(t), "failed Start leaked a file descriptor")
+
+	// And: the public error carries the marker line both ways -- inside
+	// Reason's flattened suffix (unchanged, for human display) and as a
+	// structured StderrTail entry a log pipeline can read without
+	// re-parsing Reason.
+	var crashErr *styx.PluginCrashError
+	require.ErrorAs(t, err, &crashErr)
+	require.Contains(t, crashErr.Reason, marker, "Reason must still embed the captured stderr line")
+	require.Contains(t, crashErr.StderrTail, marker, "StderrTail must carry the same line Reason's suffix embeds")
+}
+
+// Test the *styx.PluginCrashError built for Start's returned error and the
+// one built for the matching EventCrashed on Host.Events() each owning an
+// independent StderrTail copy, even though both translate the same
+// underlying internal/supervisor.CrashInfo -- one crash fans out into
+// several public errors (EventCrashed here, and Start's returned error,
+// itself translated from the same crash's EventGaveUp), and none of them
+// may alias another's backing array.
+func TestHost_PluginCrashErrors_OwnIndependentStderrTailCopies_FromSameCrash(t *testing.T) {
+	// Given: the same pre-handshake crash shape as
+	// TestHost_Start_CarriesStderrTail_MatchingReasonSuffix -- the default
+	// (zero-restart) policy means this single crash also gives up
+	// immediately, so Start's returned error and the crash's EventCrashed
+	// both trace back to the one CrashInfo this crash builds.
+	const marker = "styx-stdio-sink-test: shared-crash marker"
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{
+			Name: "sharedcrash",
+			Path: "/bin/sh",
+			Args: []string{"-c", "echo '" + marker + "' 1>&2; exit 1"},
+		}},
+	})
+
+	// When
+	startErr := h.Start(t.Context())
+	require.Error(t, startErr)
+	crashEv := awaitEvent(t, h.Events(), styx.EventCrashed)
+
+	// Then: both public errors carry the captured line.
+	var fromStart *styx.PluginCrashError
+	require.ErrorAs(t, startErr, &fromStart)
+	var fromEvent *styx.PluginCrashError
+	require.ErrorAs(t, crashEv.Err, &fromEvent)
+	require.Contains(t, fromStart.StderrTail, marker)
+	require.Contains(t, fromEvent.StderrTail, marker)
+
+	// And: mutating one's StderrTail must never affect the other's.
+	fromStart.StderrTail[0] = "mutated"
+	require.Equal(t, marker, fromEvent.StderrTail[0],
+		"StderrTail must be an independent copy per public error, not aliased across them")
+}
+
+// stdioLineCollector is a channel-backed styx.StdioSink: a test subscribes by
+// reading from lines, so it observes a delivered line as an event rather than
+// polling shared state.
+type stdioLineCollector struct {
+	lines chan string
+}
+
+func newStdioLineCollector(buffer int) *stdioLineCollector {
+	return &stdioLineCollector{lines: make(chan string, buffer)}
+}
+
+func (c *stdioLineCollector) WriteLine(stream string, line []byte) {
+	select {
+	case c.lines <- stream + ":" + string(line):
+	default:
+	}
+}
+
+// Test PluginSpec.Stdio delivering a plugin's stderr line live, with no
+// crash involved -- the plugin reaches Ready and keeps serving normally, so
+// this is stdio a PluginCrashError's tail would never carry.
+func TestHost_Start_DeliversLiveStdioLines_ToPluginSpecStdio(t *testing.T) {
+	// Given: a shell wrapper that writes one deterministic line to stderr,
+	// then execs into the real readyplugin fixture. exec replaces the
+	// process image in place (same pid, same inherited control fd and stdio
+	// pipes), so the handshake still completes normally afterward.
+	const marker = "styx-stdio-sink-test: live stderr line"
+	collector := newStdioLineCollector(8)
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{
+			Name:  "stdioready",
+			Path:  "/bin/sh",
+			Args:  []string{"-c", "echo '" + marker + "' 1>&2; exec " + fixtureReadyPlugin},
+			Stdio: collector,
+		}},
+	})
+
+	// When
+	require.NoError(t, h.Start(t.Context()))
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// Then: the marker line arrives on the collector, live -- proving
+	// PluginSpec.Stdio observes real stdio output, not only a post-crash tail.
+	select {
+	case line := <-collector.lines:
+		require.Equal(t, "stderr:"+marker, line)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the plugin's stderr line to arrive on PluginSpec.Stdio")
+	}
 }
 
 // Test Host.Events() never silently losing a GaveUp to a burst, even with
