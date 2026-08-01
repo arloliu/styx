@@ -80,7 +80,7 @@ make bench          # every root-module bench suite, -bench=. -benchmem
 `bench/shm` also holds the scheduler-regime matrix and the idle-wake cell. The
 detailed campaign record for this suite — process model, tail behavior under
 constrained scheduling, arena and size-class tuning, the region-sizing floor,
-and the recommended lean profile for a device gateway — is
+and the lean profile recommended for small-control-traffic workloads — is
 [bench/shm/REPORT.md](../bench/shm/REPORT.md).
 
 ### `bench/goplugin` — versus `hashicorp/go-plugin`

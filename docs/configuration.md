@@ -123,14 +123,20 @@ A region has two parts:
 You rarely need to hand-build a `ShmGeometry`. Two profiles cover most cases:
 
 - **`GeometryDefault()`** — `RingCapacity` 4096, `LifecycleReserve` 256, and
-  size classes topping out at 1 MiB slabs (roughly 64 MiB of arena total). This
-  is also what a zero-value `ShmGeometry{}` selects, so leaving `Geometry`
-  unset already gets you this profile. Good for a general workload where
-  memory isn't tightly constrained.
+  seven size classes graded from 256-byte slabs up to 1 MiB ones (roughly
+  63 MiB of region in total). This is also what a zero-value `ShmGeometry{}`
+  selects, so leaving `Geometry` unset already gets you this profile. Good for
+  a general workload where memory isn't tightly constrained. Every class above
+  the smallest sits 64 bytes above a power of two, because a message is longer
+  once encoded than the payload it carries: without that margin a 4 KiB payload
+  would need a 1 MiB slab, and a 1 MiB payload would not fit at all.
 - **`GeometryLean()`** — `RingCapacity` 512, `LifecycleReserve` 32, and two
   small size classes (roughly 0.6 MiB of arena total), sized for a peak of
-  about 32 concurrent calls. Good for a memory-constrained deployment, or one
-  that never needs many calls in flight at once.
+  about 32 concurrent calls. Its largest class is a hard ceiling rather than a
+  backpressure point: a message whose encoded length exceeds 4160 bytes is
+  rejected outright, not queued behind a slab. Good for small control, status,
+  and acknowledgement traffic on a memory-constrained deployment — not for one
+  that sends kilobyte-scale reports, recipes, or state snapshots.
 
 Build a custom `ShmGeometry` when neither profile fits — for example, a
 workload with its own peak concurrency or its own typical payload sizes:
@@ -175,12 +181,104 @@ has no free slab is counted as `styx.arena.setaside.count` on the configured
 counted again as `styx.arena.resumed.count` when it gets a slab and goes on.
 Set-asides that stay at zero mean callers always find a free slab on arrival;
 set-asides that climb mean callers are waiting on each other's slabs, and the
-label names the class to widen — raise that class's `SlabCount`, or add a
-class between it and the one below so payloads stop being served from a class
-far larger than they need. This is what `StrictCapacity` certifies up front,
-reported continuously instead: the counters see a class that exhausts and
-refills between two samples, which the sampled `styx.arena.utilization` gauge
-cannot.
+label names the class to widen. On the default profile the fix is to raise that
+class's `SlabCount`: its rungs are already graded closely enough that a payload
+is never served from a class far larger than it needs. On a custom geometry
+with a wide gap between two classes, adding a class inside the gap is the other
+option, and usually the cheaper one — a payload served from a class many times
+its own size both wastes the slab and shares a scarcer pool.
+This is what `StrictCapacity` certifies up front, reported continuously
+instead: the counters see a class that exhausts and refills between two
+samples, which the sampled `styx.arena.utilization` gauge cannot.
+
+### Worked example: small messages with a rare large tail
+
+A common shape is a workload where almost everything is small — say 99% of
+messages under 4 KiB — with an occasional large one, up to 1 MiB, and those
+large ones strictly sequential: never more than about two in flight. The
+default profile carries that correctly — but at roughly 63 MiB, most of it
+provisioned for concurrency in bands this workload never approaches. A
+geometry cut to the shape, set on the plugin's `PluginSpec`, looks like this:
+
+```go
+Geometry: styx.ShmGeometry{
+    RingCapacity:     4096,
+    LifecycleReserve: 256,
+    HostToPlugin: []styx.ShmSizeClass{
+        {SlabSize: 256, SlabCount: 1024},
+        {SlabSize: 1024 + 64, SlabCount: 512},
+        {SlabSize: 4096 + 64, SlabCount: 256},
+        {SlabSize: (64 << 10) + 64, SlabCount: 8},
+        {SlabSize: (1 << 20) + 64, SlabCount: 2},
+    },
+    // PluginToHost left empty: it copies HostToPlugin.
+},
+```
+
+That is 4.30 MiB of arena per direction and a 9.11 MiB region, against roughly
+63 MiB for `GeometryDefault()`. Six decisions are worth spelling out, because
+each one is easy to get wrong in a way that only shows up under load.
+
+**Two slabs for the large tail, not one.** A slab is freed only once the
+consumer's ring head has moved past the frame that used it, and the sender
+learns that has happened when it next allocates ([`shm-abi.md`](specs/shm-abi.md)
+§6). Two slabs mean the next large message always has one to take while the
+previous frame is still being retired; with one, any overlap at all parks the
+send until a retry or the peer's next frame releases it. The `+ 64` on that
+class is a separate necessity: a 1 MiB payload is longer than 1 MiB once
+encoded, so a class of exactly `1 << 20` cannot carry it at all — such a send
+is rejected outright, not delayed.
+
+**The 64 KiB rung is load-bearing, not padding.** With only two megabyte
+slabs, every message too big for the 4160-byte class competes for them, and an
+8 KiB straggler both holds a slab the large tail needs and spends a megabyte
+of arena to carry eight kilobytes. That rung costs 0.5 MiB and keeps the band
+off the top class. Drop it only if you are certain nothing lands between 4 KiB
+and 1 MiB — and if something does, the tell is set-asides appearing on the
+megabyte class even though the large tail is sequential.
+
+**Sizing the counts.** Per class, size `SlabCount` to the peak number of
+messages of that band in flight at once, plus headroom; the ABI states the
+same rule as a provisioning guideline ([`shm-abi.md`](specs/shm-abi.md) §18).
+Where slabs are cheap, several times the peak costs little — the 256-byte
+class above holds 1024 of them for a quarter of a megabyte. Where they are
+expensive, headroom is a spare rather than a multiple, which is why the top
+class is 2 and not 8. Class 0 is the one count not to read literally: its
+first slab is reserved so a payload offset of zero can mean "no slab", so 1024
+there is 1023 usable ([`shm-abi.md`](specs/shm-abi.md) §6). The table is
+validated rather than corrected — every `SlabSize` a positive multiple of 64
+and strictly larger than the one before it, the largest at least 4096, every
+`SlabCount` at least 1 — and a table that breaks any of those is refused at
+spawn with a typed error. Nothing is silently rounded or clamped.
+
+**Leave the ring at 4096/256 unless memory is desperate.** The pair of rings
+costs 0.5 MiB at those numbers, which is small beside any arena worth tuning,
+and `RingCapacity - LifecycleReserve` must stay at or above `MaxDataInflight`
+or the plugin is refused at spawn. Shrinking the ring to reclaim half a
+megabyte lowers the concurrency ceiling for every call, not just the large
+ones.
+
+**Asymmetric tables when the tail flows one way.** If only one direction
+carries the large messages — the host uploads, the plugin only acknowledges —
+give each direction its own table and leave the large rungs out of the quiet
+one. Dropping the 64 KiB and 1 MiB rungs from `PluginToHost` above takes the
+region from 9.11 MiB to 6.61 MiB. Each direction's largest class sets that
+direction's own maximum message size, so the quiet table must still cover
+everything that direction actually sends.
+
+**Check it rather than trust it.** `examples/slow-handler` prints the encoded
+length of the request it is about to send and which of its own pinned classes
+serves that length, applying the rule the allocator applies — a quick way to
+see how far encoded length sits above payload length for your message shape.
+Then watch `styx.arena.setaside.count` in production: a class whose count
+stays at zero is provisioned, and one whose count climbs names itself through
+its `slab_size` label.
+
+One caveat if you also want `StrictCapacity`: it certifies against the
+smallest usable slab count across every class, which here is the top class's
+2, so a host opting in would be admitted only at `MaxDataInflight` of 2.
+STRICT suits a geometry whose classes are all provisioned for the same
+concurrency; it works against one deliberately shaped around a rare tail.
 
 For the exact wire-level rules these numbers satisfy — the bounds on
 `RingCapacity`, the layout of a size class, and how `MaxDataInflight` is

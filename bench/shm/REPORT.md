@@ -7,8 +7,8 @@
 > [`docs/benchmark.md`](../../docs/benchmark.md). What remains uniquely here and
 > is still current: the process model and its trade-offs, the scheduler-regime
 > and tail analysis, the arena-reserve and size-class tuning results, the
-> region-provisioning floor, and the lean profile recommended for a device
-> gateway.
+> region-provisioning floor, and the lean profile recommended for
+> small-control-traffic workloads.
 
 **Milestone:** shared-memory transport exit gate (the design spec's milestone
 gate, `docs/specs/2026-07-16-styx-design.md` §25).
@@ -482,7 +482,7 @@ properly clocked core).
 scaling rule, not a magic constant." `BenchmarkReserveSweep` varies R at fixed C = 1024,
 at the shared tuning load (concurrency 64 — the same load the size-class sweep uses, §10),
 over reserves whose data budget C−R stays comfortably above the concurrency (so no point
-wedges — see §11). Medians below are over 8 repetitions, enough to average out the
+backpressures — see §11). Medians below are over 8 repetitions, enough to average out the
 shared-box run-to-run scatter (a 2-repetition version of this sweep showed swings that an
 8-repetition version does not).
 
@@ -510,8 +510,8 @@ on the correctness argument. **Recommendation: keep `R = C/16` as the scaling de
 
 ## 10. Tuning: default-profile size-class counts (per class)
 
-`BenchmarkSizeClassSweep` varies the per-direction work-class slab count above the wedge
-floor (§11), **once for each representative class size (64 B and 4096 B)**, at C = 1024 /
+`BenchmarkSizeClassSweep` varies the per-direction work-class slab count above the
+backpressure floor (§11), **once for each representative class size (64 B and 4096 B)**, at C = 1024 /
 R = 64 and the **same load the reserve sweep uses (concurrency 64)** — so the two tuning
 axes are measured comparably. Counts range from just above the concurrency floor (64) to
 well above it; medians are over 8 repetitions (as in §9).
@@ -546,57 +546,68 @@ inflates the region's virtual size for no latency or throughput gain.
 Both tuning axes are governed by one property of the current transport, and it is the
 most important sizing finding for downstream consumers:
 
-> In the current implementation a data intent that finds its ring slot or arena slab
-> unavailable is **set aside and resumes only on a lifecycle intent, the retry seam
-> (which has no production caller yet), or shutdown** — reclaiming a slot/slab does not
-> by itself wake it (`internal/transport/shm/writer.go`, the stuck-data doc: the
-> consumer→producer "space-available" wake is designed but unwired). So under continuous
-> data-only load, **under-provisioning either the ring data budget (C−R) or any arena
-> size class below the peak concurrent in-flight frames wedges that data lane rather than
-> degrading it.**
+> A data intent that finds its ring slot or arena slab unavailable is **set aside and
+> retried on the writer's own backoff timer** (100 µs, doubling to a 5 ms cap), and
+> sooner on a lifecycle intent, an inbound frame's peer-progress signal, or shutdown.
+> So under continuous data-only load, **under-provisioning either the ring data budget
+> (C−R) or any arena size class below the peak concurrent in-flight frames costs
+> latency on every affected frame — it degrades that data lane rather than wedging
+> it.**
 
-This is not hypothetical: it is why `shmtest`'s default geometry is sized generously (its
-doc records a reproduced 64-call deadlock against an 8-slab class), and the chaos suite's
-`RunStarveArena` scenario proves the wedge is ctx-bounded (a starved `Send` returns its
-caller's context error — it does not corrupt or hang unboundedly). The tuning sweeps
-above therefore stay strictly inside the safe region; the floor is characterized here
-analytically rather than by deliberately deadlocking the writer.
+That correction matters for how the floor is read. The chaos suite's `RunStarveArena`
+scenario shows a starved `Send` returns its caller's context error rather than
+corrupting or hanging unboundedly, and the arena-backpressure integration test runs
+208 callers against a 26-slab class to completion, every reply byte-exact, with the
+host's own set-aside counter for that class non-zero — so the callers demonstrably
+did wait for a slab and demonstrably did get through. The tuning sweeps above still
+stay strictly inside the region where no frame waits, so the sweeps measure the
+geometry axis rather than the retry ladder.
 
 **Consequence for sizing:** provision `C − R ≥ max concurrent in-flight` and each size
 class's slab count `≥ peak concurrent frames of that class per direction + reclaim-lag
-headroom`. Until the space-available wake is wired, this is a hard floor, not a soft
-target. (A current-state limitation to size around, not a defect this task fixes — fixing
-it would be new scope.)
+headroom`. This is a latency target, not a liveness floor: a geometry below it still
+completes every call.
 
 ---
 
-## 12. Recommended device-gateway profile
+## 12. Recommended small-control-traffic profile
 
-A device-gateway reference consumer's real host↔plugin traffic is **< 1 MiB/s —
-latency-bound, not throughput-bound** — with low concurrency. Its region should
-therefore be **lean**, sized to its message sizes and a small concurrency ceiling, not
-for sustained throughput. The recommendation below assumes a peak of ~32 concurrent
-in-flight calls (generous for < 1 MiB/s) and typical control/telemetry messages ≤ 4 KiB
-with an occasional larger frame; scale the two starred numbers if the real peak or
-message size differs.
+The lean profile below suits a workload whose every message is small: control frames,
+status polls, acknowledgements. It is **not** a device-gateway recommendation, and an
+earlier version of this section wrongly made it one. A geometry's largest class is a
+hard ceiling, not a backpressure point — a message whose encoded length exceeds it is
+rejected outright — and a device gateway's ordinary traffic exceeds 4160 bytes
+routinely: event reports run 5–7 KB, array responses 8–20 KB, and equipment recipes
+50–90 KB. A gateway on this profile would fail those calls, not slow them down.
+
+**Gateway-class workloads use `GeometryDefault()`** — seven rungs from 256 bytes to
+1 MiB, roughly 63 MiB of region — **or a custom geometry sized per equipment class from
+that class's measured message-size distribution.** The default's rungs are graded so a
+payload is served from a class close to its own size; a custom geometry is worth building
+when one equipment class's distribution is narrow enough to beat that.
+
+The lean profile assumes a peak of ~32 concurrent in-flight calls and messages that
+encode to ≤ 4160 bytes; scale the two starred numbers if the real peak differs.
 
 | Parameter | Recommended value | Rationale |
 |---|---|---|
 | Ring capacity C | **512** (power of two) | data budget C−R = 480 ≫ the 32-call peak — comfortable §11 headroom, still tiny |
 | Lifecycle reserve R | **32** (= C/16) | the confirmed §9 default; leaves 480 data slots |
-| Size classes / direction | **{512 B × 64\*, 4096 B × 64\*}** | a small class for typical frames + a ≥ 4096 B class (the `shm-abi.md` §1/§2 largest-class floor); count 64 = 2 × the 32-call peak, per the §11 floor + headroom |
-| Region size (both directions) | **≈ 0.6 MiB** | rings (512 × ~32 B × 2 ≈ 32 KiB) + arena (2 × (64×512 + 64×4096) ≈ 544 KiB) |
+| Size classes / direction | **{512 B × 64\*, 4160 B × 64\*}** | a small class for typical frames + a ≥ 4096 B class (the `shm-abi.md` §1/§2 largest-class floor), carrying 64 bytes of headroom so a 4 KiB payload still fits once encoded; count 64 = 2 × the 32-call peak, per the §11 floor + headroom |
+| Region size (both directions) | **≈ 0.6 MiB** | rings (512 × 64 B × 2 = 64 KiB) + arena (2 × (64×512 + 64×4160) ≈ 584 KiB) |
+| Largest message | **4160 bytes encoded** | anything longer is rejected, not queued — the reason this profile is for small control traffic only |
 
 That lands **well under the 10 MiB ceiling** — under 1 MiB, in fact — precisely because
-the traffic is latency-bound and low-concurrency: there is no throughput argument for a
-large region, so the profile is sized to the concurrency floor and the message sizes and
-nothing more. If the workload carries occasional larger payloads (say up to 64 KiB), raise
-the top class to `65536 B × 64` (region ≈ 8.4 MiB, still under 10 MiB); if its real peak
+the traffic is small and low-concurrency: there is no throughput argument for a large
+region, so the profile is sized to the concurrency floor and the message sizes and
+nothing more. A workload that occasionally carries larger payloads does not belong on
+this profile at all: take the default, or add the rungs it needs. If its real peak
 concurrency exceeds 32, raise both the per-class counts and C−R together to keep them
 above the §11 floor. The scaling rule, not the specific numbers, is the deliverable:
 **size C−R and every class count to the peak concurrent in-flight, plus headroom; match
-slab sizes to the message-size distribution; do not pad for throughput this workload will
-never generate.**
+slab sizes to the message-size distribution, with the largest class above the largest
+message the workload can produce; do not pad for throughput this workload will never
+generate.**
 
 ---
 
