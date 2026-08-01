@@ -75,7 +75,7 @@ handshake, typed interfaces, host-side lifecycle ownership, crash isolation.
 The reference consumer is a device gateway: a host application that manages a fleet of
 out-of-process device-protocol driver plugins, each speaking a specific wire protocol
 to a piece of connected hardware. It already runs those plugins via `arloliu/go-plugin`
-with a lifecycle contract (`Init/Start/Stop/HotReload/SaveRuntimeState/CollectMetrics/Ping`).
+with a lifecycle contract (`Init/Start/Stop/HotReload/SaveRuntimeState/LoadRuntimeState/CollectMetrics`).
 Styx must support that contract as an ordinary user-defined service, and natively provide
 what the device gateway currently builds around go-plugin:
 
