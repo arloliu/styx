@@ -129,8 +129,10 @@ func main() {
 ```
 
 More runnable examples are under [`examples/`](examples/): host-side streaming
-of all three shapes ([`examples/streaming/`](examples/streaming/)) and a
-state-preserving hot-reload ([`examples/hot-reload/`](examples/hot-reload/)).
+of all three shapes ([`examples/streaming/`](examples/streaming/)), a
+state-preserving hot-reload ([`examples/hot-reload/`](examples/hot-reload/)), and
+a handler slow enough to backpressure its caller, with the counters that name it
+([`examples/slow-handler/`](examples/slow-handler/)).
 Coming from `hashicorp/go-plugin`? See
 [docs/migration-from-go-plugin.md](docs/migration-from-go-plugin.md).
 
