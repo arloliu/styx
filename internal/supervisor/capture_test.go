@@ -209,6 +209,15 @@ func (s *boundSink) snapshot() (maxLen, count int) {
 	return s.maxLen, s.count
 }
 
+// funcSink adapts a plain func to the Sink interface, letting a test observe
+// the exact instant its WriteLine runs relative to another Sink in the same
+// composition.
+type funcSink struct {
+	fn func(stream string, line []byte)
+}
+
+func (s *funcSink) WriteLine(stream string, line []byte) { s.fn(stream, line) }
+
 // panicSink panics on a designated line and records every other line it
 // sees, safe for concurrent use across the stdout/stderr goroutines.
 type panicSink struct {
@@ -317,4 +326,87 @@ func TestStdioCapture_AdversarialInput_NoPanic_BoundsHold(t *testing.T) {
 	maxLen, count := sink.snapshot()
 	require.LessOrEqual(t, maxLen, maxLine, "a delivered line must never exceed maxLineBytes")
 	require.Positive(t, count, "the adversarial streams must still deliver at least one line")
+}
+
+// Test newSpawnSink's composition delivering one line to both the tail and the user sink in the normal case
+func TestNewSpawnSink_DeliversToTailAndUserSink_InNormalCase(t *testing.T) {
+	// Given: the exact tail-first composition newLiveInstance builds at
+	// spawn, over a plain recording sink standing in for a caller-supplied
+	// Sink.
+	user := &recordingSink{}
+	sink, tail := supervisor.NewSpawnSinkForTest(20, user)
+
+	// When
+	sink.WriteLine("stderr", []byte("one-line"))
+
+	// Then: both the tail and the user sink saw the exact same line.
+	require.Equal(t, []string{"one-line"}, tail())
+	require.Equal(t, []string{"stderr:one-line"}, user.snapshot())
+}
+
+// Test newSpawnSink's composition delivering to the tail before the user sink
+func TestNewSpawnSink_DeliversToTail_BeforeUserSink(t *testing.T) {
+	// Given: a user sink that, from inside its own WriteLine, checks whether
+	// the tail already holds the line — proving delivery order, not just
+	// that both eventually receive it.
+	var tail func() []string
+	var tailHadLineFirst bool
+	user := &funcSink{fn: func(_ string, _ []byte) {
+		tailHadLineFirst = len(tail()) == 1
+	}}
+	var sink supervisor.Sink
+	sink, tail = supervisor.NewSpawnSinkForTest(20, user)
+
+	// When
+	sink.WriteLine("stderr", []byte("one-line"))
+
+	// Then: the tail already held the line by the time the user sink ran.
+	require.True(t, tailHadLineFirst, "expected the tail to receive the line before the user sink")
+}
+
+// Test newSpawnSink's composition still delivering to the tail, and to later
+// lines, when the user sink panics
+func TestNewSpawnSink_KeepsTailLine_AndLaterLines_WhenUserSinkPanics(t *testing.T) {
+	// Given: the tail-first composition over a user sink that panics on
+	// exactly one line.
+	user := &panicSink{panicOn: "boom"}
+	sink, tail := supervisor.NewSpawnSinkForTest(20, user)
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	sc := supervisor.NewStdioCapture(stdoutR, stderrR, sink, 1024, 4)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); sc.Run(ctx) }()
+
+	// When: the panicking line is written on stderr, followed by a normal
+	// line -- the tail sink only ever retains "stderr" lines (it is the
+	// crash-reason tail), so the panicking line must land there on that
+	// stream. StdioCapture's own deliverLine recovers the panic (see
+	// TestStdioCapture_RecoversSinkPanic_AndStillDeliversLaterLines), so
+	// this composition never has to recover a panic itself.
+	go func() {
+		_, _ = fmt.Fprintln(stderrW, "boom")
+		_, _ = fmt.Fprintln(stderrW, "after")
+		_ = stdoutW.Close()
+		_ = stderrW.Close()
+	}()
+
+	// Then: the panicking line still reached the tail (delivered there before
+	// the user sink panicked), and the line after it still reached the user
+	// sink.
+	require.Eventually(t, func() bool {
+		return len(user.snapshot()) > 0
+	}, time.Second, 5*time.Millisecond, "expected the line after the panic to be delivered")
+
+	require.Equal(t, []string{"boom", "after"}, tail())
+	require.Equal(t, []string{"after"}, user.snapshot())
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("StdioCapture.Run did not return after ctx was canceled")
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
@@ -65,6 +66,39 @@ type HostConfig struct {
 	MetricsInterval time.Duration
 }
 
+// StdioSink observes a plugin's live stdout/stderr, line by line, as the
+// plugin process writes it. This is separate from and in addition to
+// PluginCrashError.StderrTail, which only appears after the plugin has
+// already crashed: a Stdio sink is the only way to see stdio output that
+// never leads to a crash -- a third-party library writing to stderr
+// directly, a Go runtime fault printed before a logger initializes, or
+// ordinary diagnostic output the plugin's author intended to be watched
+// live.
+//
+// WriteLine delivers one line from stream, which is always "stdout" or
+// "stderr". An implementation must be safe for fully concurrent WriteLine
+// calls, including two concurrent calls for the same stream: a restart or
+// hot reload runs the outgoing plugin process's final stdio deliveries
+// alongside the incoming one's first deliveries, each on its own
+// goroutines, so nothing serializes calls even within one stream name.
+//
+// line is owned exclusively by this call: it is a freshly allocated copy
+// that nothing else reads or mutates afterward, so an implementation may
+// retain it past WriteLine's return without copying.
+//
+// WriteLine must never block or run long. A sink that falls behind drops
+// lines (counted, not surfaced here) rather than queuing them unbounded,
+// so a slow or stalled sink can never back up into, or slow down, the
+// plugin's own stdio pipes. A panicking WriteLine is recovered and
+// counted, never propagated -- it loses only that one line and never
+// crashes the Host or stops later lines on the same stream from being
+// delivered.
+type StdioSink interface {
+	// WriteLine delivers one captured line. See StdioSink's own doc for the
+	// full delivery, ownership, and failure-isolation contract.
+	WriteLine(stream string, line []byte)
+}
+
 // PluginSpec declares one plugin the Host spawns and supervises.
 type PluginSpec struct {
 	Name    string
@@ -72,6 +106,11 @@ type PluginSpec struct {
 	Args    []string
 	Env     []string // additional vars merged onto the sanitized base env
 	Restart RestartPolicy
+
+	// Stdio optionally observes this plugin's live stdout/stderr.
+	// nil (the default) disables it: no line leaves the plugin process
+	// except through the crash tail a PluginCrashError already carries.
+	Stdio StdioSink
 
 	// BinarySHA256 optionally pins the plugin binary's identity.
 	// When non-nil, Start verifies it before creating any supervisor and fails
@@ -536,6 +575,7 @@ func (h *Host) supervisorConfig(spec PluginSpec, cc *ClientConn) supervisor.Conf
 	return supervisor.Config{
 		Spec:             lifecycle.Spec{Path: spec.Path, Args: spec.Args, Env: spec.Env},
 		Restart:          spec.Restart,
+		Stdio:            spec.Stdio,
 		Services:         toControlServiceRequirements(spec.Services),
 		RequireStreaming: spec.RequireStreaming,
 		// The public default (empty Transport) is "auto": offer the shared-memory
@@ -1151,9 +1191,17 @@ func translateEventErr(name string, err error) error {
 		// see PluginCrashError.Dispatched's field doc for why it cannot be
 		// derived here and why per-call errors, not this event, carry the
 		// authoritative dispatch truth.
+		//
+		// ci.StderrTail is cloned, not taken as-is: one CrashInfo is built once
+		// for a crash, but that same *CrashInfo is reachable from more than one
+		// public error translated from it (EventCrashed, EventGaveUp's wrapped
+		// cause, and Start's returned error can all trace back to the same
+		// crash). Without cloning, those PluginCrashError values would share
+		// one backing array, so mutating one's StderrTail would corrupt
+		// another's. Cloning here gives each public error an independent copy.
 		return &PluginCrashError{
 			Plugin: name, ExitStatus: ci.ExitStatus, ExitStatusKnown: ci.ExitStatusKnown,
-			Reason: err.Error(), Dispatched: false,
+			Reason: err.Error(), StderrTail: slices.Clone(ci.StderrTail), Dispatched: false,
 		}
 	}
 
