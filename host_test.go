@@ -231,11 +231,15 @@ func TestHost_Start_TranslatesIncompatible_OnBinaryPinMismatch(t *testing.T) {
 	err := h.Start(t.Context())
 
 	// Then: the internal control.IncompatibleError is translated to the
-	// public taxonomy, matchable both as the sentinel and the typed error.
+	// public taxonomy, matchable both as the sentinel and the typed error,
+	// with Kind naming the binary-identity failure so a host can tell it
+	// apart from an ordinary handshake version mismatch without parsing
+	// Reason.
 	require.Error(t, err)
 	require.ErrorIs(t, err, styx.ErrIncompatible)
 	var incompatible *styx.IncompatibleError
 	require.ErrorAs(t, err, &incompatible)
+	require.Equal(t, styx.IncompatibleBinaryIdentity, incompatible.Kind)
 }
 
 // Test ToControlServiceRequirements translating PluginSpec.Services into
@@ -325,6 +329,10 @@ func TestHost_Start_TranslatesIncompatible_OnRealServiceVersionMismatch(t *testi
 	var incompatible *styx.IncompatibleError
 	require.ErrorAs(t, err, &incompatible)
 	require.Contains(t, incompatible.Error(), "versiontest.Versioned")
+
+	// And: Kind is the zero value — an ordinary handshake negotiation
+	// failure, not the host-local binary-identity pinning case.
+	require.Equal(t, styx.IncompatibleHandshake, incompatible.Kind)
 
 	var crashErr *styx.PluginCrashError
 	require.False(t, errors.As(err, &crashErr), "expected *styx.IncompatibleError, not *styx.PluginCrashError")

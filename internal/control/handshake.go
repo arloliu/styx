@@ -93,11 +93,40 @@ type IncompatibleError struct {
 	HostOffer   Offer
 	PluginOffer Offer
 	Reason      string
+
+	// Kind discriminates why negotiation failed; see IncompatibleKind.
+	// The zero value, IncompatibleHandshake, is correct for any
+	// construction that predates this field.
+	Kind IncompatibleKind
 }
 
 func (e *IncompatibleError) Error() string {
 	return "control: incompatible handshake: " + e.Reason
 }
+
+// IncompatibleKind discriminates the two reasons Negotiate/VerifyBinaryIdentity
+// return *IncompatibleError. It mirrors the public styx.IncompatibleKind;
+// internal/control cannot import styx, so the API boundary translation
+// (host.go's translateIncompatible) maps between the two by value, not by cast.
+type IncompatibleKind int
+
+const (
+	// IncompatibleHandshake reports an ordinary handshake negotiation failure.
+	// This is the zero value, so every existing IncompatibleError construction
+	// defaults to it correctly.
+	IncompatibleHandshake IncompatibleKind = iota
+	// IncompatibleBinaryIdentity reports that VerifyBinaryIdentity found the
+	// plugin binary on disk does not match the pinned SHA-256 digest.
+	IncompatibleBinaryIdentity
+
+	// IncompatibleKindCount marks the end of the enum. It carries no meaning
+	// of its own; it exists so a test can iterate every value this enum
+	// currently defines and check it against the public-kind mapping in
+	// host.go's toIncompatibleKind. Without it, a value added here without
+	// also updating that mapping would compile and misclassify silently
+	// instead of failing a test.
+	IncompatibleKindCount
+)
 
 // Negotiate computes the compatibility tuple from the host's Offer, the plugin's
 // Offer, and the plugin's advertised service versions.
@@ -318,6 +347,7 @@ func VerifyBinaryIdentity(path string, pinned []byte) error {
 		return &IncompatibleError{
 			Reason: fmt.Sprintf("binary identity: expected %s, got %s",
 				hex.EncodeToString(pinned), hex.EncodeToString(actual)),
+			Kind: IncompatibleBinaryIdentity,
 		}
 	}
 

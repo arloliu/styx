@@ -247,10 +247,12 @@ func TestVerifyBinaryIdentity_ReturnsIncompatible_OnHashMismatch(t *testing.T) {
 	// When
 	err := control.VerifyBinaryIdentity(path, wrong[:])
 
-	// Then
+	// Then: a binary-identity IncompatibleError, distinguishable from an
+	// ordinary handshake negotiation failure via Kind, not just Reason prose.
 	var incompatErr *control.IncompatibleError
 	require.ErrorAs(t, err, &incompatErr)
 	require.Contains(t, incompatErr.Reason, "binary identity")
+	require.Equal(t, control.IncompatibleBinaryIdentity, incompatErr.Kind)
 }
 
 // Test VerifyBinaryIdentity is a no-op when no hash is pinned (pinning is optional)

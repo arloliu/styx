@@ -108,13 +108,27 @@ func (e *PluginPanicError) Error() string {
 		e.Plugin, e.Service, e.Method, e.Value)
 }
 
-// IncompatibleError carries both sides' handshake offers when negotiation fails.
+// IncompatibleError reports that a plugin could not be started: either its
+// binary identity does not match PluginSpec.BinarySHA256, checked before any
+// process is spawned or handshake runs (HostOffer and PluginOffer then
+// contain no offer data), or its handshake offer had no resolution against
+// the host's, checked during negotiation (both offers are then populated).
+// Kind tells the two apart.
 // errors.Is(err, ErrIncompatible) matches any *IncompatibleError.
-// errors.As(err, &incompatibleErr) recovers the structured offers.
+// errors.As(err, &incompatibleErr) recovers the structured detail.
 type IncompatibleError struct {
 	HostOffer   HandshakeOffer
 	PluginOffer HandshakeOffer
 	Reason      string
+
+	// Kind discriminates which of the two IncompatibleError causes applies:
+	// IncompatibleHandshake covers any handshake or negotiation
+	// incompatibility, including a mismatch found after a successful
+	// recompute; IncompatibleBinaryIdentity covers a binary pin mismatch
+	// caught before the plugin process is spawned. See IncompatibleKind.
+	// The zero value, IncompatibleHandshake, is correct for any construction
+	// that predates this field, so existing callers need no change.
+	Kind IncompatibleKind
 }
 
 func (e *IncompatibleError) Error() string {
@@ -125,6 +139,25 @@ func (e *IncompatibleError) Error() string {
 func (e *IncompatibleError) Is(target error) bool {
 	return target == ErrIncompatible
 }
+
+// IncompatibleKind discriminates the two reasons Start can fail with
+// *IncompatibleError, so a host can tell them apart with errors.As and a field
+// check instead of parsing Reason.
+type IncompatibleKind int
+
+const (
+	// IncompatibleHandshake reports an ordinary handshake negotiation failure:
+	// the host and plugin's protocol/transport/codec/feature/service offers
+	// have no compatible resolution — typically a plugin built against an
+	// older or newer contract than the host expects. This is the zero value,
+	// so every IncompatibleError construction that predates IncompatibleKind
+	// defaults to it correctly.
+	IncompatibleHandshake IncompatibleKind = iota
+	// IncompatibleBinaryIdentity reports that the plugin binary on disk does
+	// not match PluginSpec.BinarySHA256 — a wrong or tampered binary, not a
+	// version mismatch between two genuine builds.
+	IncompatibleBinaryIdentity
+)
 
 // HandshakeOffer is the public summary of one side's negotiation offer,
 // attached to IncompatibleError for inspection.
@@ -187,9 +220,12 @@ var (
 	// any) are unknown. It is not retryable — reissuing the call could repeat
 	// an effect it already had.
 	ErrOutcomeUnknown = errors.New("styx: call outcome unknown")
-	// ErrIncompatible reports a handshake negotiation failure. errors.Is(err,
-	// ErrIncompatible) matches any *IncompatibleError; errors.As recovers the
-	// structured detail (see IncompatibleError).
+	// ErrIncompatible reports that a plugin could not be started: a binary
+	// identity mismatch against PluginSpec.BinarySHA256, or a handshake
+	// negotiation failure. errors.Is(err, ErrIncompatible) matches any
+	// *IncompatibleError; errors.As recovers the structured detail,
+	// including which of the two occurred (see IncompatibleError,
+	// IncompatibleKind).
 	ErrIncompatible = errors.New("styx: incompatible handshake")
 	// ErrInvalidConfig reports a configuration value that cannot be honored,
 	// refused by Start before any process is spawned. errors.Is(err,
