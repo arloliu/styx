@@ -249,3 +249,12 @@ var ExitStatusFromState = exitStatusFromState
 func (s *Supervisor) ShmConfigForTest(maxInflight int, tuple control.Tuple) shmtransport.Config {
 	return s.shmConfig(maxInflight, tuple)
 }
+
+// StoppedForTest re-exports stopped for the crash-to-give-up gap failpoint
+// test (internal/supervisor's failpoint-tagged suite):
+// it lets that test prove Stop has already closed stopCh before releasing
+// Run from the gate, rather than assuming the close landed from timing
+// alone.
+func (s *Supervisor) StoppedForTest() bool {
+	return s.stopped()
+}

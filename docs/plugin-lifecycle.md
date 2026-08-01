@@ -137,6 +137,43 @@ what fires on `Events()` and the sharp edge in the default
 `RestartPolicy{}` (`Max: 0` gives up on the very first crash, with no
 restart attempt at all).
 
+### Host-owned restarts
+
+Some integrations already have their own supervisor, orchestrator, or process manager that decides when a crashed plugin comes back.
+Running styx's restart loop alongside it would just be two restart decisions racing each other.
+Set `PluginSpec.Restart` to `styx.NoRestart` (an explicit name for the same zero value described above) to opt a plugin out of styx's own restarts entirely.
+After the first crash, styx publishes `EventCrashed` and then exactly one `EventGaveUp`
+— unless the `Host` is stopped in the gap between the two, in which case the give-up may not arrive at all —
+and styx never spawns a replacement on its own.
+Errors already in flight when the crash happened still follow the normal crash taxonomy (`PluginCrashError` and the rest);
+`NoRestart` only changes whether a new process gets spawned, not how that crash is reported.
+
+The embedding supervisor's job, then, is to react to `EventGaveUp` by deciding whether and when to retry.
+`EventGaveUp` fires at most once for the instance it ends:
+`Supervisor.Run` returns immediately after publishing it, and publishes nothing at all if the `Host` was stopped in the race described above.
+A retry needs a fresh `Host`, but the gave-up one has to be closed out first, in this order:
+keep draining `Events()`;
+call `Stop` on the old `Host` with a live context, not one already canceled, since a canceled context makes `Stop` return without tearing anything down;
+let `Stop` complete the teardown and close `Events()`;
+then discard the old `Host` and construct the new one.
+A `Host` is single-use
+— `Start` on a `Host` whose `Stop` already completed rejects with `ErrHostStopped`, because that completed teardown released the background workers (the observability dispatchers, the `Events()` subscription) a later `Start` on the same `Host` would need —
+so there is no "reset" operation;
+a retry is a fresh `NewHost` plus `Start`, never a call back into the `Host` that just gave up.
+
+That also means `Events()` needs re-subscribing on the new `Host` rather than read from once.
+Its channel is the same one for the `Host`'s whole life and closes only once that `Host`'s `Stop` has completed its teardown.
+Treat a closed `Events()` channel as confirmation that this `Host` is done
+— its `Stop` has already run to completion —
+then build the next `Host` and start reading its `Events()` channel from the top;
+never assume one long-lived channel spans every restart attempt.
+
+Recreating a `Host` is not free.
+`Start` spawns a fresh process, runs the full handshake from scratch, and
+— if the shared-memory transport is negotiated —
+creates and seals a brand-new region rather than reusing anything from the instance that crashed.
+An embedding supervisor doing its own backoff between attempts (exactly the kind of decision `NoRestart` hands back to it) amortizes that cost the same way styx's own `RestartPolicy.Backoff` would have.
+
 ## Hot-reload — `Host.Reload`
 
 `Reload(ctx, name)` swaps a running instance for a freshly spawned

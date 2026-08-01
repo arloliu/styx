@@ -33,7 +33,7 @@ test:
 
 ## test-failpoint: Run the crash-window tests behind the failpoint build tag
 test-failpoint:
-	go test -tags failpoint ./internal/transport/shm -race -timeout=$(TEST_TIMEOUT)
+	go test -tags failpoint ./internal/transport/shm ./internal/supervisor -race -timeout=$(TEST_TIMEOUT)
 
 ## bench: Run the SHM spike benchmark suite (see bench/spike)
 bench:

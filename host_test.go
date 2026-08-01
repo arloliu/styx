@@ -19,6 +19,7 @@ import (
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/testutil"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // fixtureReadyPlugin and fixtureVersionedPlugin are paths to fixtures
@@ -146,6 +147,50 @@ func awaitEventWithin(t *testing.T, ch <-chan styx.Event, kind styx.EventKind, w
 		case <-deadline:
 			require.FailNow(t, "did not observe expected event kind", "kind=%d", kind)
 		}
+	}
+}
+
+// mkfifo creates a fresh named pipe under t.TempDir() and returns its path —
+// the deterministic, sleep-free checkpoint examples/echo/plugin/crashy's
+// "startup" mode synchronizes on: opening a FIFO for read blocks until a
+// peer opens it for write, so pairing with it proves the plugin process
+// reached a specific point in its own code, with no timer or polling
+// involved on either side. Mirrors tests/integration/echo_test.go's own
+// helper of the same name and contract.
+func mkfifo(t *testing.T) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "crashy.fifo")
+	require.NoError(t, unix.Mkfifo(path, 0o600))
+
+	return path
+}
+
+// openFifoOrFail opens path write-only, blocking until the crashy plugin
+// process opens the paired end, then closes it — releasing whichever
+// checkpoint the plugin is waiting on. Bounded to 5s so a broken pairing
+// (e.g. the plugin never reached the checkpoint) fails the test instead of
+// hanging it forever. Mirrors tests/integration/echo_test.go's own helper
+// of the same name and contract.
+func openFifoOrFail(t *testing.T, path string) {
+	t.Helper()
+
+	type result struct {
+		f   *os.File
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		ch <- result{f, err}
+	}()
+
+	select {
+	case r := <-ch:
+		require.NoError(t, r.err)
+		require.NoError(t, r.f.Close())
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting to pair with the plugin's fifo checkpoint")
 	}
 }
 
@@ -807,6 +852,99 @@ func TestHost_Health_MissedHeartbeatsResets_OnRestartAfterUnhealthy(t *testing.T
 	require.Equal(t, styx.EventReady, resetSnap.State)
 	require.Zero(t, resetSnap.MissedHeartbeats,
 		"a restarted instance's state must never be reported with the predecessor's miss count")
+}
+
+// Test the documented NoRestart recreation sequence end to end against a
+// runtime that genuinely reached Ready before it gave up: a plugin
+// configured with styx.NoRestart completes its handshake and attach and
+// serves normally, then crashes only once this test releases its
+// checkpoint, and gives up under its zero restart budget. A single drain
+// goroutine starts ranging over Events() before Stop runs — not after — so
+// it is already draining when Stop's teardown publishes whatever it
+// publishes and closes the stream; that same goroutine is what observes the
+// close. A freshly built Host for the identical spec then reaches its own
+// Ready, proving it is a genuinely independent Host rather than one still
+// entangled with the old one's teardown. No goroutine survives the whole
+// sequence, which is exactly what skipping the documented Stop would leak
+// (the old Host's relay and background workers).
+func TestHost_RunsFreshHost_AfterOldHostStopsFollowingNoRestartGaveUp(t *testing.T) {
+	testutil.RequireNoGoroutineLeak(t) // registered before the first host: see its doc comment on ordering.
+
+	// Given: a host running one plugin that reaches Ready normally — its
+	// crash goroutine is parked on a checkpoint this test controls — then
+	// crashes on this test's signal, configured to never restart on its own.
+	fifo := mkfifo(t)
+	spec := styx.PluginSpec{
+		Name:    "readythencrash",
+		Path:    fixtureCrashyPlugin,
+		Args:    []string{"startup"},
+		Env:     []string{"STYX_ECHO_CRASHY_FIFO=" + fifo},
+		Restart: styx.NoRestart,
+	}
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{spec}})
+	events := h.Events()
+
+	// When: Start succeeds — the plugin's crash goroutine is still parked
+	// on the checkpoint, so this attempt genuinely reaches Ready.
+	require.NoError(t, h.Start(t.Context()))
+	readyEv := awaitEvent(t, events, styx.EventReady)
+	require.Equal(t, "readythencrash", readyEv.Plugin)
+
+	// And: one drain goroutine starts ranging over Events() now, before the
+	// crash or Stop — it stays live across the Stop call below rather than
+	// starting only once Stop has already returned, and it signals gaveUp
+	// (without stopping the range) the instant it sees this plugin's
+	// EventGaveUp, so the test can wait for the crash to actually reach its
+	// terminal event before calling Stop rather than racing Stop against
+	// crash detection itself (the same concurrent-stop gap NoRestart
+	// documents as able to suppress GaveUp).
+	drained := make(chan []styx.Event, 1)
+	gaveUp := make(chan struct{}, 1)
+	go func() {
+		var seen []styx.Event
+		for ev := range events {
+			seen = append(seen, ev)
+			if ev.Kind == styx.EventGaveUp && ev.Plugin == "readythencrash" {
+				select {
+				case gaveUp <- struct{}{}:
+				default:
+				}
+			}
+		}
+		drained <- seen
+	}()
+
+	// And: releasing the checkpoint lets the plugin crash; with no restart
+	// budget, that is terminal. Wait for the drain goroutine to observe the
+	// resulting GaveUp before stopping the Host.
+	openFifoOrFail(t, fifo)
+	select {
+	case <-gaveUp:
+	case <-time.After(10 * time.Second):
+		t.Fatal("drain goroutine never observed EventGaveUp for readythencrash")
+	}
+
+	// And: the old Host is stopped with a fresh, live context, per the
+	// documented order — never one already canceled — while the drain
+	// goroutine above is still running.
+	require.NoError(t, h.Stop(context.Background()))
+
+	// Then: the drain goroutine — live throughout, not started only after
+	// Stop returned — observes the stream close.
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain goroutine never observed Events() close after Stop")
+	}
+
+	// And: a freshly built Host for the identical spec is not entangled with
+	// the old one — it reaches its own Ready normally.
+	h2 := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{spec}})
+	t.Cleanup(func() { _ = h2.Stop(context.Background()) })
+	events2 := h2.Events()
+	require.NoError(t, h2.Start(t.Context()))
+	ready2 := awaitEvent(t, events2, styx.EventReady)
+	require.Equal(t, "readythencrash", ready2.Plugin)
 }
 
 // TestExternalGeometryFixture_Compiles builds the external-module fixture under

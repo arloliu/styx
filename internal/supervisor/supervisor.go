@@ -536,6 +536,10 @@ func (s *Supervisor) Run(ctx context.Context) {
 		restartsUsed = effectiveRestartsUsed(s.cfg.ResetWindow, timeSinceOrZero(run.readySince), restartsUsed)
 		s.publish(Event{Kind: EventCrashed, Time: time.Now(), Err: crashErr, Gen: run.endGen})
 
+		if failpointEnabled && fpAfterCrashPublish != nil {
+			fpAfterCrashPublish()
+		}
+
 		if s.stopped() || ctx.Err() != nil {
 			return
 		}

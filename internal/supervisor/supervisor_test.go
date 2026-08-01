@@ -20,6 +20,7 @@ import (
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/testutil"
+	pubsupervisor "github.com/arloliu/styx/supervisor"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -89,14 +90,15 @@ func TestMain(m *testing.M) {
 // subscription. It is created before the Supervisor runs so no event is
 // missed to a late subscription.
 type eventCollector struct {
-	ch    <-chan supervisor.Event
-	unsub func()
+	ch       <-chan supervisor.Event
+	unsub    func()
+	quiesced func() bool
 }
 
 func newEventCollector(bus *supervisor.EventBus) *eventCollector {
-	ch, unsub, _ := bus.Subscribe()
+	ch, unsub, quiesced := bus.Subscribe()
 
-	return &eventCollector{ch: ch, unsub: unsub}
+	return &eventCollector{ch: ch, unsub: unsub, quiesced: quiesced}
 }
 
 // awaitKind blocks until an EventGaveUp is observed (recording every event
@@ -117,6 +119,44 @@ func (c *eventCollector) awaitKind(t *testing.T) []supervisor.Event {
 			}
 		case <-deadline:
 			t.Fatalf("timed out waiting for EventGaveUp; observed %d events: %+v", len(seen), seen)
+		}
+	}
+}
+
+// full drains every event published on this subscription until runDone has
+// closed AND the subscription reports quiesced (nothing queued, nothing
+// mid-delivery on the bus's unbuffered channel) — proof that everything the
+// Supervisor's Run goroutine will ever publish has already been received
+// here, rather than a guess based on a fixed silence window. Run is this
+// bus's only publisher, and it publishes nothing once it has returned, so
+// this pair of conditions makes the returned history final.
+//
+// A background poll checks runDone/quiesced on a short tick while this
+// goroutine keeps draining c.ch, because quiesced can only become true once
+// a receiver actually takes the last queued event off an unbuffered channel
+// — polling from a second goroutine would starve that receive.
+func (c *eventCollector) full(t *testing.T, runDone <-chan struct{}) []supervisor.Event {
+	t.Helper()
+
+	var seen []supervisor.Event
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(10 * time.Second)
+
+	for {
+		select {
+		case ev := <-c.ch:
+			seen = append(seen, ev)
+		case <-ticker.C:
+			select {
+			case <-runDone:
+				if c.quiesced() {
+					return seen
+				}
+			default:
+			}
+		case <-deadline:
+			t.Fatalf("timed out collecting the full event history; observed %d events: %+v", len(seen), seen)
 		}
 	}
 }
@@ -313,6 +353,134 @@ func TestSupervisor_RestartsPerPolicy_ThenEmitsGaveUp_WhenMaxExceeded(t *testing
 		t.Fatalf("unexpected event after GaveUp: %+v", ev)
 	case <-time.After(50 * time.Millisecond):
 	}
+}
+
+// Test pubsupervisor.NoRestart's contract on the complete event history: a
+// plugin that crashes is never restarted, so the full stream Run ever
+// publishes contains exactly one EventCrashed followed by exactly one
+// EventGaveUp, no EventRestarting, and nothing after GaveUp. The history is
+// collected past the first GaveUp (not truncated there, which would make an
+// exactly-one count tautological) and its completeness is proven by the
+// bus's own quiescence probe once Run has joined, not by a fixed silence
+// window that only makes a duplicate less likely to be observed.
+func TestSupervisor_NeverRestarts_WithNoRestartPolicy(t *testing.T) {
+	// Given: a plugin that crashes before ever completing the handshake, and
+	// a policy telling styx never to restart it on its own.
+	bus := supervisor.NewEventBus()
+	collector := newEventCollector(bus)
+	defer collector.unsub()
+
+	cfg := supervisor.Config{
+		Spec:    lifecycle.Spec{Path: fixtureCrashPlugin},
+		Restart: pubsupervisor.NoRestart,
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// When: collect the complete event history — Run joins on its own here
+	// (nothing stops it early), so its own zero-budget GaveUp branch always
+	// runs to completion.
+	seen := collector.full(t, runDone)
+
+	// Then: GaveUp is terminal and follows exactly one Crashed, with no
+	// Restarting ever published, and it is the only GaveUp in the whole run.
+	require.NotEmpty(t, seen)
+	last := seen[len(seen)-1]
+	require.Equal(t, supervisor.EventGaveUp, last.Kind)
+	require.Error(t, last.Err)
+
+	var crashedCount, gaveUpCount, restartingCount int
+	for _, ev := range seen {
+		//exhaustive:ignore -- only Crashed/Restarting/GaveUp are tallied
+		// here; every other kind is irrelevant to this assertion.
+		switch ev.Kind {
+		case supervisor.EventCrashed:
+			crashedCount++
+		case supervisor.EventRestarting:
+			restartingCount++
+		case supervisor.EventGaveUp:
+			gaveUpCount++
+		}
+	}
+	require.Equal(t, 1, crashedCount, "expected exactly one Crashed event")
+	require.Equal(t, 1, gaveUpCount, "expected exactly one GaveUp event")
+	require.Zero(t, restartingCount, "NoRestart must never publish Restarting")
+}
+
+// Smoke test for pubsupervisor.NoRestart under a Stop issued the instant
+// EventCrashed is observed: Publish only enqueues and wakes a separate
+// forwarder before returning, so observing EventCrashed here does not
+// actually hold Run at its stopped() re-check — Run may already have
+// published EventGaveUp and returned before this test's Stop call lands.
+// This test therefore cannot force the concurrent-stop interleaving; it
+// only proves the invariants that must hold on WHICHEVER branch the real
+// race happens to take: EventRestarting never fires, GaveUp is never
+// duplicated, and Run still joins. For a deterministic proof that Stop can
+// actually suppress the give-up, see
+// TestSupervisor_SuppressesGaveUp_WhenStoppedInCrashToGiveUpGap, which
+// holds Run at that exact gap with the crash-window failpoint.
+func TestSupervisor_NeverRestartsOrDuplicatesGaveUp_UnderRealStopTiming(t *testing.T) {
+	// Given: a plugin that crashes before ever completing the handshake, and
+	// a policy telling styx never to restart it on its own.
+	bus := supervisor.NewEventBus()
+	collector := newEventCollector(bus)
+	defer collector.unsub()
+
+	cfg := supervisor.Config{
+		Spec:    lifecycle.Spec{Path: fixtureCrashPlugin},
+		Restart: pubsupervisor.NoRestart,
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// When: stop the supervisor the instant EventCrashed is observed,
+	// racing Run's own zero-budget GaveUp branch on purpose.
+	var seen []supervisor.Event
+	crashed := false
+	deadline := time.After(10 * time.Second)
+	for !crashed {
+		select {
+		case ev := <-collector.ch:
+			seen = append(seen, ev)
+			crashed = ev.Kind == supervisor.EventCrashed
+		case <-deadline:
+			t.Fatalf("timed out waiting for EventCrashed; observed %d events: %+v", len(seen), seen)
+		}
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer stopCancel()
+	require.NoError(t, sup.Stop(stopCtx), "Stop must join Run without hanging")
+
+	// Then: Stop's nil error already proves Run joined; draining whatever
+	// else it published confirms no restart was ever attempted and that
+	// GaveUp, if it fired at all, fired at most once.
+	seen = append(seen, collector.full(t, runDone)...)
+
+	var crashedCount, gaveUpCount, restartingCount int
+	for _, ev := range seen {
+		//exhaustive:ignore -- only Crashed/Restarting/GaveUp are tallied
+		// here; every other kind is irrelevant to this assertion.
+		switch ev.Kind {
+		case supervisor.EventCrashed:
+			crashedCount++
+		case supervisor.EventRestarting:
+			restartingCount++
+		case supervisor.EventGaveUp:
+			gaveUpCount++
+		}
+	}
+	require.Equal(t, 1, crashedCount, "expected exactly one Crashed event")
+	require.Zero(t, restartingCount, "NoRestart must never publish Restarting, even under a concurrent Stop")
+	require.LessOrEqual(t, gaveUpCount, 1, "a concurrent Stop can suppress GaveUp but must never duplicate it")
 }
 
 // Test Config.OnRestart firing exactly once per restart decision, at the same
