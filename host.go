@@ -112,9 +112,11 @@ type PluginSpec struct {
 	// except through the crash tail a PluginCrashError already carries.
 	Stdio StdioSink
 
-	// BinarySHA256 optionally pins the plugin binary's identity.
-	// When non-nil, Start verifies it before creating any supervisor and fails
-	// the plugin with *IncompatibleError on a mismatch.
+	// BinarySHA256 optionally pins the plugin binary's identity. When non-nil,
+	// Start verifies it before creating any supervisor and fails the plugin
+	// with *IncompatibleError on a mismatch, with Kind set to
+	// IncompatibleBinaryIdentity so a host can tell a tampered or wrong
+	// binary apart from an ordinary handshake version mismatch.
 	BinarySHA256 []byte
 
 	// Services optionally declares the version range each service must satisfy.
@@ -1284,10 +1286,35 @@ func translateIncompatible(err error) error {
 			HostOffer:   toHandshakeOffer(ie.HostOffer),
 			PluginOffer: toHandshakeOffer(ie.PluginOffer),
 			Reason:      ie.Reason,
+			Kind:        toIncompatibleKind(ie.Kind),
 		}
 	}
 
 	return err
+}
+
+// toIncompatibleKind maps the internal control.IncompatibleKind to the public
+// IncompatibleKind at the API boundary. internal/control must not import
+// styx, so the two enums are defined independently and mapped by value here
+// rather than shared or cast.
+// control.IncompatibleHandshake intentionally falls through to default (same
+// return value) rather than an explicit case, to avoid identical-switch-branches
+// — see default's comment below. The root-package test iterating
+// control.IncompatibleKindCount checks this mapping against every value the
+// internal enum currently defines, so a value added there without a decision
+// here fails that test instead of silently defaulting unnoticed.
+func toIncompatibleKind(k control.IncompatibleKind) IncompatibleKind {
+	//exhaustive:ignore -- see doc above
+	switch k {
+	case control.IncompatibleBinaryIdentity:
+		return IncompatibleBinaryIdentity
+	default:
+		// Also covers control.IncompatibleHandshake: same branch as any value
+		// control.IncompatibleKind does not (yet) define, so revive's
+		// identical-switch-branches doesn't flag a duplicate case that
+		// returns the same value as default.
+		return IncompatibleHandshake
+	}
 }
 
 // toHandshakeOffer projects an internal control.Offer into the public,
