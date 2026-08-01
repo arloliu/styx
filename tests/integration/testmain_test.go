@@ -18,18 +18,21 @@ import (
 // These are paths to the example binaries built once here (mirroring
 // styx/host_test.go's and internal/supervisor/supervisor_test.go's own
 // build-once-per-package fixture pattern) rather than per test: examples/echo's
-// plugin, host, and crashy-plugin twin; examples/streaming's host; and
-// examples/hot-reload's plugin and host.
+// plugin, host, and crashy-plugin twin; examples/streaming's host;
+// examples/hot-reload's plugin and host; and examples/slow-handler's plugin and
+// host.
 var (
-	echoPluginBin      string
-	echoHostBin        string
-	crashyPluginBin    string
-	streamingHostBin   string
-	hotReloadPluginBin string
-	hotReloadHostBin   string
+	echoPluginBin        string
+	echoHostBin          string
+	crashyPluginBin      string
+	streamingHostBin     string
+	hotReloadPluginBin   string
+	hotReloadHostBin     string
+	slowHandlerPluginBin string
+	slowHandlerHostBin   string
 )
 
-// TestMain builds the six example binaries once via `go build` into a temp
+// TestMain builds the example binaries once via `go build` into a temp
 // directory removed on process exit, then runs the package's tests against them
 // as real spawned child processes.
 func TestMain(m *testing.M) {
@@ -55,6 +58,12 @@ func TestMain(m *testing.M) {
 
 	hotReloadHostBin = filepath.Join(dir, "hot-reload-host")
 	buildOrPanic(hotReloadHostBin, "../../examples/hot-reload/host")
+
+	slowHandlerPluginBin = filepath.Join(dir, "slow-handler-plugin")
+	buildOrPanic(slowHandlerPluginBin, "../../examples/slow-handler/plugin")
+
+	slowHandlerHostBin = filepath.Join(dir, "slow-handler-host")
+	buildOrPanic(slowHandlerHostBin, "../../examples/slow-handler/host")
 
 	m.Run()
 	_ = os.RemoveAll(dir)
