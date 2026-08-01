@@ -139,6 +139,53 @@ func TestRun_GeneratesClientAndServerStubs_WithMatchingFNV64IDs(t *testing.T) {
 	require.NotContains(t, content, "dec func(proto.Message) error")
 }
 
+// Test Run generating a client/server pair from an edition 2023 input file
+// (testdata/editions.proto, `edition = "2023"` instead of `syntax = "proto3"`)
+// the same way it does for a proto3 file: this generator only reads service,
+// method, and message shape through protogen's normalized API, never
+// field-level options or presence, so an editions descriptor carries nothing
+// its codegen needs to special-case.
+func TestRun_GeneratesClientAndServerStubs_ForEditions2023Input(t *testing.T) {
+	// Given: a CodeGeneratorRequest compiled from testdata/editions.proto
+	gen := newTestPlugin(t, "testdata/editions.proto", "editions.proto")
+
+	// When: Run(gen) against that request
+	err := main.Run(gen)
+	require.NoError(t, err)
+
+	content := styxFile(t, gen)
+
+	// Then: the emitted file contains the client constructor and the
+	// server registration function, exactly as for a proto3 input.
+	require.Contains(t, content, "func NewGreeterClient(conn *styx.ClientConn) GreeterClient")
+	require.Contains(t, content, "func RegisterGreeterServer(srv *styx.PluginServer, impl GreeterServer)")
+}
+
+// Test the editions-2023 generated code compares EXACTLY against a reviewed
+// golden file, the same byte-for-byte mechanism as TestRun_MatchesGoldenExactly
+// below, applied to an edition input instead of a proto3 one: any drift in the
+// emitted text, not just the client/server substrings spot-checked above, fails
+// here. Regenerate the golden with `UPDATE_GOLDEN=1 go test ./cmd/protoc-gen-go-styx/...`
+// after an intended change.
+func TestRun_MatchesGoldenExactly_ForEditionsInput(t *testing.T) {
+	// Given: a CodeGeneratorRequest compiled from testdata/editions.proto
+	gen := newTestPlugin(t, "testdata/editions.proto", "editions.proto")
+
+	// When: Run(gen) against that request
+	require.NoError(t, main.Run(gen))
+	content := styxFile(t, gen)
+
+	// Then: the emitted content matches the reviewed golden file exactly
+	const goldenPath = "testdata/editions.styx.go.golden"
+	if os.Getenv("UPDATE_GOLDEN") != "" {
+		require.NoError(t, os.WriteFile(goldenPath, []byte(content), 0o644))
+	}
+	want, err := os.ReadFile(goldenPath)
+	require.NoError(t, err)
+	require.Equal(t, string(want), content,
+		"generated output drifted from the reviewed golden; rerun with UPDATE_GOLDEN=1 if the change is intended")
+}
+
 // Test Run emitting an EchoRequirement() helper returning the exact
 // generated service version and full name, as an exact-version range
 // (MinVersion == MaxVersion) — the codegen half of per-service
