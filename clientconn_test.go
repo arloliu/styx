@@ -1,8 +1,11 @@
 package styx
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -603,6 +606,130 @@ func TestClientConn_Invoke_FallsBackToTheWirePath_OverUDS(t *testing.T) {
 	require.Equal(t, "hello", resp.Value)
 	_, ok := resolvePayloadFiller(clientTr, cdc, wrapperspb.String("hello"))
 	require.False(t, ok, "uds must keep the marshal-then-send path")
+}
+
+// Test a request whose marshaled size exceeds the uds transport's MaxFrameSize
+// failing before any byte reaches the wire. The send is provably not-dispatched
+// — transport.ErrPayloadTooLarge is returned before writeFrame runs — so the
+// caller must see that error directly and never the unknown-outcome
+// classification a genuinely ambiguous send would earn, and the connection must
+// stay usable for the next call.
+func TestClientConn_Invoke_RejectsOversizePayload_OverUDS(t *testing.T) {
+	// Given a plain uds pair and a request whose encoded form exceeds MaxFrameSize.
+	clientTr, pluginTr := newInProcessTransportPairForTest(t)
+	cdc := codec.Proto{}
+	table := rpcruntime.NewTable(1)
+	cc := newClientConn("echo", table, clientTr, cdc)
+
+	dispatcher := rpcruntime.NewDispatcher()
+	dispatcher.Register(fnv64a("test.Echo"), echoHandler{codec: cdc})
+	go runInProcessDispatchLoop(pluginTr, dispatcher)
+
+	oversized := wrapperspb.String(strings.Repeat("x", transport.MaxFrameSize+16))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	// When the oversize call is invoked.
+	err := cc.Invoke(ctx, "test.Echo", "Say", oversized, &wrapperspb.StringValue{})
+
+	// Then the caller sees the underlying size error, never an unknown outcome...
+	require.Error(t, err)
+	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+	require.NotErrorIs(t, err, ErrOutcomeUnknown,
+		"a send that provably wrote zero bytes must not be reported as an unknown outcome")
+
+	// ...and the connection is unharmed: a normal call right after completes.
+	resp := &wrapperspb.StringValue{}
+	err = cc.Invoke(ctx, "test.Echo", "Say", wrapperspb.String("hello"), resp)
+	require.NoError(t, err)
+	require.Equal(t, "hello", resp.Value)
+}
+
+// Test a uds Send torn mid-frame — ambiguous, never proven not-dispatched —
+// still terminating the call as an unknown outcome, through the real Invoke
+// path. Shrinking SO_SNDBUF/SO_RCVBUF forces a large payload to block after
+// its first chunk reaches the wire; reading one byte on the peer confirms
+// bytes are genuinely in flight before the sabotage runs. Closing the peer
+// out from under the blocked write turns its next write(2) into a mid-frame
+// IO failure, which uds.go's abortFrame poisons (started=true) rather than
+// proves not-dispatched — the one shape transport.NeverPublished must NOT
+// match, so this call must still land on ErrOutcomeUnknown, not REJECTED.
+func TestClientConn_Invoke_ReturnsOutcomeUnknown_WhenSendTearsMidFrame(t *testing.T) {
+	// Given a raw uds pair with shrunk buffers and a payload large enough to
+	// guarantee more than one write(2) call.
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	clientTr, err := transport.NewUDSTransport(fds[0], false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = clientTr.Close() })
+	require.NoError(t, unix.SetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 4096))
+	require.NoError(t, unix.SetsockoptInt(fds[1], unix.SOL_SOCKET, unix.SO_RCVBUF, 4096))
+
+	table := rpcruntime.NewTable(1)
+	cc := newClientConn("echo", table, clientTr, codec.Proto{})
+	req := wrapperspb.Bytes(bytes.Repeat([]byte{0xAB}, 512<<10))
+
+	errCh := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		errCh <- cc.Invoke(ctx, "test.Echo", "Say", req, &wrapperspb.StringValue{})
+	}()
+
+	// When: read one byte from the peer — the happens-before edge that proves
+	// the sender has genuinely put frame bytes on the wire (started=true) —
+	// then close the peer out from under the still-blocked write.
+	one := make([]byte, 1)
+	_, rerr := unix.Read(fds[1], one)
+	require.NoError(t, rerr)
+	require.NoError(t, unix.Close(fds[1]))
+
+	// Then
+	select {
+	case err = <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Invoke did not return after the send was torn mid-frame")
+	}
+	require.Error(t, err)
+	require.ErrorIs(t, err, transport.ErrPoisoned,
+		"a torn mid-frame send desyncs the connection")
+	require.ErrorIs(t, err, ErrOutcomeUnknown,
+		"a torn mid-frame send is genuinely ambiguous, not proven never-published")
+}
+
+// Test translateSendFailure's classification of transport.NeverPublished's
+// three sentinels: only ErrBackpressure maps to the public, documented
+// styx.ErrBackpressure — mirroring the streaming path's identical mapping —
+// because it alone is transient capacity a retry might find free. An
+// oversize payload or an unimplemented frame kind stays a known,
+// not-dispatched send failure: the caller learns the underlying error and
+// never ErrOutcomeUnknown, but IsRetryable correctly reports false, since an
+// identical retry fails the identical way.
+func TestTranslateSendFailure_MapsOnlyBackpressurePublicly(t *testing.T) {
+	// Given the three transport.NeverPublished sentinels, wrapped the way
+	// sendRequest actually wraps them before returning.
+	backpressure := fmt.Errorf("styx: invoke: send request: %w", transport.ErrBackpressure)
+	oversize := fmt.Errorf("styx: invoke: send request: %w", transport.ErrPayloadTooLarge)
+	unimplemented := fmt.Errorf("styx: invoke: send request: %w", transport.ErrUnimplementedFrameKind)
+
+	// When each is translated to the error the caller sees.
+	backpressureErr := translateSendFailure(backpressure)
+	oversizeErr := translateSendFailure(oversize)
+	unimplementedErr := translateSendFailure(unimplemented)
+
+	// Then only backpressure carries the public, retryable sentinel...
+	require.ErrorIs(t, backpressureErr, ErrBackpressure)
+	require.True(t, IsRetryable(backpressureErr), "backpressure is transient capacity, safe to retry")
+
+	// ...while the other two stay known-failed but not retryable, and never
+	// collapse into the ambiguous-outcome sentinel.
+	require.ErrorIs(t, oversizeErr, transport.ErrPayloadTooLarge)
+	require.NotErrorIs(t, oversizeErr, ErrOutcomeUnknown)
+	require.False(t, IsRetryable(oversizeErr), "an oversize payload fails the identical way again")
+
+	require.ErrorIs(t, unimplementedErr, transport.ErrUnimplementedFrameKind)
+	require.NotErrorIs(t, unimplementedErr, ErrOutcomeUnknown)
+	require.False(t, IsRetryable(unimplementedErr))
 }
 
 // Test a fill send abandoned on the caller's context terminating the call

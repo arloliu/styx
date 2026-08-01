@@ -340,6 +340,41 @@ func TestClientConn_Invoke_FailsOneCall_WhenTheRequestCodecPanics_OverSharedMemo
 	requireNoOwedObligations(t, pair)
 }
 
+// Test a Blob request whose payload exceeds the shared-memory transport's
+// negotiated max_payload being refused before anything is enqueued.
+// SendPayloadFill's admission check runs on the calling goroutine before any
+// intent reaches the arena, so the send is provably not-dispatched — the same
+// shape as the uds oversize case — and the caller must see the underlying size
+// error directly rather than the unknown-outcome classification a genuinely
+// ambiguous send would earn.
+func TestClientConn_Invoke_RejectsOversizePayload_OverSharedMemory(t *testing.T) {
+	// Given a host/plugin pair over shared memory and a payload larger than the
+	// negotiated max_payload (DefaultConfig's MaxPayload is transport.MaxFrameSize).
+	pair := newBlobPair(t, codec.Proto{})
+	client := echopb.NewEchoClient(pair.Conn)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	oversized := make([]byte, transport.MaxFrameSize+(1<<16))
+
+	// When the oversize call is invoked.
+	resp, err := client.Blob(ctx, &echopb.BlobRequest{Payload: oversized})
+
+	// Then the caller sees the underlying size error, never an unknown outcome...
+	require.Error(t, err)
+	require.Nil(t, resp)
+	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+	require.NotErrorIs(t, err, styx.ErrOutcomeUnknown,
+		"a send refused before anything was enqueued must not be reported as an unknown outcome")
+
+	// ...and the connection is unharmed: the next call completes normally.
+	require.False(t, pair.ServeLoopExited())
+	ok, err := client.Blob(ctx, &echopb.BlobRequest{Payload: []byte("healthy")})
+	require.NoError(t, err)
+	require.Equal(t, []byte("healthy"), ok.GetPayload())
+	requireNoOwedObligations(t, pair)
+}
+
 // requireNoOwedObligations asserts the plugin serve loop owes no unary response.
 // It waits rather than sampling once because the obligation closes on the serve
 // goroutine after the response reaches the transport, and the shared-memory

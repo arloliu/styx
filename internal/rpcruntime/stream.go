@@ -811,16 +811,12 @@ func (s *Stream) handleSendErr(callerCtx context.Context, err error, seq uint64)
 
 // isRollbackEligible reports whether a Send error is definitively pre-acceptance
 // (stream-protocol.md §4.5), the only case a reservation may be rolled back. It
-// matches the transport package's own pre-write sentinels, including
-// transport.ErrBackpressure — the reject-mode data-lane backpressure the shm
-// transport surfaces at this level so this package classifies it without
-// importing internal/transport/shm (that sentinel's own package). All three
-// sentinels prove the frame never reached the peer, so the reserved credit unit
-// and sequence number may be rolled back rather than stranded.
+// is transport.NeverPublished under this package's rollback-rule name: every
+// sentinel that predicate matches proves the frame never reached the peer, so
+// the reserved credit unit and sequence number may be rolled back rather than
+// stranded.
 func isRollbackEligible(err error) bool {
-	return errors.Is(err, transport.ErrUnimplementedFrameKind) ||
-		errors.Is(err, transport.ErrPayloadTooLarge) ||
-		errors.Is(err, transport.ErrBackpressure)
+	return transport.NeverPublished(err)
 }
 
 // RecvMsg returns the next delivered message, blocking until one arrives, the

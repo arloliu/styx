@@ -399,19 +399,28 @@ func (t *Table) OutcomeUnknown(id uint64, cause error) bool {
 
 // Reject CASes id to StateRejected and delivers err as the Result's Err: the
 // call failed locally and provably never reached the peer, so it belongs to the
-// not-dispatched class rather than the unknown-outcome one.
+// not-dispatched class rather than the unknown-outcome one. Not-dispatched is
+// not itself a retryability verdict — a crash-before-dispatch cause (FailAll's
+// notDispatchedErr) is retryable because a fresh instance may still serve the
+// call, while an oversize payload or an unimplemented frame kind is not,
+// because the identical call fails the identical way again; each cause's own
+// retryability is the caller layer's to classify (styx.IsRetryable), not this
+// state's to assert.
 // It accepts two source states, because a request is provably undispatched in
 // two different places:
 //
 //   - StateSubmitted: an admission failure or local queue failure, before any
 //     Publish was attempted.
 //   - StatePublished: a send that failed definitively-unpublished after the
-//     publication CAS — the caller's payload-fill callback faulted, so the
-//     transport discarded the frame and released its buffer without ever
-//     emitting a descriptor (transport.ErrPayloadFillFailed). The publication
-//     CAS is taken before the send precisely so a racing cancel is ordered
-//     against it, so reaching this terminal from PUBLISHED is the normal shape
-//     of that failure, not an anomaly.
+//     publication CAS. Two shapes reach this: the caller's payload-fill
+//     callback faulted, so the transport discarded the frame and released its
+//     buffer without ever emitting a descriptor (transport.ErrPayloadFillFailed);
+//     or the send was refused before any byte reached the wire or the arena — an
+//     oversize payload, an unimplemented frame kind, or reject-mode backpressure
+//     (transport.NeverPublished's sentinel set). The publication CAS is taken
+//     before the send precisely so a racing cancel is ordered against it, so
+//     reaching this terminal from PUBLISHED is the normal shape of either
+//     failure, not an anomaly.
 //
 // It returns false if id is already in any other terminal state
 // (first-terminal-wins) or absent.

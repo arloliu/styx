@@ -188,6 +188,31 @@ func IsFrameLocalRecvErr(err error) bool {
 		errors.Is(err, ErrConsumeFault)
 }
 
+// NeverPublished reports whether a Send error proves the frame never reached
+// the peer: an unimplemented frame kind, an oversize payload, or shm
+// reject-mode backpressure. Each of the three is returned only by a check
+// that runs before the send has any observable effect — before a byte
+// reaches the wire (uds) or before a byte reaches the arena (shm's
+// SendPayloadFill, including the writer's own post-enqueue oversize
+// backstop, which reports before the descriptor's Alloc/Push effects) — so a
+// match here is proof the call never happened, not a guess.
+//
+// It says nothing about whether the CALL is safe to retry, only that its
+// OUTCOME is known: an oversize payload or an unimplemented frame kind fails
+// the identical way on a retry, while reject-mode backpressure is transient
+// capacity that may free up. Retryability is the caller layer's classifier
+// to apply per sentinel, not this predicate's to assert.
+//
+// It exists so any Send caller — unary and streaming alike — can classify a
+// send failure by this one proof instead of re-deriving it.
+// internal/rpcruntime's own isRollbackEligible (stream-protocol.md §4.5) is
+// this predicate under the streaming path's own name for its rollback rule.
+func NeverPublished(err error) bool {
+	return errors.Is(err, ErrUnimplementedFrameKind) ||
+		errors.Is(err, ErrPayloadTooLarge) ||
+		errors.Is(err, ErrBackpressure)
+}
+
 // FrameKind identifies a Frame's role in the RPC protocol.
 // All nine kinds (unary request/response/error, cancel, and five streaming
 // kinds) are transport-agnostic and carried by both uds and shm implementations.
