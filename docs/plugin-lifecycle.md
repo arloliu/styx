@@ -45,6 +45,14 @@ background and are reported via `Events`. One plugin failing to start
 doesn't abort the others — `Start`'s returned error is every failure
 joined together (`errors.Join`), not the first one.
 
+That makes `Start` the way to retry the plugins that failed, and only
+those: a name this host already started belongs to that instance for as
+long as the host owns it, and starting it again fails with
+`ErrPluginAlreadyStarted` rather than putting a second supervisor on the
+name.
+That holds once the instance is terminal too — see
+[what to do about `EventGaveUp`](supervisor-events.md#what-to-actually-do-about-each-kind).
+
 ## Graceful shutdown — `Host.Stop`
 
 `Host.Stop(ctx)` tears every plugin down. The one thing worth internalizing

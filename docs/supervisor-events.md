@@ -326,6 +326,9 @@ should trigger something your code does.
   recovering means tearing down and recreating the whole `Host` (or
   restarting the process that owns it), which is exactly why this is the
   event to alert a human or an orchestration layer on, not just log.
+  Calling `Start` again is not that API: the host keeps the terminal
+  instance's supervisor registered under the name until `Stop`, so a
+  second `Start` of it fails with `ErrPluginAlreadyStarted`.
 
 ## Further reading
 

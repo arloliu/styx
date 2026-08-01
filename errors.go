@@ -259,6 +259,24 @@ var (
 	// ErrMethodNotFound reports that the called method has no handler
 	// registered within its service on the plugin.
 	ErrMethodNotFound = errors.New("styx: method not found")
+	// ErrPluginAlreadyStarted reports that Start named a plugin this Host has
+	// already started. A Host holds one supervisor per name, and its per-name state
+	// is built on that: one routing entry that dispatches the name's calls, one
+	// teardown gate that Stop clears. A second supervisor under the same name would
+	// overwrite the routing its predecessor still owns and share that one gate, so
+	// whichever finished tearing down first would clear it for both.
+	//
+	// Started, not still running, is the condition: a Host keeps a terminal
+	// instance's supervisor and event relay registered under the name until Stop,
+	// so the name is taken by an instance that has given up for good exactly as it
+	// is by one that is serving. Replacing a serving instance with a fresh process
+	// is what Reload does; recovering from EventGaveUp means building a new Host,
+	// which is the only respawn path this API has. A plugin whose start FAILED
+	// leaves no supervisor behind and can be started again.
+	//
+	// It is a lifecycle/framework error, not a per-call one, so IsRetryable does
+	// not classify it.
+	ErrPluginAlreadyStarted = errors.New("styx: plugin already started")
 	// ErrPluginStopping reports that a Start or Reload named a plugin whose
 	// previous instance is still shutting down: a Stop deadline expired before
 	// that instance's supervisor joined, so the name is retained in a stopping
