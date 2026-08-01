@@ -24,10 +24,22 @@ func symmetricLayout(ringCap, reserve uint32, classes []shm.SizeClass) shm.Layou
 
 // leanClasses and defaultClasses are the two recorded profiles' per-direction
 // size-class tables (bench/shm/REPORT.md's lean profile and shm-abi.md §1's
-// default profile).
+// default profile). threeClassFixture is a plain ascending table with no profile
+// behind it, for the checks that hold for any legal table: the C - R boundary and
+// class 0's slab-zero subtraction read nothing about the ladder's shape, so tying
+// them to a named profile would make a profile edit look like a mechanic changing.
 var (
-	leanClasses    = []shm.SizeClass{{SlabSize: 512, SlabCount: 64}, {SlabSize: 4096, SlabCount: 64}}
+	leanClasses    = []shm.SizeClass{{SlabSize: 512, SlabCount: 64}, {SlabSize: 4160, SlabCount: 64}}
 	defaultClasses = []shm.SizeClass{
+		{SlabSize: 256, SlabCount: 4096},
+		{SlabSize: 1088, SlabCount: 2048},
+		{SlabSize: 4160, SlabCount: 1024},
+		{SlabSize: 16448, SlabCount: 256},
+		{SlabSize: 65600, SlabCount: 128},
+		{SlabSize: 131136, SlabCount: 32},
+		{SlabSize: (1 << 20) + 64, SlabCount: 8},
+	}
+	threeClassFixture = []shm.SizeClass{
 		{SlabSize: 64, SlabCount: 4096}, {SlabSize: 4096, SlabCount: 1024}, {SlabSize: 1 << 20, SlabCount: 26},
 	}
 )
@@ -36,8 +48,8 @@ var (
 // exactly when max_data_inflight exceeds the ring's data budget C - R, at the
 // exact C - R boundary and one past it.
 func TestValidateStartupCapacity_MandatoryDeadlockFreedomBoundary(t *testing.T) {
-	// default profile: C = 4096, R = 256 => C - R = 3840.
-	layout := symmetricLayout(4096, 256, defaultClasses)
+	// C = 4096, R = 256 => C - R = 3840. The class table is immaterial here.
+	layout := symmetricLayout(4096, 256, threeClassFixture)
 
 	// At exactly C - R: admitted (non-STRICT).
 	require.NoError(t, ValidateStartupCapacity(layout, 3840, false, false))
@@ -54,25 +66,30 @@ func TestValidateStartupCapacity_MandatoryDeadlockFreedomBoundary(t *testing.T) 
 // budget with the offending class named, class 0's usable count subtracts the
 // reserved slab-zero, and a class with plenty of slabs never causes rejection.
 func TestValidateStartupCapacity_StrictNamedCases(t *testing.T) {
-	// The lean device-gateway profile (C = 512, R = 32) passes STRICT at its
+	// The lean small-control-traffic profile (C = 512, R = 32) passes STRICT at its
 	// recorded max_data_inflight = 32 (every class has >= 32 usable slabs).
 	lean := symmetricLayout(512, 32, leanClasses)
 	require.NoError(t, ValidateStartupCapacity(lean, 32, false, true),
 		"lean profile at max_data_inflight=32 must pass STRICT")
 
 	// The default profile passes STRICT only at its smallest reachable usable
-	// class count — the 1 MiB class's 26 slabs.
+	// class count — the top rung's 8 slabs. The top rung is the scarcest by
+	// design: it is the only one wide enough for a megabyte message, and the
+	// ladder spends its bytes on the rungs the traffic actually sits on.
 	def := symmetricLayout(4096, 256, defaultClasses)
-	require.NoError(t, ValidateStartupCapacity(def, 26, false, true),
-		"default profile at max_data_inflight=26 must pass STRICT")
+	require.NoError(t, ValidateStartupCapacity(def, 8, false, true),
+		"default profile at max_data_inflight=8 must pass STRICT")
+	require.ErrorIs(t, ValidateStartupCapacity(def, 9, false, true), ErrStrictCapacity,
+		"default profile at max_data_inflight=9 exceeds the top rung's 8 slabs")
 
 	// At its C - R budget (3840) it is refused under STRICT with a typed error
-	// naming the offending 1 MiB class (its 26 slabs are the binding constraint),
+	// naming the offending top rung (its 8 slabs are the binding constraint),
 	// even though the same config passes the mandatory checks.
 	require.NoError(t, ValidateStartupCapacity(def, 3840, false, false))
 	err := ValidateStartupCapacity(def, 3840, false, true)
 	require.ErrorIs(t, err, ErrStrictCapacity)
-	require.Contains(t, err.Error(), "1048576", "the offending class (the 1 MiB class) must be named")
+	require.Contains(t, err.Error(), "slab_size 1048640", "the offending class (the top rung) must be named")
+	require.Contains(t, err.Error(), "has 8 usable slabs", "the binding slab count must be named")
 
 	// Class 0's usable count subtracts the reserved slab-zero: a class-0 count of
 	// N yields N-1 usable, so N-1 passes STRICT and N does not.

@@ -40,25 +40,41 @@ const (
 	// recommended default profile (shm-abi.md §1/§18): C = 4096, R = C/16 = 256.
 	shmDefaultRingCapacity     = 4096
 	shmDefaultLifecycleReserve = 256
-	// shmLeanRingCapacity and shmLeanLifecycleReserve are the lean device-gateway
-	// profile recorded in bench/shm/REPORT.md: C = 512, R = C/16 = 32, sized to a
-	// 32-concurrent-call peak.
+	// shmLeanRingCapacity and shmLeanLifecycleReserve are the lean
+	// small-control-traffic profile recorded in bench/shm/REPORT.md:
+	// C = 512, R = C/16 = 32, sized to a 32-concurrent-call peak.
 	shmLeanRingCapacity     = 512
 	shmLeanLifecycleReserve = 32
-	// oneMiB is the default profile's largest size class (shm-abi.md §1).
+	// oneMiB is the payload size the largest default class is sized to carry.
 	oneMiB = 1 << 20
+	// slabHeadroom is the byte margin every class above the smallest carries over
+	// the power-of-two payload it is meant to serve. A payload is marshaled before
+	// it is stored, and the marshaled form is longer than the payload it wraps, so
+	// a class sized to an exact power of two cannot hold a payload of that size:
+	// the frame spills into the next class up, or past the largest one and is
+	// rejected. 64 is the ABI's mandatory slab-size granularity (shm-abi.md §1),
+	// so it is the smallest headroom that exists — anything less rounds up to it.
+	slabHeadroom = 64
 )
 
 // GeometryDefault returns the ABI's recommended default profile:
 // ring capacity 4096, lifecycle reserve 256, per-direction size classes
-// {64 B ×4096, 4 KiB ×1024, 1 MiB ×26} (at most 64 MiB total).
+// {256 B ×4096, 1088 B ×2048, 4160 B ×1024, 16448 B ×256, 65600 B ×128,
+// 131136 B ×32, 1048640 B ×8} (roughly 63 MiB of region in total).
+// The ladder is graded from a few hundred bytes to a megabyte so a payload is
+// served from a class close to its own size, and every class above the smallest
+// carries slabHeadroom so a power-of-two payload still fits after marshaling.
 // Suits a general workload; memory-constrained deployments should prefer
 // GeometryLean or a custom geometry sized to peak concurrency.
 func GeometryDefault() ShmGeometry {
 	classes := []ShmSizeClass{
-		{SlabSize: 64, SlabCount: 4096},
-		{SlabSize: 4096, SlabCount: 1024},
-		{SlabSize: oneMiB, SlabCount: 26},
+		{SlabSize: 256, SlabCount: 4096},
+		{SlabSize: 1024 + slabHeadroom, SlabCount: 2048},
+		{SlabSize: 4096 + slabHeadroom, SlabCount: 1024},
+		{SlabSize: (16 << 10) + slabHeadroom, SlabCount: 256},
+		{SlabSize: (64 << 10) + slabHeadroom, SlabCount: 128},
+		{SlabSize: (128 << 10) + slabHeadroom, SlabCount: 32},
+		{SlabSize: oneMiB + slabHeadroom, SlabCount: 8},
 	}
 
 	return ShmGeometry{
@@ -69,15 +85,21 @@ func GeometryDefault() ShmGeometry {
 	}
 }
 
-// GeometryLean returns a device-gateway profile:
+// GeometryLean returns a profile for small control traffic only:
 // ring capacity 512, lifecycle reserve 32, per-direction size classes
-// {512 B ×64, 4096 B ×64} (roughly 0.6 MiB, sized to a 32-concurrent-call peak).
+// {512 B ×64, 4160 B ×64} (roughly 0.6 MiB, sized to a 32-concurrent-call peak).
+// The largest class is a hard ceiling, not a backpressure point: a message whose
+// marshaled length exceeds 4160 bytes is rejected outright as too large, so this
+// profile suits control, status, and acknowledgement frames and nothing else.
+// A workload with kilobyte-scale reports, recipe or file transfers, or state
+// snapshots needs GeometryDefault or a custom geometry sized to its own message
+// distribution.
 // Scale the class counts and RingCapacity minus LifecycleReserve to your
 // workload's peak concurrent in-flight calls plus headroom.
 func GeometryLean() ShmGeometry {
 	classes := []ShmSizeClass{
 		{SlabSize: 512, SlabCount: 64},
-		{SlabSize: 4096, SlabCount: 64},
+		{SlabSize: 4096 + slabHeadroom, SlabCount: 64},
 	}
 
 	return ShmGeometry{

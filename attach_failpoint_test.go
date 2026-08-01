@@ -29,9 +29,10 @@ func countRegionMappings(t *testing.T) int {
 	return strings.Count(string(data), "styx-shm-region")
 }
 
-// leanLayoutForAttachTest is a small valid shared-memory geometry (the lean
-// device-gateway profile) for the plugin-side per-step attach test's scripted
-// host.
+// leanLayoutForAttachTest is a small valid shared-memory geometry for the
+// plugin-side per-step attach test's scripted host. It is deliberately minimal
+// and belongs to this test rather than tracking any shipped profile: what is
+// under test is the attach step sequence, not the geometry.
 func leanLayoutForAttachTest() shm.Layout {
 	classes := []shm.SizeClass{{SlabSize: 512, SlabCount: 64}, {SlabSize: 4096, SlabCount: 64}}
 
