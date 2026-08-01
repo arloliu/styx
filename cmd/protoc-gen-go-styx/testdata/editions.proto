@@ -1,0 +1,12 @@
+edition = "2023";
+package editionstest;
+option go_package = "github.com/arloliu/styx/cmd/protoc-gen-go-styx/testdata/editionspb";
+
+// Greeter mirrors echo.proto's shape (one unary method) but is declared under
+// edition 2023 instead of proto3, so the generator's editions support is
+// exercised against a real editions descriptor, not just a proto3 one.
+service Greeter {
+  rpc Greet (GreetRequest) returns (GreetResponse);
+}
+message GreetRequest { string name = 1; }
+message GreetResponse { string message = 1; }
