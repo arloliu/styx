@@ -2,6 +2,7 @@ package styx
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -127,12 +128,15 @@ func TestHostStop_DeliversWholeIncidentPublishedBeforeIt_ToAConsumerStillDrainin
 
 // Test the event relay draining a queued supervisor event onto Host.Events after
 // the stop signal, so a terminal event enqueued just before shutdown reaches the
-// host instead of being discarded when the subscription is torn down.
+// host instead of being discarded when the subscription is torn down. Also pins
+// that the drained event is retained for Health, not just delivered on Events():
+// the plugin name is declared in HostConfig so recordHealthEvent has a real
+// record to update rather than taking its unknown-name no-op.
 func TestRelayEvents_DrainsQueuedEventAfterStop_BeforeUnsubscribe(t *testing.T) {
 	// Given: a host whose relay is told to stop before any event is available, and
 	// a quiesced probe the test drives to model the forwarder holding one event
 	// mid-handoff (not quiesced) until the test releases it.
-	h := NewHost(HostConfig{})
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
 
 	events := make(chan supervisor.Event)
 	stopRelay := make(chan struct{})
@@ -155,7 +159,7 @@ func TestRelayEvents_DrainsQueuedEventAfterStop_BeforeUnsubscribe(t *testing.T) 
 	close(stopRelay)
 
 	// When
-	go h.relayEvents("p", events, quiesced, stopRelay, relayDone, firstOutcome)
+	go h.relayEvents("p", h.nextHealthOrigin("p"), events, quiesced, stopRelay, relayDone, firstOutcome)
 
 	// The relay is now in the drain loop (it consulted quiesced), past the main
 	// select — so the event below can only reach Host.Events() through the drain.
@@ -187,6 +191,299 @@ func TestRelayEvents_DrainsQueuedEventAfterStop_BeforeUnsubscribe(t *testing.T) 
 	case <-time.After(2 * time.Second):
 		t.Fatal("terminal event was discarded instead of relayed onto Host.Events()")
 	}
+
+	// And: once that receive completed, Health("p") reports the exact same
+	// transition — the drain's retention, not just its delivery.
+	snap, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, EventUnhealthy, snap.State,
+		"the drained event must be retained for Health, not only delivered on Events()")
+}
+
+// Test the retained record keeping a critical transition that a REAL
+// supervisor.EventBus delivered ahead of an older informational one — sequence
+// numbers assigned by the production EventBus.Publish, delivery reordered by
+// the production priority classes, both applied through the production relay.
+//
+// The reorder is built, not waited for. A subscriber's forwarder holds at most
+// one event at a time and cannot complete its send while nothing is receiving,
+// so publishing all three events before the relay starts leaves at least the
+// last two queued together; whichever of them the forwarder picks next, the
+// critical ring is drained before the informational one, and the informational
+// Starting published after the Crashed is always delivered after it.
+func TestHost_RelayEvents_RetainsCriticalTransition_WhenBusDeliversOlderInformationalLast(t *testing.T) {
+	// Given: a real event bus with one subscriber and nothing reading it yet.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
+	bus := supervisor.NewEventBus()
+	events, unsub, quiesced := bus.Subscribe()
+	defer unsub()
+
+	crashedAt := time.Now()
+	// Published in causal order, so the bus stamps 1, 2, 3. The Restarting is
+	// there only to occupy the forwarder: with nothing receiving yet, it can
+	// hold at most that one event, so the Starting and the Crashed are queued
+	// together and the critical ring is drained first.
+	bus.Publish(supervisor.Event{Kind: supervisor.EventRestarting, Time: crashedAt.Add(-2 * time.Second)})
+	bus.Publish(supervisor.Event{Kind: supervisor.EventStarting, Time: crashedAt.Add(-time.Second)})
+	bus.Publish(supervisor.Event{Kind: supervisor.EventCrashed, Time: crashedAt, Err: errors.New("p: crashed")})
+
+	// When: the production relay consumes all three in the order the bus hands
+	// them out, retaining each into the health record as it goes.
+	stopRelay := make(chan struct{})
+	relayDone := make(chan struct{})
+	firstOutcome := make(chan error, 1)
+	go h.relayEvents("p", h.nextHealthOrigin("p"), events, quiesced, stopRelay, relayDone, firstOutcome)
+
+	for range 3 {
+		select {
+		case <-h.Events():
+		case <-time.After(2 * time.Second):
+			t.Fatal("the relay did not forward every published event onto Host.Events()")
+		}
+	}
+	close(stopRelay)
+	<-relayDone
+
+	// Then: the record holds the crash, not the Starting the bus delivered
+	// after it, and it holds the crash's own bus-assigned sequence number --
+	// the ordering key the relay must thread through, not a zero it invented.
+	snap, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, EventCrashed, snap.State,
+		"an event the bus delivered late but published earlier must never overwrite the retained transition")
+	require.Equal(t, crashedAt, snap.LastTransition)
+
+	rec := h.health["p"]
+	rec.mu.Lock()
+	lastSeq := rec.lastSeq
+	rec.mu.Unlock()
+	require.Equal(t, uint64(3), lastSeq,
+		"the record must order on the sequence number EventBus.Publish assigned the crash")
+}
+
+// Test a retried Start superseding the attempt before it, and a straggler from
+// that older attempt being discarded. Each attempt builds its own
+// supervisor.EventBus, whose sequence numbering restarts at 1, so sequence
+// alone cannot order two attempts against one record that outlives both: the
+// retry's first event would look older than the failed attempt's last one.
+//
+// Every event here shares one timestamp, so nothing but the attempt number and
+// the sequence within it can decide the order.
+func TestHost_RecordHealthEvent_AppliesRetriedAttempt_WhenItsSequenceRestartsBelowThePriorAttempt(t *testing.T) {
+	// Given: a first attempt that ran to a terminal GaveUp at sequence 3.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
+	at := time.Now()
+	crashed := Event{Plugin: "p", Kind: EventCrashed, Time: at, Err: errors.New("p: crashed")}
+	gaveUp := Event{Plugin: "p", Kind: EventGaveUp, Time: at, Err: errors.New("p: gave up")}
+	first := h.nextHealthOrigin("p")
+	h.recordHealthEvent("p", Event{Plugin: "p", Kind: EventStarting, Time: at}, first, 1, 1)
+	h.recordHealthEvent("p", crashed, first, 2, 1)
+	h.recordHealthEvent("p", gaveUp, first, 3, 1)
+
+	// When: a second attempt starts, its own bus numbering from 1 again.
+	second := h.nextHealthOrigin("p")
+	h.recordHealthEvent("p", Event{Plugin: "p", Kind: EventStarting, Time: at}, second, 1, 1)
+
+	// Then: the retry's first transition supersedes the prior attempt's terminal one.
+	snap, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, EventStarting, snap.State,
+		"a retried Start's first event must supersede a failed attempt's terminal state")
+	require.NoError(t, snap.LastError, "the superseded attempt's error must not outlive it")
+
+	// And: the retry reaches Ready, after which a straggler from the first
+	// attempt -- a higher sequence number, but an attempt already superseded --
+	// changes nothing.
+	h.recordHealthEvent("p", Event{Plugin: "p", Kind: EventReady, Time: at}, second, 2, 1)
+	h.recordHealthEvent("p", gaveUp, first, 4, 1)
+
+	snap, err = h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, EventReady, snap.State,
+		"an event from a superseded Start attempt must never overwrite a newer attempt's state")
+	require.NoError(t, snap.LastError)
+}
+
+// Test each Start attempt taking its own attempt number, so the retained
+// record can order two attempts whose buses both number their events from 1.
+// Both attempts here fail the same binary pin, which records the identical
+// (1, 2) sequence pair each time -- indistinguishable without the attempt
+// number, and superseded correctly with it.
+func TestHost_StartOne_TakesAFreshOrigin_PerStartAttempt(t *testing.T) {
+	// Given: a plugin pinned to a hash its binary does not have. The binary is
+	// never spawned: the pin is verified before anything else happens.
+	wrong := make([]byte, sha256.Size)
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{
+		Name: "pinned", Path: "/bin/true", BinarySHA256: wrong,
+	}}})
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// When: the pin fails, and the caller retries the same Start.
+	require.Error(t, h.Start(context.Background()))
+	rec := h.health["pinned"]
+	rec.mu.Lock()
+	firstOrigin, firstSeq := rec.lastOrigin, rec.lastSeq
+	rec.mu.Unlock()
+
+	require.Error(t, h.Start(context.Background()))
+
+	// Then: the retry recorded under a fresh attempt number at the identical
+	// sequence the first attempt ended on -- accepted because the attempt
+	// advanced, not the sequence.
+	rec.mu.Lock()
+	secondOrigin, secondSeq := rec.lastOrigin, rec.lastSeq
+	state := rec.state
+	rec.mu.Unlock()
+
+	require.Equal(t, uint64(1), firstOrigin)
+	require.Equal(t, uint64(2), firstSeq)
+	require.Equal(t, uint64(2), secondOrigin, "each Start attempt must take its own attempt number")
+	require.Equal(t, uint64(2), secondSeq, "a fresh attempt's sequence numbering restarts, so it cannot order alone")
+	require.Equal(t, EventCrashed, state)
+}
+
+// Test the retained record ignoring a heartbeat hook left behind by a Start
+// attempt it has already moved past. A hook closure is built per attempt and
+// captures that attempt's number, so a supervisor whose attempt was superseded
+// can neither bump nor reset the count the current attempt owns.
+func TestHost_RecordHeartbeat_IgnoresHook_FromSupersededStartAttempt(t *testing.T) {
+	// Given: two Start attempts for one plugin, the newer one already having
+	// counted a miss.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
+	first := h.nextHealthOrigin("p")
+	second := h.nextHealthOrigin("p")
+	h.heartbeatMissHook("p", second)(1)
+
+	// When: the superseded attempt's own hooks fire afterward.
+	h.heartbeatMissHook("p", first)(1)
+	h.heartbeatOKHook("p", first)(1)
+
+	// Then: neither touched the count the current attempt owns.
+	snap, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, 1, snap.MissedHeartbeats,
+		"a hook from a superseded Start attempt must neither bump nor reset the current count")
+}
+
+// Test the relay threading each event's instance generation into the retained
+// record, so a successor's Ready is never reported next to the predecessor's
+// missed-heartbeat count. The relay is the only place that reads the
+// generation off a supervisor event; without it the record cannot tell which
+// instance its state half describes.
+func TestHost_RelayEvents_ReportsZeroMissed_ForTheSuccessorReadyItRetained(t *testing.T) {
+	// Given: a first instance whose monitor loop has already counted a miss.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
+	origin := h.nextHealthOrigin("p")
+	h.heartbeatOKHook("p", origin)(1)
+	h.heartbeatMissHook("p", origin)(1)
+
+	events := make(chan supervisor.Event)
+	stopRelay := make(chan struct{})
+	relayDone := make(chan struct{})
+	firstOutcome := make(chan error, 1)
+	go h.relayEvents("p", origin, events, func() bool { return true }, stopRelay, relayDone, firstOutcome)
+
+	// When: the successor's Ready reaches the relay before the successor's own
+	// loop entry has reset anything.
+	events <- supervisor.Event{Kind: supervisor.EventReady, Time: time.Now(), Seq: 4, Gen: 2}
+	select {
+	case <-h.Events():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the relay never forwarded the successor's Ready")
+	}
+	close(stopRelay)
+	<-relayDone
+
+	// Then: the snapshot reports the successor's state with no count of its
+	// own yet, not the predecessor's leftover miss.
+	snap, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, EventReady, snap.State)
+	require.Zero(t, snap.MissedHeartbeats,
+		"the relay must retain which instance a transition described, so a predecessor's count is not reported with it")
+}
+
+// Test a snapshot never pairing a successor's state with its predecessor's
+// missed-heartbeat count. A successor is published Ready before its monitor
+// loop entry can reset anything, so the two halves of the record are written
+// by different goroutines in an order neither controls; the snapshot resolves
+// it by reporting zero whenever the state half already describes a newer
+// instance than the count half does.
+func TestHost_Health_ReportsZeroMissed_WhenRetainedStateIsNewerThanTheMissCount(t *testing.T) {
+	// Given: a first instance whose loop has counted two misses.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
+	at := time.Now()
+	origin := h.nextHealthOrigin("p")
+	h.heartbeatOKHook("p", origin)(1)
+	h.heartbeatMissHook("p", origin)(1)
+	h.heartbeatMissHook("p", origin)(1)
+
+	snap, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, 2, snap.MissedHeartbeats)
+
+	// When: the successor's Ready is retained before the successor's own loop
+	// entry has reset anything.
+	h.recordHealthEvent("p", Event{Plugin: "p", Kind: EventReady, Time: at}, origin, 5, 2)
+
+	// Then: the count belongs to an instance the state has moved past, so it is
+	// not reported against the successor.
+	snap, err = h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, EventReady, snap.State)
+	require.Zero(t, snap.MissedHeartbeats,
+		"a successor's state must never be reported alongside its predecessor's missed count")
+
+	// And: once the successor's own loop starts counting, its misses are its own.
+	h.heartbeatOKHook("p", origin)(2)
+	h.heartbeatMissHook("p", origin)(2)
+
+	snap, err = h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, 1, snap.MissedHeartbeats,
+		"the successor instance's own missed beats must be reported")
+}
+
+// Test Health reporting a resumed old instance's real miss run after a
+// rolled-back reload, rather than hiding it behind coherentMissed's
+// state-newer-than-count rule. A rolled-back reload consumes a generation for
+// the failed attempt while the old instance stays routed and heartbeating
+// under its own, lower, generation; internal/supervisor now stamps every one
+// of that old instance's later events with its own generation instead of the
+// abandoned attempt's, so the state half and the count half keep naming the
+// same instance and coherentMissed reports the real count instead of zero.
+//
+// This drives recordHealthEvent/the heartbeat hooks directly with the
+// (origin, generation) pairs the corrected supervisor stamping now produces,
+// rather than through a full Host.Reload: Host has no in-process fake-plugin
+// reload fixture the way internal/supervisor's own reload tests do, so this
+// covers the coherence pairing at the record level instead.
+func TestHost_Health_ReportsRealMissedCount_ForResumedOldInstance_AfterRolledBackReload(t *testing.T) {
+	// Given: one Start attempt whose instance (generation 1) reached Ready.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
+	origin := h.nextHealthOrigin("p")
+	at := time.Now()
+	h.recordHealthEvent("p", Event{Plugin: "p", Kind: EventReady, Time: at}, origin, 1, 1)
+	h.heartbeatOKHook("p", origin)(1)
+
+	// When: a reload attempt consumes generation 2 and rolls back — it never
+	// touches this record, since a rollback promotes nothing and publishes no
+	// event for the abandoned successor — and the resumed instance
+	// (generation 1, still routed) genuinely misses three heartbeats before
+	// its own loop reports it Unhealthy, stamped with its own generation (1).
+	h.heartbeatMissHook("p", origin)(1)
+	h.heartbeatMissHook("p", origin)(1)
+	h.heartbeatMissHook("p", origin)(1)
+	h.recordHealthEvent("p", Event{Plugin: "p", Kind: EventUnhealthy, Time: at.Add(time.Second)}, origin, 2, 1)
+
+	// Then: the real miss count is visible alongside the retained Unhealthy
+	// state, because both halves name the same generation (1), not the
+	// failed reload attempt's (2).
+	snap, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, EventUnhealthy, snap.State)
+	require.Equal(t, 3, snap.MissedHeartbeats,
+		"a rolled-back reload's later Unhealthy must not hide the resumed old instance's real miss run")
 }
 
 // Test Host.Stop keeping a plugin's event relay alive when its Supervisor.Run
@@ -206,7 +503,7 @@ func TestHostStop_RetainsRelayForUnjoinedRun_UntilLaterStopJoins(t *testing.T) {
 	stopRelay := make(chan struct{})
 	relayDone := make(chan struct{})
 	firstOutcome := make(chan error, 1)
-	go h.relayEvents("p", events, quiesced, stopRelay, relayDone, firstOutcome)
+	go h.relayEvents("p", h.nextHealthOrigin("p"), events, quiesced, stopRelay, relayDone, firstOutcome)
 
 	h.mu.Lock()
 	h.runtimes = append(h.runtimes, &pluginRuntime{
@@ -279,7 +576,7 @@ func TestHostStart_RejectsName_WhilePriorInstanceStopping(t *testing.T) {
 	stopRelay := make(chan struct{})
 	relayDone := make(chan struct{})
 	firstOutcome := make(chan error, 1)
-	go h.relayEvents("p", events, quiesced, stopRelay, relayDone, firstOutcome)
+	go h.relayEvents("p", h.nextHealthOrigin("p"), events, quiesced, stopRelay, relayDone, firstOutcome)
 
 	h.mu.Lock()
 	h.plugins["p"] = newUnavailableClientConn("p")
@@ -324,7 +621,7 @@ func TestHostStop_UnretriedExpiry_CleansUpAfterRunExits(t *testing.T) {
 	stopRelay := make(chan struct{})
 	relayDone := make(chan struct{})
 	firstOutcome := make(chan error, 1)
-	go h.relayEvents("p", events, quiesced, stopRelay, relayDone, firstOutcome)
+	go h.relayEvents("p", h.nextHealthOrigin("p"), events, quiesced, stopRelay, relayDone, firstOutcome)
 
 	h.mu.Lock()
 	h.plugins["p"] = newUnavailableClientConn("p")
@@ -475,7 +772,7 @@ func wireStoppableRuntime(t *testing.T, h *Host, name string) (*supervisor.Super
 	stopRelay := make(chan struct{})
 	relayDone := make(chan struct{})
 	firstOutcome := make(chan error, 1)
-	go h.relayEvents(name, events, quiesced, stopRelay, relayDone, firstOutcome)
+	go h.relayEvents(name, h.nextHealthOrigin(name), events, quiesced, stopRelay, relayDone, firstOutcome)
 
 	h.mu.Lock()
 	h.plugins[name] = newUnavailableClientConn(name)

@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -66,11 +67,41 @@ func IsCriticalEventKind(k EventKind) bool {
 
 // Event is one supervisor lifecycle notification for a plugin instance.
 // It is internal/supervisor's own type, following the translate-at-boundary rule.
-// styx/host.go converts it to styx.Event when relaying it to Host.Events().
+// styx/host.go converts it to styx.Event when relaying it to Host.Events(); neither
+// Seq nor Gen crosses that boundary (the public styx.Event carries no such fields) —
+// styx/host.go reads them off this type directly, at the same point it translates
+// the rest of the event, and threads them separately into its own retained record.
 type Event struct {
 	Kind EventKind
 	Time time.Time
 	Err  error
+
+	// Seq is this event's position in this instance's own EventBus publish
+	// order, assigned by EventBus.Publish. Two events for the same plugin
+	// published at the identical Time cannot be told apart by timestamp alone,
+	// and the priority bus can deliver a critical event ahead of an
+	// informational one published earlier still — so a consumer that must
+	// apply events in the order they actually happened, not the order the bus
+	// hands them out, orders on Seq instead of Time. It is unique and strictly
+	// increasing per EventBus for as long as that EventBus exists, which is one
+	// Supervisor's whole life — a consumer whose own lifetime spans more than
+	// one Supervisor needs an outer key of its own to tell two buses' sequence
+	// domains apart.
+	Seq uint64
+
+	// Gen is the instance generation this event belongs to: the same
+	// Instance.Generation Config.OnReady received for the instance this
+	// transition describes, stamped explicitly at each publish call site with
+	// that instance's own generation — never a bare read of the supervisor's
+	// generation counter, which can have already advanced past the instance an
+	// event still describes (a rolled-back reload consumes a generation while
+	// leaving the old instance routed and publishing under its own, lower,
+	// generation). Config.OnHeartbeatMiss/OnHeartbeatOK carry the identical
+	// number for the instance whose beats they report, so a consumer that keeps
+	// lifecycle state and per-instance heartbeat state as two separately-written
+	// halves can tell which instance each half is describing instead of pairing
+	// a successor's state with a predecessor's count.
+	Gen uint64
 }
 
 // Bus is the generic engine behind EventBus: a non-blocking, bounded,
@@ -400,6 +431,23 @@ func (s *busSubscriber[T]) handOffToWaitingReceiver() {
 // See Bus's doc for the full informational and critical delivery semantics.
 type EventBus struct {
 	bus *Bus[Event]
+
+	// seq numbers each published Event. The number is taken here, in Publish,
+	// BEFORE the value is handed to the generic Bus, so taking a number and
+	// taking a place in a subscriber's queue are two separate steps. That the
+	// two agree — that a higher Seq is always enqueued later — rests entirely
+	// on publication being single-goroutine per supervisor: NewEventBus
+	// documents this as a single-publisher Bus, and every Supervisor.publish
+	// call site runs on that supervisor's own Run goroutine (Run's restart
+	// loop, runOneInstance, heartbeatLoop, and the reload heartbeatLoop drives
+	// inline). Two concurrent publishers would break the agreement — they can
+	// take numbers in one order and enqueue in the other — so the atomic
+	// prevents the counter itself from tearing, nothing more.
+	//
+	// One Supervisor holds exactly one EventBus for its whole life (across
+	// restarts and reloads alike; New creates it once), so seq is monotonic
+	// over that whole life and restarts at 1 for a different Supervisor.
+	seq atomic.Uint64
 }
 
 // NewEventBus creates an empty EventBus for publishing and subscribing to
@@ -421,6 +469,11 @@ func (b *EventBus) Subscribe() (<-chan Event, func(), func() bool) {
 // Publish delivers ev to every current subscriber per its class's drop-oldest
 // rule (see Bus's doc).
 // Publish never blocks regardless of subscriber read behavior.
+// It stamps ev.Seq with this EventBus's next sequence number before handing it
+// to the generic Bus, overwriting whatever the caller set: Seq identifies an
+// event's position in THIS bus's publish order, so only Publish itself may
+// assign it.
 func (b *EventBus) Publish(ev Event) {
+	ev.Seq = b.seq.Add(1)
 	b.bus.Publish(ev)
 }

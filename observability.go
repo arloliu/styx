@@ -567,18 +567,43 @@ func (h *Host) restartHook(name string) func() {
 }
 
 // heartbeatMissHook returns the supervisor's per-miss observability callback for
-// the named plugin, or nil when no sink is configured (so the supervisor's own
-// nil check skips it). The callback runs on the heartbeat loop, a cold path, and
-// only submits — it never blocks.
-func (h *Host) heartbeatMissHook(name string) func() {
-	if h.metricsDisp == nil {
-		return nil
-	}
+// the named plugin's origin-th Start attempt. It always bumps this plugin's
+// retained missed-heartbeat count — Health reads that count regardless of
+// whether a metrics sink is configured — and additionally submits a counter
+// increment when one is. The callback runs on the heartbeat loop, a cold path
+// called at most once per missed interval, so briefly taking the record's own
+// lock to bump the count costs nothing measurable there.
+//
+// The supervisor passes the generation of the instance whose beat was missed;
+// paired with the attempt's origin it tells the record which instance this
+// miss belongs to, so a miss can neither be counted against a successor nor
+// arrive from a supervisor the record has already moved past. The metric is
+// submitted unconditionally — it counts misses per plugin over the host's
+// life, a total no per-instance bookkeeping applies to.
+func (h *Host) heartbeatMissHook(name string, origin uint64) func(uint64) {
+	return func(generation uint64) {
+		h.recordHeartbeatMiss(name, origin, generation)
 
-	return func() {
+		if h.metricsDisp == nil {
+			return
+		}
 		h.metricsDisp.Submit(func(s observe.MetricsSink) {
 			s.IncrCounter(observe.MetricHeartbeatMiss, 1, observe.Label{Key: labelPlugin, Value: name})
 		})
+	}
+}
+
+// heartbeatOKHook returns the supervisor's per-received-beat observability
+// callback for the named plugin's origin-th Start attempt: it resets that
+// plugin's retained missed-heartbeat count, the recovery counterpart to
+// heartbeatMissHook, stamped with the same (origin, generation) pair. There
+// is no metric to submit here — MetricHeartbeatMiss counts misses, not beats —
+// so unlike the other hooks this one has nothing to gate on a configured sink.
+// Runs on the heartbeat loop, a cold path called at most once per received
+// beat, briefly taking the same record lock heartbeatMissHook does.
+func (h *Host) heartbeatOKHook(name string, origin uint64) func(uint64) {
+	return func(generation uint64) {
+		h.recordHeartbeatOK(name, origin, generation)
 	}
 }
 

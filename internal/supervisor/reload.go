@@ -177,7 +177,7 @@ func (s *Supervisor) runReload(lifeCtx, reqCtx context.Context, current **liveIn
 	// to the caller but not a reason to keep supervising the dead old one.
 	if successor, ok := promoted.(*reloadSuccessor); ok {
 		*current = successor.li
-		s.publish(Event{Kind: EventReady, Time: time.Now()})
+		s.publish(Event{Kind: EventReady, Time: time.Now(), Gen: successor.li.generation})
 	}
 
 	return err
