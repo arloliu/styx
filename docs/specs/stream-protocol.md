@@ -1495,8 +1495,9 @@ unwired is the cross-process half: the consumer→producer "space-available" wak
 `signalRetry` was built for is still not specified for this milestone —
 `shm-abi.md` §11/§12 define only producer→consumer wakes — so a peer that frees
 space while it has nothing of its own to send still cannot report it across the
-process boundary. The writer's own documentation states the consequence:
-*"absent further lifecycle traffic the set-aside intent resumes at shutdown."*
+process boundary. The writer's own documentation states the bounded
+consequence: a stuck data intent *"waits only for a lifecycle intent, a
+self-retry timer fire, a peer-progress signal, or shutdown"*.
 
 This is a real data-lane liveness gap and streaming newly depends on the path it
 sits on, so it is stated here rather than left for a downstream task to
