@@ -109,20 +109,31 @@ func processExists(t *testing.T, name string) bool {
 func processFromBinaryExists(t *testing.T, binPath string) bool {
 	t.Helper()
 
+	return countProcessesFromBinary(t, binPath) > 0
+}
+
+// countProcessesFromBinary reports how many live processes have binPath as their
+// /proc/<pid>/exe, on the same whole-path match processFromBinaryExists uses. The
+// count rather than the presence is what a test needs when a duplicate spawn of
+// one plugin is the thing being ruled out.
+func countProcessesFromBinary(t *testing.T, binPath string) int {
+	t.Helper()
+
 	entries, err := os.ReadDir("/proc")
 	require.NoError(t, err)
 
+	count := 0
 	for _, e := range entries {
 		exe, err := os.Readlink(filepath.Join("/proc", e.Name(), "exe"))
 		if err != nil {
 			continue
 		}
 		if exe == binPath {
-			return true
+			count++
 		}
 	}
 
-	return false
+	return count
 }
 
 // awaitEvent drains ch until it sees an event of kind, or fails on timeout.
@@ -705,6 +716,78 @@ func TestHost_Start_RejectsHostWhoseStopCompleted(t *testing.T) {
 	// Then: the start is refused as a stopped host, and nothing is running under it.
 	require.ErrorIs(t, err, styx.ErrHostStopped)
 	require.ErrorIs(t, h.Plugin("ready").Invoke(t.Context(), "svc", "M", nil, nil), styx.ErrPluginUnavailable)
+}
+
+// Test Start refusing a name whose instance is still running, and leaving that
+// instance exactly as it was. A Host routes one name to one ClientConn, so a
+// second supervisor admitted here would overwrite the routing the live one owns
+// and spawn a duplicate process behind it.
+func TestHost_Start_RejectsName_WhileItsInstanceIsRunning(t *testing.T) {
+	// Given: a plugin started and observed ready.
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{Name: "ready", Path: fixtureReadyPlugin}}})
+	require.NoError(t, h.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, h.Stop(context.Background())) })
+	awaitEvent(t, h.Events(), styx.EventReady)
+	spawned := countProcessesFromBinary(t, fixtureReadyPlugin)
+
+	// When: the same Host is started a second time.
+	err := h.Start(t.Context())
+
+	// Then: the second start is refused as already started...
+	require.ErrorIs(t, err, styx.ErrPluginAlreadyStarted)
+
+	// ...having spawned nothing. Start blocks until each plugin it admits reaches
+	// Ready, so a second instance would already be running by the time it returned.
+	require.Equal(t, spawned, countProcessesFromBinary(t, fixtureReadyPlugin),
+		"a refused Start must not have spawned a second process for the name")
+
+	// ...and the running instance is untouched: still routed (the call reaches the
+	// plugin and comes back with its own answer, not ErrPluginUnavailable — this
+	// fixture registers no services) and still Ready.
+	require.ErrorIs(t, h.Plugin("ready").Invoke(t.Context(), "svc", "M", nil, nil), styx.ErrServiceNotFound)
+	snap, healthErr := h.Health("ready")
+	require.NoError(t, healthErr)
+	require.Equal(t, styx.EventReady, snap.State)
+}
+
+// Test Start refusing a name whose instance has already given up for good. The
+// Host keeps a terminal instance's supervisor and event relay registered under
+// the name until Stop, so a second Start would attach to state the first still
+// holds; recovering from EventGaveUp means building a new Host.
+func TestHost_Start_RejectsName_AfterItsInstanceGaveUp(t *testing.T) {
+	// Given: a plugin that reaches Ready with no restart budget, so one crash is
+	// terminal.
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+		Name:    "echo",
+		Path:    fixtureCrashyPlugin,
+		Args:    []string{"echo"},
+		Env:     []string{"STYX_ECHO_PID_TAG=1"},
+		Restart: styx.RestartPolicy{Max: 0},
+	}}})
+	require.NoError(t, h.Start(t.Context()))
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// The pid-tagged response names the process to kill, and proves the instance
+	// was serving before it was killed.
+	client := echopb.NewEchoClient(h.Plugin("echo"))
+	resp, err := client.Say(t.Context(), &echopb.SayRequest{Message: "alive"})
+	require.NoError(t, err)
+	pid, body, ok := hostParsePIDTag(resp.GetMessage())
+	require.True(t, ok, "response %q is not the <pid>:<message> shape this fixture emits", resp.GetMessage())
+	require.Equal(t, "alive", body)
+
+	// When: that instance dies for good and the caller tries to start the name again.
+	require.NoError(t, syscall.Kill(pid, syscall.SIGKILL))
+	awaitEvent(t, h.Events(), styx.EventGaveUp)
+	terminal := countProcessesFromBinary(t, fixtureCrashyPlugin)
+	err = h.Start(t.Context())
+
+	// Then: the name is still this Host's, terminal or not, and no successor was
+	// spawned under it.
+	require.ErrorIs(t, err, styx.ErrPluginAlreadyStarted)
+	require.Equal(t, terminal, countProcessesFromBinary(t, fixtureCrashyPlugin),
+		"a Start refused after GaveUp must not have spawned a successor for the name")
+	require.ErrorIs(t, h.Plugin("echo").Invoke(t.Context(), "svc", "M", nil, nil), styx.ErrPluginUnavailable)
 }
 
 // Test the zero Host surviving Stop. It owns no subscription, no workers, and no

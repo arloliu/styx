@@ -478,6 +478,18 @@ func NewHost(cfg HostConfig) *Host {
 // A single plugin's failure does not abort the others; Start's returned error
 // is the combined (errors.Join) set of any that failed.
 //
+// Start is how a caller retries the plugins it failed to start, not how it
+// restarts the ones it did. A name this Host already started stays that
+// instance's for as long as the Host owns it — after the instance has given up
+// for good as much as while it is serving — and a second Start of it is refused
+// with ErrPluginAlreadyStarted, having spawned nothing and left the earlier
+// instance untouched. A name whose prior instance is still tearing down from an
+// expired Stop is refused with ErrPluginStopping until that teardown completes.
+// So a Start retried after a partial failure starts what failed and reports
+// ErrPluginAlreadyStarted for what did not: replacing a serving instance with a
+// fresh process is Reload's job, and there is no per-plugin respawn for one that
+// gave up — build a new Host.
+//
 // A Host is single-use. Once a Stop has completed the host's teardown, Start
 // rejects with ErrHostStopped and spawns nothing: that teardown ended the
 // Events() subscription and the observability workers for good, so a plugin
@@ -524,6 +536,19 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	// by Start across this call, so the read is safe.
 	if _, stopping := h.stopping[spec.Name]; stopping {
 		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, ErrPluginStopping)
+	}
+
+	// One supervisor per name, which is what every per-name structure below
+	// assumes: h.plugins routes a name to exactly one ClientConn and h.stopping
+	// gates a name's teardown exactly once, so a second supervisor here would
+	// overwrite routing its predecessor still owns and share that one gate with it.
+	// A runtime stays registered until Stop tears it down — a terminal one that
+	// gave up included, which is why this rejects those too — so the name is taken
+	// for as long as this Host owns it. A failed attempt installs no runtime and is
+	// therefore retryable, unlike either of these. h.mu is held by Start across
+	// this call, so the read is safe.
+	if h.runtimeFor(spec.Name) != nil {
+		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, ErrPluginAlreadyStarted)
 	}
 
 	// This attempt's ordering key for everything it may later write to the
