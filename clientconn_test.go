@@ -635,8 +635,10 @@ func TestClientConn_Invoke_RejectsOversizePayload_OverUDS(t *testing.T) {
 	// Then the caller sees the underlying size error, never an unknown outcome...
 	require.Error(t, err)
 	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+	require.ErrorIs(t, err, ErrPayloadTooLarge)
 	require.NotErrorIs(t, err, ErrOutcomeUnknown,
 		"a send that provably wrote zero bytes must not be reported as an unknown outcome")
+	require.False(t, IsRetryable(err), "an oversize payload fails the identical way again")
 
 	// ...and the connection is unharmed: a normal call right after completes.
 	resp := &wrapperspb.StringValue{}
@@ -698,14 +700,16 @@ func TestClientConn_Invoke_ReturnsOutcomeUnknown_WhenSendTearsMidFrame(t *testin
 }
 
 // Test translateSendFailure's classification of transport.NeverPublished's
-// three sentinels: only ErrBackpressure maps to the public, documented
-// styx.ErrBackpressure — mirroring the streaming path's identical mapping —
-// because it alone is transient capacity a retry might find free. An
-// oversize payload or an unimplemented frame kind stays a known,
-// not-dispatched send failure: the caller learns the underlying error and
-// never ErrOutcomeUnknown, but IsRetryable correctly reports false, since an
+// three sentinels: ErrBackpressure and an oversize payload each map to their
+// own public, documented sentinel (styx.ErrBackpressure and
+// styx.ErrPayloadTooLarge respectively — the oversize mapping mirrors the
+// streaming path's identical one), but only backpressure is retryable, since
+// it alone is transient capacity a retry might find free. An unimplemented
+// frame kind stays a known, not-dispatched send failure with no public
+// sentinel of its own: the caller learns the underlying error and never
+// ErrOutcomeUnknown, but IsRetryable correctly reports false, since an
 // identical retry fails the identical way.
-func TestTranslateSendFailure_MapsOnlyBackpressurePublicly(t *testing.T) {
+func TestTranslateSendFailure_MapsBackpressureAndOversizePublicly(t *testing.T) {
 	// Given the three transport.NeverPublished sentinels, wrapped the way
 	// sendRequest actually wraps them before returning.
 	backpressure := fmt.Errorf("styx: invoke: send request: %w", transport.ErrBackpressure)
@@ -722,8 +726,11 @@ func TestTranslateSendFailure_MapsOnlyBackpressurePublicly(t *testing.T) {
 	require.True(t, IsRetryable(backpressureErr), "backpressure is transient capacity, safe to retry")
 
 	// ...while the other two stay known-failed but not retryable, and never
-	// collapse into the ambiguous-outcome sentinel.
+	// collapse into the ambiguous-outcome sentinel. The oversize payload also
+	// carries the public sentinel so an external host can match it without
+	// importing internal/transport.
 	require.ErrorIs(t, oversizeErr, transport.ErrPayloadTooLarge)
+	require.ErrorIs(t, oversizeErr, ErrPayloadTooLarge)
 	require.NotErrorIs(t, oversizeErr, ErrOutcomeUnknown)
 	require.False(t, IsRetryable(oversizeErr), "an oversize payload fails the identical way again")
 

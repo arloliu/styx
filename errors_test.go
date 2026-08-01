@@ -38,6 +38,7 @@ func TestIsRetryable_ClassifiesTaxonomy(t *testing.T) {
 		{"drained", ErrDrained, true},
 		{"request declined", ErrRequestDeclined, true},
 		{"backpressure", ErrBackpressure, true},
+		{"payload too large", ErrPayloadTooLarge, false},
 		{"incompatible", ErrIncompatible, false},
 		{"deadline exceeded", ErrDeadlineExceeded, false},
 		{"canceled", ErrCanceled, false},

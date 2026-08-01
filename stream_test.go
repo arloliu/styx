@@ -3,6 +3,7 @@ package styx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -388,6 +389,7 @@ func TestStreamError_MapsStatusCodesAndSentinels(t *testing.T) {
 	require.ErrorIs(t, StreamError(rpcruntime.ErrCanceledLocally), ErrCanceled)
 	require.ErrorIs(t, StreamError(rpcruntime.ErrDeadlineExceeded), ErrDeadlineExceeded)
 	require.ErrorIs(t, StreamError(rpcruntime.ErrStreamTableClosed), ErrPluginUnavailable)
+	require.ErrorIs(t, StreamError(transport.ErrPayloadTooLarge), ErrPayloadTooLarge)
 
 	cases := map[uint32]error{
 		rpcruntime.StatusCodeStreamCanceled:         ErrCanceled,
@@ -419,6 +421,25 @@ func TestStreamError_MapsStatusCodesAndSentinels(t *testing.T) {
 	require.ErrorAs(t, panicReply, &panicErr)
 	require.Equal(t, "handler boom", panicErr.Value)
 	require.False(t, IsRetryable(panicReply))
+}
+
+// Test translateStreamSendErr mapping an oversize STREAM_OPEN to the public,
+// not-retryable styx.ErrPayloadTooLarge, rather than falling into the default
+// arm's retryable styx.ErrPluginUnavailable — the frame provably never reached
+// the peer, and an identical retry at the same size fails identically.
+func TestTranslateStreamSendErr_MapsOversizePayload_NotRetryable(t *testing.T) {
+	// Given a STREAM_OPEN send that failed with the transport's oversize sentinel.
+	sendErr := fmt.Errorf("write stream open frame: %w", transport.ErrPayloadTooLarge)
+
+	// When it is translated to the error OpenStream surfaces.
+	err := translateStreamSendErr(sendErr)
+
+	// Then it matches the public sentinel, not the retryable plugin-unavailable
+	// one the default arm would otherwise return...
+	require.ErrorIs(t, err, ErrPayloadTooLarge)
+	require.NotErrorIs(t, err, ErrPluginUnavailable)
+	// ...and IsRetryable agrees it is not safe to retry at the same size.
+	require.False(t, IsRetryable(err))
 }
 
 // A caller-context cancellation at the seam terminates the stream and frees its
