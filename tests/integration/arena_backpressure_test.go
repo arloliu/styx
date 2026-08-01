@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	// backpressurePayloadLen is sized so the encoded frame does NOT fit the default
+	// backpressurePayloadLen is sized so the encoded frame does NOT fit the pinned
 	// geometry's 4096-byte size class. An echopb.BlobRequest wraps the payload in a
 	// bytes field, which adds a field tag and a two-byte varint length, so a
 	// 4096-byte payload encodes to backpressureEncodedLen bytes. A slab is chosen by
@@ -35,9 +35,9 @@ const (
 	backpressureEncodedLen = 4099
 
 	// backpressureServingSlabSize and backpressureClassSlabs are the size class the
-	// default geometry serves backpressureEncodedLen from, and its slab count — so
+	// pinned geometry serves backpressureEncodedLen from, and its slab count — so
 	// the most 4 KiB-payload frames that can hold a slab at once. The test derives
-	// both from GeometryDefault() rather than trusting these constants.
+	// both from backpressureGeometry() rather than trusting these constants.
 	backpressureServingSlabSize = 1 << 20
 	backpressureClassSlabs      = 26
 
@@ -83,18 +83,41 @@ const (
 	backpressureCallBudget = 30 * time.Second
 )
 
-// backpressureServingClass returns the default geometry's size class that serves an
+// backpressureGeometry is the shared-memory shape this test pins for every host it
+// starts. It is pinned rather than taken from GeometryDefault() because the workload
+// below needs a serving class scarcer than its own concurrency, and that is a
+// property of one geometry, not of whatever the shipped default happens to be: a
+// default that grew a class between 4096 bytes and 1 MiB would silently turn this
+// backpressure test into a plain round-trip test. Pinning it here keeps the regime
+// the test is named for, and makes the geometry visible next to the constants
+// derived from it.
+func backpressureGeometry() styx.ShmGeometry {
+	classes := []styx.ShmSizeClass{
+		{SlabSize: 64, SlabCount: 4096},
+		{SlabSize: 4096, SlabCount: 1024},
+		{SlabSize: backpressureServingSlabSize, SlabCount: backpressureClassSlabs},
+	}
+
+	return styx.ShmGeometry{
+		RingCapacity:     4096,
+		LifecycleReserve: 256,
+		HostToPlugin:     classes,
+		PluginToHost:     classes,
+	}
+}
+
+// backpressureServingClass returns the pinned geometry's size class that serves an
 // encoded frame of n bytes, applying the rule the arena's allocator applies: the
 // smallest class whose slab size covers the stored length.
 func backpressureServingClass(t *testing.T, n uint32) styx.ShmSizeClass {
 	t.Helper()
 
-	for _, c := range styx.GeometryDefault().HostToPlugin {
+	for _, c := range backpressureGeometry().HostToPlugin {
 		if c.SlabSize >= n {
 			return c
 		}
 	}
-	t.Fatalf("no default-geometry size class can serve %d bytes", n)
+	t.Fatalf("no pinned-geometry size class can serve %d bytes", n)
 
 	return styx.ShmSizeClass{}
 }
@@ -164,11 +187,12 @@ func describeBackpressurePayload(buf []byte) string {
 		binary.LittleEndian.Uint32(buf[0:4]), binary.LittleEndian.Uint32(buf[4:8]))
 }
 
-// Test that the production default geometry completes every call, with every reply
-// intact, when far more callers are in flight than the serving size class has slabs,
-// so callers must wait on slab reclaim instead of finding a free slab on arrival. No
-// Geometry is set, so this runs the profile a host gets by default. The suites
-// either side of this one cannot reach the same place: bench/shm deliberately
+// Test that a host completes every call, with every reply intact, when far more
+// callers are in flight than the serving size class has slabs, so callers must wait
+// on slab reclaim instead of finding a free slab on arrival. The geometry is pinned
+// (backpressureGeometry) so the workload keeps reaching that regime whatever the
+// shipped default becomes. The suites either side of this one cannot reach the same
+// place: bench/shm deliberately
 // provisions more slabs per class than its concurrency so the arena never
 // backpressures, and the lean-profile workload runs at a concurrency its geometry is
 // certified to serve.
@@ -180,7 +204,7 @@ func describeBackpressurePayload(buf []byte) string {
 // discriminate the peer-progress wake from the self-retry timer: with the timer
 // alone this workload still completes, because under steady saturation the ladder
 // never climbs far from its 100 microsecond floor.
-func TestDefaultGeometryShm_CompletesEveryCall_WhenArenaBackpressures(t *testing.T) {
+func TestPinnedGeometryShm_CompletesEveryCall_WhenArenaBackpressures(t *testing.T) {
 	// Given a 4096-byte payload encodes to a length the roomy 4 KiB class cannot
 	// serve. Measured, not assumed: these three bytes decide which class the frame
 	// lands in and are invisible from the payload size.
@@ -189,11 +213,11 @@ func TestDefaultGeometryShm_CompletesEveryCall_WhenArenaBackpressures(t *testing
 		"a %d-byte payload must still encode to %d bytes for this test to reach the scarce class",
 		backpressurePayloadLen, backpressureEncodedLen)
 
-	// And the default geometry serves that length from a class with far fewer slabs
+	// And the pinned geometry serves that length from a class with far fewer slabs
 	// than this test puts calls in flight. This is the assertion that keeps the test
-	// honest as the geometry evolves: interposing any class between 4096 bytes and
-	// 1 MiB would leave the workload below never waiting, and this fails loudly
-	// instead of passing green.
+	// honest as the pinned geometry is edited: interposing any class between 4096
+	// bytes and 1 MiB would leave the workload below never waiting, and this fails
+	// loudly instead of passing green.
 	serving := backpressureServingClass(t, backpressureEncodedLen)
 	require.EqualValues(t, backpressureServingSlabSize, serving.SlabSize,
 		"the class serving a %d-byte frame must still be the 1 MiB class", backpressureEncodedLen)
@@ -214,6 +238,7 @@ func TestDefaultGeometryShm_CompletesEveryCall_WhenArenaBackpressures(t *testing
 			Name:            "echo",
 			Path:            echoPluginBin,
 			Transport:       styx.TransportSHM,
+			Geometry:        backpressureGeometry(),
 			MaxDataInflight: backpressureInFlight,
 			StrictCapacity:  true,
 		}},
@@ -231,6 +256,7 @@ func TestDefaultGeometryShm_CompletesEveryCall_WhenArenaBackpressures(t *testing
 			Name:      "echo",
 			Path:      echoPluginBin,
 			Transport: styx.TransportSHM,
+			Geometry:  backpressureGeometry(),
 		}},
 	})
 	require.NoError(t, h.Start(t.Context()))

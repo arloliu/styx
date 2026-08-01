@@ -243,22 +243,30 @@ host-local scaffolding you read back yourself; see its docstring.
 
 ### Backpressure and provisioning
 
-`ErrBackpressure` is retryable, but be aware of the provisioning floor on the
-shared-memory transport today. When a send finds the descriptor ring or the
-payload arena full, the writer sets the intent aside; the consumer-to-producer
-"space available" wake is not wired in this version, so the set-aside intent
-resumes only when further lifecycle traffic runs the writer, or at shutdown.
-For a streaming send that bound is the caller's own context — it fails with a
-deadline rather than hanging. A **unary** call's send is deliberately
-detached from the caller's context (so its outcome is always definitive),
-which means a starved unary send can outlive the call's deadline and resolve
-only on later lifecycle traffic or shutdown. Opt into
-`PluginSpec.StrictCapacity` to remove the risk at the source: STRICT
-certification (shm-abi.md §18) requires the inflight budget to fit
-every reachable size class's slab count, so no admitted data call can hit arena
-exhaustion; a geometry that fails STRICT is refused at spawn. Provision the
-geometry for the peak concurrency, or run STRICT, rather than relying on
-backpressure recovery.
+`ErrBackpressure` is retryable, and the provisioning behind it is worth
+understanding on the shared-memory transport. When a send finds the descriptor
+ring or the payload arena full, the writer sets the intent aside and retries it
+on its own bounded backoff timer — 100 µs to start, doubling to a 5 ms cap — so
+the send resumes on its own; a lifecycle intent or an inbound frame from the
+peer resumes it sooner. Under-provisioning therefore costs latency on every
+affected send rather than stalling it until something unrelated happens.
+
+For a streaming send the outer bound is still the caller's own context — it
+fails with a deadline rather than waiting indefinitely. A **unary** call's send
+is deliberately detached from the caller's context (so its outcome is always
+definitive), so a starved unary send can outlive the call's deadline; it
+resolves on the retry ladder, not on unrelated traffic.
+
+To avoid the wait rather than absorb it, provision the geometry for the peak
+concurrency, or opt into `PluginSpec.StrictCapacity`: STRICT certification
+(shm-abi.md §18) requires the inflight budget to fit every reachable size
+class's slab count, so no admitted data call can hit arena exhaustion, and a
+geometry that fails STRICT is refused at spawn. STRICT is a strong constraint
+on the default geometry, because it binds to the smallest class — the top
+rung's 8 slabs — so a STRICT host on the default profile is admitted only at a
+`MaxDataInflight` of 8 or less. A deployment that needs more sets
+`PluginSpec.Geometry` with class counts matched to the bound it wants
+certified.
 
 ## Streaming
 

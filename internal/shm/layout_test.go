@@ -57,9 +57,13 @@ func TestLayout_Parse_RoundTripsAllFields(t *testing.T) {
 func TestLayout_DeriveGeometry_MatchesDefaultProfileWorkedExample(t *testing.T) {
 	// Given
 	classes := []shm.SizeClass{
-		{SlabSize: 64, SlabCount: 4096},
-		{SlabSize: 4096, SlabCount: 1024},
-		{SlabSize: 1048576, SlabCount: 26},
+		{SlabSize: 256, SlabCount: 4096},
+		{SlabSize: 1088, SlabCount: 2048},
+		{SlabSize: 4160, SlabCount: 1024},
+		{SlabSize: 16448, SlabCount: 256},
+		{SlabSize: 65600, SlabCount: 128},
+		{SlabSize: 131136, SlabCount: 32},
+		{SlabSize: 1048640, SlabCount: 8},
 	}
 	input := shm.Layout{
 		Generation:       1,
@@ -78,12 +82,12 @@ func TestLayout_DeriveGeometry_MatchesDefaultProfileWorkedExample(t *testing.T) 
 
 	// Then
 	l := r.Layout()
-	require.Equal(t, uint64(31719424), l.Arenas[shm.HostToPlugin].Bytes, "arena_bytes_hp")
-	require.Equal(t, uint64(31719424), l.Arenas[shm.PluginToHost].Bytes, "arena_bytes_ph")
-	require.Equal(t, uint64(63971328), l.RegionSize, "region_size")
+	require.Equal(t, uint64(32731136), l.Arenas[shm.HostToPlugin].Bytes, "arena_bytes_hp")
+	require.Equal(t, uint64(32731136), l.Arenas[shm.PluginToHost].Bytes, "arena_bytes_ph")
+	require.Equal(t, uint64(65994752), l.RegionSize, "region_size")
 	require.Equal(t, uint64(4096), l.SyncPageOffset, "sync_page_offset")
 	require.Equal(t, uint64(8192), l.Rings[shm.HostToPlugin].Offset, "ring_hp_offset")
 	require.Equal(t, uint64(270336), l.Rings[shm.PluginToHost].Offset, "ring_ph_offset")
 	require.Equal(t, uint64(532480), l.Arenas[shm.HostToPlugin].Offset, "arena_hp_offset")
-	require.Equal(t, uint64(32251904), l.Arenas[shm.PluginToHost].Offset, "arena_ph_offset")
+	require.Equal(t, uint64(33263616), l.Arenas[shm.PluginToHost].Offset, "arena_ph_offset")
 }

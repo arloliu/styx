@@ -676,9 +676,9 @@ Streaming does not change this, and cannot: the serving class of a stream messag
 is a function of that message's length (`shm-abi.md` §6: smallest class with
 `slab_size ≥ stored_length`, no cross-class fallback), which is not known at
 startup. A startup check over class counts would have to assume every message
-lands in the smallest-count class — the 26-slab 1 MiB class on the `default`
+lands in the smallest-count class — the 8-slab 1048640-byte class on the `default`
 profile — and would then refuse to load any deployment whose `N_max · S_max`
-exceeds 26, including every configuration that only ever sends 64-byte messages.
+exceeds 8, including every configuration that only ever sends 64-byte messages.
 That check would reject overwhelmingly more correct configurations than incorrect
 ones, and would contradict the ABI's own position that the same situation for
 unary calls is provisioning, not a load failure.
@@ -697,13 +697,14 @@ seam (§5.4), and bounds the wait by the stream's deadline.
 A deployment that wants the stronger property — that a stream `Send` never meets
 arena backpressure at all — opts into **(S3)**, which is the streaming analogue
 of the ABI's STRICT mode and carries the same cost. Concretely, at the `default`
-profile the reachable class counts are {64 B ×4095, 4 KiB ×1024, 1 MiB ×26}
+profile the reachable class counts are {256 B ×4095, 1088 B ×2048, 4160 B ×1024,
+16448 B ×256, 65600 B ×128, 131136 B ×32, 1048640 B ×8}
 (class 0 minus the reserved slab-zero, `shm-abi.md` §6), so (S3) requires
-`N_max · S_max ≤ 26` — for example `N_max = 16, S_max = 1`, or `N_max = 2,
-S_max = 13`. At the `benchmark` profile the counts are {8191, 2048, 64}, so (S3)
+`N_max · S_max ≤ 8` — for example `N_max = 8, S_max = 1`, or `N_max = 2,
+S_max = 4`. At the `benchmark` profile the counts are {8191, 2048, 64}, so (S3)
 allows `N_max · S_max ≤ 64` — for example `N_max = 16, S_max = 4`. A deployment
 that wants both (S3) and the shipped `16 × 32` must raise its **least populous**
-class — the 1 MiB class in both profiles, which is the largest by size and the
+class — the top class in both profiles, which is the largest by size and the
 smallest by count — to at least 512 slabs (`shm-abi.md` §18's sizing guideline). This is the honest
 price of exhaustion-freedom, and it is why the ABI made it a MAY and why this
 document does too.

@@ -170,11 +170,13 @@ Two named geometries are documented as examples; a host MAY choose any geometry
 meeting the bounds above.
 
 **`default` profile (≤ 64 MiB total):** `ring_capacity = 4096`; per direction
-classes {64 B ×4096, 4 KiB ×1024, 1 MiB ×26} ⇒ `arena_bytes_dir =
-64·4096 + 4096·1024 + 1048576·26 = 262144 + 4194304 + 27262976 = 31719424`
-(~30.25 MiB); `region_size = 2·4096 + 2·(4096·64) + 2·31719424 = 8192 + 524288 +
-63438848 = 63971328` (~61.0 MiB). Asymmetric variants (e.g. a smaller P→H arena)
-are allowed.
+classes {256 B ×4096, 1088 B ×2048, 4160 B ×1024, 16448 B ×256, 65600 B ×128,
+131136 B ×32, 1048640 B ×8} ⇒ `class_total = 256·4096 + 1088·2048 + 4160·1024 +
+16448·256 + 65600·128 + 131136·32 + 1048640·8 = 1048576 + 2228224 + 4259840 +
+4210688 + 8396800 + 4196352 + 8389120 = 32729600` and `arena_bytes_dir =
+roundup(32729600, 4096) = 32731136` (~31.21 MiB); `region_size = 2·4096 +
+2·(4096·64) + 2·32731136 = 8192 + 524288 + 65462272 = 65994752` (~62.9 MiB).
+Asymmetric variants (e.g. a smaller P→H arena) are allowed.
 
 **`benchmark` profile (the spike-equivalent 146 MiB geometry — used by the Task 11
 spike comparison and MUST remain exactly this geometry for comparability):**
@@ -330,22 +332,22 @@ as a worked example). Every integer field is little-endian.
 | 8 | 4 | `layout_version` | `uint32` | `1` (fixed) | see §0; matched exactly at handshake (§19). |
 | 12 | 4 | `header_flags` | `uint32` | `0` unless a governing feature negotiated (§0, §19) | reserved header flags; MUST be 0 for every bit whose feature is not in the acknowledged tuple. |
 | 16 | 8 | `generation` | `uint64` | host-assigned (≥1) | region incarnation; increments on every restart (§15). Descriptors carry a 32-bit view (§4). |
-| 24 | 8 | `region_size` | `uint64` | host-derived (default `63971328`) | total region bytes; MUST equal the sealed memfd length and the §1 recomputed size. |
+| 24 | 8 | `region_size` | `uint64` | host-derived (default `65994752`) | total region bytes; MUST equal the sealed memfd length and the §1 recomputed size. |
 | 32 | 4 | `page_size` | `uint32` | `4096` (fixed) | MUST equal `PageSize`. |
 | 36 | 4 | `descriptor_size` | `uint32` | `64` (fixed) | MUST equal `DescriptorSize`. |
 | 40 | 4 | `ring_capacity` | `uint32` | host-chosen (default `4096`) | descriptors per ring; power of two in `[64, 1<<20]` (§1, §10). Same for both rings. |
-| 44 | 4 | `num_classes_hp` | `uint32` | host-chosen ≥1 (default `3`) | number of size classes in the **H→P** arena's class table. |
-| 48 | 4 | `num_classes_ph` | `uint32` | host-chosen ≥1 (default `3`) | number of size classes in the **P→H** arena's class table. |
+| 44 | 4 | `num_classes_hp` | `uint32` | host-chosen ≥1 (default `7`) | number of size classes in the **H→P** arena's class table. |
+| 48 | 4 | `num_classes_ph` | `uint32` | host-chosen ≥1 (default `7`) | number of size classes in the **P→H** arena's class table. |
 | 52 | 4 | `reserved_u32` | `uint32` | `0` | header alignment padding; MUST be 0. |
 | 56 | 8 | `sync_page_offset` | `uint64` | `4096` (fixed) | offset of the sync page (§3). |
 | 64 | 8 | `ring_hp_offset` | `uint64` | host-derived (default `8192`) | offset of ring H→P (§1 formula). |
 | 72 | 8 | `ring_ph_offset` | `uint64` | host-derived (default `270336`) | offset of ring P→H. |
 | 80 | 8 | `arena_hp_offset` | `uint64` | host-derived (default `532480`) | offset of arena H→P. |
-| 88 | 8 | `arena_ph_offset` | `uint64` | host-derived (default `32251904`) | offset of arena P→H. |
-| 96 | 8 | `arena_bytes_hp` | `uint64` | host-derived (default `31719424`) | H→P arena total; MUST equal `roundup(H→P class_total, PageSize)` (§1) and be `≤ 4 GiB − 1`. |
-| 104 | 8 | `arena_bytes_ph` | `uint64` | host-derived (default `31719424`) | P→H arena total; MUST equal `roundup(P→H class_total, PageSize)` (§1); independent of `arena_bytes_hp` (asymmetric allowed). |
+| 88 | 8 | `arena_ph_offset` | `uint64` | host-derived (default `33263616`) | offset of arena P→H. |
+| 96 | 8 | `arena_bytes_hp` | `uint64` | host-derived (default `32731136`) | H→P arena total; MUST equal `roundup(H→P class_total, PageSize)` (§1) and be `≤ 4 GiB − 1`. |
+| 104 | 8 | `arena_bytes_ph` | `uint64` | host-derived (default `32731136`) | P→H arena total; MUST equal `roundup(P→H class_total, PageSize)` (§1); independent of `arena_bytes_hp` (asymmetric allowed). |
 | 112 | 8 | `class_table_hp_offset` | `uint64` | host-chosen (default `256`) | layout-page offset of the H→P class table; RECOMMENDED `256`. |
-| 120 | 8 | `class_table_ph_offset` | `uint64` | host-chosen (default `304`) | layout-page offset of the P→H class table; RECOMMENDED `256 + 16·num_classes_hp`. |
+| 120 | 8 | `class_table_ph_offset` | `uint64` | host-chosen (default `368`) | layout-page offset of the P→H class table; RECOMMENDED `256 + 16·num_classes_hp`. |
 | 128 | 8 | `shard_count` | `uint64` | `1` | **reserved for v2** per-CPU sharded rings (design §12). MUST be 1 in v1. |
 | 136 | 4 | `lifecycle_reserve` | `uint32` | host-chosen (default `R = C/16`: 256 at default `C=4096`, 512 at benchmark `C=8192`) | the reservation `R` (§18); both producers read it here. MUST satisfy `0 < R < ring_capacity` (validated §1 Phase 2). |
 | 140 | 116 | `reserved_hdr` | `[116]byte` | all `0` | reserved header padding to offset 256; MUST be 0 unless a governing feature negotiated (§0, §19). |
@@ -399,12 +401,13 @@ before any entry is dereferenced** (§1 Phase-2 order):
   **reserved-zero and never allocatable** — it exists only so the next span starts
   page-aligned.
 
-**`default` profile example (both directions identical, symmetric):** 3 entries
-each — {`slab_size` 64, `slab_count` 4096, `class_base_offset` 0}, {4096, 1024,
-262144}, {1048576, 26, 4456448} — totalling `arena_bytes_dir = 31719424`. The
-**`benchmark`** profile uses {64 ×8192, 4096 ×2048, 1048576 ×64} totalling
-`76021760` (§1). A host MAY configure asymmetric tables (e.g. a response arena with
-fewer 1 MiB slabs).
+**`default` profile example (both directions identical, symmetric):** 7 entries
+each — {`slab_size` 256, `slab_count` 4096, `class_base_offset` 0}, {1088, 2048,
+1048576}, {4160, 1024, 3276800}, {16448, 256, 7536640}, {65600, 128, 11747328},
+{131136, 32, 20144128}, {1048640, 8, 24340480} — totalling `class_total =
+32729600` and `arena_bytes_dir = 32731136` (§1). The **`benchmark`** profile uses
+{64 ×8192, 4096 ×2048, 1048576 ×64} totalling `76021760` (§1). A host MAY configure
+asymmetric tables (e.g. a response arena with fewer megabyte slabs).
 
 Bytes of the layout page not occupied by the header (through 255) or the two class
 tables are reserved (`0`).
@@ -582,7 +585,7 @@ counted the 32-byte trace prefix unconditionally, shrinking `max_payload` and th
 admissible concurrency §18 derives from it for every deployment, even one that never
 set `TRACE_PRESENT` on any descriptor. (The per-message size-class jump itself was
 never universal: it only ever affected descriptors that actually set
-`TRACE_PRESENT`, not every 64-byte message.) Making `trace` a negotiated feature
+`TRACE_PRESENT`, not every 240-byte message.) Making `trace` a negotiated feature
 removes that always-on conservative overhead tax (§18) for deployments that don't
 negotiate `trace` — such deployments no longer pay the sizing cost for a feature
 they never use — while a deployment that does negotiate `trace` still incurs the
@@ -780,7 +783,8 @@ allocated** in either direction, so offset 0 unambiguously means "no slab" (§5)
 The allocator initializes each direction's class-0 free list without index 0.
 
 **Profile examples (non-normative):** the `default` profile's per-direction table
-is {64 B ×4096, 4 KiB ×1024, 1 MiB ×26}; the `benchmark` profile's is
+is {256 B ×4096, 1088 B ×2048, 4160 B ×1024, 16448 B ×256, 65600 B ×128,
+131136 B ×32, 1048640 B ×8}; the `benchmark` profile's is
 {64 B ×8192, 4 KiB ×2048, 1 MiB ×64} (§1/§2). The largest class fixes that
 direction's `max_payload` (§18).
 
@@ -1792,7 +1796,7 @@ golden tests, not `layout_version` invariants). A build configured for the
 `benchmark` profile asserts `ring_capacity == 8192`, `arena_bytes_hp ==
 arena_bytes_ph == 76021760`, `region_size == 153100288`, and the span offsets of
 §1; a `default`-profile build asserts `ring_capacity == 4096`, `arena_bytes_dir ==
-31719424`, `region_size == 63971328`. **Every** build additionally asserts the
+32731136`, `region_size == 65994752`. **Every** build additionally asserts the
 *structural* geometry rules at startup (§1 Phase-2 / §2 validation): `ring_capacity`
 a power of two in `[64,1<<20]`; **`0 < lifecycle_reserve (R) < ring_capacity`**;
 **slab bounds** (each `slab_size` a multiple of 64 and `≥ 64`, strictly ascending,
@@ -1917,18 +1921,20 @@ violates it is still valid and simply experiences typed backpressure under load.
 *Worked example (`default` profile, no features negotiated ⇒ overhead 0, guideline
 figures).* `C = 4096`, `R = C/16 = 256` ⇒ deadlock-freedom caps
 `max_data_inflight` at `C − R = 3840`. Class capacities (usable slabs):
-64 B ×`(4096−1)=4095`, 4 KiB ×1024, 1 MiB ×26. With no payload-layout features
-negotiated, a 64-byte message needs 64 B ⇒ served by the 64 B class (4095 slabs);
-a ~1 MiB message ⇒ 26 slabs. **If `trace` is negotiated and a descriptor sets
-`TRACE_PRESENT`**, that descriptor's 64-byte payload stores as `64 + 32 = 96` B ⇒ it
-is served by the 4 KiB class (1024 slabs); a negotiated-but-untraced 64-byte message
+256 B ×`(4096−1)=4095`, 1088 B ×2048, 4160 B ×1024, 16448 B ×256, 65600 B ×128,
+131136 B ×32, 1048640 B ×8. With no payload-layout features
+negotiated, a 240-byte message needs 240 B ⇒ served by the 256 B class (4095 slabs);
+a ~1 MiB message ⇒ 8 slabs. **If `trace` is negotiated and a descriptor sets
+`TRACE_PRESENT`**, that descriptor's 240-byte payload stores as `240 + 32 = 272` B ⇒ it
+is served by the 1088 B class (2048 slabs); a negotiated-but-untraced 240-byte message
 — `trace` negotiated but `TRACE_PRESENT` not set on that descriptor — still stores
-as 64 B and stays in the 64 B class, since negotiation only permits the bit rather
+as 240 B and stays in the 256 B class, since negotiation only permits the bit rather
 than setting it. So to serve, say, 1000 concurrent small calls without backpressure:
-calls that don't set `TRACE_PRESENT` fit the 64 B class's 4095 slabs; calls that do
-set `TRACE_PRESENT` consume the 4 KiB class's 1024 slabs. To serve more than 26 concurrent 1 MiB-class
-calls, enlarge that class. The `benchmark` profile (`C = 8192`, `R = 512`, counts
-{8192, 2048, 64}) raises all three.
+calls that don't set `TRACE_PRESENT` fit the 256 B class's 4095 slabs; calls that do
+set `TRACE_PRESENT` consume the 1088 B class's 2048 slabs. To serve more than 8 concurrent
+megabyte-class calls, enlarge that class. The `benchmark` profile (`C = 8192`,
+`R = 512`, counts {8192, 2048, 64}) is a separate three-class geometry with its own
+counts.
 
 ### Optional STRICT mode (MAY, exhaustion-free certification)
 

@@ -2,9 +2,12 @@ package styx
 
 import (
 	"testing"
+	"time"
 
 	"github.com/arloliu/styx/internal/shm"
+	"github.com/arloliu/styx/internal/transport"
 	shmtransport "github.com/arloliu/styx/internal/transport/shm"
+	"github.com/arloliu/styx/internal/transport/shm/shmtest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -69,4 +72,169 @@ func TestShmGeometry_ToLayout_EmptyDirectionMirrorsThePopulatedOne(t *testing.T)
 	require.Equal(t, layout.Arenas[shm.HostToPlugin].Classes, layout.Arenas[shm.PluginToHost].Classes,
 		"an empty direction copies the populated one")
 	require.Len(t, layout.Arenas[shm.PluginToHost].Classes, 1)
+}
+
+// The arena bytes per direction and the whole region CreateRegion derives from
+// GeometryDefault's ladder. They are pinned because the ladder's shape is a trade
+// against its cost: a rung added, or a slab count raised, without accounting for
+// the bytes it costs shows up here rather than in a deployment's resident memory.
+const (
+	defaultLadderArenaBytes = 32731136
+	defaultLadderRegionSize = 65994752
+)
+
+// Test that GeometryDefault is exactly the seven-rung ladder its documentation
+// describes and costs exactly the region that ladder is priced at. The slab counts
+// are half the assertion: each one is the ceiling on how many payloads of that rung's
+// size can be in flight per direction at once, so a count changed silently changes a
+// concurrency limit no other test states.
+func TestGeometryDefault_PinsTheSevenRungLadder_AndItsRegionCost(t *testing.T) {
+	// Given the default profile.
+	geo := GeometryDefault()
+
+	// When a region is built from it through the shipped layout builder. The
+	// generation is the supervisor's to stamp per instance, not the geometry's.
+	layout := geo.toLayout()
+	layout.Generation = 1
+	region, err := shm.CreateRegion(layout)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, region.Close()) })
+
+	// Then the ladder is the documented one, in both directions.
+	require.Equal(t, []ShmSizeClass{
+		{SlabSize: 256, SlabCount: 4096},
+		{SlabSize: 1088, SlabCount: 2048},
+		{SlabSize: 4160, SlabCount: 1024},
+		{SlabSize: 16448, SlabCount: 256},
+		{SlabSize: 65600, SlabCount: 128},
+		{SlabSize: 131136, SlabCount: 32},
+		{SlabSize: 1048640, SlabCount: 8},
+	}, geo.HostToPlugin, "the default ladder's rung sizes and slab counts")
+	require.Equal(t, geo.HostToPlugin, geo.PluginToHost, "the default profile is symmetric")
+	require.EqualValues(t, shmDefaultRingCapacity, geo.RingCapacity)
+	require.EqualValues(t, shmDefaultLifecycleReserve, geo.LifecycleReserve)
+
+	// And it costs the region the ladder is priced at, as internal/shm derives it
+	// rather than as this test recomputes it.
+	l := region.Layout()
+	require.EqualValues(t, defaultLadderArenaBytes, l.Arenas[shm.HostToPlugin].Bytes, "arena_bytes_hp")
+	require.EqualValues(t, defaultLadderArenaBytes, l.Arenas[shm.PluginToHost].Bytes, "arena_bytes_ph")
+	require.EqualValues(t, defaultLadderRegionSize, l.RegionSize, "region_size")
+}
+
+// serveStoredLength sends one frame of storedLen bytes through a fresh host/plugin
+// pair attached to a region built from geo, and reports the slab size the producer's
+// allocator reserved for it — read from the arena's own occupancy, which rises by
+// exactly the serving class's slab_size and nothing else. Reading it that way is what
+// makes this the production selection path: the allocator picks the class, and this
+// test never restates the rule it picked by.
+//
+// Each call gets its own pair. The writer reclaims a previous frame's slab lazily,
+// inside the next allocation, so a shared pair's occupancy would net that reclaim
+// against this frame's reservation and name neither slab.
+func serveStoredLength(t *testing.T, geo ShmGeometry, storedLen int) (uint64, error) {
+	t.Helper()
+
+	layout := geo.toLayout()
+	layout.Generation = 1
+	pair, err := shmtest.NewInProcessPairWithLayout(layout, shmtransport.Config{
+		MaxInflight:         int(geo.RingCapacity - geo.LifecycleReserve),
+		DataQueueDepth:      64,
+		LifecycleQueueDepth: 16,
+	})
+	require.NoError(t, err, "attach a pair on the profile under test")
+	t.Cleanup(func() { require.NoError(t, pair.Close()) })
+
+	occ, ok := pair.Host.(transport.ArenaOccupancyReporter)
+	require.True(t, ok, "the shared-memory transport must report arena occupancy")
+	require.Zero(t, occ.ArenaOccupancyBytes(), "a freshly attached arena holds no slab")
+
+	if err := pair.Host.Send(t.Context(), transport.Frame{
+		CallID: 1, Kind: transport.FrameUnaryReq, Service: 1, Method: 1,
+		Payload: make([]byte, storedLen),
+	}); err != nil {
+		return 0, err
+	}
+
+	require.Eventually(t, func() bool { return occ.ArenaOccupancyBytes() > 0 },
+		10*time.Second, 50*time.Microsecond, "an accepted frame must reserve a slab")
+
+	return occ.ArenaOccupancyBytes(), nil
+}
+
+// Test that every rung of the default ladder serves exactly the length range it is
+// sized for, driven through the real allocator rather than a restatement of the
+// selection rule: for each rung, the largest length it serves and the first length
+// that spills to the rung above, then the first length past the top rung, which no
+// slab can serve and which is refused rather than parked.
+//
+// The lengths here are stored lengths — what a marshaled message occupies in a slab,
+// which is what picks the class (shm-abi.md §6). A message is longer once marshaled
+// than the payload it wraps, which is why two of the cases below sit off the rung
+// boundaries: 4097 is the first length past a 4096-byte rung, where a ladder built on
+// exact powers of two sends a 4 KiB-scale message to its largest class, and 1048580
+// is what a 1 MiB payload marshals to, which such a ladder cannot carry at all.
+func TestGeometryDefault_ServesTheRungItIsSizedFor_AtEveryClassBoundary(t *testing.T) {
+	cases := []struct {
+		name       string
+		stored     int
+		wantSlab   uint64
+		wantReject bool
+	}{
+		{name: "largest served by the 256 rung", stored: 256, wantSlab: 256},
+		{name: "first length spilling the 256 rung", stored: 257, wantSlab: 1088},
+		{name: "largest served by the 1088 rung", stored: 1088, wantSlab: 1088},
+		{name: "first length spilling the 1088 rung", stored: 1089, wantSlab: 4160},
+		{name: "the first length past 4096", stored: 4097, wantSlab: 4160},
+		{name: "largest served by the 4160 rung", stored: 4160, wantSlab: 4160},
+		{name: "first length spilling the 4160 rung", stored: 4161, wantSlab: 16448},
+		{name: "largest served by the 16448 rung", stored: 16448, wantSlab: 16448},
+		{name: "first length spilling the 16448 rung", stored: 16449, wantSlab: 65600},
+		{name: "largest served by the 65600 rung", stored: 65600, wantSlab: 65600},
+		{name: "first length spilling the 65600 rung", stored: 65601, wantSlab: 131136},
+		{name: "largest served by the 131136 rung", stored: 131136, wantSlab: 131136},
+		{name: "first length spilling the 131136 rung", stored: 131137, wantSlab: 1048640},
+		{name: "a 1 MiB payload once marshaled", stored: 1048580, wantSlab: 1048640},
+		{name: "largest served by the 1048640 rung", stored: 1048640, wantSlab: 1048640},
+		{name: "first length past the top rung", stored: 1048641, wantReject: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given the default profile. When a frame of this stored length is sent.
+			slab, err := serveStoredLength(t, GeometryDefault(), tc.stored)
+
+			// Then it is served from the rung sized for it, or refused outright.
+			if tc.wantReject {
+				require.ErrorIs(t, err, transport.ErrPayloadTooLarge,
+					"%d bytes exceeds every rung and must be refused, not parked", tc.stored)
+
+				return
+			}
+
+			require.NoError(t, err, "%d bytes must be admitted", tc.stored)
+			require.Equal(t, tc.wantSlab, slab,
+				"%d bytes must be served from the %d-byte rung", tc.stored, tc.wantSlab)
+		})
+	}
+}
+
+// Test that GeometryLean's largest class behaves as the hard ceiling its
+// documentation states rather than as a backpressure point: a message that fits it
+// is carried, and one byte more is refused outright instead of waiting for a slab.
+// The class also carries the same 64 bytes of headroom the default's rungs do, so a
+// full 4 KiB payload still fits once encoded — without it, the profile's stated
+// ceiling and its real one differ by exactly the encoding's own framing.
+func TestGeometryLean_CarriesItsTopClass_AndRefusesTheFirstByteBeyondIt(t *testing.T) {
+	// Given the lean profile. When a frame of exactly its top class is sent.
+	slab, err := serveStoredLength(t, GeometryLean(), 4160)
+
+	// Then the top class serves it.
+	require.NoError(t, err, "a 4160-byte frame must fit the lean profile's top class")
+	require.EqualValues(t, 4160, slab, "the lean profile's top class must serve it")
+
+	// And one byte more is refused, not parked.
+	_, err = serveStoredLength(t, GeometryLean(), 4161)
+	require.ErrorIs(t, err, transport.ErrPayloadTooLarge,
+		"a message past the lean profile's top class is rejected, never queued")
 }

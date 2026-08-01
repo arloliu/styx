@@ -97,7 +97,7 @@
 // exactly once; steps 1-3 (admission stop, waiter wake, goroutine join) are the
 // caller's, and the eventfds are the caller's to close.
 //
-// # Head-gated reclaim and its idle-stuck limitation
+// # Head-gated reclaim and the exhausted writer's retry
 //
 // The writer frees a slab once the consumer's ring head has passed the
 // descriptor that referenced it (shm-abi.md §6): on every publish, and again
@@ -108,16 +108,16 @@
 //
 // Reclaim runs only while the writer is making progress; it cannot run while the
 // writer is parked. So a writer already stuck on arena exhaustion does not
-// recover from its draining consumer alone: it resumes on its next lifecycle
-// intent or at shutdown — both re-drive the set-aside intent through
-// place → build → stampPayload → reclaim → alloc — never from pure data traffic,
-// since a stuck writer stops pulling data to stay within its queue bound, so
-// further data sends do not wake it. A workload of pure data frames with no
-// lifecycle traffic, under a consumer that drains but sends no cancels, is the
-// uncovered corner: nothing wakes the stuck writer until the cross-process
-// consumer→producer "space-available" wake is wired, which is not specified for
-// this milestone (shm-abi.md §11/§12 define only producer→consumer wakes) and is
-// left to a later load/recovery task.
+// recover from its draining consumer directly: something must re-drive the
+// set-aside intent through place → build → stampPayload → reclaim → alloc. The
+// backoff timer always does, on its own, with no help from either peer; a
+// lifecycle intent, an inbound frame's peer-progress signal, or shutdown each do
+// it sooner. A workload of pure data frames with no lifecycle traffic, under a
+// consumer that drains but sends no cancels, therefore degrades — every wait
+// costs at most the timer's 5 millisecond cap — rather than wedging. The
+// cross-process consumer→producer "space-available" wake would remove even that
+// wait, but it is not specified (shm-abi.md §11/§12 define only
+// producer→consumer wakes) and is not needed for liveness.
 //
 // # Conformance faults poison the region
 //

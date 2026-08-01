@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Test that the lean device-gateway profile at its recorded peak concurrency
+// Test that the lean small-control-traffic profile at its recorded peak concurrency
 // (max_data_inflight = 32) passes STRICT and runs a 32-concurrent-call workload
 // over the shared-memory transport without wedging: every one of 32 simultaneous
 // unary calls completes with its own echoed reply. STRICT admits the spawn only if
