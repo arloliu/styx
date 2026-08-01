@@ -245,13 +245,15 @@ func TestChaos_SIGSTOPWedgesPlugin_HostCallBoundedByCtx(t *testing.T) {
 }
 
 // TestChaos_StarveArena_CallerContextBounded drives a small-arena region to
-// exhaustion against a peer that never drains the requests, and proves the wedge
-// is real and bounded: at most the arena's usable-slab capacity can publish, so
-// at least the rest MUST fail to obtain a slab and end in a caller-context
-// termination — distinguishing a genuine exhaustion wedge from "everything
-// succeeded". It asserts only what the library owns without a wired
-// space-available wake (that wake has no production caller; the exhausted lane
-// wedges by design), and the whole run is bounded, so it never hangs.
+// exhaustion against a peer that never drains the requests, and proves the
+// result is real and bounded: at most the arena's usable-slab capacity can
+// publish, so at least the rest MUST fail to obtain a slab and end in a
+// caller-context termination — distinguishing genuine exhaustion from
+// "everything succeeded". The writer retries an exhausted send on its own
+// backoff timer, but this scenario's peer never frees a slab for a retry to
+// find, so the retries cannot succeed; it asserts only what the library owns
+// in that situation — a caller-context-bounded failure, not a hang — and the
+// whole run is itself bounded, so it never hangs.
 func TestChaos_StarveArena_CallerContextBounded(t *testing.T) {
 	oc, err := RunStarveArena(context.Background(), peerBin)
 	require.NoError(t, err)

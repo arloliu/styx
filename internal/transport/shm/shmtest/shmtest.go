@@ -48,16 +48,18 @@ const (
 // Slab counts for defaultLayout's three classes. These are deliberately
 // generous -- comfortably above the largest per-class concurrent population
 // a caller sweeping up to a few hundred concurrent calls could produce --
-// for a reason stronger than pipelining efficiency: writer.go's own doc
-// records that the consumer-to-producer "space-available" wake has no
-// production caller yet, so once a writer's data lane sticks on arena
-// exhaustion, NOTHING automatically retries it (only new lifecycle traffic
-// or shutdown does). A geometry that lets any one size class run out under
-// realistic concurrent load therefore does not degrade to slower
-// pipelining -- it wedges that data lane permanently. Under-provisioning
-// this was a real, reproduced hang (a 64-call concurrent workload cycling
-// through 64/4096/DefaultLargestPayload-byte payloads deadlocked with the
-// original 8-slab top class), not a hypothetical one; each count here is
+// because a size class that runs dry mid-sweep costs latency, not
+// correctness: the writer goroutine sets aside the one send that finds a
+// class exhausted as its sole carry, retried on its own backoff timer (100µs
+// doubling to a 5ms cap, writer.go's own doc); every later call on that
+// direction stays queued behind it until the carry resolves.
+// tests/integration/arena_backpressure_test.go's
+// TestPinnedGeometryShm_CompletesEveryCall_WhenArenaBackpressures is this
+// repo's durable proof of that property: 208 concurrent callers against a
+// class with 26 slabs still complete every call with an exact reply, with
+// the host's own per-class set-aside counter asserted non-zero. These counts
+// stay generous anyway, because the sizing goal here is pipelining
+// efficiency for a several-hundred-concurrent-caller sweep: each count is
 // sized with headroom above 512 concurrent calls cycled three ways
 // (⌈512/3⌉ = 171 worst case per class) -- the largest concurrency this
 // module's own differential harness exercises. A caller that needs a

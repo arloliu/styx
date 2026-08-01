@@ -83,10 +83,12 @@
 //
 // Two further boundaries stand on their own:
 //
-//   - StarveArena asserts only caller-context-boundedness. The
-//     consumer->producer space-available wake has no production caller, so an
-//     exhausted data lane waits for lifecycle traffic or shutdown — a documented
-//     wedge (writer.go), not graceful backpressure recovery.
+//   - StarveArena asserts only caller-context-boundedness. The writer retries
+//     an exhausted send on its own backoff timer (writer.go), but the
+//     scenario's peer never serves a request, so no slab is ever freed for a
+//     retry to find; the retries cannot succeed, so each call ends only when
+//     its own caller's context bounds it — not graceful backpressure
+//     recovery, because nothing here ever recovers.
 //   - fd/mapping counts prove no leak, NOT no double-unmap; idempotent Close is
 //     tested separately.
 package chaos

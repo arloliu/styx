@@ -99,9 +99,12 @@ const (
 
 // Small-arena geometry for the starvation scenario: a tiny slab count so a
 // modest concurrent workload drives the workload's size class to
-// arena.ErrExhausted, which — with no wired consumer->producer space-available
-// wake — wedges that data lane until the caller's context bounds and tears the
-// call down (writer.go's own doc records the wedge; shm-abi.md §11/§12).
+// arena.ErrExhausted. The writer goroutine sets aside the one send that finds
+// the class exhausted as its sole carry, retried on its own backoff timer
+// (writer.go's own doc); every later call stays queued behind it and never
+// even attempts an allocation. modeStall's peer never serves a request, so no
+// slab is ever freed for that carry's retry to find, and each call ends only
+// when its own caller's context bounds it (shm-abi.md §11/§12).
 //
 // starveDummySlabSize's single-slab class 0 exists only to absorb the reserved
 // slab-zero (shm-abi.md §6: class 0 index 0 is never allocated), so the

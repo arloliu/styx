@@ -73,7 +73,9 @@ const (
 	// on — the harness must never itself hang.
 	reapDeadline = 10 * time.Second
 	// starveDeadline is the shared per-call ctx bound for the starvation workload:
-	// the calls that cannot obtain a slab wedge until this fires, all together.
+	// the peer never serves, so no slab is ever freed for the writer's retries to
+	// find, and every call that could not obtain a slab blocks until this fires,
+	// all together.
 	starveDeadline = 3 * time.Second
 	// The hard* deadlines are the harness's own backstops around a bounded call
 	// that is itself already ctx-bounded: a Recv/Send that ignored cancellation
@@ -1261,11 +1263,14 @@ type StarveOutcome struct {
 
 // RunStarveArena spawns a peer that attaches but never serves, then drives a
 // concurrent batch of full-slab requests at the host. The peer never drains the
-// host's outbound arena, so exactly its concurrent-slab capacity can publish and
-// every further call wedges — the consumer->producer space-available wake is
-// unwired (writer.go's run doc; shm-abi.md §11/§12), so an exhausted data lane
-// resumes only on lifecycle traffic or shutdown — until each wedged call's own
-// context bounds it. The whole run is bounded, so it never hangs.
+// host's outbound arena, so exactly its concurrent-slab capacity can publish.
+// The writer goroutine sets aside the next send that finds the class exhausted
+// as its one carry, retried on its own backoff timer (writer.go's run doc;
+// shm-abi.md §11/§12); every call after that stays queued behind it and never
+// even attempts an allocation until the carry is resolved. The peer never
+// frees a slab for that carry's retry to find, so it never resolves, and every
+// call queued behind it blocks until its own context bounds it. The whole run
+// is bounded, so it never hangs.
 func RunStarveArena(ctx context.Context, peerBin string) (StarveOutcome, error) {
 	oc := StarveOutcome{Issued: starveCalls}
 
@@ -1275,7 +1280,7 @@ func RunStarveArena(ctx context.Context, peerBin string) (StarveOutcome, error) 
 	}
 	defer func() { _ = s.Close() }()
 
-	// A single shared ctx: the calls that cannot obtain a slab all wedge until it
+	// A single shared ctx: the calls that cannot obtain a slab all block until it
 	// fires, together, rather than serially at their own deadlines.
 	sctx, cancel := context.WithTimeout(ctx, starveDeadline)
 	defer cancel()
