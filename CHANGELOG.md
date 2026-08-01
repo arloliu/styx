@@ -5,6 +5,53 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-01
+
+Public-API additions from the first external integration of the
+shared-memory transport, plus the fixes that integration surfaced.
+
+### Added
+
+- **`ErrPayloadTooLarge`**: an oversize payload is rejected before any byte
+  is published, and the rejection is now matchable with `errors.Is` at the
+  public API — on unary `Invoke`, stream opens, and stream sends — instead
+  of surfacing only as a wrapped internal sentinel.
+- **Live stdio observation**: `PluginSpec.Stdio` accepts a `StdioSink`
+  receiving every stdout/stderr line a plugin writes, live; a slow or
+  panicking sink never blocks or crashes the plugin. `PluginCrashError`
+  additionally carries the crash-reason stderr tail as a structured
+  `StderrTail []string`, so log pipelines no longer parse it out of
+  `Reason`.
+- **`Host.Health(name)`**: a pull-based, level-triggered health snapshot —
+  most recent lifecycle state, last transition time, last error, and the
+  current consecutive missed-heartbeat count — for synchronous probes that
+  previously had to rebuild retained state from the edge-triggered
+  `Host.Events()` channel. Unknown names answer the new
+  `ErrUnknownPlugin`.
+- **Protobuf editions support** in `protoc-gen-go-styx`: `edition = "2023"`
+  contract files now generate (editions 2 through 2024, mirroring the
+  pinned protobuf runtime), with golden and response-contract tests.
+- **`NoRestart`**: a named supervision policy for hosts whose embedding
+  supervisor owns restart decisions, plus a documented host-owned-restart
+  pattern (fresh `Host` per recreation) in `docs/plugin-lifecycle.md`.
+- **`IncompatibleError.Kind`**: distinguishes a binary-identity pin
+  mismatch (`IncompatibleBinaryIdentity`) from a genuine handshake
+  incompatibility (`IncompatibleHandshake`) without parsing `Reason`.
+- **`ErrPluginAlreadyStarted`**: `Start` now refuses a name whose plugin
+  this `Host` already started, instead of silently attaching a second
+  supervisor to it.
+
+### Fixed
+
+- An oversize `STREAM_OPEN` surfaced wrapped in the retryable
+  `ErrPluginUnavailable`, mislabeling a deterministic rejection as
+  transient; it now maps to the non-retryable `ErrPayloadTooLarge`.
+- The shared-memory writer's arena oversize backstop reported an error
+  outside the never-published classification, which would have
+  misclassified a provably-unpublished send as outcome-unknown.
+- `make lint` never linted the failpoint-tagged files that
+  `make test-failpoint` tests; the `ci` gate now runs both passes.
+
 ## [0.1.0] - 2026-08-01
 
 Initial release.
@@ -50,4 +97,5 @@ Initial release.
 - **Migration guide** from `hashicorp/go-plugin`
   (`docs/migration-from-go-plugin.md`).
 
+[0.2.0]: https://github.com/arloliu/styx/releases/tag/v0.2.0
 [0.1.0]: https://github.com/arloliu/styx/releases/tag/v0.1.0
