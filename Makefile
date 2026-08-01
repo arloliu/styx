@@ -12,7 +12,7 @@ BIN_DIR                 := bin
 GENERATOR_BIN           := $(BIN_DIR)/protoc-gen-go-styx
 
 .DEFAULT_GOAL := help
-.PHONY: help build test test-failpoint bench bench-goplugin bench-goplugin-check vet lint fmt generate tidy clean \
+.PHONY: help build test test-failpoint bench bench-goplugin bench-goplugin-check vet lint lint-failpoint fmt generate tidy clean \
 	linter-update linter-version clean-linter-cache \
 	buf-update buf-version ci
 
@@ -58,6 +58,13 @@ lint:
 		echo "golangci-lint version mismatch (have $$INSTALLED, want $(GOLANGCI_LINT_VERSION)); run 'make linter-update'"; exit 1; fi
 	go tool $(LINTER_GOMOD) golangci-lint run --timeout=$(LINT_TIMEOUT)
 
+## lint-failpoint: Run golangci-lint with the failpoint build tag (its guarded files, e.g. under internal/transport/shm, only compile with the tag set, so the plain lint pass above never sees them)
+lint-failpoint:
+	@INSTALLED=$$(go tool $(LINTER_GOMOD) golangci-lint --version 2>/dev/null | grep -oE 'version [^ ]+' | cut -d' ' -f2 || echo none); \
+	if [ "$$INSTALLED" != "$(GOLANGCI_LINT_VERSION)" ]; then \
+		echo "golangci-lint version mismatch (have $$INSTALLED, want $(GOLANGCI_LINT_VERSION)); run 'make linter-update'"; exit 1; fi
+	go tool $(LINTER_GOMOD) golangci-lint run --timeout=$(LINT_TIMEOUT) --build-tags failpoint
+
 ## fmt: Format code (gofmt + goimports via golangci-lint fmt)
 fmt:
 	go tool $(LINTER_GOMOD) golangci-lint fmt
@@ -102,4 +109,4 @@ buf-version:
 	go tool $(BUF_GOMOD) buf --version
 
 ## ci: Full local gate (lint, vet, test, failpoint tests)
-ci: lint vet test test-failpoint bench-goplugin-check
+ci: lint lint-failpoint vet test test-failpoint bench-goplugin-check
