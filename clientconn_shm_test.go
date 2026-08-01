@@ -364,8 +364,10 @@ func TestClientConn_Invoke_RejectsOversizePayload_OverSharedMemory(t *testing.T)
 	require.Error(t, err)
 	require.Nil(t, resp)
 	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+	require.ErrorIs(t, err, styx.ErrPayloadTooLarge)
 	require.NotErrorIs(t, err, styx.ErrOutcomeUnknown,
 		"a send refused before anything was enqueued must not be reported as an unknown outcome")
+	require.False(t, styx.IsRetryable(err), "an oversize payload fails the identical way again")
 
 	// ...and the connection is unharmed: the next call completes normally.
 	require.False(t, pair.ServeLoopExited())

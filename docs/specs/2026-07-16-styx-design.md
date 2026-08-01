@@ -599,7 +599,9 @@ Three disjoint classes, distinguishable with `errors.As`/`errors.Is`:
   `ErrOutcomeUnknown` is never automatically retryable; crash-before-dispatch is.
 - **Framework errors** — `ErrIncompatible`, `ErrDeadlineExceeded`, `ErrCanceled`,
   `ErrBackpressure`, `ErrRequestDeclined`, `ErrPoisoned`, `ErrServiceNotFound`,
-  `ErrMethodNotFound`.
+  `ErrMethodNotFound`, `ErrPayloadTooLarge` (a deterministic pre-publish
+  oversize rejection: the outcome is known, and a retry at the same size
+  fails the same way).
 
 This taxonomy is what lets the device gateway map "critical device fault → fast shutdown" versus
 "transient → retry/restart" without string matching.

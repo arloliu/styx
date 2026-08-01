@@ -1717,7 +1717,10 @@ func TestWriter_RejectsUnsupportedKind_AtBuild(t *testing.T) {
 }
 
 // Test that an oversize payload (arena.ErrTooLarge) is surfaced on the intent as a
-// terminal reject, distinct from retryable exhaustion.
+// terminal reject, distinct from retryable exhaustion, and that the reported error
+// stays inside transport.NeverPublished's proof: the arena's own sentinel alone
+// would not match transport.ErrPayloadTooLarge, which is the one NeverPublished
+// checks, so a caller relying on that predicate must see both.
 func TestWriter_SurfacesArenaTooLarge_OnData(t *testing.T) {
 	// Given an arena that rejects the payload as too large.
 	w := newWriterFromParts(&recordRing{}, tooLargeArena{}, 1, 1, admitBlock)
@@ -1730,9 +1733,15 @@ func TestWriter_SurfacesArenaTooLarge_OnData(t *testing.T) {
 	// When building it.
 	_, st := w.build(i)
 
-	// Then
+	// Then the reported error carries both the arena's own sentinel and the
+	// transport-level one NeverPublished actually matches...
 	require.Equal(t, buildFailed, st)
-	require.ErrorIs(t, <-i.done, arena.ErrTooLarge)
+	reported := <-i.done
+	require.ErrorIs(t, reported, arena.ErrTooLarge)
+	require.ErrorIs(t, reported, transport.ErrPayloadTooLarge)
+	// ...so a caller classifying by NeverPublished sees this send as proven
+	// never-published rather than an unknown outcome.
+	require.True(t, transport.NeverPublished(reported))
 }
 
 // Test that a payload larger than MaxFrameSize is rejected terminally before any

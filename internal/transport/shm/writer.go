@@ -1463,7 +1463,17 @@ func (w *writer) stampPayload(
 
 			return d, buildStuck
 		}
-		w.report(i, err) // ErrTooLarge: payload exceeds the largest size class
+		if errors.Is(err, arena.ErrTooLarge) {
+			// transport.NeverPublished matches transport.ErrPayloadTooLarge, not the
+			// arena's own sentinel (see its doc in transport.go: the writer's
+			// oversize backstop reports before any Alloc/Push effect). Reporting the
+			// raw arena error here would let a provably-unpublished send escape that
+			// set and be misclassified as outcome-unknown by the caller.
+			w.report(i, fmt.Errorf("%w: %w", transport.ErrPayloadTooLarge, err))
+
+			return d, buildFailed
+		}
+		w.report(i, err)
 
 		return d, buildFailed
 	}

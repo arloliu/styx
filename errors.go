@@ -194,6 +194,14 @@ var (
 	// ErrBackpressure reports that a shared-memory send was refused because its
 	// ring or payload arena was full. It is retryable once capacity frees up.
 	ErrBackpressure = errors.New("styx: backpressure")
+	// ErrPayloadTooLarge reports that a call, stream open, or stream send was
+	// refused because its encoded payload exceeded the transport's per-frame
+	// limit (uds's framing constant, or shm's geometry-derived
+	// per-direction max_payload).
+	// The rejection happens before any byte is published, so the outcome is
+	// known and this is never ErrOutcomeUnknown. It is not retryable: an
+	// identical retry at the same size fails the identical way.
+	ErrPayloadTooLarge = errors.New("styx: payload too large")
 	// ErrPoisoned reports that a conformance violation desynchronized a
 	// shared-memory region, tearing the connection down. It is not retryable on
 	// the same instance; the supervisor's restart policy runs.
@@ -249,8 +257,8 @@ var (
 // decline with a deterministic cause answers the same way again and a caller
 // that reissues it immediately will spin; false for everything else, including a nil
 // error, an application *Status, PluginPanicError, ErrIncompatible,
-// ErrDeadlineExceeded, ErrCanceled, ErrPoisoned, ErrServiceNotFound, and
-// ErrMethodNotFound.
+// ErrDeadlineExceeded, ErrCanceled, ErrPoisoned, ErrServiceNotFound,
+// ErrMethodNotFound, and ErrPayloadTooLarge.
 func IsRetryable(err error) bool {
 	if errors.Is(err, ErrOutcomeUnknown) {
 		return false

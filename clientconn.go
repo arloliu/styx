@@ -1228,11 +1228,15 @@ func sendRequest(
 // production today; the mapping exists for a reject-mode writer and for
 // parity with the streaming path, which already has one.
 //
-// Everything else reaching here — an oversize payload or an unimplemented
-// frame kind — is known-failed and not-dispatched but not retryable in the
-// same sense: the connection is clean and the outcome is known, but an
-// identical retry fails identically. It is reported as a send failure rather
-// than a marshal one, since nothing about encoding this message was at fault.
+// transport.ErrPayloadTooLarge is mapped to the public styx.ErrPayloadTooLarge:
+// known-failed and not-dispatched, but not retryable, since an identical retry
+// at the same size fails identically.
+//
+// Everything else reaching here — an unimplemented frame kind — is
+// known-failed and not-dispatched but not retryable in the same sense: the
+// connection is clean and the outcome is known, but an identical retry fails
+// identically. It is reported as a send failure rather than a marshal one,
+// since nothing about encoding this message was at fault.
 func translateSendFailure(err error) error {
 	switch {
 	case isContextErr(err):
@@ -1241,6 +1245,8 @@ func translateSendFailure(err error) error {
 		return fmt.Errorf("styx: invoke: marshal request: %w", err)
 	case errors.Is(err, transport.ErrBackpressure):
 		return fmt.Errorf("styx: invoke: send request: %w: %w", err, ErrBackpressure)
+	case errors.Is(err, transport.ErrPayloadTooLarge):
+		return fmt.Errorf("styx: invoke: send request: %w: %w", err, ErrPayloadTooLarge)
 	default:
 		return fmt.Errorf("styx: invoke: send request: %w", err)
 	}

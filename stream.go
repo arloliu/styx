@@ -1196,12 +1196,16 @@ func translateStreamOpenErr(err error) error {
 
 // translateStreamSendErr maps a STREAM_OPEN publication failure to the styx
 // taxonomy. The frame never reached the peer, so every case is not-dispatched:
-// transport backpressure and a generic failure are retryable, a caller-ctx error
-// keeps its own meaning.
+// transport backpressure is retryable, an oversize payload is a known,
+// not-retryable rejection, a caller-ctx error keeps its own meaning, and a
+// generic failure (an unimplemented frame kind) falls back to the retryable
+// default.
 func translateStreamSendErr(err error) error {
 	switch {
 	case errors.Is(err, transport.ErrBackpressure):
 		return ErrBackpressure
+	case errors.Is(err, transport.ErrPayloadTooLarge):
+		return fmt.Errorf("styx: open stream: %w: %w", err, ErrPayloadTooLarge)
 	case errors.Is(err, context.DeadlineExceeded):
 		return ErrDeadlineExceeded
 	case errors.Is(err, context.Canceled):
@@ -1283,12 +1287,14 @@ func acceptanceUnknown(tr transport.Transport, sendErr error) bool {
 // it surfaces a stream error to user code.
 //
 // It maps the engine's local terminal sentinels (a local cancel or an elapsed
-// budget) and the four framework stream status codes a peer STREAM_ERR may carry
-// (stream-protocol.md §9.1): CANCELED -> ErrCanceled, DEADLINE ->
-// ErrDeadlineExceeded, INCOMPATIBLE -> ErrIncompatible, BACKPRESSURE ->
-// ErrBackpressure. A peer STREAM_ERR carrying an application status surfaces as a
-// *styx.Status, exactly as a unary error response does. A nil error stays nil,
-// and io.EOF (normal remote/stream end) is returned unchanged.
+// budget), a send that provably never reached the peer because it exceeded the
+// transport's per-frame limit (ErrPayloadTooLarge), and the four framework
+// stream status codes a peer STREAM_ERR may carry (stream-protocol.md §9.1):
+// CANCELED -> ErrCanceled, DEADLINE -> ErrDeadlineExceeded, INCOMPATIBLE ->
+// ErrIncompatible, BACKPRESSURE -> ErrBackpressure. A peer STREAM_ERR carrying
+// an application status surfaces as a *styx.Status, exactly as a unary error
+// response does. A nil error stays nil, and io.EOF (normal remote/stream end)
+// is returned unchanged.
 func StreamError(err error) error {
 	if err == nil {
 		return nil
@@ -1300,6 +1306,8 @@ func StreamError(err error) error {
 		return ErrDeadlineExceeded
 	case errors.Is(err, rpcruntime.ErrStreamTableClosed):
 		return ErrPluginUnavailable
+	case errors.Is(err, transport.ErrPayloadTooLarge):
+		return ErrPayloadTooLarge
 	case errors.Is(err, context.Canceled):
 		// A raw caller-context cancellation a byte op surfaced (RecvMsg/SendMsg/
 		// CloseSend return ctx.Err() directly on a pre-admission or credit-blocked

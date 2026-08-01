@@ -228,6 +228,9 @@ a fresh attempt is safe:
   turn it into anything it could dispatch, so it answered with a refusal instead
   of leaving the call unanswered (retryable: no handler ran, so a fresh attempt
   repeats no side effect).
+- `ErrPayloadTooLarge` — the payload exceeded the transport's per-frame limit.
+  The rejection happens before anything is published, so the outcome is known
+  (not retryable: an identical retry at the same size fails identically).
 - A `*Status` — an application-level error your handler returned, with a code and
   message, round-tripped as a typed value.
 - `*PluginPanicError` — a handler panicked. A unary caller receives it directly;
