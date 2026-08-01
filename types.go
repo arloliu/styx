@@ -24,6 +24,10 @@ type BackoffFunc = supervisor.BackoffFunc
 // here so ExpBackoff and supervisor.ExpBackoff refer to the identical value.
 var ExpBackoff = supervisor.ExpBackoff
 
+// NoRestart is the supervisor's no-restart policy, aliased here so
+// NoRestart and supervisor.NoRestart refer to the identical value.
+var NoRestart = supervisor.NoRestart
+
 // PluginServerConfig configures a PluginServer before Serve.
 // The zero value is valid: no metrics, default reporter cadence, default panic
 // policy, and both data-plane transports advertised.

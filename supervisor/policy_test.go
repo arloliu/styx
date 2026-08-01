@@ -27,3 +27,10 @@ func TestExpBackoff_GrowsExponentially_UpToJitteredMax(t *testing.T) {
 	require.GreaterOrEqual(t, d10, maxDelay)
 	require.LessOrEqual(t, d10, maxDelay+maxDelay/5) // capped at max, plus up to 20% jitter
 }
+
+// Test NoRestart being exactly the RestartPolicy zero value, so a caller who
+// never sets Config.Restart already gets its never-restart behavior
+func TestNoRestart_IsRestartPolicyZeroValue(t *testing.T) {
+	// Given / When / Then
+	require.Equal(t, supervisor.RestartPolicy{}, supervisor.NoRestart)
+}

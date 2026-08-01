@@ -145,10 +145,11 @@ If you need a plugin's exact last state across shutdown, read it off the event y
 `Event.Plugin` names which plugin the event is about, and `Event.Time` is
 when the supervisor observed the transition. A `PluginSpec` with `Restart`
 left at its zero value has `Max: 0`, so **the very first crash already
-exhausts the restart budget** — you get `EventCrashed` immediately followed
-by `EventGaveUp`, with no restart attempt in between. Set `Restart.Max` (and
-usually `Restart.Backoff`, e.g. `styx.ExpBackoff(base, cap)`) if you want
-the supervisor to retry a crash at all.
+exhausts the restart budget**: you get `EventCrashed` immediately followed
+by `EventGaveUp`, with no restart attempt in between
+— unless the supervisor or its owning `Host` is stopped in the gap between the two, in which case the give-up may not be published at all.
+Either way, a zero restart budget never produces two `EventGaveUp` events for the same instance and never triggers a respawn.
+Set `Restart.Max` (and usually `Restart.Backoff`, e.g. `styx.ExpBackoff(base, cap)`) if you want the supervisor to retry a crash at all.
 
 A hot-reload (`Host.Reload`) that promotes its successor publishes only
 `EventReady` — no `EventStarting` precedes it, because the new instance
@@ -303,7 +304,12 @@ should trigger something your code does.
 - **`EventCrashed`** — inspect `Err` with `errors.As` for a
   `*PluginCrashError` to get `ExitStatus`/`ExitStatusKnown` and the crash
   reason. A crash alone doesn't mean the plugin is gone for good — expect
-  either `EventRestarting` (recovering) or `EventGaveUp` (not) to follow.
+  either `EventRestarting` (recovering) or `EventGaveUp` (not) to follow,
+  except under a zero restart budget whose supervisor or owning `Host` is
+  stopped in the gap right after `EventCrashed`:
+  the give-up may not be published at all in that case, though a respawn
+  under a zero budget never happens either way, and `EventGaveUp` never
+  fires twice for the same instance.
   In-flight calls at the time of the crash resolve on their own terms
   (`ErrOutcomeUnknown` or `ErrPluginUnavailable` per call — see the error
   taxonomy in
