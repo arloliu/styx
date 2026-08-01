@@ -280,6 +280,13 @@ var (
 	// teardown and does not trigger this. It is a lifecycle/framework error, not a
 	// per-call one, so IsRetryable does not classify it.
 	ErrHostStopped = errors.New("styx: host stopped")
+	// ErrUnknownPlugin reports that a call named a plugin this Host's
+	// HostConfig.Plugins never declared. It is distinct from
+	// ErrPluginUnavailable, which means a declared plugin isn't currently
+	// running; this means the name has no supervisor to ever have run it. It is
+	// a lifecycle/framework error, not a per-call one, so IsRetryable does not
+	// classify it.
+	ErrUnknownPlugin = errors.New("styx: unknown plugin")
 	// ErrStreamAlreadyClosed reports that a stream recorded a completed outcome at a
 	// point where its STREAM_OPEN provably never reached the peer, so there is no
 	// usable stream and no peer result to return. A completion the peer actually

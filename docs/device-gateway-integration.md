@@ -35,8 +35,10 @@ match the source, both confirmed by reading it rather than assumed:
   progress-based heartbeat that classifies a plugin as healthy, wedged, or
   overloaded without any RPC at all (see
   [`docs/migration-from-go-plugin.md`](migration-from-go-plugin.md#lifecycle-liveness-shutdown-and-kill)).
-  Adding a `Ping` method to this contract would only duplicate that
-  mechanism, so it isn't here.
+  `Host.Health(name)` is how application code reads that classification
+  synchronously, filling the role a `Ping` call served in the old framework
+  without adding one to the wire. Adding a `Ping` method to this contract
+  would only duplicate that mechanism, so it isn't here.
 - **`SaveRuntimeState` and `CollectMetrics` are unary, not streaming.**
   Nothing in the real contract chunks a state snapshot or streams a metric
   event. `SaveRuntimeState` returns one opaque `bytes` blob in a single
@@ -287,11 +289,22 @@ section scopes, not code this pilot ships:
   plugin process. A shim needs to decide how device-level criticality maps
   onto a process-level policy when one plugin process can serve more than
   one device (see the next section for why that mapping isn't obvious yet).
-- **Health surface for the gateway's own liveness probe.** The real gateway
-  fails its own Kubernetes liveness probe when a critical device is
-  faulted, or when every sandboxed device is faulted. A shim needs to
-  translate `Host.Events()` (`EventCrashed`, `EventGaveUp`, `EventRestarting`)
-  into that same aggregate signal.
+- **Aggregating per-plugin health into the gateway's liveness probe.** The
+  real gateway fails its own Kubernetes liveness probe when a critical
+  device is faulted, or when every sandboxed device is faulted.
+  `Host.Health(name)` now answers the per-plugin half of that directly and
+  synchronously — it is the pull-based, level-triggered probe a Kubernetes
+  liveness handler expects, returning the plugin's most recent lifecycle
+  state (`EventCrashed`, `EventGaveUp`, `EventRestarting`, ...) without a
+  goroutine consuming `Host.Events()` to rebuild that state by hand, and
+  without the probe's correctness depending on that goroutine's lifetime.
+  What a shim still has to do is aggregate: call `Health` for every plugin
+  process behind a critical device (or every device, for the "every
+  sandboxed device is faulted" case) and fold the results into the one
+  pass/fail answer the probe returns.
+  That aggregation, and the device-to-process mapping described in
+  [What doesn't map cleanly today](#what-doesnt-map-cleanly-today),
+  is still shim work.
 - **stderr routing.** The real gateway routes plugin stderr/logs through an hclog-compatible adapter into its own structured logger.
   `PluginSpec.Stdio` gives a shim a live line-by-line feed of a plugin's stdout/stderr to adapt into that hclog-compatible sink; `PluginCrashError.StderrTail` separately carries the bounded crash-reason tail once a plugin has already gone down.
   Styx still doesn't prescribe the logging integration itself — only where the lines and the tail come from.

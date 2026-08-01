@@ -240,6 +240,14 @@ func TestHost_Start_TranslatesIncompatible_OnBinaryPinMismatch(t *testing.T) {
 	var incompatible *styx.IncompatibleError
 	require.ErrorAs(t, err, &incompatible)
 	require.Equal(t, styx.IncompatibleBinaryIdentity, incompatible.Kind)
+
+	// And: the mismatch is retained for Health, not only returned from Start —
+	// a caller polling Health for this plugin sees the same crash Start's
+	// error already reported.
+	snap, healthErr := h.Health("pinned")
+	require.NoError(t, healthErr)
+	require.Equal(t, styx.EventCrashed, snap.State)
+	require.ErrorIs(t, snap.LastError, styx.ErrIncompatible)
 }
 
 // Test ToControlServiceRequirements translating PluginSpec.Services into
@@ -659,6 +667,146 @@ func TestHost_Start_RejectsHostWhoseStopCompleted(t *testing.T) {
 // dereferencing what NewHost would have set.
 func TestHost_Stop_OnZeroValueHost_IsANoOp(t *testing.T) {
 	require.NoError(t, (&styx.Host{}).Stop(context.Background()))
+}
+
+// Test Host.Health reporting a ready plugin's retained snapshot: the Ready
+// state, no missed heartbeats, no error, and a real transition time.
+func TestHost_Health_ReportsReady_AfterObservingEventReady(t *testing.T) {
+	// Given
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{Name: "ready", Path: fixtureReadyPlugin}},
+	})
+	require.NoError(t, h.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, h.Stop(context.Background())) })
+
+	// When
+	awaitEvent(t, h.Events(), styx.EventReady)
+	snap, err := h.Health("ready")
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, "ready", snap.Plugin)
+	require.Equal(t, styx.EventReady, snap.State)
+	require.Zero(t, snap.MissedHeartbeats)
+	require.NoError(t, snap.LastError)
+	require.False(t, snap.LastTransition.IsZero())
+}
+
+// Test Host.Health reporting a terminal GaveUp with the same error Events()
+// carried for it, once a "plugin" that cannot even handshake exhausts the
+// zero-value RestartPolicy's no-restart budget (the same /bin/true trick
+// TestHost_Events_DeliversLatestGaveUp_AfterBurst_WithWedgedReader uses).
+func TestHost_Health_ReportsGaveUp_WithMatchingError_WhenRestartBudgetIsZero(t *testing.T) {
+	// Given: a plugin that exits immediately and never restarts.
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{Name: "doomed", Path: "/bin/true"}},
+	})
+	require.Error(t, h.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, h.Stop(context.Background())) })
+
+	// When
+	ev := awaitEvent(t, h.Events(), styx.EventGaveUp)
+	snap, err := h.Health("doomed")
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, styx.EventGaveUp, snap.State)
+	require.Equal(t, ev.Err, snap.LastError)
+}
+
+// Test Host.Health rejecting a name this Host's config never declared, distinct
+// from ErrPluginUnavailable (which means a declared plugin isn't running).
+func TestHost_Health_ReturnsErrUnknownPlugin_ForUndeclaredName(t *testing.T) {
+	// Given
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{Name: "ready", Path: fixtureReadyPlugin}}})
+
+	// When
+	_, err := h.Health("nope")
+
+	// Then
+	require.ErrorIs(t, err, styx.ErrUnknownPlugin)
+}
+
+// Test Host.Health refusing a Host whose Stop already completed its teardown,
+// matching Start's own ErrHostStopped contract (TestHost_Start_RejectsHostWhoseStopCompleted).
+func TestHost_Health_ReturnsErrHostStopped_AfterStopCompletes(t *testing.T) {
+	// Given: a host that has been stopped.
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{Name: "ready", Path: fixtureReadyPlugin}}})
+	require.NoError(t, h.Start(t.Context()))
+	require.NoError(t, h.Stop(context.Background()))
+
+	// When
+	_, err := h.Health("ready")
+
+	// Then
+	require.ErrorIs(t, err, styx.ErrHostStopped)
+}
+
+// Test Host.Health giving ErrHostStopped precedence over ErrUnknownPlugin for
+// a name this Host's config never declared, once Stop has completed: the
+// implementation checks the stopped gate before the name lookup, so a
+// never-declared name still reports the Host is done rather than that the
+// name itself was never valid.
+func TestHost_Health_ReturnsErrHostStopped_ForUndeclaredName_AfterStopCompletes(t *testing.T) {
+	// Given: a host that has been stopped.
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{Name: "ready", Path: fixtureReadyPlugin}}})
+	require.NoError(t, h.Start(t.Context()))
+	require.NoError(t, h.Stop(context.Background()))
+
+	// When
+	_, err := h.Health("never-declared")
+
+	// Then
+	require.ErrorIs(t, err, styx.ErrHostStopped)
+}
+
+// Test Host.Health's MissedHeartbeats rising to its one-miss budget, then
+// reading zero the moment the restarted instance's own state is what the
+// snapshot reports. The count is heartbeat-path-owned, so the successor's
+// monitor loop is what eventually resets it (see
+// TestSupervisor_CallsOnHeartbeatOK_OnceAtLoopEntry_BeforeAnyBeat for the
+// deterministic internal-level proof of where that reset happens) — but a
+// successor is reported Ready before its loop can run, so the snapshot must
+// already refuse to report the predecessor's count against the successor's
+// state rather than leaving a window where the two are paired.
+//
+// Receiving EventReady is the anchor: the relay retains a transition before it
+// publishes the event, so by the time that event is in hand the record's state
+// half already belongs to the successor. The genuine "a received beat resets
+// the count" path is covered at the internal/supervisor level
+// (TestSupervisor_CallsOnHeartbeatOK_PerReceivedBeat), since no fixture here
+// can make a plugin miss once and then resume without a multi-second wait.
+func TestHost_Health_MissedHeartbeatsResets_OnRestartAfterUnhealthy(t *testing.T) {
+	// Given: a plugin silent after its first heartbeat, a one-miss budget so
+	// Unhealthy fires promptly, and a restart budget so a second instance spawns.
+	fastBackoff := func(int) time.Duration { return 10 * time.Millisecond }
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+		Name:                     "silent",
+		Path:                     fixtureReadyPlugin,
+		Env:                      []string{styx.HeartbeatIntervalEnv + "=" + silentPluginHeartbeat},
+		MissedHeartbeatThreshold: 1,
+		Restart:                  styx.RestartPolicy{Max: 2, Backoff: fastBackoff},
+	}}})
+	require.NoError(t, h.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, h.Stop(context.Background())) })
+
+	// When: the first instance is declared unhealthy after its one allotted miss.
+	awaitEventWithin(t, h.Events(), styx.EventUnhealthy, unhealthyVerdictBudget)
+	firstSnap, err := h.Health("silent")
+	require.NoError(t, err)
+
+	// And: the restarted instance reaches Ready, so the record's state half
+	// already describes the successor.
+	awaitEventWithin(t, h.Events(), styx.EventReady, unhealthyVerdictBudget)
+	resetSnap, err := h.Health("silent")
+	require.NoError(t, err)
+
+	// Then: the run rose to the threshold under the first instance, and the
+	// successor's own state never carries it.
+	require.Equal(t, 1, firstSnap.MissedHeartbeats)
+	require.Equal(t, styx.EventReady, resetSnap.State)
+	require.Zero(t, resetSnap.MissedHeartbeats,
+		"a restarted instance's state must never be reported with the predecessor's miss count")
 }
 
 // TestExternalGeometryFixture_Compiles builds the external-module fixture under

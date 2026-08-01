@@ -346,14 +346,37 @@ type Config struct {
 	// nil (the default) disables it: only the crash tail captures stdio.
 	Stdio Sink
 
-	// OnHeartbeatMiss is called once per missed heartbeat interval.
+	// OnHeartbeatMiss is called once per missed heartbeat interval, with the
+	// generation of the instance whose beat was missed — the same number
+	// Event.Gen carries for that instance's lifecycle transitions, so a caller
+	// keeping a running miss count alongside lifecycle state can tell which
+	// instance each half describes.
 	// Called before the running missed count is checked against MissedHeartbeats.
 	// It is an optional observability seam owned by this package with no dependency
 	// on the styx layer; the styx layer adapts it to a metrics submit.
 	// Runs on the heartbeat loop goroutine (a cold path called at most once per
-	// interval), so it MUST NOT block.
+	// interval), so it must not perform I/O or any other long wait; a brief,
+	// bounded wait on an internal lock (the styx layer's adapter briefly holds a
+	// per-plugin record mutex) is fine.
 	// nil (the default) disables it.
-	OnHeartbeatMiss func()
+	OnHeartbeatMiss func(generation uint64)
+
+	// OnHeartbeatOK is the recovery counterpart to OnHeartbeatMiss, carrying the
+	// same instance generation: it is called
+	// once at the heartbeat loop's own entry (a fresh instance's running missed
+	// count starts at zero from the moment the loop begins watching it, not from
+	// its EventStarting/EventReady transition), once at each received heartbeat
+	// the loop's own running missed count resets to zero, and once from a
+	// serviced reload's own reset (the loop is not re-entered for a reload, so
+	// that path calls it directly, with the promoted successor's generation).
+	// It is an optional observability seam owned
+	// by this package with no dependency on the styx layer; the styx layer
+	// adapts it to reset a per-plugin retained counter.
+	// Runs on the heartbeat loop goroutine (a cold path), so it must not perform
+	// I/O or any other long wait; a brief, bounded wait on an internal lock (the
+	// styx layer's adapter briefly holds a per-plugin record mutex) is fine.
+	// nil (the default) disables it.
+	OnHeartbeatOK func(generation uint64)
 
 	// OnReloadDropped is called once per hot-reload that reaped calls without their
 	// real outcome, with how many were lost.
@@ -503,15 +526,15 @@ func (s *Supervisor) Run(ctx context.Context) {
 		}
 
 		generation := s.nextGeneration()
-		s.publish(Event{Kind: EventStarting, Time: time.Now()})
+		s.publish(Event{Kind: EventStarting, Time: time.Now(), Gen: generation})
 
-		readySince, terminal, crashErr := s.runOneInstance(ctx, generation)
+		run, terminal, crashErr := s.runOneInstance(ctx, generation)
 		if terminal {
 			return
 		}
 
-		restartsUsed = effectiveRestartsUsed(s.cfg.ResetWindow, timeSinceOrZero(readySince), restartsUsed)
-		s.publish(Event{Kind: EventCrashed, Time: time.Now(), Err: crashErr})
+		restartsUsed = effectiveRestartsUsed(s.cfg.ResetWindow, timeSinceOrZero(run.readySince), restartsUsed)
+		s.publish(Event{Kind: EventCrashed, Time: time.Now(), Err: crashErr, Gen: run.endGen})
 
 		if s.stopped() || ctx.Err() != nil {
 			return
@@ -528,6 +551,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 			s.publish(Event{
 				Kind: EventGaveUp, Time: time.Now(),
 				Err: fmt.Errorf("supervisor: gave up: handshake incompatible: %w", crashErr),
+				Gen: run.endGen,
 			})
 
 			return
@@ -537,6 +561,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 			s.publish(Event{
 				Kind: EventGaveUp, Time: time.Now(),
 				Err: fmt.Errorf("supervisor: gave up after %d restart(s): %w", restartsUsed, crashErr),
+				Gen: run.endGen,
 			})
 
 			return
@@ -547,7 +572,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 		if s.cfg.OnRestart != nil {
 			s.cfg.OnRestart()
 		}
-		s.publish(Event{Kind: EventRestarting, Time: time.Now()})
+		s.publish(Event{Kind: EventRestarting, Time: time.Now(), Gen: run.endGen})
 
 		if !s.sleep(ctx, delay) {
 			return
@@ -626,6 +651,16 @@ func (s *Supervisor) sleep(ctx context.Context, d time.Duration) bool {
 }
 
 // publish forwards ev to this Supervisor's EventBus.
+//
+// Every call site stamps ev.Gen itself, with the generation of the instance
+// ev actually describes, before calling publish: the generation about to be
+// spawned for EventStarting, the live instance heartbeatLoop is watching for
+// an Unhealthy verdict, the generation that just ended for Crashed/GaveUp/
+// Restarting, the promoted successor's for a reload's own Ready. publish
+// does not fill Gen from s.generation itself, because that counter can have
+// already moved past the instance an event describes: a rolled-back reload
+// advances it for the failed attempt while the old instance stays routed and
+// keeps publishing under its own, now-lower, generation.
 func (s *Supervisor) publish(ev Event) {
 	s.bus.Publish(ev)
 }
@@ -721,22 +756,45 @@ func (li *liveInstance) notifyConnLost() {
 // a successor is never promoted Ready while its predecessor is unreaped, and a reload's
 // own predecessor is reaped by the transaction before the reload completes.
 //
+// instanceRun is what running one instance to its end produced: when it
+// reached Ready and which generation was actually current when it ended.
+// Bundled into one return value, alongside terminal and crashErr, so
+// runOneInstance stays within the function-result limit — the same reason
+// handshakeResult bundles handshakeAndAttach's return above.
+type instanceRun struct {
+	readySince time.Time
+	// endGen is the generation of whichever instance was current when the
+	// call ended: the call's own generation argument for a pre-Ready spawn/
+	// handshake failure, or a later, promoted successor's generation if a
+	// hot-reload replaced the instance in place before it ended. Run stamps
+	// the Crashed/GaveUp/Restarting events that follow with endGen, not with
+	// the generation the call started with, so a crash after a successful
+	// mid-life reload is attributed to the instance that actually crashed.
+	endGen uint64
+}
+
 // terminal reports whether Run should stop entirely (ctx canceled or Stop() called)
 // rather than evaluate a restart; crashErr is always non-nil when terminal is false.
 func (s *Supervisor) runOneInstance(
 	ctx context.Context, generation uint64,
-) (readySince time.Time, terminal bool, crashErr error) {
+) (run instanceRun, terminal bool, crashErr error) {
 	cur, err := s.spawn(ctx, ctx, generation, false)
 	if err != nil {
-		return time.Time{}, false, err
+		return instanceRun{endGen: generation}, false, err
 	}
 
 	cur.hooks = cur.promote()
 
 	readyAt := time.Now()
-	s.publish(Event{Kind: EventReady, Time: readyAt})
+	s.publish(Event{Kind: EventReady, Time: readyAt, Gen: generation})
 
 	stopped, endErr := s.heartbeatLoop(ctx, &cur)
+
+	// cur.generation is read after heartbeatLoop returns so a mid-life
+	// successful reload's swap (heartbeatLoop replaces *current in place) is
+	// reflected: the generation that actually ended may differ from the one
+	// this call started with.
+	run = instanceRun{readySince: readyAt, endGen: cur.generation}
 
 	// On this restart path the crash reason (endErr) is the caller-facing
 	// outcome; a teardown fault of an already-ending instance is not itself a
@@ -744,12 +802,12 @@ func (s *Supervisor) runOneInstance(
 	reaped, _ := cur.teardown(ctx, control.ReplyDeadlines[control.KindShutdown])
 
 	if stopped {
-		return readyAt, true, nil
+		return run, true, nil
 	}
 
 	exitStatus, known := exitStatusFromState(reaped)
 
-	return readyAt, false, crashReason(cur.stderrTail, endErr, exitStatus, known)
+	return run, false, crashReason(cur.stderrTail, endErr, exitStatus, known)
 }
 
 // specForSpawn builds the lifecycle.Spec to spawn with.
@@ -907,8 +965,27 @@ func (s *Supervisor) nextGeneration() uint64 {
 // The reload transaction runs inline here on this same goroutine, so its Sends
 // and Recvs never interleave with the loop's own Recv.
 // The one-owner invariant holds by construction, not by a lock.
+//
+// A fresh instance's missed-heartbeat count owes its zero to THIS call, not to
+// the EventStarting/EventReady transition that preceded it: the loop fires
+// OnHeartbeatOK once at entry, before any Recv, so a caller's retained miss
+// counter starts at zero from the same moment this loop begins watching the
+// instance, atomically with nothing else. Run calls this once per generation
+// (a fresh instance every time, since Run's for loop is strictly sequential —
+// one generation's heartbeatLoop always returns before the next one starts),
+// and the only other caller of Config.OnHeartbeatOK/OnHeartbeatMiss for THIS
+// Supervisor is this same loop later in its own body, so no two of one
+// Supervisor's own hook calls ever run concurrently. That says nothing about
+// two Supervisors: a caller that can point more than one of them at the same
+// retained state needs its own way to tell their hooks apart, which is what
+// the generation each call carries is for. A serviced reload does not re-enter this
+// function (it swaps *current in place and keeps this same loop running), so
+// its own reset runs through the reloadServiced case below instead.
 func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) (stopped bool, endErr error) {
 	missed := 0
+	if s.cfg.OnHeartbeatOK != nil {
+		s.cfg.OnHeartbeatOK((*current).generation)
+	}
 	var prev *HeartbeatSample
 	// The window is converted to a Sequence-increment span on the plugin's actual send
 	// cadence, not on cfg.HeartbeatInterval (the host's liveness wait): each adjacent
@@ -949,11 +1026,11 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 				// heartbeat into the transaction's strict receive.
 				missed++
 				if s.cfg.OnHeartbeatMiss != nil {
-					s.cfg.OnHeartbeatMiss()
+					s.cfg.OnHeartbeatMiss((*current).generation)
 				}
 				if missed >= s.cfg.MissedHeartbeats {
 					reason := fmt.Errorf("supervisor: missed %d consecutive heartbeats", missed)
-					s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: reason})
+					s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: reason, Gen: (*current).generation})
 
 					return false, reason
 				}
@@ -1000,6 +1077,11 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 			// baseline, not a continuation of any stall observed before it.
 			missed, prev = 0, nil
 			tracker.clear()
+			if s.cfg.OnHeartbeatOK != nil {
+				// *current is the promoted successor by now, so this reset is
+				// stamped with the successor's generation, not the retired one's.
+				s.cfg.OnHeartbeatOK((*current).generation)
+			}
 
 			continue
 		case reloadNone, reloadNoop:
@@ -1010,6 +1092,9 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 		}
 
 		missed = 0
+		if s.cfg.OnHeartbeatOK != nil {
+			s.cfg.OnHeartbeatOK((*current).generation)
+		}
 		_ = ackHeartbeat(ctx, conn, sample.Sequence) // best-effort; a lost ack does not itself end the instance.
 
 		if prev != nil {
@@ -1021,7 +1106,7 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 			// nor mask a real one.
 			if firedKind, fire := tracker.observe(class, wedge, sample.Sequence); fire {
 				reason := wedgeError(firedKind)
-				s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: reason})
+				s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: reason, Gen: (*current).generation})
 
 				return false, reason
 			}

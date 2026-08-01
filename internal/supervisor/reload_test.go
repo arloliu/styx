@@ -107,6 +107,7 @@ type spawner struct {
 	restoreReason string
 	teardownErr   error              // when set, every instance's teardown reports it (post-promote fault).
 	refuseResume  bool               // when set, the old instance never acks Resume, making rollback crash-equivalent.
+	silentPromote bool               // when set, a promoted successor never heartbeats; it only waits to be torn down.
 	roleFor       func(int) peerRole // overrides the default index-based role assignment.
 	beforeSend    func(seq uint64)   // if set, each peer calls it before sending a heartbeat, letting a test pace it.
 	captureNotify func(func())       // if set, each instance hands its NotifyConnLost closure here at promote.
@@ -151,6 +152,7 @@ func (sp *spawner) spawn(
 		restoreReady:  sp.restoreReady,
 		restoreReason: sp.restoreReason,
 		refuseResume:  sp.refuseResume,
+		silentPromote: sp.silentPromote,
 		beforeSend:    sp.beforeSend,
 		done:          make(chan struct{}),
 	}
@@ -192,6 +194,7 @@ type scriptedPeer struct {
 	restoreReady  bool
 	restoreReason string
 	refuseResume  bool
+	silentPromote bool
 	beforeSend    func(seq uint64)
 
 	drainSeen   atomic.Bool
@@ -217,6 +220,15 @@ func (p *scriptedPeer) run() {
 		}
 		if !ready {
 			p.drainUntilClosed() // host will roll back and tear us down; do not serve.
+
+			return
+		}
+		if p.silentPromote {
+			// Promoted and routing, but never heartbeating: a test that needs the
+			// reload's own health reset to be the only thing that can fire the
+			// host's received-beat seam uses this to remove the ordinary beats
+			// that would otherwise fire it too.
+			p.drainUntilClosed()
 
 			return
 		}
@@ -623,6 +635,100 @@ func TestSupervisor_Reload_PromotesSuccessorAndKeepsSupervising(t *testing.T) {
 	require.Equal(t, uint64(3), router.state.Load().generation)
 }
 
+// Test a serviced reload invoking Config.OnHeartbeatOK to reset health, the
+// distinct branch TestSupervisor_CallsOnHeartbeatOK_PerReceivedBeat does not
+// cover: that test only drives the loop's ordinary per-beat ack, never a
+// reload. The heartbeat loop's reloadServiced case calls the identical hook
+// so a promoted successor's retained missed-heartbeat count starts from the
+// same zero an ordinary first ack would give it, stamped with the successor's
+// own generation.
+//
+// Two things keep the assertion on that one branch. The second heartbeat is
+// held back until the reload request is queued, so the beat that finally
+// reaches the loop is consumed by the transaction instead of acked ordinarily.
+// And the promoted successor never heartbeats at all, so no ordinary beat can
+// fire the hook after the reload either — deleting the reloadServiced call
+// leaves nothing in the whole run that could produce the signal this test
+// waits for. The generation it carries is the successor's, which an ordinary
+// pre-reload beat could not have supplied even if one arrived.
+func TestSupervisor_Reload_InvokesOnHeartbeatOK_OnServicedReset(t *testing.T) {
+	// Given: a reload-capable supervisor whose peer is paced so the only
+	// heartbeat left to arrive once the reload is requested is the one the
+	// transaction itself will consume, and whose successor stays silent once
+	// promoted.
+	admission := &lifecycle.AdmissionGate{}
+	router := &fakeRouter{admission: admission}
+	sp := newSpawner(t, router)
+	sp.silentPromote = true
+
+	reachedGate := make(chan struct{})
+	release := make(chan struct{})
+	var gateOnce sync.Once
+	sp.beforeSend = func(seq uint64) {
+		// Let the first heartbeat through (acked ordinarily), then hold the
+		// second back until the test has queued a reload for it to be
+		// serviced against instead.
+		if seq == 2 {
+			gateOnce.Do(func() { close(reachedGate) })
+			<-release
+		}
+	}
+
+	cfg := reloadConfig(router)
+	cfg.HeartbeatInterval = 100 * time.Millisecond
+	// The gate holds one heartbeat back deliberately and the successor never
+	// sends any, so every wait after the reload times out. A budget far above
+	// what this test's own runtime can consume keeps that silence from ending
+	// the instance before the assertions are done.
+	cfg.MissedHeartbeats = 1000
+	// Buffered generously so the loop's own calls never block on this test's
+	// reader falling behind.
+	okSignals := make(chan uint64, 64)
+	cfg.OnHeartbeatOK = func(generation uint64) { okSignals <- generation }
+	sup, _, cleanup := runReloadSupervisor(t, sp, cfg)
+	defer cleanup()
+
+	<-reachedGate // the first heartbeat was received and acked; the loop now waits for the gated second one.
+	// Drain what the loop entry and the first beat's ordinary ack already
+	// queued, so the channel holds only calls made from here on.
+	drainSignals(okSignals)
+
+	// When: the reload is requested while the second heartbeat is held back,
+	// and the hold releases only once the request is queued, so the loop
+	// services the reload on the beat it was waiting for rather than acking it.
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- sup.Reload(t.Context()) }()
+	require.Eventually(t, sup.ReloadQueuedForTest, 2*time.Second, time.Millisecond,
+		"the reload request must be accepted before the held heartbeat is released")
+	close(release)
+
+	// Then: an OnHeartbeatOK call arrives carrying the promoted successor's
+	// generation. Nothing else in this run can produce one: the gated beat is
+	// consumed entirely by the reload transaction and never acked, and the
+	// successor sends no beats of its own.
+	select {
+	case generation := <-okSignals:
+		require.Equal(t, uint64(2), generation,
+			"a serviced reload must reset health for the promoted successor's own generation")
+	case <-time.After(2 * time.Second):
+		t.Fatal("a serviced reload must invoke OnHeartbeatOK to reset health")
+	}
+	require.NoError(t, <-reloadDone)
+	require.Zero(t, sp.peers[1].sentSeq.Load(),
+		"the successor must have stayed silent, so only the reload could have fired the hook")
+}
+
+// drainSignals empties ch of everything already queued, without blocking.
+func drainSignals(ch <-chan uint64) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
 // Test that only a reload's own successor spawn is marked reloadSuccessor:
 // the supervisor's first-start spawn must not be, since a plugin spawned
 // that way waits on a Restore that will never arrive if it thinks it is a
@@ -702,6 +808,82 @@ func TestSupervisor_Reload_KeepsOldServing_WhenRestoreRefused(t *testing.T) {
 	sp.restoreReady = true
 	require.NoError(t, sup.Reload(t.Context()))
 	require.Equal(t, uint64(3), router.state.Load().generation)
+}
+
+// Test a rolled-back reload's later lifecycle event still naming the resumed
+// old instance's own generation, not the generation the failed reload attempt
+// consumed. A rollback advances the supervisor's generation counter for the
+// successor it spawned and then abandoned, while the old instance — still the
+// one actually routed and heartbeating — keeps its original, lower,
+// generation; a later Unhealthy/Crashed of that resumed instance must carry
+// that original generation so it lines up with what Config.OnHeartbeatMiss
+// already reports for it, or Health's coherence check wrongly treats the
+// state half as describing a newer instance than the count half and hides a
+// real miss run.
+func TestSupervisor_Reload_StampsResumedOldGeneration_OnMissedHeartbeatAfterRollback(t *testing.T) {
+	// Given: a reload that will roll back (the successor refuses the restore),
+	// and a peer whose heartbeats can be cut off on command once resumed.
+	admission := &lifecycle.AdmissionGate{}
+	router := &fakeRouter{admission: admission}
+	sp := newSpawner(t, router)
+	sp.restoreReady = false
+	sp.restoreReason = "incompatible snapshot format"
+
+	var resumed atomic.Bool
+	block := make(chan struct{})
+	sp.beforeSend = func(uint64) {
+		if resumed.Load() {
+			<-block
+		}
+	}
+
+	cfg := reloadConfig(router)
+	cfg.MissedHeartbeats = 3 // small, so a real miss run completes quickly.
+	missSignals := make(chan uint64, 64)
+	cfg.OnHeartbeatMiss = func(generation uint64) { missSignals <- generation }
+
+	sup, ch, cleanup := runReloadSupervisor(t, sp, cfg)
+	defer cleanup()
+	defer close(block) // unblock the stalled peer before cleanup tears it down.
+
+	// When: the reload rolls back, and the resumed old instance's heartbeats
+	// are then cut off — the same way a real stall would starve the loop.
+	err := sup.Reload(t.Context())
+	require.Error(t, err)
+	require.True(t, sp.peers[0].resumeSeen.Load(), "rollback must resume the old instance")
+	resumed.Store(true)
+
+	// Then: every reported miss is attributed to the resumed old instance's
+	// own generation (1), never the failed reload attempt's (2).
+	for range cfg.MissedHeartbeats {
+		select {
+		case generation := <-missSignals:
+			require.Equal(t, uint64(1), generation,
+				"a post-rollback miss must be attributed to the resumed old instance")
+		case <-time.After(5 * time.Second):
+			t.Fatal("the resumed old instance's heartbeats were never reported missed")
+		}
+	}
+
+	// And: the Unhealthy event that run of misses produces carries that same
+	// old generation — not the generation the failed reload attempt consumed,
+	// which is the defect this test guards against.
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case ev := <-ch:
+			if ev.Kind != supervisor.EventUnhealthy {
+				continue
+			}
+			require.Equal(t, uint64(1), ev.Gen,
+				"a rolled-back reload's later Unhealthy event must carry the resumed old "+
+					"instance's generation, not the failed attempt's")
+
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for the resumed old instance's Unhealthy event")
+		}
+	}
 }
 
 // Test a reload whose successor cannot even be spawned rolling back to the old

@@ -95,6 +95,42 @@ A `Host` is single-use. Once a `Stop` has completed the teardown, `Start`
 rejects with `ErrHostStopped` rather than running plugins whose events
 would go nowhere; build a new `Host` to reconnect.
 
+## `Health`: pull, not subscribe
+
+`Events()` is edge-triggered — it tells you a transition happened, once, as it happens.
+`Host.Health(name)` is its level-triggered counterpart: it answers "what is this plugin's state right now" on its own schedule, without a subscription to maintain.
+
+```go
+snap, err := host.Health("device-driver")
+if err != nil {
+    // ErrUnknownPlugin (name not in HostConfig.Plugins) or ErrHostStopped
+    // (Stop already completed the teardown; takes precedence over
+    // ErrUnknownPlugin, so a never-declared name still reports
+    // ErrHostStopped once the Host itself is done).
+}
+if snap.State == styx.EventGaveUp || snap.State == styx.EventCrashed {
+    // fail a liveness probe, gate traffic, etc.
+}
+```
+
+`HealthSnapshot.State` is the same `EventKind` `Events()` reports — the kind of this plugin's most recent lifecycle transition, not a separate health enum.
+`LastError` is the identical translated error the corresponding `Events()` event carried.
+`MissedHeartbeats` is the current run of consecutive missed heartbeats, maintained entirely by the heartbeat path rather than by any lifecycle transition: it resets to zero once at a fresh instance's own monitor loop entry (before that instance's first heartbeat wait), again on any later received heartbeat, and again on a serviced hot-reload's own reset.
+It is always the run belonging to the instance `State` describes, never another one's.
+A successor is reported `EventReady` before its monitor loop can reset anything, so a snapshot taken in that window reports zero rather than the predecessor's leftover run.
+
+This is the shape a synchronous, `Ping()`-style liveness probe expects.
+`Health` does not block on plugin operations — it reads a retained record, never the plugin's supervisor or a channel — though it may briefly wait on that plugin's own internal record lock, and its answer does not depend on a consumer goroutine having kept up with `Events()`, or even having existed.
+Before this pull-based probe existed, wiring `Events()` into a synchronous check meant running a goroutine that consumed the channel and rebuilt the same retained state by hand, coupling the probe's correctness to that goroutine's lifetime.
+`Health` retains that state itself, so the two APIs serve different jobs without one having to emulate the other: subscribe to `Events()` to react to a change as it happens, call `Health` to ask what is true right now.
+
+A name whose instance is currently stopping, restarting, or mid-reload still returns its most recently retained transition — `Health` describes the `Host`'s current belief about a plugin, not a live round-trip to it.
+Records live for the `Host`'s whole single-use lifetime, the same span `Events()` covers — with one exception, worth knowing before you lean on it during shutdown:
+
+**`Health` can return `ErrHostStopped` for a plugin whose last event you just received off `Events()`.**
+Once `Stop`'s teardown has finished, `Health` stops answering for every plugin, including one whose final transition you took off `Events()` moments earlier — the two calls race once shutdown has started, and completing that receive proves only that the event was handed to you, not that a `Health` call for it right afterward is still guaranteed to succeed.
+If you need a plugin's exact last state across shutdown, read it off the event you just received (`Event` carries the identical translated `Kind`/`Err` a snapshot would have held) instead of making a second, separate `Health` call for it; call `Health` before you initiate `Stop` if what you actually want is this `Host`'s belief about a plugin's state before shutdown began.
+
 ## The six event kinds
 
 | Kind | Fires when | `Err` |
@@ -289,6 +325,7 @@ should trigger something your code does.
 
 - [`types.go`](../types.go) — the exact `EventKind`/`Event` godoc, the
   source of truth if this guide and the code ever disagree.
+- [`host.go`](../host.go) — `HealthSnapshot` and `Host.Health`'s exact godoc.
 - [docs/migration-from-go-plugin.md](migration-from-go-plugin.md#lifecycle-liveness-shutdown-and-kill) —
   how this replaces go-plugin's manual `Ping()`/`Kill()` model.
 - [`examples/echo/host/main.go`](../examples/echo/host/main.go) — a runnable

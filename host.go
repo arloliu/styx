@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/arloliu/styx/codec"
@@ -284,8 +285,8 @@ type ServiceRequirement struct {
 // supervision, and teardown. Generated client stubs reach a plugin through
 // the *ClientConn Plugin returns.
 //
-// All exported Host methods (Plugin, Start, Stop, Reload, Events) are safe for
-// concurrent use by multiple goroutines.
+// All exported Host methods (Plugin, Start, Stop, Reload, Events, Health) are
+// safe for concurrent use by multiple goroutines.
 type Host struct {
 	mu       sync.Mutex
 	cfg      HostConfig
@@ -308,6 +309,33 @@ type Host struct {
 	// reaches it first.
 	stopRequested   bool
 	workersReleased bool
+	// hostStopped mirrors workersReleased for Health's own check: Health must
+	// never block on h.mu, which Start and Stop can each hold for as long as a
+	// whole plugin spawn or teardown takes — far longer than a synchronous
+	// health probe should ever wait. It is set, once, by maybeReleaseWorkers —
+	// but only after that same call's wait for the Events() subscription to go
+	// quiescent has returned, never alongside workersReleased itself, so the
+	// store waits as long as this teardown reasonably can before closing Health
+	// off. That wait proves only that the bus handed the final event to a
+	// receiver that was already waiting for it (an unbuffered channel send
+	// completing); it does not, and cannot without a different consumption API,
+	// wait for that receiver's NEXT statement to run. A receiver that loses the
+	// scheduling race between taking the event and calling Health can still see
+	// ErrHostStopped for the transition it just received — see Health's own doc
+	// for the contract this leaves callers with. Read lock-free by Health.
+	hostStopped atomic.Bool
+
+	// health retains one record per plugin declared in cfg.Plugins, built once
+	// in NewHost and never added to or removed from afterward — only the
+	// records themselves mutate, so a lookup needs no lock of its own. relayEvents
+	// updates a record's state/lastTransition/lastErr/missed at the same point it
+	// builds the public Event Events() delivers for the identical transition; the
+	// supervisor's heartbeat hooks update missed from a different goroutine, under
+	// the same record lock. Each record carries its own mutex for exactly that
+	// reason: a dedicated lock avoids coupling Health, or the heartbeat loop, to
+	// h.mu, which Start/Stop hold across operations far longer than a health read
+	// or a heartbeat tick.
+	health map[string]*healthRecord
 
 	// bus fans every plugin's relayed events into the one channel Events()
 	// exposes, using internal/supervisor.Bus's own drop-oldest-informational /
@@ -404,11 +432,19 @@ func NewHost(cfg HostConfig) *Host {
 	h := &Host{
 		cfg:             cfg,
 		plugins:         make(map[string]*ClientConn),
+		health:          make(map[string]*healthRecord, len(cfg.Plugins)),
 		bus:             bus,
 		events:          events,
 		eventsUnsub:     unsubEvents,
 		eventsQuiesced:  eventsQuiesced,
 		metricsInterval: resolveMetricsInterval(cfg.MetricsInterval),
+	}
+	// Every configured name gets a record up front, and only here: h.health is
+	// never written again after NewHost returns, so a later lookup needs no lock
+	// against a concurrent insert. A name absent from cfg.Plugins was never
+	// declared, and Health reports ErrUnknownPlugin for it.
+	for _, spec := range cfg.Plugins {
+		h.health[spec.Name] = &healthRecord{}
 	}
 
 	// A configured sink and/or logger each runs one dispatcher goroutine for the
@@ -420,19 +456,15 @@ func NewHost(cfg HostConfig) *Host {
 	}
 	if cfg.Metrics != nil {
 		h.metricsDisp = observeq.NewDispatcher(cfg.Metrics, metricsBufferSize)
-		h.obsWG.Add(1)
-		go func() {
-			defer h.obsWG.Done()
+		h.obsWG.Go(func() {
 			h.metricsDisp.Run(h.obsCtx)
-		}()
+		})
 	}
 	if cfg.Logger != nil {
 		h.logDisp = observeq.NewDispatcher(cfg.Logger, logBufferSize)
-		h.obsWG.Add(1)
-		go func() {
-			defer h.obsWG.Done()
+		h.obsWG.Go(func() {
 			h.logDisp.Run(h.obsCtx)
-		}()
+		})
 	}
 
 	return h
@@ -494,11 +526,31 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, ErrPluginStopping)
 	}
 
+	// This attempt's ordering key for everything it may later write to the
+	// retained health record — this relay's events and this supervisor's
+	// heartbeat hooks alike. Taken once, here, so a retried Start supersedes a
+	// failed attempt's leftovers rather than colliding with them; see
+	// nextHealthOrigin. Start holds h.mu across this call.
+	origin := h.nextHealthOrigin(spec.Name)
+
 	if spec.BinarySHA256 != nil {
 		if verr := control.VerifyBinaryIdentity(spec.Path, spec.BinarySHA256); verr != nil {
 			err := translateIncompatible(verr)
-			h.publish(Event{Plugin: spec.Name, Kind: EventStarting, Time: time.Now()})
-			h.publish(Event{Plugin: spec.Name, Kind: EventCrashed, Time: time.Now(), Err: err})
+			starting := Event{Plugin: spec.Name, Kind: EventStarting, Time: time.Now()}
+			crashed := Event{Plugin: spec.Name, Kind: EventCrashed, Time: time.Now(), Err: err}
+			// Recorded before publish, same ordering relayEvents and drainOnStop
+			// use: a caller reading Events() must never observe this crash before
+			// Health can report it. These two events never reach a
+			// supervisor.EventBus (the mismatch is caught before one is ever
+			// created for this name), so there is no bus-assigned Seq to read off
+			// them — a local pair (1, then 2) inside this attempt's own origin
+			// orders them, and the origin keeps them from colliding with any
+			// other attempt's numbering. Generation 0: no instance was ever
+			// spawned for this attempt, so no heartbeat loop can claim it.
+			h.recordHealthEvent(spec.Name, starting, origin, 1, 0)
+			h.publish(starting)
+			h.recordHealthEvent(spec.Name, crashed, origin, 2, 0)
+			h.publish(crashed)
 
 			return fmt.Errorf("styx: start plugin %q: %w", spec.Name, err)
 		}
@@ -507,14 +559,14 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	cc := newUnavailableClientConn(spec.Name)
 	cc.metrics = h.metricsDisp
 	bus := supervisor.NewEventBus()
-	sup := supervisor.New(h.supervisorConfig(spec, cc), bus)
+	sup := supervisor.New(h.supervisorConfig(spec, cc, origin), bus)
 
 	events, unsub, quiesced := bus.Subscribe()
 	stopRelay := make(chan struct{})
 	relayDone := make(chan struct{})
 	firstOutcome := make(chan error, 1)
 
-	go h.relayEvents(spec.Name, events, quiesced, stopRelay, relayDone, firstOutcome)
+	go h.relayEvents(spec.Name, origin, events, quiesced, stopRelay, relayDone, firstOutcome)
 	//nolint:gosec // sup.Run's lifetime is host-scoped (until sup.Stop, e.g. on
 	// Host shutdown), not scoped to ctx, which only bounds this call's wait for
 	// the first Ready/GaveUp outcome below.
@@ -556,11 +608,9 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	// bound to the host metrics context so Stop joins it. Started only on success,
 	// so a failed start leaves no reporter behind.
 	if h.metricsDisp != nil {
-		h.obsWG.Add(1)
-		go func() {
-			defer h.obsWG.Done()
+		h.obsWG.Go(func() {
 			cc.runMetricsReporter(h.obsCtx, h.metricsDisp, h.metricsInterval)
-		}()
+		})
 	}
 
 	return nil
@@ -573,7 +623,11 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 // The liveness-tuning fields are passed through unresolved. A zero there is the
 // caller's "use the default", and internal/supervisor applies it, so each default
 // has exactly one definition and this layer cannot drift from it.
-func (h *Host) supervisorConfig(spec PluginSpec, cc *ClientConn) supervisor.Config {
+//
+// origin is the Start attempt this supervisor belongs to; the heartbeat hooks
+// carry it so the retained health record can ignore a hook from a supervisor
+// an attempt it has already moved past left behind.
+func (h *Host) supervisorConfig(spec PluginSpec, cc *ClientConn, origin uint64) supervisor.Config {
 	return supervisor.Config{
 		Spec:             lifecycle.Spec{Path: spec.Path, Args: spec.Args, Env: spec.Env},
 		Restart:          spec.Restart,
@@ -597,7 +651,8 @@ func (h *Host) supervisorConfig(spec PluginSpec, cc *ClientConn) supervisor.Conf
 		WedgeWindow:       spec.WedgeWindow,
 
 		ConsumeFaultRunThreshold: spec.ConsumeFaultRunThreshold,
-		OnHeartbeatMiss:          h.heartbeatMissHook(spec.Name),
+		OnHeartbeatMiss:          h.heartbeatMissHook(spec.Name, origin),
+		OnHeartbeatOK:            h.heartbeatOKHook(spec.Name, origin),
 		OnRestart:                h.restartHook(spec.Name),
 		OnReloadDropped:          h.reloadDroppedHook(spec.Name),
 		// The reload transaction drives the SAME admission gate a caller's
@@ -657,8 +712,14 @@ func validateLivenessTuning(spec PluginSpec) error {
 // reports this plugin's FIRST Ready or GaveUp on firstOutcome (nil for
 // Ready, the GaveUp reason otherwise), non-blockingly — startOne only
 // waits for the first one.
+//
+// origin is the Start attempt this relay belongs to (see nextHealthOrigin).
+// Every event it retains is stamped with it, so the record can tell this
+// attempt's events from a retry's, whose own bus restarts its sequence
+// numbering at 1.
 func (h *Host) relayEvents(
 	name string,
+	origin uint64,
 	events <-chan supervisor.Event,
 	quiesced func() bool,
 	stopRelay, relayDone chan struct{},
@@ -669,7 +730,15 @@ func (h *Host) relayEvents(
 	for {
 		select {
 		case ev := <-events:
-			h.publish(translateEvent(name, ev))
+			e := translateEvent(name, ev)
+			// Recorded before publish, not after: a caller that receives e off
+			// Events() and immediately calls Health must see this exact
+			// transition already retained, never a stale one still in flight
+			// behind the bus's own asynchronous fan-out. (origin, ev.Seq) — not
+			// e.Time — is what recordHealthEvent orders on, and ev.Gen is which
+			// instance the transition described; see its own doc for why.
+			h.recordHealthEvent(name, e, origin, ev.Seq, ev.Gen)
+			h.publish(e)
 			// Restart and heartbeat-miss metrics are counted at their authoritative
 			// supervisor seams (OnRestart/OnHeartbeatMiss), not off this
 			// drop-oldest informational relay; logging routes through the bounded,
@@ -692,7 +761,7 @@ func (h *Host) relayEvents(
 				}
 			}
 		case <-stopRelay:
-			h.drainOnStop(name, events, quiesced)
+			h.drainOnStop(name, origin, events, quiesced)
 
 			return
 		}
@@ -716,11 +785,16 @@ func (h *Host) relayEvents(
 // nothing new enqueues, and the forwarder keeps making progress, so an event
 // still queued or mid-handoff is received on a later turn and quiesced then
 // reports the subscription idle (nothing queued, nothing in flight).
-func (h *Host) drainOnStop(name string, events <-chan supervisor.Event, quiesced func() bool) {
+func (h *Host) drainOnStop(name string, origin uint64, events <-chan supervisor.Event, quiesced func() bool) {
 	for {
 		select {
 		case ev := <-events:
-			h.publish(translateEvent(name, ev))
+			e := translateEvent(name, ev)
+			// Same ordering rationale as relayEvents' own case above, and the
+			// same Start attempt: a drain relays what that attempt's own bus
+			// still holds.
+			h.recordHealthEvent(name, e, origin, ev.Seq, ev.Gen)
+			h.publish(e)
 			h.logEvent(name, ev)
 		default:
 			if quiesced() {
@@ -909,6 +983,14 @@ func (h *Host) maybeReleaseWorkers() {
 		waitEventsQuiesced(h.eventsQuiesced, eventsDrainBound)
 		h.eventsUnsub()
 	}
+
+	// Set only after the Events() handoff above has finished, not alongside
+	// workersReleased, so this store happens as late as this teardown
+	// reasonably can make it — but the wait it follows proves only that the
+	// bus delivered the event, not that the receiver has gone on to call
+	// Health for it; see hostStopped's own doc for the residual race this
+	// does not close.
+	h.hostStopped.Store(true)
 }
 
 // eventsDrainBound bounds the wait for a consumer to take what the teardown
@@ -1027,6 +1109,319 @@ func (h *Host) Events() <-chan Event {
 // whether anything is reading Events().
 func (h *Host) publish(e Event) {
 	h.bus.Publish(e)
+}
+
+// HealthSnapshot is a point-in-time copy of one plugin's retained health
+// state: the kind of its most recent lifecycle transition, when that
+// transition happened, the error it carried (if any), and its current run of
+// missed heartbeats.
+//
+// It is the pull-based, level-triggered counterpart to Events(): Events()
+// reports each transition once, as it happens, while a HealthSnapshot answers
+// "what is true right now" without needing a goroutine to have consumed every
+// event leading up to it. Use Events() to react to a change as it occurs; use
+// Health for a synchronous, Ping()-style liveness probe that asks on its own
+// schedule.
+type HealthSnapshot struct {
+	// Plugin is the name Health was asked about.
+	Plugin string
+	// State is the kind of this plugin's most recent lifecycle transition —
+	// the identical EventKind Events() reports (EventStarting/EventReady/
+	// EventUnhealthy/EventCrashed/EventRestarting/EventGaveUp), not a separate
+	// health enum: a snapshot's state IS exactly the last transition observed,
+	// so a second enum would only drift from this one. Before this plugin's
+	// first transition is recorded, State reads as EventStarting's zero value
+	// and LastTransition is the zero time; check LastTransition.IsZero to
+	// tell a real Starting transition from one that has not happened yet.
+	State EventKind
+	// LastTransition is when State was recorded.
+	LastTransition time.Time
+	// LastError is the same translated error the corresponding Events() event
+	// carried, or nil for a kind that carries none (e.g. EventReady).
+	LastError error
+	// MissedHeartbeats is the CURRENT run of consecutive missed heartbeats for
+	// the instance State describes, not a lifetime total, and never another
+	// instance's run. It is maintained entirely by the heartbeat path, never by
+	// a lifecycle transition: it resets to zero once at a fresh instance's own
+	// monitor loop entry (before that instance's first Recv), again on any
+	// later received heartbeat, and again on a serviced reload's own reset.
+	// A successor is reported Ready before its monitor loop entry can reset
+	// anything, so a snapshot taken in that window reads zero rather than the
+	// predecessor's leftover run: a plugin whose State already belongs to the
+	// successor never carries a predecessor's silence in this count.
+	MissedHeartbeats int
+}
+
+// healthRecord is one plugin's retained health state, as HealthSnapshot
+// reports it. relayEvents (or drainOnStop) updates the state half at the same
+// point it builds the public Event Events() delivers for the identical
+// transition; the supervisor's heartbeat hooks update the count half from the
+// heartbeat loop goroutine, a different goroutine, but under this same record
+// mutex. Every field shares that one mutex so Health always reads them as a
+// single causal snapshot. Guarded by its own mutex rather than h.mu so neither
+// Health nor a heartbeat tick ever contends with Start/Stop's much longer
+// critical sections.
+//
+// The two halves are deliberately kept apart: recordHealthEvent (lifecycle
+// transitions) never touches missed, and the heartbeat hooks
+// (recordHeartbeatMiss/recordHeartbeatOK) never touch the state half — see
+// recordHealthEvent's own doc for why a lifecycle transition is the wrong
+// place to reset a running heartbeat count. Because they are written
+// independently, each half records WHOSE instance it last spoke for, and
+// coherentMissed uses those stamps to keep a snapshot from pairing one
+// instance's state with another instance's count.
+//
+// A record outlives every writer that updates it: it is created once in
+// NewHost and lives for the Host's whole life, while each Start attempt
+// creates a fresh supervisor.EventBus whose Seq restarts at 1 and a fresh
+// heartbeat loop whose generations restart at 1. origin is the outer ordering
+// key that makes those per-attempt domains comparable — see nextHealthOrigin.
+type healthRecord struct {
+	mu sync.Mutex
+
+	// origin counts this record's Start attempts. startOne takes the next value
+	// once per attempt, under h.mu, and threads it through everything that
+	// attempt can later write here. Ordering compares (origin, seq) so a retried
+	// Start supersedes every event of a failed prior attempt no matter what
+	// sequence numbers that attempt's own bus reached.
+	origin uint64
+
+	state          EventKind
+	lastTransition time.Time
+	lastErr        error
+	// lastOrigin/lastSeq are the Start attempt and that attempt's bus-assigned
+	// Seq for the last applied transition — this record's ordering key, compared
+	// lexicographically. See recordHealthEvent's doc.
+	lastOrigin uint64
+	lastSeq    uint64
+	// lastEventGen is the instance generation the last applied transition
+	// described (supervisor.Event.Gen). Paired with lastOrigin it names the
+	// instance the state half is speaking for.
+	lastEventGen uint64
+
+	missed int
+	// hookOrigin/hookGen name the instance the count half is speaking for: the
+	// Start attempt and instance generation of the heartbeat loop that last
+	// updated missed. A hook from an older origin is a supervisor the record has
+	// already moved past and is ignored outright.
+	hookOrigin uint64
+	hookGen    uint64
+}
+
+// Health returns a point-in-time copy of name's retained health state. It is
+// safe for concurrent use: it reads a retained record, never the plugin's
+// supervisor, a channel, or anything Start/Stop may be holding, so it does
+// not block on plugin operations — but it may briefly wait on the named
+// plugin's own internal record lock, which a concurrent recordHealthEvent or
+// heartbeat hook can hold only for the few stores that build one snapshot.
+//
+// It returns ErrHostStopped once Stop has completed the host's teardown,
+// checked before the name lookup, so a name that was never declared in this
+// Host's HostConfig.Plugins still reports ErrHostStopped rather than
+// ErrUnknownPlugin once the Host itself is done; matches Start's own
+// ErrHostStopped contract (the retained records end with the Host).
+// Otherwise it returns ErrUnknownPlugin for an undeclared name. A name whose
+// instance is currently stopping, restarting, or mid-reload still returns
+// its most recently retained transition: records live for the Host's
+// single-use lifetime, not for one instance's.
+//
+// Health for a name whose last event you just received off Events() can
+// still return ErrHostStopped if Stop's teardown completes in between: the
+// two calls race once shutdown has started, and completing the unbuffered
+// receive off Events() proves only that the event was handed to you, not
+// that a subsequent Health call for it is still guaranteed to succeed. A
+// consumer that needs a plugin's exact last state across shutdown should read
+// it off the event it just received (Event carries the identical translated
+// Kind/Err this record would have held) rather than making a second,
+// separate call back into Health for it; call Health before initiating Stop
+// if what you need is this Host's belief about a plugin's state before
+// shutdown began.
+func (h *Host) Health(name string) (HealthSnapshot, error) {
+	if h.hostStopped.Load() {
+		return HealthSnapshot{}, fmt.Errorf("styx: health plugin %q: %w", name, ErrHostStopped)
+	}
+
+	rec, ok := h.health[name]
+	if !ok {
+		return HealthSnapshot{}, fmt.Errorf("styx: health plugin %q: %w", name, ErrUnknownPlugin)
+	}
+
+	rec.mu.Lock()
+	snap := HealthSnapshot{
+		Plugin:           name,
+		State:            rec.state,
+		LastTransition:   rec.lastTransition,
+		LastError:        rec.lastErr,
+		MissedHeartbeats: rec.coherentMissed(),
+	}
+	rec.mu.Unlock()
+
+	return snap, nil
+}
+
+// coherentMissed reports the missed-heartbeat run belonging to the same
+// instance the retained state describes. Callers hold rec.mu.
+//
+// Invariant: a snapshot never pairs one instance's state with another
+// instance's missed count. The two halves have separate writers — the event
+// relay writes the state, the heartbeat loop writes the count — and neither
+// waits for the other, so either can be the one that has caught up. Each half
+// stamps whose instance it last spoke for, and comparing those stamps decides
+// which reading is current:
+//
+//   - state half strictly newer: that instance's heartbeat loop has not begun
+//     watching yet, so it cannot have missed a beat and the count reads zero.
+//     Without this a successor's Ready would be visible alongside the
+//     predecessor's leftover count, since a successor is published Ready
+//     before its loop entry resets anything.
+//   - halves equal, or count half newer: the stored count is that instance's
+//     own (the loop is running, or has already entered for an instance whose
+//     Ready is still in the relay) and is reported unchanged.
+//
+// Ordering is lexicographic on (Start attempt, instance generation): both
+// numbers restart per Start attempt, so neither alone is comparable across the
+// record's lifetime.
+func (rec *healthRecord) coherentMissed() int {
+	if rec.lastOrigin > rec.hookOrigin ||
+		(rec.lastOrigin == rec.hookOrigin && rec.lastEventGen > rec.hookGen) {
+		return 0
+	}
+
+	return rec.missed
+}
+
+// nextHealthOrigin takes name's next Start-attempt number, the outer half of
+// this record's ordering key. Called once per attempt from startOne, which
+// Start holds h.mu across, so attempts cannot interleave.
+//
+// It exists because the record outlives every ordering domain that writes to
+// it. A Start attempt builds a fresh supervisor.EventBus whose Seq restarts at
+// 1 and a fresh supervisor whose instance generations restart at 1; the record
+// they write to was created in NewHost and lives for the Host's whole life. A
+// failed attempt can be retried (Start refuses only a released Host or a name
+// still stopping), so without an outer key a retry's first events would look
+// older than the failed attempt's last ones and be discarded. Numbering the
+// attempt makes every event and every heartbeat hook for one record totally
+// ordered across all of them.
+//
+// A name with no record — one no HostConfig.Plugins entry declared — has
+// nothing to order; 0 is returned and every write for it is a no-op anyway.
+func (h *Host) nextHealthOrigin(name string) uint64 {
+	rec, ok := h.health[name]
+	if !ok {
+		return 0
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+
+	rec.origin++
+
+	return rec.origin
+}
+
+// recordHealthEvent updates name's retained health record from e, the exact
+// public Event relayEvents (or drainOnStop) just built for Events() — so
+// Health and Events() can never disagree about State or LastError for the
+// same transition. origin is the Start attempt the event belongs to (see
+// nextHealthOrigin); seq and gen are that same internal/supervisor.Event's Seq
+// and Gen — its bus-enqueue-time sequence number, which is that event's real
+// causal publish order within its own attempt, and the instance generation it
+// describes. The host-side synthetic binary-identity-mismatch pair (startOne)
+// never reaches a supervisor.Bus at all, so it supplies its own local pair
+// within its own attempt's origin instead.
+//
+// An event is applied only if (origin, seq) is strictly greater than the
+// record's retained (lastOrigin, lastSeq); anything else is discarded. Two
+// distinct reorderings need that:
+//
+//   - Within one attempt, the per-plugin supervisor bus dequeues critical
+//     events (Unhealthy/Crashed/GaveUp) ahead of informational ones
+//     (Starting/Ready/Restarting), so an older Starting can still be enqueued
+//     before, and delivered after, a newer Crashed or GaveUp. Applying it
+//     would regress a terminal record back to looking like the instance is
+//     still starting. Time cannot break this tie — two events published in the
+//     same clock tick carry equal Time — but seq is unique and strictly
+//     increasing within an attempt.
+//   - Across attempts, seq restarts at 1, so a retry's first events would look
+//     older than a failed attempt's last ones. The origin comparison decides
+//     first, so a newer attempt always supersedes an older one and a straggler
+//     from the older attempt can never overwrite it.
+//
+// It does NOT touch missed: a lifecycle transition and the running
+// heartbeat-miss count are two independent halves of this record, each owned
+// by its own writer (see healthRecord's own doc). Resetting missed here would
+// tie its zero to whichever lifecycle event this relay happens to be
+// processing, which is exactly the delayed-relay hazard the heartbeat-owned
+// reset in Supervisor.heartbeatLoop (and the reload transaction's own
+// reloadServiced reset) avoids: those run on the heartbeat loop itself, so
+// their reset can never be delayed behind, or preceded by, a miss recorded by
+// that same loop for a beat that has not happened yet. It does record which
+// instance the transition described, which is what lets coherentMissed decide
+// whether the stored count belongs to that same instance.
+func (h *Host) recordHealthEvent(name string, e Event, origin, seq, gen uint64) {
+	rec, ok := h.health[name]
+	if !ok {
+		return
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+
+	if origin < rec.lastOrigin || (origin == rec.lastOrigin && seq <= rec.lastSeq) {
+		return
+	}
+
+	rec.state = e.Kind
+	rec.lastTransition = e.Time
+	rec.lastErr = e.Err
+	rec.lastOrigin = origin
+	rec.lastSeq = seq
+	rec.lastEventGen = gen
+}
+
+// recordHeartbeatMiss bumps name's current missed-heartbeat run. Runs on the
+// supervisor's heartbeat loop goroutine, a cold path called at most once per
+// missed interval, under the same record lock recordHealthEvent uses so a
+// concurrent Health read never observes a state/missed pairing that never
+// coexisted.
+//
+// origin and gen name the instance whose beat was missed. A call from an older
+// (origin, gen) than the record's own is discarded: it comes from a heartbeat
+// loop the record has already moved past, and letting it through would bump a
+// successor's count for a predecessor's silence.
+func (h *Host) recordHeartbeatMiss(name string, origin, gen uint64) {
+	h.recordHeartbeat(name, origin, gen, func(rec *healthRecord) { rec.missed++ })
+}
+
+// recordHeartbeatOK resets name's current missed-heartbeat run to zero. Runs
+// on the supervisor's heartbeat loop goroutine — once at a fresh instance's
+// monitor-loop entry, once per received beat, and once at a serviced
+// reload's own reset (see Config.OnHeartbeatOK's doc) — with the same locking
+// and the same stale-instance rule as recordHeartbeatMiss.
+func (h *Host) recordHeartbeatOK(name string, origin, gen uint64) {
+	h.recordHeartbeat(name, origin, gen, func(rec *healthRecord) { rec.missed = 0 })
+}
+
+// recordHeartbeat applies apply to name's count half on behalf of instance
+// (origin, gen), advancing the half's own instance stamp, and does nothing at
+// all for a call from an older instance than the one that stamp already names.
+func (h *Host) recordHeartbeat(name string, origin, gen uint64, apply func(*healthRecord)) {
+	rec, ok := h.health[name]
+	if !ok {
+		return
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+
+	if origin < rec.hookOrigin || (origin == rec.hookOrigin && gen < rec.hookGen) {
+		return
+	}
+
+	rec.hookOrigin = origin
+	rec.hookGen = gen
+	apply(rec)
 }
 
 // teardownAdmissionCloseBound bounds the publication join the teardown-path cutoff

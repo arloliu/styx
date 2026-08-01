@@ -2,6 +2,7 @@ package styx
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -59,12 +60,13 @@ func (s *countingSink) IncrCounter(metric string, delta int64, labels ...observe
 // labels it was recorded under — so a test can assert per-class counts rather
 // than a total that cannot say which class stalled.
 func metricKey(metric string, labels []observe.Label) string {
-	key := metric
+	var key strings.Builder
+	key.WriteString(metric)
 	for _, l := range labels {
-		key += "|" + l.Key + "=" + l.Value
+		key.WriteString("|" + l.Key + "=" + l.Value)
 	}
 
-	return key
+	return key.String()
 }
 
 func (s *countingSink) SetGauge(metric string, value float64, _ ...observe.Label) {
@@ -291,25 +293,61 @@ func TestHost_RestartHook_SubmitsWhenEnabled(t *testing.T) {
 		time.Second, 5*time.Millisecond)
 }
 
-// Test the heartbeat-miss hook submitting the miss counter when a sink is set,
-// and being nil (so the supervisor skips it) when none is.
-func TestHost_HeartbeatMissHook_SubmitsWhenEnabled(t *testing.T) {
-	// Given a host with a sink and one without.
+// Test the heartbeat-miss hook always bumping the plugin's retained health
+// record — Health must see a miss whether or not a sink is configured — and
+// additionally submitting the miss counter only when a sink is set.
+func TestHost_HeartbeatMissHook_AlwaysBumpsHealth_SubmitsOnlyWhenSinkIsSet(t *testing.T) {
+	// Given a host with a sink and one without, each with a plugin declared so
+	// the hook has a health record to update.
 	sink := newCountingSink()
-	withSink := NewHost(HostConfig{Metrics: sink})
+	withSink := NewHost(HostConfig{Metrics: sink, Plugins: []PluginSpec{{Name: "echo"}}})
 	t.Cleanup(func() { _ = withSink.Stop(context.Background()) })
-	without := NewHost(HostConfig{})
+	without := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "echo"}}})
 	t.Cleanup(func() { _ = without.Stop(context.Background()) })
 
-	// When / Then
-	require.Nil(t, without.heartbeatMissHook("echo"), "no sink means no hook, so the supervisor skips it")
+	// When: no sink is configured.
+	hookWithoutSink := without.heartbeatMissHook("echo", without.nextHealthOrigin("echo"))
+	hookWithoutSink(1)
 
-	hook := withSink.heartbeatMissHook("echo")
+	// Then: the health record still moved, even though nothing was submitted.
+	snap, err := without.Health("echo")
+	require.NoError(t, err)
+	require.Equal(t, 1, snap.MissedHeartbeats)
+
+	// When: a sink is configured.
+	hook := withSink.heartbeatMissHook("echo", withSink.nextHealthOrigin("echo"))
 	require.NotNil(t, hook)
-	hook()
-	hook()
+	hook(1)
+	hook(1)
+
+	// Then: the counter is submitted too.
 	require.Eventually(t, func() bool { return sink.counter(observe.MetricHeartbeatMiss) == 2 },
 		time.Second, 5*time.Millisecond)
+}
+
+// Test the heartbeat-OK hook resetting the plugin's retained missed-heartbeat
+// count, the recovery counterpart to heartbeatMissHook — it has no metric to
+// submit, so it always acts regardless of whether a sink is configured.
+func TestHost_HeartbeatOKHook_ResetsHealth_WithNoSinkRequired(t *testing.T) {
+	// Given a host with no sink and a plugin whose health record already shows
+	// a miss.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "echo"}}})
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	origin := h.nextHealthOrigin("echo")
+	h.heartbeatMissHook("echo", origin)(1)
+	snap, err := h.Health("echo")
+	require.NoError(t, err)
+	require.Equal(t, 1, snap.MissedHeartbeats)
+
+	// When
+	hook := h.heartbeatOKHook("echo", origin)
+	require.NotNil(t, hook)
+	hook(1)
+
+	// Then
+	snap, err = h.Health("echo")
+	require.NoError(t, err)
+	require.Zero(t, snap.MissedHeartbeats)
 }
 
 // counterLabelSink records both the magnitude and the labels of each counter
@@ -436,9 +474,9 @@ func TestHost_Stop_BoundedAgainstWedgedSink(t *testing.T) {
 	h := NewHost(HostConfig{Metrics: sink})
 
 	// When a submit reaches the sink and wedges the dispatcher goroutine.
-	hook := h.heartbeatMissHook("p")
+	hook := h.heartbeatMissHook("p", h.nextHealthOrigin("p"))
 	require.NotNil(t, hook)
-	hook()
+	hook(1)
 	select {
 	case <-sink.entered:
 	case <-time.After(2 * time.Second):

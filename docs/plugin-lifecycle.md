@@ -286,8 +286,10 @@ described above.
 ## Further reading
 
 - [docs/supervisor-events.md](supervisor-events.md) — what each transition
-  in this document looks like on `Host.Events()`, and what's worth
-  building alerting around.
+  in this document looks like on `Host.Events()`,
+  how to check the same retained state synchronously with `Host.Health`
+  instead of subscribing,
+  and what's worth building alerting around.
 - [docs/migration-from-go-plugin.md](migration-from-go-plugin.md#lifecycle-liveness-shutdown-and-kill) —
   how this compares to `hashicorp/go-plugin`'s `Kill()`/reattach model.
 - [`examples/hot-reload/`](../examples/hot-reload/) — a runnable host and

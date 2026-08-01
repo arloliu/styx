@@ -678,7 +678,7 @@ func TestSupervisor_CallsOnHeartbeatMiss_PerMissedInterval(t *testing.T) {
 		HeartbeatInterval: wiringInterval,
 		MissedHeartbeats:  missBudget,
 		WedgeWindow:       wiringWindow,
-		OnHeartbeatMiss:   func() { misses.Add(1) },
+		OnHeartbeatMiss:   func(uint64) { misses.Add(1) },
 	}
 	sup := supervisor.New(cfg, bus)
 	sup.SetSpawnForTest(spawnSilentPeer(t))
@@ -694,6 +694,207 @@ func TestSupervisor_CallsOnHeartbeatMiss_PerMissedInterval(t *testing.T) {
 	// Then: OnHeartbeatMiss fired once per missed interval, exactly to the budget.
 	require.Contains(t, ev.Err.Error(), "missed")
 	require.Equal(t, int64(missBudget), misses.Load())
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// spawnHeartbeatsThenHangUp builds an instance-spawn seam whose peer sends
+// exactly n heartbeats at cadence and then closes its end of the connection,
+// so the host's next receive fails as a lost connection rather than a missed
+// interval — a deterministic stopping point for counting exactly how many
+// received beats the host classified before the instance ended.
+func spawnHeartbeatsThenHangUp(t *testing.T, cadence time.Duration, n int) supervisor.FakeSpawn {
+	t.Helper()
+
+	return func(_, _ context.Context, generation uint64, _ bool) (*supervisor.FakeInstance, error) {
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+		require.NoError(t, err)
+		hostConn := control.NewConn(fds[0], generation)
+		peerConn := control.NewConn(fds[1], generation)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ctx := context.Background()
+			for seq := uint64(1); seq <= uint64(n); seq++ {
+				msg := &controlpb.ControlMessage{Body: &controlpb.ControlMessage_Heartbeat{
+					Heartbeat: &controlpb.Heartbeat{Sequence: seq},
+				}}
+				if peerConn.Send(ctx, msg) != nil {
+					break
+				}
+				time.Sleep(cadence)
+			}
+			_ = peerConn.Close()
+		}()
+
+		teardown := func(context.Context, time.Duration) (*os.ProcessState, error) {
+			_ = hostConn.Close() // unblocks the host's Recv if it is still waiting.
+			<-done
+
+			return nil, nil
+		}
+
+		return &supervisor.FakeInstance{
+			Conn:     hostConn,
+			Promote:  func() supervisor.ReadyHooks { return supervisor.ReadyHooks{} },
+			Teardown: teardown,
+		}, nil
+	}
+}
+
+// Test the supervisor invoking Config.OnHeartbeatOK exactly once per received
+// heartbeat -- the recovery counterpart to OnHeartbeatMiss -- until the peer
+// hangs up and the instance ends as a lost connection rather than a miss.
+func TestSupervisor_CallsOnHeartbeatOK_PerReceivedBeat(t *testing.T) {
+	// Given: a peer that sends exactly 5 heartbeats and then closes, and a miss
+	// budget high enough that only the closed connection, never a missed
+	// interval, can end the instance.
+	const beatCount = 5
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	var oks atomic.Int64
+	cfg := supervisor.Config{
+		Restart:           supervisor.RestartPolicy{Max: 0},
+		HeartbeatInterval: wiringInterval,
+		MissedHeartbeats:  50,
+		WedgeWindow:       wiringWindow,
+		OnHeartbeatOK:     func(uint64) { oks.Add(1) },
+	}
+	sup := supervisor.New(cfg, bus)
+	sup.SetSpawnForTest(spawnHeartbeatsThenHangUp(t, wiringInterval, beatCount))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// When: the instance ends because the peer hung up, not a missed interval.
+	requireEventOfKind(t, ch, supervisor.EventCrashed)
+
+	// Then: OnHeartbeatOK fired once per beat the peer actually sent, plus the
+	// one extra call the loop makes at its own entry before any beat arrives
+	// (see TestSupervisor_CallsOnHeartbeatOK_OnceAtLoopEntry_BeforeAnyBeat).
+	require.Equal(t, int64(beatCount+1), oks.Load())
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// Test every published event and every heartbeat hook carrying the generation
+// of the instance it describes, across a restart. A consumer that keeps
+// lifecycle state and per-instance heartbeat state as separately-written
+// halves has no other way to tell which instance each half is speaking for,
+// and would otherwise report a successor's state next to a predecessor's
+// count.
+//
+// Informational events are FIFO among themselves, so the two Ready events
+// arrive in the order they were published: the first instance's, then its
+// replacement's.
+func TestSupervisor_StampsInstanceGeneration_OnEventsAndHeartbeatHooks(t *testing.T) {
+	// Given: a peer that hangs up without ever heartbeating, and a budget for
+	// exactly one restart, so two instances run and each publishes its own Ready.
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	okGenerations := make(chan uint64, 8)
+	cfg := supervisor.Config{
+		Restart:           supervisor.RestartPolicy{Max: 1},
+		HeartbeatInterval: wiringInterval,
+		MissedHeartbeats:  50,
+		WedgeWindow:       wiringWindow,
+		OnHeartbeatOK:     func(generation uint64) { okGenerations <- generation },
+	}
+	sup := supervisor.New(cfg, bus)
+	sup.SetSpawnForTest(spawnHeartbeatsThenHangUp(t, wiringInterval, 0))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// When: both instances reach Ready.
+	readyGenerations := make([]uint64, 0, 2)
+	for len(readyGenerations) < 2 {
+		select {
+		case ev := <-ch:
+			if ev.Kind == supervisor.EventReady {
+				readyGenerations = append(readyGenerations, ev.Gen)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the replacement instance never reached Ready")
+		}
+	}
+
+	// Then: each Ready names its own instance, and so does each loop entry's
+	// own health reset.
+	require.Equal(t, []uint64{1, 2}, readyGenerations,
+		"each event must carry the generation of the instance it describes")
+	require.Equal(t, uint64(1), <-okGenerations, "the first instance's loop entry must name its own generation")
+	require.Equal(t, uint64(2), <-okGenerations, "the replacement's loop entry must name the replacement")
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// Test the supervisor invoking Config.OnHeartbeatOK exactly once at the
+// heartbeat loop's own entry, before any beat is ever received: a peer that
+// never heartbeats still gets this one reset, proving it comes from the loop
+// starting to watch a fresh instance, not from a beat that instance never
+// sent. This is the deterministic internal-level proof behind
+// HealthSnapshot.MissedHeartbeats' own doc: the retained count resets at a
+// fresh instance's monitor-loop entry, not at its EventStarting/EventReady.
+func TestSupervisor_CallsOnHeartbeatOK_OnceAtLoopEntry_BeforeAnyBeat(t *testing.T) {
+	// Given: a peer that never heartbeats, so every OnHeartbeatMiss is real and
+	// OnHeartbeatOK can only have fired from the loop's own entry.
+	const missBudget = 3
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	var oks atomic.Int64
+	var misses atomic.Int64
+	cfg := supervisor.Config{
+		Restart:           supervisor.RestartPolicy{Max: 0},
+		HeartbeatInterval: wiringInterval,
+		MissedHeartbeats:  missBudget,
+		WedgeWindow:       wiringWindow,
+		OnHeartbeatMiss:   func(uint64) { misses.Add(1) },
+		OnHeartbeatOK:     func(uint64) { oks.Add(1) },
+	}
+	sup := supervisor.New(cfg, bus)
+	sup.SetSpawnForTest(spawnSilentPeer(t))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// When: the instance is declared unhealthy after the miss budget, having
+	// never received a single heartbeat.
+	awaitUnhealthy(t, ch)
+
+	// Then: OnHeartbeatOK fired exactly once — the loop's own entry — despite
+	// every interval missing.
+	require.Equal(t, int64(missBudget), misses.Load())
+	require.Equal(t, int64(1), oks.Load(),
+		"OnHeartbeatOK must fire once at loop entry even when no beat ever arrives")
 
 	cancel()
 	select {

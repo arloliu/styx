@@ -249,7 +249,7 @@ func (h *Host) AddRuntimeForTest(name string, sup *supervisor.Supervisor) {
 // including that an unset knob still passes the zero that selects
 // internal/supervisor's own default.
 func (h *Host) SupervisorConfigForTest(spec PluginSpec) supervisor.Config {
-	return h.supervisorConfig(spec, newUnavailableClientConn(spec.Name))
+	return h.supervisorConfig(spec, newUnavailableClientConn(spec.Name), h.nextHealthOrigin(spec.Name))
 }
 
 // DroppedInformationalEventCounts re-exports h.bus's informational-event
