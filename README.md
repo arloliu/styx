@@ -1,6 +1,32 @@
 # Styx
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/arloliu/styx.svg)](https://pkg.go.dev/github.com/arloliu/styx)
+[![Release](https://img.shields.io/github/v/release/arloliu/styx)](https://github.com/arloliu/styx/releases)
+
 Styx is a Go plugin framework for local, same-machine, process-isolated plugin communication. It replaces gRPC-over-Unix-domain-socket with a shared-memory data plane (descriptor rings, payload arena, eventfd wakeups), targeting unary RPC round-trips in the low single-digit microseconds. Plugins are separate executables with their own runtime and crash boundary; users define services in standard protobuf `service` blocks and get gRPC-style generated clients and servers, seeing no shared-memory details.
+
+## Why "Styx"?
+
+In the old maps of the underworld, the Styx is the river between two worlds —
+the boundary itself. That's a plugin framework: your host lives in one
+process, your plugin in another world entirely, with its own runtime and its
+own crash domain. When it dies, it dies over there. The boundary is the
+point — but a boundary you can't cross efficiently is just a wall, so
+everything depends on the ferry.
+
+Styx is the ferry, and the fare is nearly nothing. Both banks touch the same
+water: a sealed shared-memory region — descriptor rings, a slab arena,
+eventfd wakeups — carries a unary round trip in ~2.4 µs where gRPC-over-UDS
+takes ~16. One fixed-size memfd, resident memory pay-as-you-touch. No
+daemons, no sidecars — one river, two banks.
+
+The mythology holds up under load. The gods swore unbreakable oaths on the
+Styx — ours are the frozen [`shm-abi.md`](docs/specs/shm-abi.md) and
+[`stream-protocol.md`](docs/specs/stream-protocol.md). Achilles was dipped in
+it and came out nearly invulnerable — this transport was dipped in a chaos
+suite, a differential oracle, and a leak soak. And with state-preserving hot
+reload, Styx is the rare river you can cross back over: a plugin goes down,
+its state ferries home, its successor picks up where it left off.
 
 ## Installation
 
@@ -182,6 +208,12 @@ Styx is feature-complete on both data-plane transports — shared memory and
 Unix domain sockets, unary and streaming RPC, supervised plugin lifecycle
 with hot-reload — and validated by a differential test suite against the
 UDS oracle, a fault-injection (chaos) suite, and a long-running leak soak.
+
+Current release: **v0.1.0** (see [CHANGELOG.md](CHANGELOG.md)). Pre-1.0: the
+public Go API may still move between minor versions; the wire contracts
+([`shm-abi.md`](docs/specs/shm-abi.md),
+[`stream-protocol.md`](docs/specs/stream-protocol.md)) are frozen and change
+only by explicit, versioned amendment.
 
 At a 64-byte payload with one in-flight call, a unary round trip measures a p50
 of 2.4 µs over shared memory, against 7.7 µs over Unix domain sockets and
