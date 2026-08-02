@@ -1,5 +1,10 @@
+<p align="center">
+  <img src="docs/logo.png" alt="Styx" width="480">
+</p>
+
 # Styx
 
+[![CI](https://github.com/arloliu/styx/actions/workflows/ci.yml/badge.svg)](https://github.com/arloliu/styx/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/arloliu/styx.svg)](https://pkg.go.dev/github.com/arloliu/styx)
 [![Release](https://img.shields.io/github/v/release/arloliu/styx)](https://github.com/arloliu/styx/releases)
 
