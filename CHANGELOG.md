@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Event.Revision`** and **`HealthSnapshot.Revision`**: a dense, per-plugin
+  position in that plugin's transition history, taken from the same retained
+  record both views already read. An event that advanced the record carries the
+  position it advanced to; one the record discarded as superseded carries 0 and
+  is still delivered. A consumer can now seed a view from `Health` and fold
+  `Events()` with one comparison — ignore anything whose `Revision` is not
+  strictly greater than what it has already applied — instead of reconstructing
+  an order from `Kind` and `Time`, which cannot work: the bus delivers a
+  critical `EventCrashed` ahead of an informational `EventStarting` published
+  before it, and two events in the same clock tick carry equal `Time`. The
+  numbering is dense where it is assigned but not where it is delivered, so a
+  gap between two accepted revisions means transitions were dropped, a
+  lower-numbered one is still in flight behind the event that overtook it, or
+  both — a prompt to re-read `Health`, not a count of what was lost. Nothing
+  reports how many events `Events()` dropped. Revisions count one plugin's
+  transitions, so they are comparable only within a single `Event.Plugin`;
+  `MissedHeartbeats` is written by the heartbeat path, records no transition,
+  and is deliberately outside the numbering. Adding a field is source-compatible
+  for every consumer that does not build a `styx.Event` or `styx.HealthSnapshot`
+  by positional composite literal.
 - **`observe.MetricStdioDropped`** (`styx.stdio.dropped.count`): counts
   stdout/stderr lines a plugin's stdio capture discarded because a
   `PluginSpec.Stdio` sink fell behind, labelled by plugin and by stream.

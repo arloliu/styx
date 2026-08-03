@@ -183,11 +183,14 @@ func TestRelayEvents_DrainsQueuedEventAfterStop_BeforeUnsubscribe(t *testing.T) 
 		t.Fatal("relay did not finish after the queue drained and quiesced")
 	}
 
-	// Then: the terminal event reached Host.Events() despite the stop preceding it.
+	// Then: the terminal event reached Host.Events() despite the stop preceding
+	// it, carrying the position the drain's own apply assigned it.
 	select {
 	case got := <-h.Events():
 		require.Equal(t, EventUnhealthy, got.Kind)
 		require.Equal(t, "p", got.Plugin)
+		require.Equal(t, uint64(1), got.Revision,
+			"the drain must stamp what it applied, so a shutdown transition is foldable like any other")
 	case <-time.After(2 * time.Second):
 		t.Fatal("terminal event was discarded instead of relayed onto Host.Events()")
 	}
@@ -198,6 +201,7 @@ func TestRelayEvents_DrainsQueuedEventAfterStop_BeforeUnsubscribe(t *testing.T) 
 	require.NoError(t, err)
 	require.Equal(t, EventUnhealthy, snap.State,
 		"the drained event must be retained for Health, not only delivered on Events()")
+	require.Equal(t, uint64(1), snap.Revision)
 }
 
 // Test the retained record keeping a critical transition that a REAL
@@ -259,6 +263,327 @@ func TestHost_RelayEvents_RetainsCriticalTransition_WhenBusDeliversOlderInformat
 	rec.mu.Unlock()
 	require.Equal(t, uint64(3), lastSeq,
 		"the record must order on the sequence number EventBus.Publish assigned the crash")
+}
+
+// Test the record numbering one plugin's applied transitions densely across a
+// crash and the restart that follows it. Density is a property of assignment,
+// not of delivery, and it is what makes a revision foldable at all: a consumer
+// accepts an event only when its revision exceeds the last it accepted, so a
+// number the record skipped at assignment would make it discard a live
+// transition. What a consumer observes can still arrive out of order, so a gap
+// it sees proves nothing on its own — the reordering test below pins that.
+//
+// Each event is taken off Events() before the next is relayed, so the bus holds
+// at most one at a time and delivery order is publish order; the reordering
+// case has its own test below.
+func TestHost_RelayEvents_NumbersTransitionsDensely_AcrossACrashAndRestart(t *testing.T) {
+	// Given: a relay for a declared plugin, driven one supervisor event at a time.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
+	origin := h.nextHealthOrigin("p")
+	events := make(chan supervisor.Event)
+	stopRelay := make(chan struct{})
+	relayDone := make(chan struct{})
+	firstOutcome := make(chan error, 1)
+	go h.relayEvents("p", origin, events, func() bool { return true }, stopRelay, relayDone, firstOutcome)
+
+	// When: one instance starts, serves, is judged unhealthy and crashes, and a
+	// replacement is started and becomes ready -- the sequence numbers one
+	// attempt's own bus assigns, the generations its two instances carry.
+	at := time.Now()
+	sequence := []supervisor.Event{
+		{Kind: supervisor.EventStarting, Seq: 1, Gen: 1},
+		{Kind: supervisor.EventReady, Seq: 2, Gen: 1},
+		{Kind: supervisor.EventUnhealthy, Seq: 3, Gen: 1, Err: errors.New("p: wedged")},
+		{Kind: supervisor.EventCrashed, Seq: 4, Gen: 1, Err: errors.New("p: crashed")},
+		{Kind: supervisor.EventRestarting, Seq: 5, Gen: 1},
+		{Kind: supervisor.EventStarting, Seq: 6, Gen: 2},
+		{Kind: supervisor.EventReady, Seq: 7, Gen: 2},
+	}
+
+	got := make([]uint64, 0, len(sequence))
+	for i, ev := range sequence {
+		ev.Time = at.Add(time.Duration(i))
+		select {
+		case events <- ev:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the relay stopped consuming the supervisor's events")
+		}
+		got = append(got, awaitAnyHostEvent(t, h.Events()).Revision)
+	}
+	close(stopRelay)
+	<-relayDone
+
+	// Then: every transition was applied and numbered exactly one above the one
+	// before it, and the snapshot reports the position the last one reached.
+	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6, 7}, got,
+		"a plugin's applied transitions must be numbered densely, so a strictly-greater fold never discards a live one")
+
+	snap, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), snap.Revision,
+		"a snapshot must report the position of the last transition applied to the record")
+}
+
+// Test recordHealthEvent reporting 0 for an event it does not apply, and
+// consuming no position for it. A superseded event is still published on
+// Events(), so 0 is what tells a consumer's fold to ignore it; consuming a
+// position for one would leave a hole in the numbering that no transition ever
+// fills.
+func TestHost_RecordHealthEvent_ReportsZeroRevision_ForAnEventItDiscards(t *testing.T) {
+	// Given: a first Start attempt with two applied transitions.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
+	at := time.Now()
+	starting := Event{Plugin: "p", Kind: EventStarting, Time: at}
+	crashed := Event{Plugin: "p", Kind: EventCrashed, Time: at, Err: errors.New("p: crashed")}
+	gaveUp := Event{Plugin: "p", Kind: EventGaveUp, Time: at, Err: errors.New("p: gave up")}
+
+	first := h.nextHealthOrigin("p")
+	require.Equal(t, uint64(1), h.recordHealthEvent("p", starting, first, 1, 1))
+	require.Equal(t, uint64(2), h.recordHealthEvent("p", crashed, first, 2, 1))
+
+	// When: the retry's own first transition applies, and is then followed by a
+	// straggler from the superseded attempt, a replay of a sequence number the
+	// record already holds, and an event for a name this Host has no record for.
+	second := h.nextHealthOrigin("p")
+	retried := h.recordHealthEvent("p", starting, second, 1, 1)
+	straggler := h.recordHealthEvent("p", gaveUp, first, 3, 1)
+	replayed := h.recordHealthEvent("p", Event{Plugin: "p", Kind: EventReady, Time: at}, second, 1, 1)
+	undeclared := h.recordHealthEvent("other", Event{Plugin: "other", Kind: EventReady, Time: at}, 1, 1, 1)
+
+	// Then: the retry kept counting rather than restarting the way its attempt's
+	// sequence numbers do, and nothing the record refused took a position.
+	require.Equal(t, uint64(3), retried, "a retried Start's transitions continue the record's numbering")
+	require.Zero(t, straggler, "an event from a superseded Start attempt advances nothing")
+	require.Zero(t, replayed, "an event the record has already moved past advances nothing")
+	require.Zero(t, undeclared, "a name this Host holds no record for has no transition history")
+
+	// And: the next applied transition takes the very next position, so the
+	// three refusals left no hole behind them.
+	require.Equal(t, uint64(4), h.recordHealthEvent("p", gaveUp, second, 2, 1))
+
+	snap, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), snap.Revision)
+	require.Equal(t, EventGaveUp, snap.State)
+}
+
+// Test a consumer seeding from Health and folding Events() by revision landing
+// on the right state when the bus delivers a critical transition ahead of an
+// informational one published before it. This is the reordering neither Kind
+// nor Time can resolve -- two events published in one clock tick carry equal
+// Time -- and the fold that resolves it is a single strict-greater comparison,
+// with no terminal latch and no re-check after the seed.
+//
+// The reorder is built, not waited for. A subscriber's forwarder holds at most
+// one event while nothing is receiving, so publishing the last three with no
+// relay running leaves at least two of them queued together; whichever the
+// forwarder picks next, the critical ring is drained before the informational
+// one, and the Starting published before the Crashed is delivered after it.
+func TestHost_Events_FoldByRevision_ResolvesACriticalEventDeliveredAheadOfAnOlderOne(t *testing.T) {
+	// Given: a relay over a real supervisor bus, and a consumer that took its
+	// seed snapshot once the plugin reached Ready.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
+	bus := supervisor.NewEventBus()
+	events, unsub, quiesced := bus.Subscribe()
+	defer unsub()
+
+	origin := h.nextHealthOrigin("p")
+	at := time.Now()
+	seedStop, seedDone := make(chan struct{}), make(chan struct{})
+	go h.relayEvents("p", origin, events, quiesced, seedStop, seedDone, make(chan error, 1))
+
+	bus.Publish(supervisor.Event{Kind: supervisor.EventStarting, Time: at, Gen: 1})
+	bus.Publish(supervisor.Event{Kind: supervisor.EventReady, Time: at, Gen: 1})
+	for range 2 {
+		awaitAnyHostEvent(t, h.Events())
+	}
+	close(seedStop)
+	<-seedDone
+
+	seed, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, EventReady, seed.State)
+	require.Equal(t, uint64(2), seed.Revision)
+
+	// When: the instance is restarted and the replacement crashes, all published
+	// with no relay draining the subscription, and a relay then consumes them in
+	// the order the bus hands them out.
+	bus.Publish(supervisor.Event{Kind: supervisor.EventRestarting, Time: at, Gen: 1})
+	bus.Publish(supervisor.Event{Kind: supervisor.EventStarting, Time: at, Gen: 2})
+	bus.Publish(supervisor.Event{Kind: supervisor.EventCrashed, Time: at, Gen: 2, Err: errors.New("p: crashed")})
+
+	stopRelay, relayDone := make(chan struct{}), make(chan struct{})
+	go h.relayEvents("p", origin, events, quiesced, stopRelay, relayDone, make(chan error, 1))
+
+	delivered := make([]Event, 0, 3)
+	for range 3 {
+		delivered = append(delivered, awaitAnyHostEvent(t, h.Events()))
+	}
+	close(stopRelay)
+	<-relayDone
+
+	// Then: the fold ignores everything not strictly greater than what it has
+	// already applied, which is exactly enough to reject the late Starting.
+	applied, state := seed.Revision, seed.State
+	crashedIdx, startingIdx := -1, -1
+	var crashedRev, startingRev uint64
+	for i, ev := range delivered {
+		if ev.Kind == EventCrashed {
+			crashedIdx, crashedRev = i, ev.Revision
+		}
+		if ev.Kind == EventStarting {
+			startingIdx, startingRev = i, ev.Revision
+		}
+		if ev.Revision > applied {
+			applied, state = ev.Revision, ev.Kind
+		}
+	}
+
+	require.Greater(t, startingIdx, crashedIdx,
+		"the test needs the bus to deliver the Crashed ahead of the Starting published before it")
+	require.Zero(t, startingRev,
+		"the record discarded the late Starting as superseded, so it must be published carrying no position")
+	require.Greater(t, crashedRev, seed.Revision,
+		"a transition applied after the seed must carry a position above the seed's")
+	require.Equal(t, EventCrashed, state,
+		"folding by revision must land on the crash, not on the Starting the bus delivered after it")
+
+	snap, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, EventCrashed, snap.State)
+	require.Equal(t, applied, snap.Revision,
+		"a fold over the stream must reach the same position a snapshot reports")
+}
+
+// Test Host's own bus delivering one applied revision after a higher applied
+// revision, and a fold over that stream still landing on current state. The
+// relay numbers a transition when the record applies it and only then publishes
+// it, so Host's bus reorders events that already carry positions -- unlike the
+// per-plugin bus, whose reordering happens before assignment and shows up as a
+// Revision of 0. A gap therefore proves nothing about loss: here every position
+// the record assigned is delivered, and a consumer folding the stream still
+// sees 1 jump to 3.
+//
+// The reorder is built, not waited for. Nothing receives until all three are
+// published, so the forwarder holds at most the first of them and the critical
+// Crashed is queued while the informational Restarting still is too; whichever
+// the forwarder picks next, the critical ring drains first. The fourth event is
+// a straggler the record discards, and its send is what proves the Crashed was
+// already published: the relay cannot take it until it has.
+func TestHost_Events_DeliversAppliedRevisionsOutOfOrder_WhenACriticalOvertakesAQueuedOne(t *testing.T) {
+	// Given: a relay for a declared plugin, and no consumer draining Events().
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p"}}})
+	origin := h.nextHealthOrigin("p")
+	events := make(chan supervisor.Event)
+	stopRelay := make(chan struct{})
+	relayDone := make(chan struct{})
+	go h.relayEvents("p", origin, events, func() bool { return true }, stopRelay, relayDone, make(chan error, 1))
+
+	// When: an instance starts, is restarted, and the restart crashes -- three
+	// transitions the record applies and numbers 1, 2 and 3 -- followed by a
+	// straggler from a sequence number the record has already moved past.
+	at := time.Now()
+	sequence := []supervisor.Event{
+		{Kind: supervisor.EventStarting, Seq: 1, Gen: 1, Time: at},
+		{Kind: supervisor.EventRestarting, Seq: 2, Gen: 1, Time: at},
+		{Kind: supervisor.EventCrashed, Seq: 3, Gen: 1, Time: at, Err: errors.New("p: crashed")},
+		{Kind: supervisor.EventStarting, Seq: 1, Gen: 1, Time: at},
+	}
+	for _, ev := range sequence {
+		select {
+		case events <- ev:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the relay stopped consuming the supervisor's events")
+		}
+	}
+
+	delivered := make([]Event, 0, len(sequence))
+	for range len(sequence) {
+		delivered = append(delivered, awaitAnyHostEvent(t, h.Events()))
+	}
+	close(stopRelay)
+	<-relayDone
+
+	// Then: the crash carrying position 3 arrived ahead of the restart carrying
+	// position 2, so delivery order is not revision order even though both
+	// positions were assigned before either was published.
+	crashedIdx, restartingIdx := -1, -1
+	var crashedRev, restartingRev uint64
+	applied, state := uint64(0), EventStarting
+	assigned := make([]uint64, 0, len(sequence))
+	for i, ev := range delivered {
+		if ev.Kind == EventCrashed {
+			crashedIdx, crashedRev = i, ev.Revision
+		}
+		if ev.Kind == EventRestarting {
+			restartingIdx, restartingRev = i, ev.Revision
+		}
+		if ev.Revision != 0 {
+			assigned = append(assigned, ev.Revision)
+		}
+		if ev.Revision > applied {
+			applied, state = ev.Revision, ev.Kind
+		}
+	}
+
+	require.Less(t, crashedIdx, restartingIdx,
+		"the critical Crashed must be delivered ahead of the informational Restarting published before it")
+	require.Equal(t, uint64(3), crashedRev)
+	require.Equal(t, uint64(2), restartingRev,
+		"the overtaken event carries the position the record assigned it, not 0: the record applied it")
+
+	// And: nothing was lost. The gap a consumer sees between accepting 1 and
+	// accepting 3 is delivery order alone, so a gap must never be read as a
+	// count of dropped transitions.
+	require.ElementsMatch(t, []uint64{1, 2, 3}, assigned,
+		"every position the record assigned must still be delivered, gap or no gap")
+
+	// And: the fold lands on current state regardless, because strictly-greater
+	// ignores the late arrival exactly as it ignores the straggler carrying 0.
+	require.Equal(t, uint64(3), applied)
+	require.Equal(t, EventCrashed, state)
+
+	snap, err := h.Health("p")
+	require.NoError(t, err)
+	require.Equal(t, EventCrashed, snap.State)
+	require.Equal(t, applied, snap.Revision,
+		"a fold over the reordered stream must reach the same position a snapshot reports")
+}
+
+// Test the synthetic pair a failed binary pin publishes carrying positions of
+// its own. That pair never reaches a supervisor.EventBus -- the mismatch is
+// caught before one is created -- so it is the one publish path whose events
+// could stay at 0 while the record moved on, which would make a consumer's
+// fold ignore a real crash.
+func TestHost_StartOne_StampsRevisions_OnTheBinaryPinFailurePair(t *testing.T) {
+	// Given: a plugin pinned to a hash its binary does not have; the pin is
+	// verified before anything is spawned, so no process ever exists.
+	wrong := make([]byte, sha256.Size)
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{
+		Name: "pinned", Path: "/bin/true", BinarySHA256: wrong,
+	}}})
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// When: the pin fails, and the caller retries the same Start.
+	require.Error(t, h.Start(context.Background()))
+	require.Error(t, h.Start(context.Background()))
+
+	// Then: all four events carry their own position, dense across both
+	// attempts. They are keyed by position rather than by arrival because the
+	// shared bus drains its critical ring first, so a Crashed can arrive ahead
+	// of the Starting published before it here too.
+	byRevision := map[uint64]EventKind{}
+	for range 4 {
+		ev := awaitAnyHostEvent(t, h.Events())
+		byRevision[ev.Revision] = ev.Kind
+	}
+	require.Equal(t, map[uint64]EventKind{
+		1: EventStarting, 2: EventCrashed, 3: EventStarting, 4: EventCrashed,
+	}, byRevision, "the host-synthesized pin-failure pair must be numbered like any other transition")
+
+	snap, err := h.Health("pinned")
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), snap.Revision)
 }
 
 // Test a retried Start superseding the attempt before it, and a straggler from
@@ -807,6 +1132,22 @@ func awaitClosed(t *testing.T, ch <-chan struct{}, msg string) {
 	case <-time.After(2 * time.Second):
 		t.Fatal(msg)
 	}
+}
+
+// awaitAnyHostEvent takes the next event off ch, whatever its kind, or fails on
+// timeout. Unlike awaitHostEvent it discards nothing, so a caller can assert on
+// the order events were delivered in.
+func awaitAnyHostEvent(t *testing.T, ch <-chan Event) Event {
+	t.Helper()
+
+	select {
+	case ev := <-ch:
+		return ev
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "no host event was delivered")
+	}
+
+	return Event{}
 }
 
 // awaitHostEvent drains ch until it sees an event of kind, or fails on timeout.

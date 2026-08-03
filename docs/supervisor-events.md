@@ -131,6 +131,39 @@ Records live for the `Host`'s whole single-use lifetime, the same span `Events()
 Once `Stop`'s teardown has finished, `Health` stops answering for every plugin, including one whose final transition you took off `Events()` moments earlier — the two calls race once shutdown has started, and completing that receive proves only that the event was handed to you, not that a `Health` call for it right afterward is still guaranteed to succeed.
 If you need a plugin's exact last state across shutdown, read it off the event you just received (`Event` carries the identical translated `Kind`/`Err` a snapshot would have held) instead of making a second, separate `Health` call for it; call `Health` before you initiate `Stop` if what you actually want is this `Host`'s belief about a plugin's state before shutdown began.
 
+## `Revision`: one position both views share
+
+`Events()` and `Health` are two views of the same retained record, one per plugin, and `Revision` is that record's own position in the plugin's transition history — the field that makes the two comparable.
+`HealthSnapshot.Revision` is the position a snapshot reflects: 0 before the plugin's first transition, then the position of the most recent one.
+`Event.Revision` is the position the record advanced to when it applied that event, or 0 for an event the record discarded as superseded.
+
+Seed a view from `Health`, then fold `Events()` by ignoring anything not strictly greater than what you have already applied:
+
+```go
+snap, err := host.Health("device-driver")
+if err != nil {
+    // ...
+}
+applied, state := snap.Revision, snap.State
+
+for ev := range host.Events() {
+    if ev.Plugin != "device-driver" || ev.Revision <= applied {
+        continue // another plugin, or a transition this view already reflects
+    }
+    applied, state = ev.Revision, ev.Kind
+}
+```
+
+That single comparison is the whole ordering rule, and it isn't a convenience — it is the only thing that works.
+`Kind` and `Time` cannot order this stream: the critical backlog is drained ahead of the informational one, so an `EventCrashed` is delivered ahead of an `EventStarting` published *before* it, and two events published in the same clock tick carry equal `Time`.
+Comparing revisions subsumes both the "latch once `EventGaveUp` arrives" rule and the re-check after seeding that a hand-rolled fold otherwise needs, because a snapshot and the stream are now numbered by the same counter.
+
+Three things to know before leaning on it:
+
+- **Revisions are per-plugin, not per-stream.** They count one plugin's transitions — 1 for its first, then one higher per transition after it, for the `Host`'s whole life, across crashes, restarts, hot reloads, and retried `Start`s alike. Two plugins' revisions are unrelated numbers; compare only within one `Event.Plugin`.
+- **A superseded event is still delivered, carrying 0.** `Events()` reports what a supervisor published, not what the record kept, so an event the record discarded still arrives — with `Revision == 0`, which the comparison above already rejects.
+- **`MissedHeartbeats` is outside the numbering.** It is maintained by the heartbeat path, which records no transition, advances no revision, and publishes no event, so two snapshots with the same `Revision` can still report different `MissedHeartbeats`. Call `Health` for that count; the stream does not carry it.
+
 ## The six event kinds
 
 | Kind | Fires when | `Err` |
@@ -247,9 +280,14 @@ window rounds up to whole heartbeats.
   operation; a `Host` under sustained multi-plugin failure with no reader is
   the scenario where it matters.
 
-There is currently no public counter for how many informational events
-were dropped, so you cannot detect a falling-behind reader from the
-`Event` stream itself. The practical takeaway: read `Events()` promptly
+No counter reports how many informational events were dropped, and a gap in the revisions you accept does not stand in for one.
+Revisions are dense where they are assigned — the record numbers each transition as it applies it — but the critical backlog is drained ahead of the informational one, so a revision the record assigned can be delivered after a higher one.
+A gap between one accepted `Revision` and the next therefore means at least one of two things: transitions this stream dropped, or a lower-numbered transition still in flight behind the one that overtook it, arriving later for the fold to ignore.
+Nothing tells the two apart, so read a gap as a prompt to re-read `Health`, never as loss accounting.
+What a gap does not cost you is the state: the highest `Revision` your fold has accepted is the newest transition the `Host` applied and handed over, and `Health` re-reads the current state whole (see
+[`Revision`: one position both views share](#revision-one-position-both-views-share)).
+What neither the gap nor `Health` recovers is *which* transitions were lost — a counted-transitions fold, such as detecting a restart storm, cannot be repaired after the fact the way a level-triggered state view can.
+The practical takeaway: read `Events()` promptly
 from a dedicated goroutine that does nothing slow inline (dispatch to your
 own buffered queue or worker pool if your handling — writing to a
 database, paging a human — can be slow), treat `Starting`/`Ready`/
