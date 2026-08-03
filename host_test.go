@@ -937,6 +937,43 @@ func TestHost_Health_MissedHeartbeatsResets_OnRestartAfterUnhealthy(t *testing.T
 		"a restarted instance's state must never be reported with the predecessor's miss count")
 }
 
+// Test the missed-heartbeat verdict arriving as the typed
+// *styx.MissedHeartbeatsError on both the delivered Event and the retained
+// HealthSnapshot, not a bare untyped error a default-deny error table could
+// only file under "unknown." recordHealthEvent retains a transition before
+// this event is ever published (see relayEvents' own doc), so Health called
+// right after receiving the event observes the identical translated error.
+func TestHost_Health_And_Events_CarryMissedHeartbeatsError_OnUnhealthyVerdict(t *testing.T) {
+	// Given: a plugin silent after its first heartbeat, with a one-miss
+	// budget so Unhealthy fires promptly.
+	fastBackoff := func(int) time.Duration { return 10 * time.Millisecond }
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+		Name:                     "silent",
+		Path:                     fixtureReadyPlugin,
+		Env:                      []string{styx.HeartbeatIntervalEnv + "=" + silentPluginHeartbeat},
+		MissedHeartbeatThreshold: 1,
+		Restart:                  styx.RestartPolicy{Max: 2, Backoff: fastBackoff},
+	}}})
+	require.NoError(t, h.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, h.Stop(context.Background())) })
+
+	// When: the instance is declared unhealthy after its one allotted miss.
+	ev := awaitEventWithin(t, h.Events(), styx.EventUnhealthy, unhealthyVerdictBudget)
+	snap, err := h.Health("silent")
+	require.NoError(t, err)
+
+	// Then: the delivered event's Err carries the exact count structurally...
+	var evErr *styx.MissedHeartbeatsError
+	require.ErrorAs(t, ev.Err, &evErr)
+	require.Equal(t, 1, evErr.Missed)
+	require.ErrorIs(t, ev.Err, styx.ErrHeartbeatsMissed)
+
+	// ...and so does the retained HealthSnapshot for the same transition.
+	var snapErr *styx.MissedHeartbeatsError
+	require.ErrorAs(t, snap.LastError, &snapErr)
+	require.Equal(t, 1, snapErr.Missed)
+}
+
 // Test the documented NoRestart recreation sequence end to end against a
 // runtime that genuinely reached Ready before it gave up: a plugin
 // configured with styx.NoRestart completes its handshake and attach and

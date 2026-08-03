@@ -1398,6 +1398,12 @@ func TestSupervisor_ShmSIGSTOPWedge_DeclaredUnhealthyWithinBound(t *testing.T) {
 		"unhealthy must be declared at exactly the configured 3-miss threshold, not another count or cause: %v",
 		ev.Err)
 
+	// And: the same count is available structurally, not only as message text
+	// a future rewording could silently break for a consumer relying on it.
+	var mhe *supervisor.MissedHeartbeatsError
+	require.ErrorAs(t, ev.Err, &mhe)
+	require.Equal(t, 3, mhe.Missed)
+
 	// Corroborate with timing: each miss is a full HeartbeatInterval receive wait no
 	// heartbeat cuts short (the peer is frozen), so the window from the last received
 	// beat to Unhealthy is at least MissedHeartbeats x HeartbeatInterval = 300ms. The

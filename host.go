@@ -1577,7 +1577,8 @@ func translateEvent(name string, ev supervisor.Event) Event {
 
 // translateEventErr converts an internal/supervisor error into a public
 // one. This is the same translate-at-boundary rule used elsewhere for
-// IncompatibleError/HandshakeOffer: a bare *supervisor.CrashInfo or
+// IncompatibleError/HandshakeOffer: a bare *supervisor.CrashInfo,
+// *supervisor.WedgedError, *supervisor.MissedHeartbeatsError, or
 // *control.IncompatibleError (or any other internal-package-originated
 // error) can never cross onto Event.Err as-is — internal/ packages are not
 // importable outside this module, so an external caller could never even
@@ -1595,8 +1596,14 @@ func translateEvent(name string, ev supervisor.Event) Event {
 // discards the offending service/reason. Otherwise, a
 // *supervisor.CrashInfo becomes a *PluginCrashError, carrying the real
 // ExitStatus/ExitStatusKnown through when internal/lifecycle.Teardown
-// reaped the process (see CrashInfo's own doc for when it did not);
-// anything else keeps its message but not its internal identity.
+// reaped the process (see CrashInfo's own doc for when it did not).
+//
+// *supervisor.WedgedError and *supervisor.MissedHeartbeatsError are the
+// EventUnhealthy verdict itself, never wrapped in a *CrashInfo at this
+// point (that wrapping happens later, for the EventCrashed that always
+// follows an unhealthy verdict), so their checks do not compete with the
+// two above for the same value; anything else keeps its message but not
+// its internal identity.
 func translateEventErr(name string, err error) error {
 	if err == nil {
 		return nil
@@ -1627,7 +1634,29 @@ func translateEventErr(name string, err error) error {
 		}
 	}
 
+	var we *supervisor.WedgedError
+	if errors.As(err, &we) {
+		return &WedgedError{Kind: translateWedgeKind(we.Kind)}
+	}
+
+	var mhe *supervisor.MissedHeartbeatsError
+	if errors.As(err, &mhe) {
+		return &MissedHeartbeatsError{Missed: mhe.Missed}
+	}
+
 	return errors.New(err.Error())
+}
+
+// translateWedgeKind maps internal/supervisor's WedgeKind onto the public
+// one carried by WedgedError. WedgeNone (Classify's non-wedge value) never
+// reaches here: heartbeatLoop only builds a *supervisor.WedgedError once
+// tracker.observe has already fired on WedgeTransport or WedgeDispatch.
+func translateWedgeKind(kind supervisor.WedgeKind) WedgeKind {
+	if kind == supervisor.WedgeDispatch {
+		return WedgeDispatch
+	}
+
+	return WedgeTransport
 }
 
 // resolveTransport maps a PluginSpec.Transport value to the supervisor's

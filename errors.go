@@ -201,6 +201,69 @@ func (e *ConfigError) Is(target error) bool {
 	return target == ErrInvalidConfig
 }
 
+// MissedHeartbeatsError reports that a plugin instance went silent for
+// PluginSpec.MissedHeartbeatThreshold consecutive heartbeat waits, so the
+// supervisor declared it unhealthy and ended it.
+// It appears in Host.Events() event errors and, while that verdict is still
+// the plugin's most recent recorded transition, as HealthSnapshot.LastError.
+// errors.Is(err, ErrHeartbeatsMissed) matches any *MissedHeartbeatsError;
+// errors.As(err, &missedErr) recovers the exact count.
+type MissedHeartbeatsError struct {
+	// Missed is the consecutive miss count that reached the configured
+	// threshold.
+	Missed int
+}
+
+func (e *MissedHeartbeatsError) Error() string {
+	return fmt.Sprintf("styx: missed %d consecutive heartbeats", e.Missed)
+}
+
+// Is reports whether target is ErrHeartbeatsMissed.
+func (e *MissedHeartbeatsError) Is(target error) bool {
+	return target == ErrHeartbeatsMissed
+}
+
+// WedgedError reports that a plugin instance stopped making progress long
+// enough for the heartbeat classifier to declare it unhealthy, so the
+// supervisor ended it: either a stalled ring consumer with queued work, or a
+// dispatch owing a response with no running handler. Kind tells the two
+// apart.
+// It appears in Host.Events() event errors and, while that verdict is still
+// the plugin's most recent recorded transition, as HealthSnapshot.LastError.
+// errors.Is(err, ErrWedged) matches any *WedgedError; errors.As(err,
+// &wedgedErr) recovers which component wedged.
+type WedgedError struct {
+	Kind WedgeKind
+}
+
+func (e *WedgedError) Error() string {
+	const prefix = "styx: heartbeat classifier detected a wedged plugin: "
+
+	if e.Kind == WedgeDispatch {
+		return prefix + "dispatch-wedged (response owed with no running handler)"
+	}
+
+	return prefix + "transport-wedged (ring consumer stalled with queued work)"
+}
+
+// Is reports whether target is ErrWedged.
+func (e *WedgedError) Is(target error) bool {
+	return target == ErrWedged
+}
+
+// WedgeKind discriminates the two components a WedgedError can report as
+// stalled.
+type WedgeKind int
+
+const (
+	// WedgeTransport reports a stalled ring consumer: the plugin's consume
+	// counter is frozen while inbound work is still readable.
+	WedgeTransport WedgeKind = iota
+	// WedgeDispatch reports a stalled dispatch: a response is owed with no
+	// live handler lease renewing it.
+	WedgeDispatch
+)
+
 var (
 	// ErrPluginUnavailable reports that a call was not admitted because no live
 	// instance is routed for the named plugin — it isn't running, its prior
@@ -317,6 +380,16 @@ var (
 	// guard case cannot rule out a peer that already processed the stream, and
 	// reissuing blindly in that case could repeat a side effect.
 	ErrStreamAlreadyClosed = errors.New("styx: stream already closed")
+	// ErrHeartbeatsMissed reports that a plugin was declared unhealthy after
+	// missing enough consecutive heartbeats. errors.Is(err,
+	// ErrHeartbeatsMissed) matches any *MissedHeartbeatsError; errors.As
+	// recovers the exact count (see MissedHeartbeatsError).
+	ErrHeartbeatsMissed = errors.New("styx: missed consecutive heartbeats")
+	// ErrWedged reports that a plugin was declared unhealthy because its
+	// heartbeat classifier detected a stalled component. errors.Is(err,
+	// ErrWedged) matches any *WedgedError; errors.As recovers which
+	// component wedged (see WedgedError, WedgeKind).
+	ErrWedged = errors.New("styx: heartbeat classifier detected a wedged plugin")
 )
 
 // IsRetryable reports whether err represents a failure the caller may

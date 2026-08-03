@@ -132,8 +132,10 @@ var (
 	errDispatchWedged  = fmt.Errorf("%w: dispatch-wedged (response owed with no running handler)", errWedged)
 )
 
-// wedgeError maps a Classify WedgeKind to the EventUnhealthy sentinel it carries.
-func wedgeError(kind WedgeKind) error {
+// wedgeSentinel maps a Classify WedgeKind to its component-specific sentinel.
+// WedgedError.Error and WedgedError.Unwrap both read through this so the two
+// stay in lockstep instead of drifting apart.
+func wedgeSentinel(kind WedgeKind) error {
 	if kind == WedgeDispatch {
 		return errDispatchWedged
 	}
@@ -238,6 +240,42 @@ func (c *CrashInfo) Error() string {
 }
 
 func (c *CrashInfo) Unwrap() error { return c.Cause }
+
+// MissedHeartbeatsError reports that an instance went silent for
+// Config.MissedHeartbeats consecutive heartbeat waits.
+// It is heartbeatLoop's endErr for the missed-heartbeat verdict and what
+// EventUnhealthy carries for it; styx/host.go's translateEventErr converts
+// it into a public error at the Event.Err boundary rather than letting this
+// internal type cross it.
+type MissedHeartbeatsError struct {
+	// Missed is the consecutive miss count that reached Config.MissedHeartbeats.
+	Missed int
+}
+
+func (e *MissedHeartbeatsError) Error() string {
+	return fmt.Sprintf("supervisor: missed %d consecutive heartbeats", e.Missed)
+}
+
+// WedgedError reports that Classify's per-pair verdict persisted for the
+// wedge window, so heartbeatLoop ended the instance.
+// Kind names which component wedged (see WedgeKind). It is heartbeatLoop's
+// endErr for the wedge verdict and what EventUnhealthy carries for it;
+// styx/host.go's translateEventErr converts it into a public error at the
+// Event.Err boundary rather than letting this internal type cross it.
+// errors.Is(err, errWedged) matches any WedgedError regardless of Kind;
+// errors.Is against errTransportWedged/errDispatchWedged narrows to the
+// specific component that wedged.
+type WedgedError struct {
+	Kind WedgeKind
+}
+
+func (e *WedgedError) Error() string {
+	return wedgeSentinel(e.Kind).Error()
+}
+
+func (e *WedgedError) Unwrap() error {
+	return wedgeSentinel(e.Kind)
+}
 
 // Config is one plugin's full supervision configuration for spawn, heartbeat,
 // health, restart, and event delivery.
@@ -1033,7 +1071,7 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 					s.cfg.OnHeartbeatMiss((*current).generation)
 				}
 				if missed >= s.cfg.MissedHeartbeats {
-					reason := fmt.Errorf("supervisor: missed %d consecutive heartbeats", missed)
+					reason := &MissedHeartbeatsError{Missed: missed}
 					s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: reason, Gen: (*current).generation})
 
 					return false, reason
@@ -1109,7 +1147,7 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 			// so a slow host consumer can neither stretch a short stall into a wedge
 			// nor mask a real one.
 			if firedKind, fire := tracker.observe(class, wedge, sample.Sequence); fire {
-				reason := wedgeError(firedKind)
+				reason := &WedgedError{Kind: firedKind}
 				s.publish(Event{Kind: EventUnhealthy, Time: time.Now(), Err: reason, Gen: (*current).generation})
 
 				return false, reason
