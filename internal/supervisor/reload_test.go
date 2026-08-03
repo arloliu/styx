@@ -848,7 +848,7 @@ func newStdioFlood(t *testing.T) *stdioFlood {
 	require.NoError(t, err)
 
 	f := &stdioFlood{stdout: stdoutW, stderr: stderrW, done: make(chan struct{})}
-	f.capture = supervisor.NewStdioCapture(stdoutR, stderrR, stdioBlackHole{}, 4096, stdioFloodQueueLines)
+	f.capture = supervisor.NewStdioCapture(stdoutR, stderrR, nil, stdioBlackHole{}, 4096, stdioFloodQueueLines)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() {

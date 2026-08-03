@@ -949,9 +949,15 @@ func (s *Supervisor) newLiveInstance(
 
 	conn := control.NewConn(proc.ControlFD, generation)
 
+	// The tail is a tap rather than half of a fan-out Sink: it is what a crash
+	// reason is built from, so it must survive both a configured Stdio sink
+	// falling behind and the cancellation that ends delivery on the way to
+	// reporting that crash. A tap is written by the reader itself and sees
+	// neither.
 	stderrTail := newTailSink(stderrTailLines)
-	sink := newSpawnSink(stderrTail, s.cfg.Stdio)
-	capture := NewStdioCapture(proc.Stdout, proc.Stderr, sink, maxCapturedLineBytes, capturedBufferLines)
+	capture := NewStdioCapture(
+		proc.Stdout, proc.Stderr, stderrTail, s.cfg.Stdio, maxCapturedLineBytes, capturedBufferLines,
+	)
 	captureCtx, cancelCapture := context.WithCancel(lifeCtx)
 	captureDone := make(chan struct{})
 	go func() { defer close(captureDone); capture.Run(captureCtx) }()
@@ -1941,34 +1947,4 @@ func (s *tailSink) tail() []string {
 	copy(out, s.lines)
 
 	return out
-}
-
-// fanOutSink delivers each line to first, then second, in that order.
-//
-// deliverLine recovers a panic around its whole call into a Sink (see that
-// method's doc), so a panic in second unwinds out of this WriteLine call too
-// -- but only after first has already returned, so a panicking second can
-// never stop first from receiving the line. This is what lets newSpawnSink
-// put the crash-reason tail in first and a caller-supplied Sink in second:
-// the tail's own delivery cannot be lost to a bad user Sink.
-type fanOutSink struct {
-	first, second Sink
-}
-
-func (s *fanOutSink) WriteLine(stream string, line []byte) {
-	s.first.WriteLine(stream, line)
-	s.second.WriteLine(stream, line)
-}
-
-// newSpawnSink composes the crash-reason tail sink with an optional
-// caller-supplied Sink for one spawned instance, tail first (see
-// fanOutSink's doc for why the order matters). A nil user sink is the
-// common case (Config.Stdio unset) and skips the fan-out entirely, so the
-// unconfigured path costs nothing extra.
-func newSpawnSink(tail *tailSink, user Sink) Sink {
-	if user == nil {
-		return tail
-	}
-
-	return &fanOutSink{first: tail, second: user}
 }

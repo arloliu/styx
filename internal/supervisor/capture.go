@@ -30,8 +30,18 @@ type Sink interface {
 // Each delivery goroutine still exits on its own once its queue closes
 // and drains, or ctx is canceled; it only leaks if the Sink never
 // returns from WriteLine.
+//
+// A tap, unlike a Sink, is written by the reading goroutine itself, before
+// the line is queued. Everything the queue can do to a line — drop it when a
+// slow Sink has filled the queue, or strand it when cancellation ends
+// delivery with the queue non-empty — would otherwise apply equally to a
+// caller that must not lose the line at all. A tap must therefore be cheap
+// and must never block: it runs on the path that keeps the plugin's pipe
+// drained, so a slow tap does what the queue exists to prevent and backs up
+// into the plugin's own writes.
 type StdioCapture struct {
 	stdout, stderr io.Reader
+	tap            Sink
 	sink           Sink
 	maxLineBytes   int
 
@@ -49,10 +59,15 @@ type StdioCapture struct {
 // delivering to sink. maxLineBytes caps a single delivered line (a longer
 // line is truncated, not buffered unbounded); bufferLines bounds each
 // stream's pending-delivery queue.
-func NewStdioCapture(stdout, stderr io.Reader, sink Sink, maxLineBytes, bufferLines int) *StdioCapture {
+//
+// tap, which may be nil, sees every line the reader captures, synchronously
+// and before the queue — see the type doc for what that buys and what it
+// demands of the tap.
+func NewStdioCapture(stdout, stderr io.Reader, tap, sink Sink, maxLineBytes, bufferLines int) *StdioCapture {
 	return &StdioCapture{
 		stdout:       stdout,
 		stderr:       stderr,
+		tap:          tap,
 		sink:         sink,
 		maxLineBytes: maxLineBytes,
 		stdoutQueue:  make(chan []byte, bufferLines),
@@ -66,11 +81,13 @@ func NewStdioCapture(stdout, stderr io.Reader, sink Sink, maxLineBytes, bufferLi
 // for exactly which goroutines Run waits on.
 func (c *StdioCapture) Run(ctx context.Context) {
 	var wg sync.WaitGroup
-	wg.Go(func() { c.readLoop(c.stdout, c.stdoutQueue, &c.stdoutDropped) })
-	wg.Go(func() { c.readLoop(c.stderr, c.stderrQueue, &c.stderrDropped) })
+	wg.Go(func() { c.readLoop("stdout", c.stdout, c.stdoutQueue, &c.stdoutDropped) })
+	wg.Go(func() { c.readLoop("stderr", c.stderr, c.stderrQueue, &c.stderrDropped) })
 
-	go c.deliverLoop(ctx, "stdout", c.stdoutQueue, &c.stdoutPanicked)
-	go c.deliverLoop(ctx, "stderr", c.stderrQueue, &c.stderrPanicked)
+	if c.sink != nil {
+		go c.deliverLoop(ctx, "stdout", c.stdoutQueue, &c.stdoutPanicked)
+		go c.deliverLoop(ctx, "stderr", c.stderrQueue, &c.stderrPanicked)
+	}
 
 	wg.Wait()
 }
@@ -96,7 +113,11 @@ func (c *StdioCapture) PanicCount() (stdout, stderr uint64) {
 // itself never blocks on a slow Sink. It returns once r returns a
 // non-nil error (EOF included), closing queue so deliverLoop can observe
 // end-of-stream after draining whatever is still queued.
-func (c *StdioCapture) readLoop(r io.Reader, queue chan<- []byte, dropped *atomic.Uint64) {
+//
+// Any tap is written here, before the enqueue, so that what the tap keeps
+// does not depend on the queue draining or on delivery outliving a
+// cancellation.
+func (c *StdioCapture) readLoop(stream string, r io.Reader, queue chan<- []byte, dropped *atomic.Uint64) {
 	defer close(queue)
 
 	br := bufio.NewReader(r)
@@ -104,10 +125,18 @@ func (c *StdioCapture) readLoop(r io.Reader, queue chan<- []byte, dropped *atomi
 		line, err := readLine(br, c.maxLineBytes)
 		if len(line) > 0 {
 			cpy := append([]byte(nil), line...)
-			select {
-			case queue <- cpy:
-			default:
-				dropped.Add(1)
+			if c.tap != nil {
+				c.tap.WriteLine(stream, cpy)
+			}
+			// With no Sink there is nothing to deliver to, and queueing anyway
+			// would fill the queue once and then count every later line as
+			// dropped — reporting loss against a Sink that was never asked for.
+			if c.sink != nil {
+				select {
+				case queue <- cpy:
+				default:
+					dropped.Add(1)
+				}
 			}
 		}
 		if err != nil {
