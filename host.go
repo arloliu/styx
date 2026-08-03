@@ -369,12 +369,20 @@ type Host struct {
 	// user Logger synchronously on the event relay. obsCtx/obsCancel bound both
 	// dispatcher goroutines and every per-plugin reporter, all joined (within a
 	// bound) via obsWG on Stop.
+	//
+	// The per-plugin reporters are tracked in obsProducerWG rather than obsWG
+	// because the metrics dispatcher waits for them itself, through its producer
+	// join, before it cuts off and publishes its final drop count — a wait that
+	// would deadlock on a WaitGroup holding the dispatcher's own goroutine. Every
+	// Add to it happens in startPlugin under h.mu, which no longer admits a start
+	// once a Stop has set stopRequested, so the release below cannot race one in.
 	metricsDisp     *observeq.Dispatcher[observe.MetricsSink]
 	logDisp         *observeq.Dispatcher[observe.Logger]
 	metricsInterval time.Duration
 	obsCtx          context.Context
 	obsCancel       context.CancelFunc
 	obsWG           sync.WaitGroup
+	obsProducerWG   sync.WaitGroup
 }
 
 // pluginRuntime is the host-side handle to one supervised plugin: the
@@ -456,12 +464,24 @@ func NewHost(cfg HostConfig) *Host {
 	}
 	if cfg.Metrics != nil {
 		h.metricsDisp = observeq.NewDispatcher(cfg.Metrics, metricsBufferSize)
+		h.metricsDisp.SetDropReporter(h.metricsInterval, h.observeDroppedReporter("metrics"))
+		// The per-plugin reporters share obsCtx with this dispatcher, so ending it
+		// starts them unwinding but does not finish them. Waiting for that unwind
+		// before the cutoff is what leaves nothing able to submit past the final
+		// drop report; the reporters read atomic counter snapshots and submit
+		// without blocking, so the wait is over as soon as they observe the cancel.
+		h.metricsDisp.SetProducerJoin(h.obsProducerWG.Wait)
 		h.obsWG.Go(func() {
 			h.metricsDisp.Run(h.obsCtx)
 		})
 	}
 	if cfg.Logger != nil {
 		h.logDisp = observeq.NewDispatcher(cfg.Logger, logBufferSize)
+		h.logDisp.SetDropReporter(h.metricsInterval, h.observeDroppedReporter("log"))
+		// No producer join: this dispatcher's only producers are the per-plugin
+		// event relays (logEvent), and the release below runs only once every
+		// runtime's relay has been joined and unsubscribed (completeTeardown), so
+		// they are already stopped before obsCtx ends.
 		h.obsWG.Go(func() {
 			h.logDisp.Run(h.obsCtx)
 		})
@@ -631,9 +651,11 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 
 	// The per-plugin periodic reporter runs only when a sink is configured; it is
 	// bound to the host metrics context so Stop joins it. Started only on success,
-	// so a failed start leaves no reporter behind.
+	// so a failed start leaves no reporter behind. It is a producer for the metrics
+	// dispatcher, so it is tracked in the producer group the dispatcher itself
+	// waits on before its final drop report (see obsProducerWG).
 	if h.metricsDisp != nil {
-		h.obsWG.Go(func() {
+		h.obsProducerWG.Go(func() {
 			cc.runMetricsReporter(h.obsCtx, h.metricsDisp, h.metricsInterval)
 		})
 	}
@@ -680,6 +702,8 @@ func (h *Host) supervisorConfig(spec PluginSpec, cc *ClientConn, origin uint64) 
 		OnHeartbeatOK:            h.heartbeatOKHook(spec.Name, origin),
 		OnRestart:                h.restartHook(spec.Name),
 		OnReloadDropped:          h.reloadDroppedHook(spec.Name),
+		OnStdioDropped:           h.stdioDroppedHook(spec.Name),
+		OnStdioPanicked:          h.stdioPanickedHook(spec.Name),
 		// The reload transaction drives the SAME admission gate a caller's
 		// Invoke checks, so a cutoff a reload begins is the cutoff Invoke
 		// observes. internal/supervisor never names *ClientConn; it holds only
@@ -974,7 +998,11 @@ func (h *Host) watchJoin(rt *pluginRuntime) {
 // The observability half is a no-op when neither a sink nor a logger was
 // configured (obsCancel stays nil); its join is bounded, so a user sink or logger
 // call wedged inside a dispatcher can never stall past obsShutdownBound (see
-// joinBounded).
+// joinBounded). One cancel ends the dispatchers and the per-plugin reporters
+// together, and the dispatchers order themselves behind the reporters (see
+// obsProducerWG), so the final drop count each publishes is one nothing can add
+// to afterward. That ordering is the dispatcher's own and holds whether or not
+// this bounded join outlives it.
 //
 // The Events() subscription is ended last, so the event stream stays open for
 // every earlier step of the teardown. By the time it is ended, each plugin's relay

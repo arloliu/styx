@@ -70,6 +70,10 @@ type PluginServer struct {
 	// cadence.
 	metrics         *observeq.Dispatcher[observe.MetricsSink]
 	metricsInterval time.Duration
+	// metricsSink is the raw sink metrics wraps, held separately because the
+	// dispatcher's self-report hook (SetDropReporter) must call it directly,
+	// bypassing the same queue whose loss it is reporting. nil when metrics is nil.
+	metricsSink observe.MetricsSink
 
 	// continueAfterPanic is the handler-panic policy from PluginServerConfig, fixed
 	// at construction and read once when the serving session builds its
@@ -114,7 +118,9 @@ func NewPluginServer(cfg PluginServerConfig) *PluginServer {
 		consumeFaultRunThreshold: cfg.ConsumeFaultRunThreshold,
 	}
 	if cfg.Metrics != nil {
+		s.metricsSink = cfg.Metrics
 		s.metrics = observeq.NewDispatcher(cfg.Metrics, metricsBufferSize)
+		s.metrics.SetDropReporter(s.metricsInterval, s.observeDroppedReporter())
 	}
 
 	return s
@@ -292,6 +298,13 @@ func (s *PluginServer) runServing(
 	// so that join is unbounded. The dispatcher join stays bounded (a user sink call
 	// wedged inside it can never stall teardown, and the dispatcher touches no
 	// transport state), so it runs in the deferred backstop.
+	//
+	// The dispatcher runs the same stopReporter as its producer join, so it cuts off
+	// and publishes its final drop count only once the reporter — its one producer —
+	// has stopped. Reaching that path through the shared cancel alone would leave the
+	// reporter free to submit into an already-reported dispatcher, losing exactly the
+	// drops a shutdown causes. The once makes the two callers idempotent: whichever
+	// arrives second blocks until the first's cancel-and-join has finished.
 	stopReporter := func() {}
 	if s.metrics != nil {
 		metricsCtx, metricsCancel := context.WithCancel(ctx)
@@ -301,7 +314,9 @@ func (s *PluginServer) runServing(
 			joinBounded(&dispWG, obsShutdownBound)
 		}()
 		var stopOnce sync.Once
-		stopReporter = func() { stopOnce.Do(func() { metricsCancel(); repWG.Wait() }) }
+		stop := func() { stopOnce.Do(func() { metricsCancel(); repWG.Wait() }) }
+		stopReporter = stop
+		s.metrics.SetProducerJoin(stop)
 		dispWG.Add(1)
 		go func() { defer dispWG.Done(); s.metrics.Run(metricsCtx) }()
 		repWG.Add(1)

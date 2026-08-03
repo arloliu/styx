@@ -10,12 +10,14 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/arloliu/styx/internal/control"
+	"github.com/arloliu/styx/internal/control/controlpb"
 	"github.com/arloliu/styx/internal/lifecycle"
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/supervisor"
@@ -528,6 +530,429 @@ func TestSupervisor_CallsOnRestart_PerRestartDecision(t *testing.T) {
 	}
 	require.Equal(t, maxRestarts, restartingCount, "expected one Restarting per allowed restart")
 	require.Equal(t, int64(restartingCount), restarts.Load(), "OnRestart must fire once per restart decision")
+}
+
+// stdioBlackHole is a Sink whose WriteLine never returns, forcing
+// StdioCapture's delivery queue to fill and drop lines rather than ever
+// draining it -- the "sink falls behind" case the queue's drop policy exists
+// for, forced deterministically rather than relying on a slow but
+// eventually-returning sink.
+type stdioBlackHole struct{}
+
+func (stdioBlackHole) WriteLine(string, []byte) { select {} }
+
+// Test Config.OnStdioDropped delivering the real, accumulated stdio-drop
+// count a plugin spraying stdout while its Sink falls behind produces --
+// reported at the heartbeat loop's own cadence, not once per dropped line.
+func TestSupervisor_CallsOnStdioDropped_WithRealDroppedLines(t *testing.T) {
+	// Given: a shell wrapper that floods stdout with far more lines than
+	// StdioCapture's delivery queue (capturedBufferLines) can ever hold, then
+	// execs into the real readyplugin fixture so the handshake and heartbeat
+	// loop still run. The configured Sink never drains, so every flooded
+	// line beyond the queue bound is a real, not simulated, drop.
+	const floodLines = 2000
+	bus := supervisor.NewEventBus()
+
+	var stdoutDropped, stderrDropped atomic.Uint64
+	reported := make(chan struct{}, 1)
+	cfg := supervisor.Config{
+		Spec: lifecycle.Spec{
+			Path: "/bin/sh",
+			Args: []string{"-c",
+				fmt.Sprintf("for i in $(seq 1 %d); do echo line-$i; done; exec %s", floodLines, fixtureReadyPlugin)},
+		},
+		Stdio: stdioBlackHole{},
+		OnStdioDropped: func(stdout, stderr uint64) {
+			stdoutDropped.Add(stdout)
+			stderrDropped.Add(stderr)
+			select {
+			case reported <- struct{}{}:
+			default:
+			}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go sup.Run(ctx)
+
+	// When / Then: OnStdioDropped fires with a positive stdout count, once the
+	// heartbeat loop's first iteration reports the drop that already
+	// happened before the plugin ever reached Ready.
+	select {
+	case <-reported:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected OnStdioDropped to fire")
+	}
+	require.Positive(t, stdoutDropped.Load())
+	require.Zero(t, stderrDropped.Load(), "the flood only wrote to stdout")
+
+	// Stop while ctx is still live: Stop's own graceful Shutdown exchange
+	// needs a live control connection to negotiate over. Letting a deferred
+	// or Cleanup-registered cancel race ahead of it (t.Context() is itself
+	// canceled just before Cleanup functions run) would abort that exchange
+	// and fall back to the same reply-deadline path a lost connection takes,
+	// turning a sub-millisecond teardown into one bounded by
+	// control.ReplyDeadlines[control.KindShutdown].
+	_ = sup.Stop(context.Background())
+}
+
+// stdioPanicker is a Sink whose WriteLine always panics, forcing
+// StdioCapture's delivery goroutine to recover a real panic on every captured
+// line rather than a simulated one -- the "sink itself is broken" case
+// StdioCapture.PanicCount exists to count.
+type stdioPanicker struct{}
+
+func (stdioPanicker) WriteLine(string, []byte) { panic("boom") }
+
+// Test Config.OnStdioPanicked delivering the real, accumulated stdio-sink-panic
+// count a plugin writing to stdout while its Sink panics on every line
+// produces -- reported at the heartbeat loop's own cadence, not once per panic.
+func TestSupervisor_CallsOnStdioPanicked_WithRealPanicCount(t *testing.T) {
+	// Given: a shell wrapper that writes one line to stdout, then execs into
+	// the real readyplugin fixture so the handshake and heartbeat loop still
+	// run. The configured Sink panics on every WriteLine, so the captured
+	// line's delivery is a real, not simulated, Sink panic.
+	bus := supervisor.NewEventBus()
+
+	var stdoutPanicked, stderrPanicked atomic.Uint64
+	reported := make(chan struct{}, 1)
+	cfg := supervisor.Config{
+		Spec: lifecycle.Spec{
+			Path: "/bin/sh",
+			Args: []string{"-c", fmt.Sprintf("echo boom; exec %s", fixtureReadyPlugin)},
+		},
+		Stdio: stdioPanicker{},
+		OnStdioPanicked: func(stdout, stderr uint64) {
+			stdoutPanicked.Add(stdout)
+			stderrPanicked.Add(stderr)
+			select {
+			case reported <- struct{}{}:
+			default:
+			}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go sup.Run(ctx)
+
+	// When / Then: OnStdioPanicked fires with a positive stdout count, once
+	// the heartbeat loop's first iteration reports the panic that already
+	// happened before the plugin ever reached Ready.
+	select {
+	case <-reported:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected OnStdioPanicked to fire")
+	}
+	require.Positive(t, stdoutPanicked.Load())
+	require.Zero(t, stderrPanicked.Load(), "the flood only wrote to stdout")
+
+	// Stop while ctx is still live: Stop's own graceful Shutdown exchange
+	// needs a live control connection to negotiate over. Letting a deferred
+	// or Cleanup-registered cancel race ahead of it (t.Context() is itself
+	// canceled just before Cleanup functions run) would abort that exchange
+	// and fall back to the same reply-deadline path a lost connection takes,
+	// turning a sub-millisecond teardown into one bounded by
+	// control.ReplyDeadlines[control.KindShutdown].
+	_ = sup.Stop(context.Background())
+}
+
+// finalStdioHarness drives one instance's stdio reporting with no child
+// process: a real StdioCapture over pipes the test writes itself, a socketpair
+// control conn whose plugin end never sends a heartbeat, and the spawn seam
+// handing both to the Supervisor. Because no heartbeat ever arrives and the
+// heartbeat interval outlasts the test, the heartbeat loop parks in its receive
+// after its first sample and cannot sample again until the test ends the
+// instance -- which is what places a flood of dropped lines strictly inside the
+// interval the loop will never report, the interval a real crash flood lands in.
+type finalStdioHarness struct {
+	sup         *supervisor.Supervisor
+	capture     *supervisor.StdioCapture
+	stdout      *os.File // write end of the captured stdout pipe
+	stderr      *os.File // write end of the captured stderr pipe
+	captureDone chan struct{}
+	peer        *control.Conn // the plugin end of the control socketpair
+	runDone     chan struct{}
+
+	mu       sync.Mutex
+	reported uint64 // every stdout-drop delta OnStdioDropped has reported, summed
+}
+
+// finalStdioQueueLines is the harness capture's per-stream delivery-queue
+// bound. Small on purpose: with a Sink that never returns, a handful of written
+// lines is already a real overflow, so the test needs no flood of thousands.
+const finalStdioQueueLines = 4
+
+func setupFinalStdioHarness(t *testing.T) *finalStdioHarness {
+	t.Helper()
+
+	stdoutR, stdoutW, err := os.Pipe()
+	require.NoError(t, err)
+	stderrR, stderrW, err := os.Pipe()
+	require.NoError(t, err)
+
+	h := &finalStdioHarness{
+		stdout: stdoutW, stderr: stderrW,
+		captureDone: make(chan struct{}), runDone: make(chan struct{}),
+	}
+
+	// The Sink never returns, so every line past the queue bound is a real
+	// drop rather than a simulated one.
+	h.capture = supervisor.NewStdioCapture(stdoutR, stderrR, stdioBlackHole{}, 4096, finalStdioQueueLines)
+	captureCtx, cancelCapture := context.WithCancel(context.Background())
+	t.Cleanup(cancelCapture)
+	go func() { defer close(h.captureDone); h.capture.Run(captureCtx) }()
+
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	hostConn := control.NewConn(fds[0], 1)
+	h.peer = control.NewConn(fds[1], 1)
+	t.Cleanup(func() { _ = h.peer.Close() })
+
+	cfg := supervisor.Config{
+		// No heartbeat ever arrives, so this is how long the loop parks in its
+		// receive: long enough that only the test can end that park.
+		HeartbeatInterval: 10 * time.Second,
+		MissedHeartbeats:  100,
+		OnStdioDropped: func(stdout, _ uint64) {
+			h.mu.Lock()
+			h.reported += stdout
+			h.mu.Unlock()
+		},
+	}
+	h.sup = supervisor.New(cfg, supervisor.NewEventBus())
+	h.sup.SetSpawnForTest(func(
+		_, _ context.Context, _ uint64, _ bool,
+	) (*supervisor.FakeInstance, error) {
+		return &supervisor.FakeInstance{
+			Conn:    hostConn,
+			Capture: h.capture,
+			Promote: func() supervisor.ReadyHooks { return supervisor.ReadyHooks{} },
+			Teardown: func(context.Context, time.Duration) (*os.ProcessState, error) {
+				_ = hostConn.Close()
+				// Nothing to reap: this instance is in-process, and no test here
+				// asserts on an exit status.
+				var reaped *os.ProcessState
+
+				return reaped, nil
+			},
+		}, nil
+	})
+
+	return h
+}
+
+// writeLines writes n lines to the captured stdout pipe.
+func (h *finalStdioHarness) writeLines(t *testing.T, n int) {
+	t.Helper()
+
+	for i := range n {
+		_, err := fmt.Fprintf(h.stdout, "line-%d\n", i)
+		require.NoError(t, err)
+	}
+}
+
+// awaitDroppedLines waits until the capture has actually dropped a line, so a
+// test that needs the heartbeat loop's first sample to see a drop does not race
+// the capture's own reader.
+func (h *finalStdioHarness) awaitDroppedLines(t *testing.T) uint64 {
+	t.Helper()
+
+	var dropped uint64
+	require.Eventually(t, func() bool {
+		dropped, _ = h.capture.DroppedCount()
+
+		return dropped > 0
+	}, 5*time.Second, 5*time.Millisecond, "the written lines never overflowed the delivery queue")
+
+	return dropped
+}
+
+// sealCapture closes both pipes and waits for the capture's readers to finish,
+// so the drop counts it then reports are final and cannot move under the
+// assertions.
+func (h *finalStdioHarness) sealCapture(t *testing.T) uint64 {
+	t.Helper()
+
+	require.NoError(t, h.stdout.Close())
+	require.NoError(t, h.stderr.Close())
+	select {
+	case <-h.captureDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stdio capture never finished reading after both pipes closed")
+	}
+	dropped, _ := h.capture.DroppedCount()
+
+	return dropped
+}
+
+// awaitReport waits until OnStdioDropped has reported at least want lines in
+// total.
+func (h *finalStdioHarness) awaitReport(t *testing.T, want uint64) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+
+		return h.reported >= want
+	}, 5*time.Second, 5*time.Millisecond, "expected OnStdioDropped to report at least %d dropped lines", want)
+}
+
+// reportsSoFar is the running total OnStdioDropped has reported.
+func (h *finalStdioHarness) reportsSoFar() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.reported
+}
+
+// awaitRunReturned fails the test unless Run has joined.
+func (h *finalStdioHarness) awaitRunReturned(t *testing.T) {
+	t.Helper()
+
+	select {
+	case <-h.runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run never returned")
+	}
+}
+
+// Test the stdio drops of the interval a crash ends still being reported: they
+// happen after the heartbeat loop's last sample, and a restarted successor's
+// counts start from its own capture's zero, so nothing after the crash can
+// recover them.
+func TestSupervisor_ReportsStdioDrops_FromTheIntervalACrashEnds(t *testing.T) {
+	// Given: a served instance whose heartbeat loop has already taken its one
+	// sample, with the drops that sample saw already reported.
+	h := setupFinalStdioHarness(t)
+	h.writeLines(t, finalStdioQueueLines+8)
+	seeded := h.awaitDroppedLines(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	go func() { defer close(h.runDone); h.sup.Run(ctx) }()
+
+	h.awaitReport(t, seeded)
+	beforeFlood := h.reportsSoFar()
+
+	// When: more lines are dropped while that loop is parked in its receive,
+	// and the instance then crashes without it ever sampling again.
+	h.writeLines(t, 16)
+	finalDropped := h.sealCapture(t)
+	require.Greater(t, finalDropped, beforeFlood, "the flood must have dropped lines the loop never sampled")
+
+	require.NoError(t, h.peer.Close()) // the plugin end goes away: a crash to the loop.
+	h.awaitRunReturned(t)
+
+	// Then: every dropped line was reported, the flood included.
+	require.Equal(t, finalDropped, h.reportsSoFar(),
+		"the drops of the interval the crash ended must still be reported")
+}
+
+// Test the same for the interval a Stop ends: Stop is observed at the top of a
+// heartbeat-loop iteration, before that iteration would sample, so the drops
+// since the previous sample are reported only by the report that follows
+// teardown.
+func TestSupervisor_ReportsStdioDrops_FromTheIntervalAStopEnds(t *testing.T) {
+	// Given: a served instance whose heartbeat loop has already taken its one
+	// sample, with the drops that sample saw already reported.
+	h := setupFinalStdioHarness(t)
+	h.writeLines(t, finalStdioQueueLines+8)
+	seeded := h.awaitDroppedLines(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	go func() { defer close(h.runDone); h.sup.Run(ctx) }()
+
+	h.awaitReport(t, seeded)
+	beforeFlood := h.reportsSoFar()
+
+	// When: more lines are dropped while that loop is parked in its receive,
+	// and the supervisor is then stopped.
+	h.writeLines(t, 16)
+	finalDropped := h.sealCapture(t)
+	require.Greater(t, finalDropped, beforeFlood, "the flood must have dropped lines the loop never sampled")
+
+	// A Stop whose own context is already spent still latches the stop state
+	// before it returns, so the wake-up that follows it can never be the one
+	// that races it: the loop is guaranteed to see the stop, not to sample.
+	spent, cancelSpent := context.WithCancel(context.Background())
+	cancelSpent()
+	require.ErrorIs(t, h.sup.Stop(spent), context.Canceled)
+
+	// Wake the parked receive with a message the loop ignores, so the stop is
+	// observed now rather than a heartbeat interval from now.
+	require.NoError(t, h.peer.Send(context.Background(), &controlpb.ControlMessage{
+		Body: &controlpb.ControlMessage_HeartbeatAck{HeartbeatAck: &controlpb.HeartbeatAck{}},
+	}))
+	h.awaitRunReturned(t)
+
+	// Then: every dropped line was reported, the flood included.
+	require.Equal(t, finalDropped, h.reportsSoFar(),
+		"the drops of the interval the Stop ended must still be reported")
+}
+
+// Test the stdio drops of a spawn that never reached Ready still being
+// reported. That capture's whole life is the failed spawn: no instance is
+// returned from it, so no heartbeat loop ever samples it and no later
+// generation inherits its counts — a plugin that sprayed output and then failed
+// its handshake would otherwise be indistinguishable from one that printed
+// nothing.
+func TestSupervisor_ReportsStdioDrops_WhenSpawnFailsBeforeReady(t *testing.T) {
+	// Given: a process that floods stdout with far more lines than
+	// StdioCapture's delivery queue (capturedBufferLines) can hold and then
+	// exits without ever answering the handshake, so the host's own Hello
+	// exchange fails only once the whole flood has been written. The configured
+	// Sink never drains, so every line past the queue bound is a real drop.
+	// Restarts are disabled, so exactly one spawn happens and the report this
+	// test waits for can only be that spawn's own final one.
+	const floodLines = 2000
+	bus := supervisor.NewEventBus()
+
+	var stdoutDropped, stderrDropped atomic.Uint64
+	reported := make(chan struct{}, 1)
+	cfg := supervisor.Config{
+		Spec: lifecycle.Spec{
+			Path: "/bin/sh",
+			Args: []string{"-c", fmt.Sprintf("for i in $(seq 1 %d); do echo line-$i; done", floodLines)},
+		},
+		Restart: supervisor.RestartPolicy{Max: 0},
+		Stdio:   stdioBlackHole{},
+		OnStdioDropped: func(stdout, stderr uint64) {
+			stdoutDropped.Add(stdout)
+			stderrDropped.Add(stderr)
+			select {
+			case reported <- struct{}{}:
+			default:
+			}
+		},
+	}
+	sup := supervisor.New(cfg, bus)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	// When / Then: the drops of the failed spawn are reported, even though the
+	// instance never became one the heartbeat loop could supervise.
+	select {
+	case <-reported:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a spawn that failed before Ready must still report the lines its capture dropped")
+	}
+	require.Positive(t, stdoutDropped.Load())
+	require.Zero(t, stderrDropped.Load(), "the flood only wrote to stdout")
+
+	select {
+	case <-runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not give up after its only spawn attempt failed")
+	}
 }
 
 // Test Supervisor making full restart-then-GaveUp progress even with a

@@ -3,6 +3,7 @@ package supervisor_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
@@ -112,6 +113,13 @@ type spawner struct {
 	beforeSend    func(seq uint64)   // if set, each peer calls it before sending a heartbeat, letting a test pace it.
 	captureNotify func(func())       // if set, each instance hands its NotifyConnLost closure here at promote.
 
+	// captureFor, if set, supplies the StdioCapture the instance of each spawn
+	// call carries, keyed by that call's index. It is what lets a reload test
+	// drive real stdio drops against one specific generation. Left nil, no
+	// instance has a capture, as a spawn that never got far enough to create one
+	// has none either.
+	captureFor func(idx int) *supervisor.StdioCapture
+
 	mu              sync.Mutex
 	calls           int
 	peers           []*scriptedPeer
@@ -176,8 +184,14 @@ func (sp *spawner) spawn(
 		return sp.router.onReady(supervisor.Instance{Generation: generation})
 	}
 
+	var capture *supervisor.StdioCapture
+	if sp.captureFor != nil {
+		capture = sp.captureFor(idx)
+	}
+
 	return &supervisor.FakeInstance{
-		Conn: hostConn, Promote: promote, Teardown: teardown, CaptureNotify: sp.captureNotify,
+		Conn: hostConn, Promote: promote, Teardown: teardown,
+		CaptureNotify: sp.captureNotify, Capture: capture,
 	}, nil
 }
 
@@ -808,6 +822,166 @@ func TestSupervisor_Reload_KeepsOldServing_WhenRestoreRefused(t *testing.T) {
 	sp.restoreReady = true
 	require.NoError(t, sup.Reload(t.Context()))
 	require.Equal(t, uint64(3), router.state.Load().generation)
+}
+
+// stdioFlood is one instance's real StdioCapture over pipes the test writes
+// itself, delivering to a Sink that never returns: every line past the queue
+// bound is a real drop rather than a simulated one. It stands in for a plugin
+// generation spraying output faster than its Sink can take it.
+type stdioFlood struct {
+	capture        *supervisor.StdioCapture
+	stdout, stderr *os.File // write ends of the captured pipes
+	done           chan struct{}
+}
+
+// stdioFloodQueueLines is a flood capture's per-stream delivery-queue bound.
+// Small on purpose: with a Sink that never returns, a handful of written lines
+// is already a real overflow, so no flood of thousands is needed.
+const stdioFloodQueueLines = 4
+
+func newStdioFlood(t *testing.T) *stdioFlood {
+	t.Helper()
+
+	stdoutR, stdoutW, err := os.Pipe()
+	require.NoError(t, err)
+	stderrR, stderrW, err := os.Pipe()
+	require.NoError(t, err)
+
+	f := &stdioFlood{stdout: stdoutW, stderr: stderrW, done: make(chan struct{})}
+	f.capture = supervisor.NewStdioCapture(stdoutR, stderrR, stdioBlackHole{}, 4096, stdioFloodQueueLines)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		_ = stdoutW.Close()
+		_ = stderrW.Close()
+	})
+	go func() { defer close(f.done); f.capture.Run(ctx) }()
+
+	return f
+}
+
+// floodAndSeal writes more lines than the delivery queue can hold, then closes
+// both pipes and waits for the capture's readers to finish, and returns the
+// drop count — final by then, so it cannot move under a later assertion. It
+// reports zero rather than failing if the flood never overflowed, because the
+// reload paths call it from the heartbeat loop's own goroutine, where a
+// testing.T assertion is not allowed; the caller asserts on what it returns.
+func (f *stdioFlood) floodAndSeal() uint64 {
+	for i := range stdioFloodQueueLines + 8 {
+		if _, err := fmt.Fprintf(f.stdout, "line-%d\n", i); err != nil {
+			return 0
+		}
+	}
+	_ = f.stdout.Close()
+	_ = f.stderr.Close()
+
+	select {
+	case <-f.done:
+	case <-time.After(5 * time.Second):
+		return 0
+	}
+	dropped, _ := f.capture.DroppedCount()
+
+	return dropped
+}
+
+// Test a reload reporting the retired predecessor's final stdio drops. The
+// heartbeat loop keeps running past that teardown against the promoted
+// successor, and its next sample rebaselines onto the successor's own capture,
+// so what the predecessor dropped after the loop's last sample of it is
+// reported by the teardown or by nobody.
+func TestSupervisor_Reload_ReportsPredecessorFinalStdioDrops(t *testing.T) {
+	// Given: both generations carry a real stdio capture, and the predecessor's
+	// floods only once its own routing teardown has begun — after the successor
+	// was promoted, so the loop can never sample that capture again.
+	admission := &lifecycle.AdmissionGate{}
+	router := &fakeRouter{admission: admission}
+	sp := newSpawner(t, router)
+
+	floods := []*stdioFlood{newStdioFlood(t), newStdioFlood(t)}
+	sp.captureFor = func(idx int) *supervisor.StdioCapture { return floods[idx].capture }
+
+	var predecessorDropped atomic.Uint64
+	router.onStopAdmission = func(generation uint64) {
+		if generation == 1 {
+			predecessorDropped.Store(floods[0].floodAndSeal())
+		}
+	}
+
+	var mu sync.Mutex
+	var reported uint64
+	cfg := reloadConfig(router)
+	cfg.OnStdioDropped = func(stdout, _ uint64) {
+		mu.Lock()
+		reported += stdout
+		mu.Unlock()
+	}
+	sup, _, cleanup := runReloadSupervisor(t, sp, cfg)
+	defer cleanup()
+
+	// When: the reload promotes the successor and retires the predecessor.
+	require.NoError(t, sup.Reload(t.Context()))
+
+	// Then: every line the predecessor dropped was reported. Only its own
+	// teardown could have done it — the successor's capture dropped nothing, and
+	// a sample of it would have rebaselined the predecessor's counts away.
+	dropped := predecessorDropped.Load()
+	require.Positive(t, dropped, "the predecessor's flood must have overflowed its delivery queue")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, dropped, reported,
+		"a reload must report what the predecessor it retires dropped since the last sample")
+}
+
+// Test a rolled-back reload reporting the discarded successor's final stdio
+// drops. That successor was never promoted, so the heartbeat loop never sampled
+// its capture and no later generation inherits its counts: its rollback
+// teardown is the only report it will ever get.
+func TestSupervisor_Reload_ReportsRollbackSuccessorFinalStdioDrops(t *testing.T) {
+	// Given: a successor that will refuse the snapshot, whose capture has
+	// already dropped lines by the time the rollback tears it down.
+	admission := &lifecycle.AdmissionGate{}
+	router := &fakeRouter{admission: admission}
+	sp := newSpawner(t, router)
+	sp.restoreReady = false
+	sp.restoreReason = "incompatible snapshot format"
+
+	floods := []*stdioFlood{newStdioFlood(t), newStdioFlood(t)}
+	var successorDropped atomic.Uint64
+	sp.captureFor = func(idx int) *supervisor.StdioCapture {
+		if idx == 1 {
+			successorDropped.Store(floods[idx].floodAndSeal())
+		}
+
+		return floods[idx].capture
+	}
+
+	var mu sync.Mutex
+	var reported uint64
+	cfg := reloadConfig(router)
+	cfg.OnStdioDropped = func(stdout, _ uint64) {
+		mu.Lock()
+		reported += stdout
+		mu.Unlock()
+	}
+	sup, _, cleanup := runReloadSupervisor(t, sp, cfg)
+	defer cleanup()
+
+	// When: the reload rolls back and discards the successor.
+	require.ErrorContains(t, sup.Reload(t.Context()), "incompatible snapshot format")
+	require.True(t, sp.torn[1].Load(), "the refused successor must have been torn down by the rollback")
+
+	// Then: every line that successor dropped was reported, even though it never
+	// routed a call and never became the loop's current instance.
+	dropped := successorDropped.Load()
+	require.Positive(t, dropped, "the successor's flood must have overflowed its delivery queue")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, dropped, reported,
+		"a rollback must report what the successor it discards dropped")
 }
 
 // Test a rolled-back reload's later lifecycle event still naming the resumed

@@ -22,6 +22,15 @@ const labelPlugin = "plugin"
 // the class's identity in the arena's ascending class table (shm-abi.md §2).
 const labelSlabSize = "slab_size"
 
+// labelStream is the metric label key carrying which stdio stream ("stdout" or
+// "stderr") a per-stream signal is about.
+const labelStream = "stream"
+
+// labelDispatcher is the metric label key naming which observability
+// dispatcher (metricsDisp or logDisp) a self-reported drop count belongs to:
+// "metrics" or "log".
+const labelDispatcher = "dispatcher"
+
 // metricsBufferSize bounds each MetricsSink dispatcher's pending-event queue.
 // Beyond it the dispatcher drops oldest (counted), so a slow sink never stalls a
 // caller; sized generously because a submit is a cheap channel send and events
@@ -549,6 +558,42 @@ func (s *PluginServer) reportArenaCarries(
 	return cur
 }
 
+// observeDroppedReporter returns the callback the plugin's metrics dispatcher's
+// self-report hook (see observeq.Dispatcher.SetDropReporter) calls with its own
+// cumulative dropped count, or nil when no metrics sink is configured — there is
+// nowhere to report to.
+// It calls s.metricsSink directly rather than going through s.metrics.Submit:
+// routing the dispatcher's own drop count through the very queue that drops
+// events would make the counter that reports loss itself capable of being lost, a
+// lower bound on a lower bound. It runs on the dispatcher's own Run goroutine (see
+// SetDropReporter), so it must not block; it only ever calls the sink.
+// A plugin process owns exactly one dispatcher (there is no plugin-side log
+// dispatcher — PluginServerConfig has no Logger field), so the dispatcher label is
+// always "metrics"; it is still attached so the metric's label contract (see
+// observe.MetricObserveDropped) reads the same on either side of the process
+// boundary.
+// The returned closure is called from a single goroutine only (Run never runs two
+// ticks concurrently), so the plain local "last" baseline it closes over needs no
+// synchronization.
+func (s *PluginServer) observeDroppedReporter() func(dropped uint64) {
+	if s.metricsSink == nil {
+		return nil
+	}
+
+	var last uint64
+
+	return func(dropped uint64) {
+		delta := counterDelta(dropped, last)
+		last = dropped
+		if delta == 0 {
+			return
+		}
+		//nolint:gosec // per-interval delta of a dropped-event count; never overflows int64.
+		s.metricsSink.IncrCounter(observe.MetricObserveDropped, int64(delta),
+			observe.Label{Key: labelDispatcher, Value: "metrics"})
+	}
+}
+
 // restartHook returns the supervisor's restart-decision observability callback for
 // the named plugin, or nil when no sink is configured (so the supervisor's own nil
 // check skips it). The callback runs on the supervisor Run goroutine at the
@@ -622,6 +667,99 @@ func (h *Host) reloadDroppedHook(name string) func(int) {
 		h.metricsDisp.Submit(func(s observe.MetricsSink) {
 			s.IncrCounter(observe.MetricReloadDropped, int64(dropped), observe.Label{Key: labelPlugin, Value: name})
 		})
+	}
+}
+
+// stdioDroppedHook returns the supervisor's per-heartbeat-loop-iteration
+// stdio-drop observability callback for the named plugin, or nil when no sink
+// is configured (so the supervisor's own nil check skips it). The supervisor
+// calls it with the delta accumulated since its last call, at its own
+// heartbeat-loop cadence rather than per dropped line: lines drop exactly when
+// a plugin is spraying output, and a callback per line would push that same
+// flood into the metrics dispatcher — the flood Submit's drop-oldest policy
+// exists to absorb, not amplify. It runs on the heartbeat loop, a cold path,
+// and only submits — it never blocks.
+func (h *Host) stdioDroppedHook(name string) func(stdout, stderr uint64) {
+	if h.metricsDisp == nil {
+		return nil
+	}
+
+	return func(stdout, stderr uint64) {
+		h.metricsDisp.Submit(func(s observe.MetricsSink) {
+			if stdout != 0 {
+				//nolint:gosec // per-interval delta of a dropped-line count; never overflows int64.
+				s.IncrCounter(observe.MetricStdioDropped, int64(stdout),
+					observe.Label{Key: labelPlugin, Value: name}, observe.Label{Key: labelStream, Value: "stdout"})
+			}
+			if stderr != 0 {
+				//nolint:gosec // per-interval delta of a dropped-line count; never overflows int64.
+				s.IncrCounter(observe.MetricStdioDropped, int64(stderr),
+					observe.Label{Key: labelPlugin, Value: name}, observe.Label{Key: labelStream, Value: "stderr"})
+			}
+		})
+	}
+}
+
+// stdioPanickedHook returns the supervisor's per-heartbeat-loop-iteration
+// stdio-sink-panic observability callback for the named plugin, or nil when no
+// sink is configured (so the supervisor's own nil check skips it). The
+// supervisor calls it with the delta accumulated since its last call, at its
+// own heartbeat-loop cadence rather than per panic: a panicking Sink can fail
+// as fast as the plugin writes lines, and a callback per panic would push that
+// same flood into the metrics dispatcher — the flood Submit's drop-oldest
+// policy exists to absorb, not amplify. It runs on the heartbeat loop, a cold
+// path, and only submits — it never blocks.
+func (h *Host) stdioPanickedHook(name string) func(stdout, stderr uint64) {
+	if h.metricsDisp == nil {
+		return nil
+	}
+
+	return func(stdout, stderr uint64) {
+		h.metricsDisp.Submit(func(s observe.MetricsSink) {
+			if stdout != 0 {
+				//nolint:gosec // per-interval delta of a sink-panic count; never overflows int64.
+				s.IncrCounter(observe.MetricStdioSinkPanic, int64(stdout),
+					observe.Label{Key: labelPlugin, Value: name}, observe.Label{Key: labelStream, Value: "stdout"})
+			}
+			if stderr != 0 {
+				//nolint:gosec // per-interval delta of a sink-panic count; never overflows int64.
+				s.IncrCounter(observe.MetricStdioSinkPanic, int64(stderr),
+					observe.Label{Key: labelPlugin, Value: name}, observe.Label{Key: labelStream, Value: "stderr"})
+			}
+		})
+	}
+}
+
+// observeDroppedReporter returns the callback a Dispatcher's self-report hook
+// (see observeq.Dispatcher.SetDropReporter) calls with its own cumulative
+// dropped count, or nil when no metrics sink is configured — there is nowhere
+// to report to. kind labels which dispatcher the count belongs to ("metrics"
+// or "log").
+// It calls sink directly rather than going through metricsDisp.Submit:
+// routing a dispatcher's own drop count through the very queue that drops
+// events would make the counter that reports loss itself capable of being
+// lost, a lower bound on a lower bound. It runs on that dispatcher's own Run
+// goroutine (see SetDropReporter), so like the hooks above it must not block;
+// it only ever calls the sink.
+// The returned closure is called from a single goroutine only (Run never runs
+// two ticks concurrently), so the plain local "last" baseline it closes over
+// needs no synchronization.
+func (h *Host) observeDroppedReporter(kind string) func(dropped uint64) {
+	sink := h.cfg.Metrics
+	if sink == nil {
+		return nil
+	}
+
+	var last uint64
+
+	return func(dropped uint64) {
+		delta := counterDelta(dropped, last)
+		last = dropped
+		if delta == 0 {
+			return
+		}
+		//nolint:gosec // per-interval delta of a dropped-event count; never overflows int64.
+		sink.IncrCounter(observe.MetricObserveDropped, int64(delta), observe.Label{Key: labelDispatcher, Value: kind})
 	}
 }
 

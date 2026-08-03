@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"github.com/arloliu/styx/examples/echo/echopb"
 	"github.com/arloliu/styx/internal/control"
 	"github.com/arloliu/styx/internal/testutil"
+	"github.com/arloliu/styx/observe"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -574,6 +576,136 @@ func TestHost_Start_DeliversLiveStdioLines_ToPluginSpecStdio(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected the plugin's stderr line to arrive on PluginSpec.Stdio")
 	}
+}
+
+// blackHoleStdioSink is a styx.StdioSink whose WriteLine never returns,
+// so it never drains — the "sink falls behind" case StdioCapture's own
+// bounded-queue drop policy exists for, forced deterministically rather than
+// relying on a slow but eventually-returning sink.
+type blackHoleStdioSink struct{}
+
+func (blackHoleStdioSink) WriteLine(string, []byte) { select {} }
+
+// recordingMetricsSink is a minimal observe.MetricsSink recording every
+// IncrCounter call's cumulative delta and most recent labels per metric name,
+// safe for concurrent use.
+type recordingMetricsSink struct {
+	mu     sync.Mutex
+	deltas map[string]int64
+	labels map[string][]observe.Label
+}
+
+func newRecordingMetricsSink() *recordingMetricsSink {
+	return &recordingMetricsSink{deltas: map[string]int64{}, labels: map[string][]observe.Label{}}
+}
+
+func (s *recordingMetricsSink) ObserveLatency(string, time.Duration, ...observe.Label) {}
+func (s *recordingMetricsSink) SetGauge(string, float64, ...observe.Label)             {}
+
+func (s *recordingMetricsSink) IncrCounter(metric string, delta int64, labels ...observe.Label) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deltas[metric] += delta
+	s.labels[metric] = labels
+}
+
+func (s *recordingMetricsSink) delta(metric string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.deltas[metric]
+}
+
+func (s *recordingMetricsSink) labelsFor(metric string) []observe.Label {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.labels[metric]
+}
+
+// Test a real dropped stdio line reaching a configured observe.MetricsSink as
+// styx.stdio.dropped.count, labelled by plugin and stream. Without this, an
+// operator cannot tell "the plugin printed nothing" apart from "the sink fell
+// behind" -- an absent log line proves nothing by itself.
+func TestHost_Start_ReportsStdioDropped_ToConfiguredSink(t *testing.T) {
+	// Given: a shell wrapper that floods stdout with far more lines than
+	// StdioCapture's delivery queue can ever hold, then execs into the real
+	// readyplugin fixture so the handshake and heartbeat loop still run.
+	// PluginSpec.Stdio never drains (blackHoleStdioSink blocks forever), so
+	// every flooded line beyond the queue bound is a real, not simulated, drop.
+	const floodLines = 2000
+	sink := newRecordingMetricsSink()
+	h := styx.NewHost(styx.HostConfig{
+		Metrics: sink,
+		Plugins: []styx.PluginSpec{{
+			Name: "stdioflood",
+			Path: "/bin/sh",
+			Args: []string{"-c",
+				fmt.Sprintf("for i in $(seq 1 %d); do echo line-$i; done; exec %s", floodLines, fixtureReadyPlugin)},
+			Stdio: blackHoleStdioSink{},
+		}},
+	})
+
+	// When
+	require.NoError(t, h.Start(t.Context()))
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// Then: styx.stdio.dropped.count eventually carries a positive count for
+	// the stdout stream, attributed to this plugin -- reported at the
+	// supervisor's own heartbeat-loop cadence, not one event per dropped line.
+	require.Eventually(t, func() bool {
+		return sink.delta(observe.MetricStdioDropped) > 0
+	}, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t,
+		[]observe.Label{{Key: "plugin", Value: "stdioflood"}, {Key: "stream", Value: "stdout"}},
+		sink.labelsFor(observe.MetricStdioDropped),
+	)
+}
+
+// panickingStdioSink is a styx.StdioSink whose WriteLine always panics, so
+// every captured line the delivery goroutine hands it panics deterministically
+// -- the "sink itself is broken" case StdioCapture.PanicCount exists to count,
+// forced for real rather than simulated.
+type panickingStdioSink struct{}
+
+func (panickingStdioSink) WriteLine(string, []byte) { panic("boom") }
+
+// Test a real panicking StdioSink reaching a configured observe.MetricsSink as
+// styx.stdio.sink.panic.count, labelled by plugin and stream. Without this, an
+// operator cannot tell a Sink that is silently broken (WriteLine panics on
+// every call) apart from a plugin that printed nothing, or a Sink that merely
+// fell behind (styx.stdio.dropped.count) -- three otherwise indistinguishable
+// causes for the same symptom, an absent captured line.
+func TestHost_Start_ReportsStdioSinkPanic_ToConfiguredSink(t *testing.T) {
+	// Given: a shell wrapper that writes one line to stdout, then execs into the
+	// real readyplugin fixture so the handshake and heartbeat loop still run.
+	// PluginSpec.Stdio panics on every WriteLine, so the captured line's delivery
+	// is a real, not simulated, Sink panic.
+	sink := newRecordingMetricsSink()
+	h := styx.NewHost(styx.HostConfig{
+		Metrics: sink,
+		Plugins: []styx.PluginSpec{{
+			Name:  "stdiopanic",
+			Path:  "/bin/sh",
+			Args:  []string{"-c", fmt.Sprintf("echo boom; exec %s", fixtureReadyPlugin)},
+			Stdio: panickingStdioSink{},
+		}},
+	})
+
+	// When
+	require.NoError(t, h.Start(t.Context()))
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// Then: styx.stdio.sink.panic.count eventually carries a positive count for
+	// the stdout stream, attributed to this plugin -- reported at the
+	// supervisor's own heartbeat-loop cadence, not one event per panic.
+	require.Eventually(t, func() bool {
+		return sink.delta(observe.MetricStdioSinkPanic) > 0
+	}, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t,
+		[]observe.Label{{Key: "plugin", Value: "stdiopanic"}, {Key: "stream", Value: "stdout"}},
+		sink.labelsFor(observe.MetricStdioSinkPanic),
+	)
 }
 
 // Test Host.Events() never silently losing a GaveUp to a burst, even with

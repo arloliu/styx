@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`observe.MetricStdioDropped`** (`styx.stdio.dropped.count`): counts
+  stdout/stderr lines a plugin's stdio capture discarded because a
+  `PluginSpec.Stdio` sink fell behind, labelled by plugin and by stream.
+  Reported as a per-interval delta rather than one event per dropped line,
+  so a plugin spraying output cannot turn this counter into its own flood.
+- **`observe.MetricObserveDropped`** (`styx.observe.dropped.count`): counts
+  metric updates or log entries a `Metrics` or `Logger` dispatcher
+  discarded under backpressure, labelled by which dispatcher (`"metrics"`
+  or `"log"`) lost them. Delivered by the dispatcher calling the sink
+  directly on its own schedule rather than through the queue it reports on,
+  so the counter can never itself be part of the loss it describes. A
+  nonzero value means every other `Metrics`-sourced counter for that
+  window, including `styx.heartbeat.miss.count` and `styx.timeout.count`,
+  is a lower bound rather than an exact count.
+
 ### Changed
 
 - **`PluginPanicError`**: `Plugin`, `Service`, and `Method` are now filled in

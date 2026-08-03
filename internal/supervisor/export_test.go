@@ -91,6 +91,14 @@ type FakeInstance struct {
 	// data-plane fault escalation and observe the heartbeat loop tear the instance
 	// down, exactly as the routing layer would.
 	CaptureNotify func(notifyConnLost func())
+
+	// Capture, if set, becomes the instance's stdio capture — the same field a
+	// real spawn fills — so a test can drive stdio-drop and Sink-panic reporting
+	// off a real StdioCapture it feeds itself, with no child process to time the
+	// output against. Left nil, the instance has no capture and the stdio
+	// reporting is skipped, as it is for a spawn that never got far enough to
+	// create one.
+	Capture *StdioCapture
 }
 
 // FakeSpawn is the shape of a test replacement for the instance-spawn seam.
@@ -114,7 +122,7 @@ func (s *Supervisor) SetSpawnForTest(f FakeSpawn) {
 
 		li := &liveInstance{
 			conn: fake.Conn, generation: generation, stderrTail: newTailSink(1),
-			connLost: make(chan struct{}),
+			capture: fake.Capture, connLost: make(chan struct{}),
 		}
 		li.promote = func() ReadyHooks {
 			if fake.CaptureNotify != nil {
