@@ -276,6 +276,12 @@ picking the wrong one for a given job is a common mistake:
   others), for dashboards and alerting rules built on rates and thresholds
   rather than individual transitions.
 
+`Metrics` and `Logger` delivery each go through their own bounded, drop-oldest queue — the same shape `Events()` uses, for the same reason: a slow or wedged sink must never stall the supervisor.
+Under sustained backpressure that queue can lose events the same way `Events()` can, but unlike `Events()` this loss is not silent: `styx.observe.dropped.count` counts it, labelled by which queue lost them (`dispatcher` is `"metrics"` or `"log"`), delivered by a path that does not itself go through that queue so the counter reporting the loss can never be part of it.
+`Stop` closes each queue to new events before it joins the dispatcher, and one last count is published after that cutoff, so the interval a shutdown ends — the one carrying the events the cutoff itself drops — is reported like any other rather than being lost with the goroutine that reports it.
+When `styx.observe.dropped.count` is nonzero for a window, every other `Metrics`-sourced counter for that same window is a lower bound rather than an exact count — including `styx.heartbeat.miss.count` and `styx.timeout.count`.
+This section covers `HostConfig`'s two dispatchers; a plugin process reports `styx.observe.dropped.count` for its own metrics dispatcher the same way, always under `dispatcher="metrics"` since `PluginServerConfig` has no `Logger` field.
+
 Two of those counters report shared-memory *arena* stalls, and they are the
 only signal that a call waited on the region's shape rather than on the
 plugin. Both carry a `slab_size` label naming the size class they are about,

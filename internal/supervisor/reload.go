@@ -109,7 +109,13 @@ const (
 // If the abort landed before any wire message (cutoff-only rollback), the plugin
 // never entered draining and is still a normal serving peer that must be acked.
 // If it landed later, rollback already resumed the plugin on a detached context.
-func (s *Supervisor) serviceReload(lifeCtx context.Context, current **liveInstance) (reloadOutcome, error) {
+//
+// stdio is the loop's stdio report baselines, handed down so a reload that
+// retires the current instance reports that instance's final counts before the
+// loop rebaselines onto the successor's own capture.
+func (s *Supervisor) serviceReload(
+	lifeCtx context.Context, current **liveInstance, stdio *stdioBaselines,
+) (reloadOutcome, error) {
 	select {
 	case req := <-s.reloadCh:
 		if err := req.ctx.Err(); err != nil {
@@ -118,7 +124,7 @@ func (s *Supervisor) serviceReload(lifeCtx context.Context, current **liveInstan
 			return reloadNoop, nil
 		}
 
-		err := s.runReload(lifeCtx, req.ctx, current)
+		err := s.runReload(lifeCtx, req.ctx, current, stdio)
 		req.done <- err
 
 		switch {
@@ -143,7 +149,14 @@ func (s *Supervisor) serviceReload(lifeCtx context.Context, current **liveInstan
 // reaped the old instance so it is not torn down again here.
 // On failure current is left unchanged: the transaction has already resumed the
 // old instance and reopened admission, so the loop keeps supervising it.
-func (s *Supervisor) runReload(lifeCtx, reqCtx context.Context, current **liveInstance) error {
+//
+// stdio is the loop's stdio report baselines: the outgoing instance's adapter
+// continues from them when the transaction retires it, so the tail it dropped
+// since the loop's last sample is reported before the loop rebaselines onto the
+// successor's capture.
+func (s *Supervisor) runReload(
+	lifeCtx, reqCtx context.Context, current **liveInstance, stdio *stdioBaselines,
+) error {
 	old := *current
 	generation := s.nextGeneration()
 
@@ -153,10 +166,12 @@ func (s *Supervisor) runReload(lifeCtx, reqCtx context.Context, current **liveIn
 			return nil, err
 		}
 
-		return &reloadSuccessor{li: li}, nil
+		return &reloadSuccessor{li: li, sup: s}, nil
 	}
 
-	tx := lifecycle.NewTransaction(reloadOld{li: old}, spawnNew, s.reloadDeadlines(), s.cfg.Admission)
+	tx := lifecycle.NewTransaction(
+		reloadOld{li: old, sup: s, stdio: stdio}, spawnNew, s.reloadDeadlines(), s.cfg.Admission,
+	)
 	promoted, err := tx.Run(reqCtx)
 
 	// Calls the retired instance had already answered but whose answers this host
@@ -200,8 +215,14 @@ var (
 
 // reloadOld adapts the loop's current instance as the transaction's outgoing target.
 // The transaction promotes only the successor, so Promote is unreachable here.
+//
+// sup and stdio are what Teardown reports this instance's final stdio counts
+// through: stdio is the heartbeat loop's own baselines, so the report continues
+// from the loop's last sample rather than restating counts already reported.
 type reloadOld struct {
-	li *liveInstance
+	li    *liveInstance
+	sup   *Supervisor
+	stdio *stdioBaselines
 }
 
 func (o reloadOld) Control() *control.Conn { return o.li.conn }
@@ -219,6 +240,12 @@ func (o reloadOld) Promote(context.Context) error {
 // without it, teardown's fail-in-flight step destroys calls whose responses are
 // already sitting unread in this host's own inbound queue and reports them as
 // outcome-unknown. A nil hook (a caller with no data plane to join) reports zero.
+//
+// This is also where the retired instance's stdio counts are reported for the
+// last time. The heartbeat loop keeps running past this teardown against the
+// promoted successor, and its next sample rebaselines onto that successor's own
+// capture, so anything this instance dropped since the loop's last sample is
+// reported here or nowhere.
 func (o reloadOld) Teardown(ctx context.Context, deadline time.Duration) (int, error) {
 	stragglers := 0
 	if o.li.hooks.JoinResponses != nil {
@@ -226,6 +253,7 @@ func (o reloadOld) Teardown(ctx context.Context, deadline time.Duration) (int, e
 	}
 
 	_, err := o.li.teardown(ctx, deadline)
+	o.sup.reportFinalStdio(o.li.capture, o.stdio)
 
 	return stragglers, err
 }
@@ -234,8 +262,14 @@ func (o reloadOld) Teardown(ctx context.Context, deadline time.Duration) (int, e
 // transaction's incoming target.
 // Promote installs its styx routing via Config.OnReady (the supervisor's only seam);
 // on rollback the transaction tears it down instead.
+//
+// stdio is this instance's own baseline rather than the loop's: a successor torn
+// down by rollback was never the loop's current instance, so nothing has ever
+// reported any of its stdio counts and the whole of them is its final delta.
 type reloadSuccessor struct {
-	li *liveInstance
+	li    *liveInstance
+	sup   *Supervisor
+	stdio stdioBaselines
 }
 
 func (n *reloadSuccessor) Control() *control.Conn { return n.li.conn }
@@ -251,8 +285,14 @@ func (n *reloadSuccessor) Promote(context.Context) error {
 // That zero is a fact about this instance, not a placeholder: a successor is torn
 // down only from rollback, which runs strictly before promote, so nothing was ever
 // routed to it and it has no answer to wait for.
+//
+// Its stdio counts are the opposite: they are real and reported here, since this
+// teardown is the instance's whole life. A successor that spammed output while
+// failing its restore drops lines like any other plugin, and the loop never
+// sampled this capture, so this is the only report it will ever get.
 func (n *reloadSuccessor) Teardown(ctx context.Context, deadline time.Duration) (int, error) {
 	_, err := n.li.teardown(ctx, deadline)
+	n.sup.reportFinalStdio(n.li.capture, &n.stdio)
 
 	return 0, err
 }

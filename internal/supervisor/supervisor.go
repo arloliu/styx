@@ -426,6 +426,41 @@ type Config struct {
 	// nil (the default) disables it.
 	OnReloadDropped func(dropped int)
 
+	// OnStdioDropped is called once per heartbeat-loop iteration (this
+	// package's own liveness-check cadence, not per dropped line) with the
+	// stdout and stderr line counts this instance's StdioCapture has dropped
+	// since the previous call, and once more when the instance ends — the call
+	// that reports the interval a crash, a Stop, a hot-reload retiring the
+	// instance, or a spawn that failed its handshake ends, which no later call
+	// can: the next instance's counts start from its own capture's zero.
+	// It is called only when at least one of the two deltas is non-zero: a
+	// plugin whose stdio a Sink is keeping up with reports nothing.
+	// Lines drop exactly when a plugin is spraying output, so reporting per
+	// line (rather than accumulating a delta on this cadence) would turn that
+	// same flood into a flood of calls here.
+	// It is an optional observability seam owned by this package (no styx
+	// dependency).
+	// Runs on the heartbeat loop goroutine, so it MUST NOT block.
+	// nil (the default) disables it.
+	OnStdioDropped func(stdoutDropped, stderrDropped uint64)
+
+	// OnStdioPanicked is called once per heartbeat-loop iteration (this
+	// package's own liveness-check cadence, not per panic) with the stdout and
+	// stderr counts of times this instance's StdioCapture recovered a panic
+	// from its Sink's WriteLine, since the previous call, and once more when the
+	// instance ends, at every site OnStdioDropped's own final call is made and
+	// for the same reason.
+	// It is called only when at least one of the two deltas is non-zero: a
+	// Sink that never panics reports nothing.
+	// A panicking Sink can fail as fast as the plugin writes lines, so
+	// reporting per panic (rather than accumulating a delta on this cadence)
+	// would turn that same flood into a flood of calls here.
+	// It is an optional observability seam owned by this package (no styx
+	// dependency).
+	// Runs on the heartbeat loop goroutine, so it MUST NOT block.
+	// nil (the default) disables it.
+	OnStdioPanicked func(stdoutPanicked, stderrPanicked uint64)
+
 	// OnRestart is called once at the authoritative restart-decision site.
 	// Called after a crash is classified restart-eligible and the restart budget
 	// is charged, as the Restarting transition is taken.
@@ -741,6 +776,14 @@ type liveInstance struct {
 	generation uint64
 	stderrTail *tailSink
 
+	// capture is this instance's stdio capture, read by the heartbeat loop to
+	// report Config.OnStdioDropped deltas at its own cadence. Its identity
+	// changes with the instance (a crash-restart or a hot-reload's successor
+	// each get their own StdioCapture), which is what lets the heartbeat loop
+	// tell a fresh instance's zero baseline apart from an unrelated
+	// predecessor's counts.
+	capture *StdioCapture
+
 	// connLost is closed by NotifyConnLost when the routing layer detects a
 	// data-plane fault (conformance poison or connection-fatal CANCEL failure).
 	// The heartbeat loop observes it and ends this instance so the restart policy runs.
@@ -830,7 +873,12 @@ func (s *Supervisor) runOneInstance(
 	readyAt := time.Now()
 	s.publish(Event{Kind: EventReady, Time: readyAt, Gen: generation})
 
-	stopped, endErr := s.heartbeatLoop(ctx, &cur)
+	// The stdio report baselines outlive the heartbeat loop deliberately: the loop
+	// reports on its own cadence, and the final report below continues from wherever
+	// it left off. Held here, they cannot be lost with the loop that stops sampling.
+	var stdio stdioBaselines
+
+	stopped, endErr := s.heartbeatLoop(ctx, &cur, &stdio)
 
 	// cur.generation is read after heartbeatLoop returns so a mid-life
 	// successful reload's swap (heartbeatLoop replaces *current in place) is
@@ -842,6 +890,8 @@ func (s *Supervisor) runOneInstance(
 	// outcome; a teardown fault of an already-ending instance is not itself a
 	// restart trigger, so its error is not surfaced here.
 	reaped, _ := cur.teardown(ctx, control.ReplyDeadlines[control.KindShutdown])
+
+	s.reportFinalStdio(cur.capture, &stdio)
 
 	if stopped {
 		return run, true, nil
@@ -913,6 +963,16 @@ func (s *Supervisor) newLiveInstance(
 		_ = conn.Close()
 		<-captureDone
 
+		// This capture's whole life is the failed spawn: no instance is returned,
+		// so nothing downstream can ever read it, and a later generation's counts
+		// start from its own capture's zero. Reported against a zero baseline
+		// because nothing has reported any of it before, and after the join above
+		// because that is what makes the counts final.
+		// A plugin that sprays output and then fails its handshake is exactly the
+		// case a lost report would leave indistinguishable from one that printed
+		// nothing.
+		s.reportFinalStdio(capture, &stdioBaselines{})
+
 		exitStatus, exitStatusKnown := exitStatusFromState(state)
 
 		return nil, crashReason(stderrTail, hsErr, exitStatus, exitStatusKnown)
@@ -920,7 +980,7 @@ func (s *Supervisor) newLiveInstance(
 	tr, streaming, shmRes := hs.tr, hs.streaming, hs.shmRes
 
 	li := &liveInstance{
-		conn: conn, generation: generation, stderrTail: stderrTail,
+		conn: conn, generation: generation, stderrTail: stderrTail, capture: capture,
 		connLost: make(chan struct{}),
 	}
 	li.promote = func() ReadyHooks {
@@ -1023,7 +1083,13 @@ func (s *Supervisor) nextGeneration() uint64 {
 // the generation each call carries is for. A serviced reload does not re-enter this
 // function (it swaps *current in place and keeps this same loop running), so
 // its own reset runs through the reloadServiced case below instead.
-func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) (stopped bool, endErr error) {
+//
+// stdio carries the stdio report baselines the caller owns for the whole
+// instance, so the final report the caller makes after teardown continues from
+// this loop's last sample instead of starting over or being lost with the loop.
+func (s *Supervisor) heartbeatLoop(
+	ctx context.Context, current **liveInstance, stdio *stdioBaselines,
+) (stopped bool, endErr error) {
 	missed := 0
 	if s.cfg.OnHeartbeatOK != nil {
 		s.cfg.OnHeartbeatOK((*current).generation)
@@ -1040,6 +1106,9 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 		if s.stopped() || ctx.Err() != nil {
 			return true, nil
 		}
+
+		s.reportStdioDropped((*current).capture, &stdio.dropped)
+		s.reportStdioPanicked((*current).capture, &stdio.panicked)
 
 		// A data-plane fault the routing layer escalated (NotifyConnLost) ends this
 		// instance as a crash so Run's teardown/restart path runs.
@@ -1105,7 +1174,7 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 		// A heartbeat still in flight would fail the transaction's strict receive.
 		// Withholding the ack keeps a well-behaved plugin from sending its next
 		// heartbeat until the reload finishes and the loop resumes acking.
-		switch outcome, reloadErr := s.serviceReload(ctx, current); outcome {
+		switch outcome, reloadErr := s.serviceReload(ctx, current, stdio); outcome {
 		case reloadCrashEquivalent:
 			// Rollback could not resume the frozen old instance and left admission closed.
 			// It can never serve a call again.
@@ -1158,6 +1227,134 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, current **liveInstance) 
 		}
 		prev = &sample
 	}
+}
+
+// stdioBaselines is one instance's whole stdio-reporting state: what the
+// heartbeat loop advances each iteration, and what the final report after
+// teardown continues from. Bundled so the loop takes one parameter for both
+// counters rather than two.
+type stdioBaselines struct {
+	dropped  stdioDropBaseline
+	panicked stdioPanicBaseline
+}
+
+// reportFinalStdio reports capture's last drop and Sink-panic deltas as the
+// instance owning it ends, continuing from baseline.
+// Every capture that ends goes through here exactly once, from whichever site
+// ends it: the serving loop's own teardown, a reload retiring the predecessor,
+// a rollback discarding an unpromoted successor, or a spawn that failed its
+// handshake. Without it the interval between the last sample and the end of the
+// instance is reported by nobody — the heartbeat loop has stopped sampling that
+// capture, and the next instance's baseline is keyed to its own capture, so it
+// starts from that capture's zero rather than inheriting this one's unreported
+// tail. That interval is exactly where a crash flood lands, and losing it leaves
+// a plugin that sprayed output until it died indistinguishable from one that
+// printed nothing.
+// Callers must have joined the capture's readers first (teardown or the spawn
+// abort path does), which is what makes the counts final.
+// Neither hook may block (see Config), so neither can extend a teardown.
+func (s *Supervisor) reportFinalStdio(capture *StdioCapture, baseline *stdioBaselines) {
+	s.reportStdioDropped(capture, &baseline.dropped)
+	s.reportStdioPanicked(capture, &baseline.panicked)
+}
+
+// stdioDropBaseline is reportStdioDropped's running state across heartbeat-loop
+// iterations: the capture it last read from, and the stdout/stderr counts as of
+// that read.
+type stdioDropBaseline struct {
+	capture        *StdioCapture
+	stdout, stderr uint64
+}
+
+// reportStdioDropped calls Config.OnStdioDropped with the stdout/stderr drop
+// counts capture has accumulated since baseline's last read, then advances
+// baseline to capture's current counts. It is a no-op when no hook is
+// configured or capture is nil (an instance whose spawn never reached the
+// point of creating one).
+// A capture identity change from baseline's own — a fresh instance after a
+// crash-restart or hot-reload — resets the baseline to that capture's own
+// zero rather than diffing against an unrelated predecessor's counts.
+// Called once per heartbeat-loop iteration (that loop's own liveness-check
+// cadence) rather than once per dropped line: lines drop exactly when a
+// plugin is spraying output, and a call per line would turn that same flood
+// into a flood of calls here. Called once more when the instance ends, through
+// reportFinalStdio, which is what reports the interval between the loop's last
+// sample and that end.
+func (s *Supervisor) reportStdioDropped(capture *StdioCapture, baseline *stdioDropBaseline) {
+	if s.cfg.OnStdioDropped == nil || capture == nil {
+		return
+	}
+
+	if capture != baseline.capture {
+		baseline.capture, baseline.stdout, baseline.stderr = capture, 0, 0
+	}
+
+	stdout, stderr := capture.DroppedCount()
+	stdoutDelta := deltaSinceBaseline(stdout, baseline.stdout)
+	stderrDelta := deltaSinceBaseline(stderr, baseline.stderr)
+	baseline.stdout, baseline.stderr = stdout, stderr
+
+	if stdoutDelta == 0 && stderrDelta == 0 {
+		return
+	}
+	s.cfg.OnStdioDropped(stdoutDelta, stderrDelta)
+}
+
+// stdioPanicBaseline is reportStdioPanicked's running state across
+// heartbeat-loop iterations: the capture it last read from, and the
+// stdout/stderr Sink-panic counts as of that read.
+type stdioPanicBaseline struct {
+	capture        *StdioCapture
+	stdout, stderr uint64
+}
+
+// reportStdioPanicked calls Config.OnStdioPanicked with the stdout/stderr
+// Sink-panic counts capture has accumulated since baseline's last read, then
+// advances baseline to capture's current counts. It is a no-op when no hook
+// is configured or capture is nil (an instance whose spawn never reached the
+// point of creating one).
+// A capture identity change from baseline's own — a fresh instance after a
+// crash-restart or hot-reload — resets the baseline to that capture's own
+// zero rather than diffing against an unrelated predecessor's counts.
+// Called once per heartbeat-loop iteration (that loop's own liveness-check
+// cadence) rather than once per panic: see OnStdioPanicked's own doc for why.
+// Called once more when the instance ends, the same way reportStdioDropped is,
+// so the last interval before that end is reported.
+// A capture's delivery goroutines are deliberately not joined by its
+// teardown (a wedged Sink must never hold one up), so a panic from the last
+// lines they drain can still land after that final report; every drop is
+// covered, since the reading side is joined.
+func (s *Supervisor) reportStdioPanicked(capture *StdioCapture, baseline *stdioPanicBaseline) {
+	if s.cfg.OnStdioPanicked == nil || capture == nil {
+		return
+	}
+
+	if capture != baseline.capture {
+		baseline.capture, baseline.stdout, baseline.stderr = capture, 0, 0
+	}
+
+	stdout, stderr := capture.PanicCount()
+	stdoutDelta := deltaSinceBaseline(stdout, baseline.stdout)
+	stderrDelta := deltaSinceBaseline(stderr, baseline.stderr)
+	baseline.stdout, baseline.stderr = stdout, stderr
+
+	if stdoutDelta == 0 && stderrDelta == 0 {
+		return
+	}
+	s.cfg.OnStdioPanicked(stdoutDelta, stderrDelta)
+}
+
+// deltaSinceBaseline returns cur - last for a cumulative counter, treating a
+// decrease as a counter that restarted from zero and counting cur itself — the
+// same belt-and-braces guard the styx layer's own per-connection reporters
+// apply to their monotonic counters (a same-instance counter never actually
+// decreases; this only guards a baseline reset that raced the read).
+func deltaSinceBaseline(cur, last uint64) uint64 {
+	if cur < last {
+		return cur
+	}
+
+	return cur - last
 }
 
 // handshakeAndAttach performs the host side of Hello->HelloAck and

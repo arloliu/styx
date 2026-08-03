@@ -42,6 +42,11 @@ this with plugin-local knobs: `Metrics`, `MetricsInterval`, `ContinueAfterPanic`
 (the handler-panic policy), and `Transports` (see below). Its zero value is a
 sensible default: no metrics, taint-and-terminate on a handler panic, both
 transports advertised.
+When `Metrics` is configured, the plugin process's own metrics dispatcher
+self-reports `styx.observe.dropped.count` the same way the host's does (see
+[Events, Logger, and MetricsSink are three different jobs](supervisor-events.md#events-logger-and-metricssink-are-three-different-jobs)),
+always under `dispatcher="metrics"` — a plugin process has no log dispatcher,
+so it never reports the `"log"` value that side of the connection can.
 
 ## Choosing a transport
 
@@ -385,3 +390,9 @@ crash/restart, and hot-reload actually do underneath those signals.
 `PluginSpec.Stdio` is separate from all of that: it delivers a plugin's raw stdout/stderr live, line by line, whether or not the plugin ever crashes.
 Set it to see output a crash tail would never carry — a third-party library writing to stderr directly, or a runtime fault printed before the plugin's own logger initializes.
 A crashed instance's *last* captured stderr lines are still available separately, both flattened into `PluginCrashError.Reason` and structured on `PluginCrashError.StderrTail`, regardless of whether `Stdio` is set.
+
+A `Stdio` implementation that falls behind a plugin spraying output does not back up into, or slow down, the plugin's own stdio pipes: the excess lines are dropped instead, counted rather than silently lost.
+When `Metrics` is also configured, `styx.stdio.dropped.count` reports those drops, labelled by plugin and by stream (`"stdout"` or `"stderr"`), as a per-interval delta rather than one event per dropped line.
+A final delta is reported when the instance ends, so lines dropped in the interval a crash or a shutdown cuts short are counted too — the interval a crash flood lands in, and one nothing later could account for, since a restarted plugin's counts start from its own capture's zero.
+A `Stdio` implementation whose `WriteLine` panics does not crash the host either: the panic is recovered per line, and `styx.stdio.sink.panic.count` reports it under the same plugin and stream labels, again as a per-interval delta with a final one when the instance ends.
+Without these two counters, an absent log line from a quiet plugin, one from a `Stdio` that fell behind, and one from a `Stdio` that is silently broken all look identical; together they tell the three apart.

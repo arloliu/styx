@@ -9,7 +9,10 @@ import "time"
 //
 // Which metrics are live depends on the active data-plane transport.
 // Over the uds transport, the latency, bytes-moved, timeout, cancellation, restart,
-// reload-dropped, and heartbeat-miss signals carry real values.
+// reload-dropped, and heartbeat-miss signals carry real values. The stdio-dropped,
+// stdio-sink-panic, and observe-dropped signals are independent of the data-plane
+// transport entirely (they are sourced from stdio capture and the observability
+// dispatchers), so all three carry real values over either transport.
 // Shared-memory-only signals are sourced from optional transport capabilities
 // that the periodic reporter samples; the uds transport omits those capabilities,
 // so no value is reported and none is fabricated.
@@ -94,6 +97,72 @@ const (
 	// whose run fired shows the climb, and its peer, torn down by the same event,
 	// may show nothing at all.
 	MetricConsumeFault = "styx.consume.fault.count"
+	// MetricStdioDropped counts captured stdout/stderr lines a plugin's stdio
+	// capture discarded because its delivery queue was full: the downstream
+	// consumer (the crash-reason tail buffer, and any StdioSink the caller
+	// configured) was not keeping up with the plugin's output rate. It carries
+	// a plugin label naming which plugin and a stream label ("stdout" or
+	// "stderr") naming which pipe.
+	// It is reported as a per-interval accumulated delta, not one event per
+	// dropped line: lines drop exactly when a plugin is spraying output, and a
+	// callback per line would turn that same flood into a flood of this metric.
+	// A final delta is reported however the instance ends, so the interval its
+	// end cuts short is counted too — a crash, a host shutdown, a hot-reload
+	// retiring the predecessor, a rollback discarding the successor, and a spawn
+	// that never got past its handshake all report one. That is the interval a
+	// crash flood lands in, and the one no later report could recover: the next
+	// instance's counts start from its own capture's zero.
+	// A nonzero value means captured output was lost for that plugin and
+	// stream in that window — without it, an absent log line proves nothing:
+	// it cannot be told apart from the plugin having printed nothing at all.
+	MetricStdioDropped = "styx.stdio.dropped.count"
+	// MetricStdioSinkPanic counts times a plugin's stdio capture recovered a
+	// panic from the caller-supplied StdioSink's WriteLine while delivering a
+	// captured stdout/stderr line: the plugin's own process is unaffected —
+	// only the Sink call failed. It carries a plugin label naming which plugin
+	// and a stream label ("stdout" or "stderr") naming which pipe.
+	// It is reported as a per-interval accumulated delta, not one event per
+	// panic: a Sink that panics can do so as fast as the plugin writes lines,
+	// and a callback per panic would turn that same flood into a flood of
+	// this metric. A final delta is reported when the instance ends, the same
+	// way MetricStdioDropped's is, except for panics raised while the capture's
+	// last queued lines are still being delivered: those goroutines are
+	// deliberately not waited on, since a wedged Sink must never hold up a
+	// teardown.
+	// A nonzero value means the Sink itself is broken for that plugin and
+	// stream in that window. Together with MetricStdioDropped, it resolves
+	// what an absent captured line means: zero on both counters means the
+	// plugin printed nothing, MetricStdioDropped nonzero means the Sink fell
+	// behind, and this counter nonzero means the Sink panicked outright —
+	// three causes otherwise indistinguishable from an operator's side.
+	MetricStdioSinkPanic = "styx.stdio.sink.panic.count"
+	// MetricObserveDropped counts events — metric updates or log entries — a
+	// Styx observability dispatcher discarded, under backpressure or after its
+	// producer cutoff at shutdown. It carries a dispatcher label ("metrics" or
+	// "log") naming which dispatcher the drop belongs to.
+	// It is delivered by the dispatcher calling the sink directly from its own
+	// delivery goroutine, on a schedule, rather than through the same queue it
+	// is reporting the loss of — so this counter is never itself subject to
+	// the loss it describes.
+	// One last report is published as the dispatcher stops, so the interval a
+	// shutdown ends — the one carrying the drops the shutdown itself causes — is
+	// reported rather than waiting for a tick from a goroutine that has already
+	// returned. That report is terminal: a stopping dispatcher waits for the
+	// producers Styx owns to stop before it cuts off, so none of them can add a
+	// drop the report has already gone past. The one producer it cannot wait
+	// for is a caller's own goroutine — a call still in flight when the host
+	// stops records its latency from there, and a drop that submission takes
+	// lands after the report. Calls that finish before Stop leave no such
+	// window.
+	// Because delivery is drop-oldest, every other metric the "metrics"
+	// dispatcher carries is a lower bound whenever this counter is nonzero for
+	// the same window, including MetricHeartbeatMiss and MetricTimeout — both
+	// gate inputs during a pilot soak, where "lower bound, silently" is the
+	// wrong contract.
+	// Both the host and a plugin process report it for their own dispatcher(s):
+	// a plugin has only a metrics dispatcher (no plugin-side Logger), so its
+	// dispatcher label is always "metrics".
+	MetricObserveDropped = "styx.observe.dropped.count"
 )
 
 // Label is a key/value dimension attached to a metric (for example, the plugin name).

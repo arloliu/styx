@@ -415,6 +415,385 @@ func TestHost_ReloadDroppedHook_SubmitsWhenEnabled(t *testing.T) {
 		"a dropped-call count must be attributable to the plugin that lost them")
 }
 
+// Test the stdio-dropped hook submitting each stream's delta under its own
+// stream label, attributed to the plugin that lost them, and being nil (so
+// the supervisor skips it) when no sink is set.
+func TestHost_StdioDroppedHook_SubmitsWhenEnabled(t *testing.T) {
+	// Given a host with a sink and one without.
+	sink := newCountingSink()
+	withSink := NewHost(HostConfig{Metrics: sink})
+	t.Cleanup(func() { _ = withSink.Stop(context.Background()) })
+	without := NewHost(HostConfig{})
+	t.Cleanup(func() { _ = without.Stop(context.Background()) })
+
+	// When / Then
+	require.Nil(t, without.stdioDroppedHook("echo"), "no sink means no hook, so the supervisor skips it")
+
+	hook := withSink.stdioDroppedHook("echo")
+	require.NotNil(t, hook)
+	hook(3, 2)
+
+	require.Eventually(t, func() bool {
+		return sink.labeledCounter(observe.MetricStdioDropped,
+			observe.Label{Key: labelPlugin, Value: "echo"}, observe.Label{Key: labelStream, Value: "stdout"}) == 3
+	}, time.Second, 5*time.Millisecond)
+	require.Equal(t, int64(2), sink.labeledCounter(observe.MetricStdioDropped,
+		observe.Label{Key: labelPlugin, Value: "echo"}, observe.Label{Key: labelStream, Value: "stderr"}))
+}
+
+// Test the observe-dropped reporter computing the per-interval delta of a
+// dispatcher's own cumulative drop count, labelling it by which dispatcher it
+// came from, and being nil (so SetDropReporter installs no self-report hook)
+// when no metrics sink is configured -- there would be nowhere to report to.
+func TestHost_ObserveDroppedReporter_ComputesDeltaAndLabels(t *testing.T) {
+	// Given a host with a sink and one without.
+	sink := newCounterLabelSink()
+	withSink := NewHost(HostConfig{Metrics: sink})
+	t.Cleanup(func() { _ = withSink.Stop(context.Background()) })
+	without := NewHost(HostConfig{})
+	t.Cleanup(func() { _ = without.Stop(context.Background()) })
+
+	// When / Then
+	require.Nil(t, without.observeDroppedReporter("metrics"))
+
+	report := withSink.observeDroppedReporter("log")
+	require.NotNil(t, report)
+	report(5)
+	report(5) // the same cumulative value again: zero delta, nothing new emitted
+	report(9)
+
+	require.Equal(t, int64(9), sink.delta(observe.MetricObserveDropped))
+	require.Equal(t, []observe.Label{{Key: labelDispatcher, Value: "log"}},
+		sink.labelsFor(observe.MetricObserveDropped))
+}
+
+// wedgeThenRecordSink blocks every IncrCounter call until release is closed
+// (closing entered on the first call so a test can detect the wedge), then
+// records every call under a mutex. It forces a dispatcher into a genuine
+// saturation episode -- a real drop-oldest overflow, not a simulated one --
+// so a test can prove its self-report hook still delivers the correct,
+// already-accumulated drop count once the wedge clears.
+type wedgeThenRecordSink struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+
+	mu     sync.Mutex
+	deltas map[string]int64
+	labels map[string][]observe.Label
+}
+
+func newWedgeThenRecordSink() *wedgeThenRecordSink {
+	return &wedgeThenRecordSink{
+		entered: make(chan struct{}), release: make(chan struct{}),
+		deltas: map[string]int64{}, labels: map[string][]observe.Label{},
+	}
+}
+
+func (s *wedgeThenRecordSink) ObserveLatency(string, time.Duration, ...observe.Label) {}
+func (s *wedgeThenRecordSink) SetGauge(string, float64, ...observe.Label)             {}
+
+func (s *wedgeThenRecordSink) IncrCounter(metric string, delta int64, labels ...observe.Label) {
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+
+	s.mu.Lock()
+	s.deltas[metric] += delta
+	s.labels[metric] = labels
+	s.mu.Unlock()
+}
+
+func (s *wedgeThenRecordSink) delta(metric string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.deltas[metric]
+}
+
+func (s *wedgeThenRecordSink) labelsFor(metric string) []observe.Label {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.labels[metric]
+}
+
+// Test a dispatcher's self-report hook delivering the correct,
+// already-accumulated drop count after a real saturation episode -- the
+// dispatcher goroutine wedged inside one sink call while a flood of further
+// submits overflows the bounded queue behind it -- proving the wiring NewHost
+// installs does not depend on draining the same queue whose loss it reports.
+func TestHost_ObserveDroppedReporter_SurvivesRealDispatcherSaturation(t *testing.T) {
+	// Given a host whose sink wedges on its first call and a fast self-report
+	// cadence.
+	sink := newWedgeThenRecordSink()
+	h := NewHost(HostConfig{Metrics: sink, MetricsInterval: 5 * time.Millisecond})
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// When: one submit wedges the dispatcher goroutine inside the sink call.
+	hook := h.heartbeatMissHook("p", h.nextHealthOrigin("p"))
+	require.NotNil(t, hook)
+	hook(1)
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sink was never called")
+	}
+
+	// And a flood of further submits, arriving while the goroutine is wedged
+	// (so nothing drains them), overflows the bounded queue and genuinely
+	// drops exactly this many of them.
+	const flood = 3 * metricsBufferSize
+	for range flood {
+		h.metricsDisp.Submit(func(observe.MetricsSink) {})
+	}
+	require.Equal(t, uint64(2*metricsBufferSize), h.metricsDisp.Dropped())
+
+	// When: the wedge clears.
+	close(sink.release)
+
+	// Then: MetricObserveDropped eventually carries the accumulated drop
+	// count, labelled as belonging to the metrics dispatcher -- delivered by
+	// the self-report hook itself, not by any of the flooded (mostly dropped)
+	// submits, which are no-ops.
+	require.Eventually(t, func() bool {
+		return sink.delta(observe.MetricObserveDropped) == int64(2*metricsBufferSize)
+	}, 2*time.Second, 5*time.Millisecond)
+	require.Equal(t, []observe.Label{{Key: labelDispatcher, Value: "metrics"}},
+		sink.labelsFor(observe.MetricObserveDropped))
+}
+
+// wedgeThenPinSink wedges the dispatcher goroutine inside its first call of any
+// kind -- so a flood submitted behind it becomes a real drop-oldest overflow --
+// and then never returns from the self-report call that carries the resulting
+// drop count. That second call is the one a shutdown's final report is made
+// through, so a sink built this way is what proves that report cannot hold a
+// teardown open past the caller's budget.
+type wedgeThenPinSink struct {
+	firstCall chan struct{} // closed when the first call of any kind is entered
+	release   chan struct{} // closed by the test to end the first-call wedge
+	pinned    chan struct{} // closed when the observe-dropped report is entered
+	unpin     chan struct{} // closed by cleanup, so the pinned goroutine can exit
+
+	wedgeOnce sync.Once
+	pinOnce   sync.Once
+}
+
+func newWedgeThenPinSink() *wedgeThenPinSink {
+	return &wedgeThenPinSink{
+		firstCall: make(chan struct{}), release: make(chan struct{}),
+		pinned: make(chan struct{}), unpin: make(chan struct{}),
+	}
+}
+
+func (s *wedgeThenPinSink) ObserveLatency(string, time.Duration, ...observe.Label) {}
+func (s *wedgeThenPinSink) SetGauge(string, float64, ...observe.Label)             {}
+
+func (s *wedgeThenPinSink) IncrCounter(metric string, _ int64, _ ...observe.Label) {
+	if metric == observe.MetricObserveDropped {
+		s.pinOnce.Do(func() { close(s.pinned) })
+		<-s.unpin
+
+		return
+	}
+
+	s.wedgeOnce.Do(func() {
+		close(s.firstCall)
+		<-s.release
+	})
+}
+
+// Test a sink that never returns from the shutdown's final drop report leaving
+// Stop inside the caller's own budget: the report is published on the
+// dispatcher's goroutine, inside the join Stop bounds, so a wedged sink costs
+// the teardown its bound and nothing more.
+func TestHost_Stop_StaysBounded_WhenTheFinalDropReportWedges(t *testing.T) {
+	// Given a host whose sink wedges on its first call, with a self-report
+	// cadence no tick can reach inside the test -- so the only drop report that
+	// can be published is the final one, at shutdown.
+	sink := newWedgeThenPinSink()
+	t.Cleanup(func() { close(sink.unpin) })
+	h := NewHost(HostConfig{Metrics: sink, MetricsInterval: time.Hour})
+
+	hook := h.heartbeatMissHook("p", h.nextHealthOrigin("p"))
+	require.NotNil(t, hook)
+	hook(1)
+	select {
+	case <-sink.firstCall:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sink was never called")
+	}
+
+	// And a real drop-oldest overflow behind that wedge, so the final report
+	// has a non-zero delta to publish.
+	const flood = 3 * metricsBufferSize
+	for range flood {
+		h.metricsDisp.Submit(func(observe.MetricsSink) {})
+	}
+	require.Equal(t, uint64(2*metricsBufferSize), h.metricsDisp.Dropped())
+	close(sink.release)
+
+	// When: Stop runs with a budget far shorter than the fixed shutdown bound,
+	// and the sink never returns from the final drop report.
+	const budget = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	start := time.Now()
+	require.NoError(t, h.Stop(ctx))
+	elapsed := time.Since(start)
+
+	// Then: the final report was genuinely entered (so the wedge is where the
+	// teardown would hang), and Stop still returned inside its own budget
+	// rather than waiting out a sink call that never returns.
+	select {
+	case <-sink.pinned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the final drop report never reached the sink")
+	}
+	require.Less(t, elapsed, obsShutdownBound,
+		"a wedged final drop report must not extend teardown past the caller's budget")
+	require.GreaterOrEqual(t, elapsed, budget/2,
+		"the wedged report must be inside the join Stop bounds, not after it")
+}
+
+// Test the host's shutdown holding the metrics dispatcher's final drop report
+// back until its periodic producers have stopped, so nothing can add to the
+// count after it is published.
+//
+// One cancel ends the dispatchers and the per-plugin reporters together, and a
+// reporter does not stop the instant it sees that cancel — it has its own
+// goroutine to unwind. A dispatcher that cut off, drained and reported on the
+// cancel alone would publish its count in the middle of that unwind, and every
+// submission the reporter still made would be counted as a drop with no
+// reporter left to publish it. Standing in for a reporter here is what makes
+// the ordering observable without spawning a plugin: it registers in the very
+// group startPlugin puts the real ones in.
+func TestHost_Stop_ReportsDropsAfterProducersStop(t *testing.T) {
+	// Given a host whose sink wedges on its first call, with a self-report
+	// cadence no tick can reach inside the test -- so the only drop report that
+	// can be published is the final one, at shutdown.
+	sink := newWedgeThenRecordSink()
+	h := NewHost(HostConfig{Metrics: sink, MetricsInterval: time.Hour})
+
+	hook := h.heartbeatMissHook("p", h.nextHealthOrigin("p"))
+	require.NotNil(t, hook)
+	hook(1)
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sink was never called")
+	}
+
+	// And a real drop-oldest overflow behind that wedge, so the final report has
+	// a non-zero delta to publish.
+	const flood = 3 * metricsBufferSize
+	for range flood {
+		h.metricsDisp.Submit(func(observe.MetricsSink) {})
+	}
+	require.Equal(t, uint64(2*metricsBufferSize), h.metricsDisp.Dropped())
+	close(sink.release)
+
+	// And a stand-in periodic reporter that outlives the observability cancel.
+	releaseProducer := make(chan struct{})
+	h.obsProducerWG.Go(func() {
+		<-h.obsCtx.Done()
+		<-releaseProducer
+	})
+
+	// When Stop runs while that producer is still unwinding.
+	stopped := make(chan struct{})
+	go func() { defer close(stopped); _ = h.Stop(context.Background()) }()
+
+	// Then the final report is still unpublished: the dispatcher is waiting on
+	// the producer, not racing it.
+	reported := func() int64 { return sink.delta(observe.MetricObserveDropped) }
+	require.Never(t, func() bool { return reported() != 0 },
+		100*time.Millisecond, 5*time.Millisecond,
+		"the final drop report must not be published while a producer can still submit")
+
+	// And it is published once that producer has stopped, carrying every drop.
+	close(releaseProducer)
+	require.Eventually(t, func() bool { return reported() == int64(2*metricsBufferSize) },
+		2*time.Second, 5*time.Millisecond)
+
+	select {
+	case <-stopped:
+	case <-time.After(obsShutdownBound + 3*time.Second):
+		t.Fatal("Stop never returned after the producer stopped")
+	}
+}
+
+// Test the plugin's observe-dropped reporter computing the per-interval delta
+// of its own dispatcher's cumulative drop count, labelling it as belonging to
+// the "metrics" dispatcher (a plugin process has no log dispatcher --
+// PluginServerConfig has no Logger field), and being nil (so SetDropReporter
+// installs no self-report hook) when no metrics sink is configured -- there
+// would be nowhere to report to.
+func TestPluginServer_ObserveDroppedReporter_ComputesDeltaAndLabels(t *testing.T) {
+	// Given a plugin server with a sink and one without.
+	sink := newCounterLabelSink()
+	withSink := &PluginServer{metricsSink: sink}
+	without := &PluginServer{}
+
+	// When / Then
+	require.Nil(t, without.observeDroppedReporter())
+
+	report := withSink.observeDroppedReporter()
+	require.NotNil(t, report)
+	report(5)
+	report(5) // the same cumulative value again: zero delta, nothing new emitted
+	report(9)
+
+	require.Equal(t, int64(9), sink.delta(observe.MetricObserveDropped))
+	require.Equal(t, []observe.Label{{Key: labelDispatcher, Value: "metrics"}},
+		sink.labelsFor(observe.MetricObserveDropped))
+}
+
+// Test NewPluginServer actually wiring its metrics dispatcher's self-report
+// hook to the configured sink (SetDropReporter), proven with a real dispatcher
+// saturation episode rather than by calling observeDroppedReporter directly --
+// this is the wiring NewPluginServer must perform, not just the reporter
+// function's own correctness. Before this change, s.metrics.Dropped() was
+// tracked but nothing ever read it on the plugin side.
+func TestPluginServer_ObserveDroppedReporter_SurvivesRealDispatcherSaturation(t *testing.T) {
+	// Given a plugin server whose sink wedges on its first call and a fast
+	// self-report cadence.
+	sink := newWedgeThenRecordSink()
+	s := NewPluginServer(PluginServerConfig{Metrics: sink, MetricsInterval: 5 * time.Millisecond})
+	dispCtx, dispCancel := context.WithCancel(context.Background())
+	t.Cleanup(dispCancel)
+	go s.metrics.Run(dispCtx)
+
+	// When: one submit wedges the dispatcher goroutine inside the sink call.
+	s.metrics.Submit(func(sink observe.MetricsSink) { sink.IncrCounter("test.counter", 1) })
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sink was never called")
+	}
+
+	// And a flood of further submits, arriving while the goroutine is wedged
+	// (so nothing drains them), overflows the bounded queue and genuinely
+	// drops exactly this many of them.
+	const flood = 3 * metricsBufferSize
+	for range flood {
+		s.metrics.Submit(func(observe.MetricsSink) {})
+	}
+	require.Equal(t, uint64(2*metricsBufferSize), s.metrics.Dropped())
+
+	// When: the wedge clears.
+	close(sink.release)
+
+	// Then: MetricObserveDropped eventually carries the accumulated drop
+	// count, labelled as belonging to the metrics dispatcher -- delivered by
+	// the self-report hook NewPluginServer installed, not by any of the
+	// flooded (mostly dropped) submits, which are no-ops.
+	require.Eventually(t, func() bool {
+		return sink.delta(observe.MetricObserveDropped) == int64(2*metricsBufferSize)
+	}, 2*time.Second, 5*time.Millisecond)
+	require.Equal(t, []observe.Label{{Key: labelDispatcher, Value: "metrics"}},
+		sink.labelsFor(observe.MetricObserveDropped))
+}
+
 // panickingLogger is a Logger whose every method panics, proving lifecycle
 // logging routes through the panic-isolated dispatcher rather than running the
 // user Logger synchronously on the event relay.
