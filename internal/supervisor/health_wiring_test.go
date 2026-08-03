@@ -209,6 +209,14 @@ func TestSupervisor_TransportWedged_WhenConsumerFrozenWithInboundReadable(t *tes
 	require.ErrorIs(t, ev.Err, supervisor.ErrTransportWedged)
 	require.ErrorIs(t, ev.Err, supervisor.ErrWedged)
 	require.NotErrorIs(t, ev.Err, supervisor.ErrDispatchWedged)
+
+	// And: the event carries the structured *WedgedError styx/host.go's
+	// translateEventErr reads Kind off of — not just a sentinel a consumer
+	// can match but never inspect.
+	var we *supervisor.WedgedError
+	require.ErrorAs(t, ev.Err, &we)
+	require.Equal(t, supervisor.WedgeTransport, we.Kind)
+
 	requireEventOfKind(t, ch, supervisor.EventRestarting)
 
 	cancel()
@@ -255,6 +263,13 @@ func TestSupervisor_DispatchWedged_WhenUnleasedResponseOwed(t *testing.T) {
 	require.ErrorIs(t, ev.Err, supervisor.ErrDispatchWedged)
 	require.ErrorIs(t, ev.Err, supervisor.ErrWedged)
 	require.NotErrorIs(t, ev.Err, supervisor.ErrTransportWedged)
+
+	// And: the event carries the structured *WedgedError styx/host.go's
+	// translateEventErr reads Kind off of — not just a sentinel a consumer
+	// can match but never inspect.
+	var we *supervisor.WedgedError
+	require.ErrorAs(t, ev.Err, &we)
+	require.Equal(t, supervisor.WedgeDispatch, we.Kind)
 
 	cancel()
 	select {

@@ -137,7 +137,7 @@ If you need a plugin's exact last state across shutdown, read it off the event y
 |---|---|---|
 | `EventStarting` | A plugin instance is being spawned — first start or a restart — before its handshake completes. | never |
 | `EventReady` | An instance completed its handshake and data-plane attach and is now serving calls. Also fires (with no preceding `EventStarting`) when a `Reload` promotes its successor. | never |
-| `EventUnhealthy` | An instance stopped proving it is serving: either it went silent for `MissedHeartbeatThreshold` consecutive heartbeat waits, or the heartbeat classifier judged it wedged (a stalled ring consumer with queued work, or a dispatch owing a response with no running handler). | describes which verdict, as an opaque message — see [below](#eventunhealthy-err-is-not-a-typed-value) |
+| `EventUnhealthy` | An instance stopped proving it is serving: either it went silent for `MissedHeartbeatThreshold` consecutive heartbeat waits, or the heartbeat classifier judged it wedged (a stalled ring consumer with queued work, or a dispatch owing a response with no running handler). | `*MissedHeartbeatsError` or `*WedgedError` — see [below](#eventunhealthys-err-is-a-typed-verdict) |
 | `EventCrashed` | An instance attempt failed: a running instance exited or lost its connection, a spawned instance failed before reaching ready, or a spawn failed before any process existed. | the failure detail — often a `*PluginCrashError` |
 | `EventRestarting` | The restart policy scheduled another attempt and is backing off before spawning the replacement. The spawn itself is reported by the `EventStarting` that follows. | never |
 | `EventGaveUp` | Terminal: no further restart will happen, either because the restart budget is exhausted or because a handshake incompatibility can never be recovered by retrying. | the last failure detail |
@@ -166,16 +166,36 @@ for the full set of ways a `Reload` call can end, including the
 easy-to-miss case where it returns an error despite the reload having
 actually succeeded.
 
-## `EventUnhealthy`'s `Err` is not a typed value
+## `EventUnhealthy`'s `Err` is a typed verdict
 
-The heartbeat classifier distinguishes two wedge conditions internally
-(a stalled transport consumer vs. a dispatch owing a response), but that
-distinction does not cross into the public `Event.Err` as a type you can
-`errors.As` into — it is a plain error whose message happens to describe
-which one fired. Match on the plugin name and treat `EventUnhealthy` as one
-undifferentiated "this instance is making no progress" signal; don't build
-logic that string-matches the message to tell the two wedge kinds apart,
-since that text is not a stable contract.
+`EventUnhealthy` fires for one of two reasons, and `Err` tells them apart as
+a type, not just a message:
+
+- **`*styx.MissedHeartbeatsError`** — the instance went silent for
+  `MissedHeartbeatThreshold` consecutive heartbeat waits. `Missed` carries
+  the exact count that tripped it. `errors.Is(err, styx.ErrHeartbeatsMissed)`
+  matches any value of this type.
+- **`*styx.WedgedError`** — the heartbeat classifier judged the instance
+  wedged. `Kind` (`styx.WedgeTransport` or `styx.WedgeDispatch`) tells a
+  stalled ring consumer with queued work apart from a dispatch owing a
+  response with no running handler. `errors.Is(err, styx.ErrWedged)` matches
+  any value of this type regardless of `Kind`.
+
+Use `errors.As` to recover whichever one fired:
+
+```go
+case styx.EventUnhealthy:
+    var wedged *styx.WedgedError
+    if errors.As(ev.Err, &wedged) {
+        log.Printf("plugin %s wedged: %v", ev.Plugin, wedged.Kind)
+        break
+    }
+    log.Printf("plugin %s unhealthy: %v", ev.Plugin, ev.Err)
+```
+
+The same translated error is what `HealthSnapshot.LastError` carries while
+that verdict is still the plugin's most recently retained transition — see
+[`Health`: pull, not subscribe](#health-pull-not-subscribe) above.
 
 An `EventUnhealthy` is a verdict already reached, not a warning that one
 may be coming. The supervisor publishes it and immediately ends the
