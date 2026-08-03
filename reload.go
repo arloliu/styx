@@ -131,6 +131,12 @@ var (
 // returns ErrPluginUnavailable if no plugin of that name is running, and ctx's
 // error (as a styx error) if ctx is done.
 //
+// Before any of that, Reload takes the host's lock, which a concurrent Start
+// holds while each plugin it admitted waits for that plugin's first outcome.
+// That acquisition does not observe ctx, so a Reload racing a Start can wait
+// for the length of a spawn, and a ctx expiring during the wait is reported
+// only once the lock is held rather than cutting it short.
+//
 // Cancelling ctx aborts a reload that has not yet promoted. Past that point the
 // reload is committed and cancellation no longer shortens it: the successor is
 // already routing, so there is nothing left to abandon, and cutting the wait for

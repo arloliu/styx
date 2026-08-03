@@ -194,7 +194,9 @@ how to consume the channel.
   the teardown's own configured shutdown deadline, then `SIGKILL`, then a
   `waitpid` reap — always, never leaving an orphan. The `ctx` passed to `Stop`
   bounds `Stop`'s wait for the teardown goroutines to join, not the graceful
-  window itself. Process termination is owned by the supervisor and `Host.Stop`;
+  window itself, and an already-expired `ctx` therefore still tears every plugin
+  down — it just returns without waiting for the reap. Process termination is
+  owned by the supervisor and `Host.Stop`;
   you tear a whole host down rather than killing one plugin from arbitrary call
   sites, which keeps a freely callable concurrent kill off the API. Unlike a
   drain-in-flight-requests shutdown you may be used to, `Stop` fails every

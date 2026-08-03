@@ -55,6 +55,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string name to give, so `Service`/`Method` carry the routing hash rendered
   as hex instead. The unused `Stack []byte` field, never populated on any
   path, is removed.
+- **`Host.Stop`**: the context now bounds how long the teardown waits,
+  never whether it happens. A `Stop` handed an already-canceled or expired
+  context previously returned immediately having torn nothing down, leaving
+  the host's background workers running and — the real cost — every plugin
+  process alive with nothing left to reap it. It now stops every plugin,
+  which tears each instance down through the same graceful-`Shutdown`,
+  `SIGKILL`, `waitpid` sequence any other `Stop` uses, and returns each
+  plugin's context error instead of waiting for the join. Recovering from a
+  reused `signal.NotifyContext` no longer requires a second `Stop`; giving
+  `Stop` a real budget now only decides whether the teardown has finished by
+  the time it returns.
+- **`Host.Stop`'s fixed teardown tails** — joining the observability
+  dispatchers, and waiting for an `Events()` consumer to take what the
+  shutdown published — are now capped by the caller's context as well as by
+  their own internal bounds, instead of being spent on top of it. A `Stop`
+  given a one-second budget can no longer run for roughly 2.25 seconds, so
+  sizing a shutdown deadline no longer means reading styx's constants out of
+  its source.
+- **`Host.Start` after a `Stop` has begun** now reports `ErrHostStopped`,
+  where previously only a `Stop` that had already finished its teardown did.
+  A `Host` is single-use, and the teardown decides which plugins it owns when
+  it takes its snapshot, so a plugin admitted after that point would be
+  supervised by a teardown that will never stop it. A name that `Stop` is
+  still tearing down keeps reporting the more specific `ErrPluginStopping`.
+  A `Start` already inside a plugin spawn when a `Stop` begins abandons that
+  attempt and reports `ErrHostStopped` for it, leaving no process behind,
+  rather than making the teardown wait the spawn out.
+
+### Fixed
+
+- **`Host.Stop` with concurrent callers** reported teardowns that had not
+  happened. Only one caller's snapshot held the runtimes, so a second
+  concurrent `Stop` found an empty host and returned `nil` while plugins
+  were still being torn down; it could also reach the worker release ahead
+  of the caller that owned the teardown and, with a spent context, end the
+  `Events()` subscription immediately — cutting short a drain the first
+  caller still had budget for. Concurrent `Stop`s are now serialized: one
+  owns the teardown and the others wait for it, so every caller returns only
+  once a teardown it observed has finished or its own context has expired,
+  and the bounded teardown waits are always charged against the owner's
+  budget. A waiting caller with budget left runs its own pass afterward,
+  which is how it completes a join an earlier caller ran out of time for.
 
 ## [0.2.0] - 2026-08-01
 

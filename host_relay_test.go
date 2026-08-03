@@ -5,9 +5,13 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/observe"
@@ -995,6 +999,84 @@ func TestHostStop_UnretriedExpiry_CleansUpAfterRunExits(t *testing.T) {
 	require.False(t, stillStopping, "stopping gate did not clear after the deferred cleanup")
 }
 
+// Test Stop's wait for a consumer to take what the teardown published staying
+// inside the caller's own context, not only inside eventsDrainBound. A Host whose
+// Events() nothing reads never quiesces, so that wait always runs to its bound —
+// which, charged on top of the caller's budget rather than capped by it, makes a
+// shutdown deadline impossible to size without reading Styx's own constants.
+func TestHostStop_BoundsEventsDrain_ByCallerContext(t *testing.T) {
+	// Given: one published event with nobody reading Events(), which parks the
+	// subscription's forwarder in its handoff so the subscription cannot quiesce
+	// and the wait has something real to wait on.
+	h := NewHost(HostConfig{})
+	h.publish(Event{Plugin: "p", Kind: EventReady, Time: time.Now()})
+	require.Eventually(t, func() bool { return !h.eventsQuiesced() }, 5*time.Second, time.Millisecond,
+		"the unread subscription never went non-quiescent, so this proves nothing about the wait")
+
+	// When: Stop is given a small fraction of eventsDrainBound.
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	require.NoError(t, h.Stop(ctx))
+	elapsed := time.Since(start)
+
+	// Then: it returned on the caller's budget. A wait that ignored the budget
+	// runs the full bound exactly, because a subscription nobody reads never
+	// quiesces early — so the whole bound is a threshold the two outcomes sit on
+	// opposite sides of by a wide margin, not a timing judgment call.
+	require.Less(t, elapsed, eventsDrainBound,
+		"Stop spent the fixed events-drain bound instead of the budget its caller sized")
+}
+
+// Test remainingBound keeping each fixed teardown bound as a ceiling rather than
+// replacing it with the caller's context: shortening these waits is what keeps
+// Stop inside its budget, but the fixed bound is what keeps a wedged dispatcher
+// or an unread Events() from hanging teardown forever, so a caller with no
+// deadline — or one further out than the bound — must still get the bound.
+func TestRemainingBound_KeepsFixedBoundAsCeiling_AndTakesTheShorterBudget(t *testing.T) {
+	const bound = 2 * time.Second
+
+	t.Run("no deadline keeps the fixed bound", func(t *testing.T) {
+		// Given / When / Then
+		require.Equal(t, bound, remainingBound(context.Background(), bound))
+	})
+
+	t.Run("a deadline past the bound keeps the fixed bound", func(t *testing.T) {
+		// Given
+		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+		defer cancel()
+
+		// When / Then
+		require.Equal(t, bound, remainingBound(ctx, bound))
+	})
+
+	t.Run("a deadline inside the bound shortens the wait", func(t *testing.T) {
+		// Given
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+
+		// When
+		got := remainingBound(ctx, bound)
+
+		// Then: what is left of the caller's own budget, never the fixed bound.
+		require.Positive(t, got)
+		require.LessOrEqual(t, got, 200*time.Millisecond)
+	})
+
+	t.Run("a spent budget leaves nothing to wait with", func(t *testing.T) {
+		// Given: the two ways a context arrives with nothing left — canceled
+		// outright, and expired by its own deadline.
+		canceled, cancel := context.WithCancel(context.Background())
+		cancel()
+		expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancelExpired()
+
+		// When / Then
+		require.Zero(t, remainingBound(canceled, bound))
+		require.Zero(t, remainingBound(expired, bound))
+	})
+}
+
 // Test Host.Start rejecting a plugin name while a Stop of it is still in flight:
 // the gate must hold from the moment Stop snapshots the runtimes, not only after
 // an unjoined Run's deadline expires, so a Start racing the teardown window never
@@ -1025,6 +1107,306 @@ func TestHostStart_RejectsName_DuringInFlightStop(t *testing.T) {
 	awaitClosed(t, relayDone, "relay was not torn down after Run exited")
 }
 
+// Test the per-name admission refusing a plugin once a Stop has latched, before
+// anything is created for it. The refusal has to come first: past that point the
+// call has already subscribed a relay and launched a supervisor for a name the
+// teardown's snapshot does not own, and that snapshot is the only thing that
+// decides what ever gets stopped.
+func TestHostStartOne_RefusesBeforeSpawning_OnceStopHasLatched(t *testing.T) {
+	// Given: a host whose Stop has latched, holding the lock Start runs startOne
+	// under. Latching the flag directly is what isolates this gate: driving it
+	// through a real Stop would also signal the in-flight-Start abort, which
+	// refuses the same attempt one step later.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p", Path: "/nonexistent"}}})
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopRequested = true
+
+	// When
+	err := h.startOne(t.Context(), PluginSpec{Name: "p", Path: "/nonexistent"}, nil)
+
+	// Then: refused as a stopped host's, with nothing created for the name — no
+	// routing, no runtime, and no health transition a real attempt would record.
+	require.ErrorIs(t, err, ErrHostStopped)
+	require.NotContains(t, h.plugins, "p")
+	require.Nil(t, h.runtimeFor("p"))
+
+	snap, herr := h.Health("p")
+	require.NoError(t, herr)
+	require.True(t, snap.LastTransition.IsZero(),
+		"an attempt ran for a name a latched Stop must refuse before spawning")
+}
+
+// Test a Start already inside a plugin spawn abandoning it as soon as a Stop
+// begins. Start holds the host's lock across that spawn, so a teardown that could
+// only learn of the Stop under that lock would wait the whole spawn out — on a
+// budget its caller sized for waiting on children, not on another caller's
+// admission. The signal the spawn observes is deliberately not one held under
+// that lock.
+func TestHostStartOne_AbandonsSpawn_WhenAStopBegins(t *testing.T) {
+	// Given: a spec whose first attempt cannot reach an outcome — the spawn fails
+	// and the restart backoff parks for an hour, so neither Ready nor GaveUp is
+	// ever published — and a Stop that has broadcast its start but not yet latched
+	// under the lock, which is exactly the window an admitted Start runs in.
+	spec := PluginSpec{
+		Name:    "p",
+		Path:    "/nonexistent",
+		Restart: RestartPolicy{Max: 1, Backoff: func(int) time.Duration { return time.Hour }},
+	}
+	h := NewHost(HostConfig{Plugins: []PluginSpec{spec}})
+	h.signalStopBegun()
+
+	// The attempt's own budget is generous but finite, so an attempt that waited
+	// for it instead of for the broadcast reports that context rather than hanging.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	h.mu.Lock()
+
+	// When
+	err := h.startOne(ctx, spec, nil)
+
+	// Then: abandoned on the broadcast, with no routing installed for a name no
+	// caller may reach, and the attempt handed to the teardown that broadcast —
+	// registered under the same lock that teardown takes its snapshot under, and
+	// gated stopping so nothing starts a second supervisor for the name meanwhile.
+	require.ErrorIs(t, err, ErrHostStopped)
+	require.NotContains(t, h.plugins, "p")
+	require.NotNil(t, h.runtimeFor("p"), "the abandoned attempt was left for no teardown to own")
+	require.Contains(t, h.stopping, "p")
+	h.mu.Unlock()
+
+	// And: that handover completes on its own once the abandoned supervisor's Run
+	// returns, freeing the name again.
+	require.Eventually(t, func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+
+		return h.runtimeFor("p") == nil && len(h.stopping) == 0
+	}, 5*time.Second, 5*time.Millisecond, "the abandoned attempt's teardown never completed")
+}
+
+// Test Host.Stop returning inside the budget its caller set while a Start sits
+// parked in a plugin spawn. Start holds the host's lock for its whole call, so a
+// teardown that had to wait for the abandoned attempt's supervisor to join before
+// it could even take its snapshot would spend the spawn's own deadline — several
+// times the budget here — before any of the waits Stop documents began.
+func TestHostStop_ReturnsWithinItsBudget_WhileAStartIsParkedInASpawn(t *testing.T) {
+	// stopBudget is what the Stop below is given; spawnFloor sits far below the
+	// host's Hello reply deadline but far above that budget, so returning under it
+	// can only mean the teardown did not wait the spawn out.
+	const (
+		stopBudget = 200 * time.Millisecond
+		spawnFloor = time.Second
+	)
+
+	// Given: a child that never answers the handshake and does not exit, so its
+	// spawn parks for that whole reply deadline, and a Start blocked inside it.
+	spec := PluginSpec{Name: "p", Path: "/bin/sh", Args: []string{"-c", "exec sleep 30"}}
+	h := NewHost(HostConfig{Plugins: []PluginSpec{spec}})
+
+	events := h.Events()
+	startReturned := make(chan error, 1)
+	go func() { startReturned <- h.Start(t.Context()) }()
+
+	// The supervisor publishes this transition on its own goroutine immediately
+	// before it spawns, and nothing between there and the handshake deadline
+	// consults the stop signal — so observing it means the spawn is committed,
+	// without a clock having to say so.
+	awaitHostEvent(t, events, EventStarting)
+
+	// When
+	stopCtx, cancel := context.WithTimeout(t.Context(), stopBudget)
+	defer cancel()
+
+	began := time.Now()
+	stopErr := h.Stop(stopCtx)
+	elapsed := time.Since(began)
+
+	// Then: the call ended on its own deadline rather than on the spawn's. The
+	// error is half the proof and the elapsed time the other half — a Stop that
+	// waited the spawn out under the lock reports no error at all, having found an
+	// empty snapshot by the time it got in.
+	require.Less(t, elapsed, spawnFloor, "Stop waited out the spawn a Start was parked in")
+	require.ErrorIs(t, stopErr, context.DeadlineExceeded)
+	require.ErrorIs(t, <-startReturned, ErrHostStopped)
+
+	// And: the parked attempt was owned, not dropped — its teardown completes once
+	// that spawn finally ends, which frees the name and releases the background
+	// workers the host would otherwise keep running forever.
+	require.Eventually(t, func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+
+		return h.runtimeFor("p") == nil && len(h.stopping) == 0 && h.workersReleased
+	}, 15*time.Second, 5*time.Millisecond, "the parked attempt's teardown never completed")
+}
+
+// Test Host.Stop returning within its budget while a Start is parked in the
+// binary-pin check. Hashing a pinned binary is unbounded work — it grows with
+// the file and never finishes at all for a path that reaches no EOF — so a Stop
+// that had to wait it out before it could take its snapshot would outlive
+// whatever budget its caller set, expired ones included.
+func TestHostStop_ReturnsWithinItsBudget_WhileAStartIsHashingAPinnedBinary(t *testing.T) {
+	// Given: a pinned "binary" that is a named pipe with no writer, so the check
+	// blocks in its read until this test releases it. Opening the paired write end
+	// below returns exactly when the check opens the read end, which makes the
+	// park a checkpoint both sides agree on rather than something a clock guesses.
+	fifo := filepath.Join(t.TempDir(), "plugin.fifo")
+	require.NoError(t, unix.Mkfifo(fifo, 0o600))
+
+	pin := sha256.Sum256([]byte("a binary this pipe is not"))
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p", Path: fifo, BinarySHA256: pin[:]}}})
+
+	startReturned := make(chan error, 1)
+	go func() { startReturned <- h.Start(context.Background()) }()
+
+	writer := openFifoWriteEnd(t, fifo)
+
+	// When: a Stop with nothing left to spend runs alongside that parked check.
+	spent, cancelSpent := context.WithCancel(context.Background())
+	cancelSpent()
+
+	stopReturned := make(chan error, 1)
+	go func() { stopReturned <- h.Stop(spent) }()
+
+	// Then: it returns while the check is still parked. Nothing has written to or
+	// closed the pipe yet, so the Start cannot have got past it — a Stop that
+	// arrives here has demonstrably not waited that read out.
+	select {
+	case err := <-stopReturned:
+		require.NoError(t, err, "the teardown itself failed, so this proves nothing about the wait")
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "Stop waited out the pin check a Start was parked in")
+	}
+
+	select {
+	case err := <-startReturned:
+		require.FailNow(t, "the parked Start returned before the pipe was released", "%v", err)
+	default:
+	}
+
+	// And: releasing the pipe ends the check against an empty file, whose digest
+	// cannot match the pin — but the Stop that finished meanwhile owns the host by
+	// then, so the attempt is refused as a stopped host's rather than spawned.
+	require.NoError(t, writer.Close())
+	require.ErrorIs(t, <-startReturned, ErrHostStopped)
+}
+
+// Test Host.Start admitting no plugin at all once a Stop has begun. A name that
+// teardown snapshotted reports the specific ErrPluginStopping; every other
+// configured name reports ErrHostStopped rather than being spawned behind a
+// snapshot that will never own it — a runtime admitted there would be supervised
+// by nothing, and the worker release, which counts only stopping names, would end
+// Events() and observability around a plugin still running.
+func TestHostStart_AdmitsNoPlugin_OnceStopHasBegun(t *testing.T) {
+	// Given: a host configured with two plugins but holding a runtime only for the
+	// first, whose Run has not started so a Stop of it parks below.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{
+		{Name: "started", Path: "/nonexistent"},
+		{Name: "unstarted", Path: "/nonexistent"},
+	}})
+
+	sup, relayDone := wireStoppableRuntime(t, h, "started")
+
+	// When: a Stop is in flight — past its snapshot, still waiting below — and a
+	// Start races it.
+	stopCtx, stopCancel := context.WithCancel(context.Background())
+	stopReturned := make(chan error, 1)
+	go func() { stopReturned <- h.Stop(stopCtx) }()
+	awaitStopSnapshotTaken(t, h)
+
+	err := h.Start(context.Background())
+
+	// Then: the started name is refused as still stopping and the unstarted one —
+	// in neither the stopping set nor the snapshot — as belonging to a stopped host.
+	require.ErrorIs(t, err, ErrPluginStopping)
+	require.ErrorIs(t, err, ErrHostStopped)
+
+	// And: the unstarted name was refused before anything was spawned for it. An
+	// admitted one would have run a real attempt against its nonexistent path and
+	// recorded that attempt's transitions, so an untouched record proves the refusal.
+	snap, herr := h.Health("unstarted")
+	require.NoError(t, herr)
+	require.True(t, snap.LastTransition.IsZero(),
+		"a plugin was spawned behind a teardown's snapshot")
+
+	// Release the parked Stop and let the retained runtime's teardown finish.
+	stopCancel()
+	require.Error(t, <-stopReturned)
+	go sup.Run(context.Background())
+	awaitClosed(t, relayDone, "relay was not torn down after Run exited")
+}
+
+// Test a Stop that finds another one in flight reporting its own context's error
+// rather than a success it never observed. The in-flight caller already
+// snapshotted every runtime, so a caller returning nil here would tell its own
+// caller the host was down while plugins were still being torn down — and would
+// have reached the worker release with a budget the owner never agreed to.
+func TestHostStop_ConcurrentStop_ReportsItsOwnContextError_NotAPrematureSuccess(t *testing.T) {
+	// Given: a host holding one runtime whose Run has not started, so the first
+	// Stop parks inside Supervisor.Stop until the test releases it.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p", Path: "/nonexistent"}}})
+
+	sup, relayDone := wireStoppableRuntime(t, h, "p")
+
+	firstCtx, firstCancel := context.WithCancel(context.Background())
+	firstReturned := make(chan error, 1)
+	go func() { firstReturned <- h.Stop(firstCtx) }()
+	awaitStopSnapshotTaken(t, h)
+
+	// When: a second Stop runs with a context that is already spent.
+	spent, cancelSpent := context.WithCancel(context.Background())
+	cancelSpent()
+
+	// Then: it reports that context, not a completed teardown. The teardown the
+	// first caller owns still runs and still reaps every child, whether this
+	// caller waits for it or not.
+	require.ErrorIs(t, h.Stop(spent), context.Canceled)
+
+	// Release the first Stop and let the retained runtime's teardown finish.
+	firstCancel()
+	require.Error(t, <-firstReturned)
+	go sup.Run(context.Background())
+	awaitClosed(t, relayDone, "relay was not torn down after Run exited")
+}
+
+// Test the two bounded waits that end the host's background workers belonging to
+// the Stop that owns the teardown. They are what gives a reader time to take a
+// terminal event the shutdown published; a concurrent caller with nothing left to
+// spend must not reach them, or the caller that did have budget loses the drain it
+// was paying for.
+func TestHostStop_TeardownTail_KeepsTheOwningCallersBudget(t *testing.T) {
+	// Given: a Host whose Events() nobody reads, with one event published, so the
+	// drain wait has something real to wait on and runs to its whole bound rather
+	// than quiescing early — which makes that bound a threshold the two outcomes,
+	// the owner's whole budget or none of it, sit far apart on.
+	h := NewHost(HostConfig{})
+	h.publish(Event{Plugin: "p", Kind: EventReady, Time: time.Now()})
+	require.Eventually(t, func() bool { return !h.eventsQuiesced() }, 5*time.Second, time.Millisecond,
+		"the unread subscription never went non-quiescent, so this proves nothing about the wait")
+
+	// When: a Stop with a full budget owns the teardown and is inside that drain...
+	elapsed := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		_ = h.Stop(context.Background())
+		elapsed <- time.Since(start)
+	}()
+	awaitWorkerReleaseClaimed(t, h)
+
+	// ...and a Stop with nothing left to spend arrives alongside it.
+	spent, cancelSpent := context.WithCancel(context.Background())
+	cancelSpent()
+
+	// Then: the spent caller takes its own context's error instead of running the
+	// release on a budget of zero, and the owner's drain keeps the whole of its own.
+	require.ErrorIs(t, h.Stop(spent), context.Canceled)
+	require.GreaterOrEqual(t, <-elapsed, eventsDrainBound,
+		"the owning caller's drain was cut short by a caller that had no budget")
+}
+
 // Test Host.Reload rejecting a plugin name while a Stop of it is still in flight:
 // during the teardown window the name reports as stopping, distinct from the
 // unavailable it would report once the snapshot has already cleared its runtime.
@@ -1052,16 +1434,18 @@ func TestHostReload_RejectsName_DuringInFlightStop(t *testing.T) {
 	awaitClosed(t, relayDone, "relay was not torn down after Run exited")
 }
 
-// Test a concurrent second Stop not releasing observability while the first Stop
-// still retains a runtime whose Run has not joined: the second Stop's snapshot is
-// empty, so it only reaches the observability gate, which the first Stop's stopping
-// names must keep closed until the retained runtime tears down.
-func TestHostStop_ConcurrentSecondStop_KeepsObservabilityUntilRetained(t *testing.T) {
+// Test a concurrent second Stop neither releasing observability nor reporting a
+// teardown while the first Stop still owns a runtime whose Run has not joined.
+// The first caller snapshotted every runtime, so the second has observed no
+// teardown of its own to report: it waits for the one in flight and then runs its
+// own pass, which is what lets it report the join the first caller had no budget
+// for.
+func TestHostStop_ConcurrentSecondStop_WaitsAndKeepsObservabilityUntilRetained(t *testing.T) {
 	// Given: a host with observability configured (so the shared obs context and a
 	// dispatcher run) holding one runtime whose Run has not started.
 	h := NewHost(HostConfig{Metrics: observe.NoopMetricsSink()})
 
-	sup, _ := wireStoppableRuntime(t, h, "p")
+	sup, relayDone := wireStoppableRuntime(t, h, "p")
 
 	// When: the first Stop is in flight — parked below waiting for the unjoined Run.
 	stopCtx, stopCancel := context.WithCancel(context.Background())
@@ -1069,19 +1453,112 @@ func TestHostStop_ConcurrentSecondStop_KeepsObservabilityUntilRetained(t *testin
 	go func() { firstReturned <- h.Stop(stopCtx) }()
 	awaitStopSnapshotTaken(t, h)
 
-	// A second, concurrent Stop's snapshot is empty, so it publishes no stopping
-	// names and only reaches the observability-release gate.
-	require.NoError(t, h.Stop(context.Background()))
+	// A second, concurrent Stop with a budget of its own runs alongside it.
+	secondReturned := make(chan error, 1)
+	go func() { secondReturned <- h.Stop(context.Background()) }()
 
-	// Then: observability is not released — the first Stop still owns a runtime
-	// whose Run has not joined, so its stopping name keeps the gate closed.
+	// Then: the second Stop reports nothing while that teardown is in flight, and
+	// observability is not released — the first Stop still owns a runtime whose Run
+	// has not joined, so its stopping name keeps the gate closed.
+	require.Never(t, func() bool {
+		select {
+		case <-secondReturned:
+			return true
+		default:
+			return false
+		}
+	}, 200*time.Millisecond, 5*time.Millisecond,
+		"the second Stop reported a teardown that had not happened")
 	require.NoError(t, h.obsCtx.Err(), "observability released while a runtime was still retained")
 
-	// Release the first Stop; once the retained Run joins, observability is freed.
+	// Release the first Stop; once the retained Run joins, observability is freed
+	// and the second caller's own pass reports the join it really did observe.
 	stopCancel()
 	require.Error(t, <-firstReturned)
 	go sup.Run(context.Background())
 	awaitClosed(t, h.obsCtx.Done(), "observability was never released after the retained Run joined")
+	require.NoError(t, <-secondReturned)
+	awaitClosed(t, relayDone, "the retained runtime's relay was never torn down")
+}
+
+// Test a Stop that arrives while the detached join watcher is running the host's
+// worker release waiting for that release instead of reading the claim as proof
+// the workers are down. The claim is taken under the host's lock, but the joining
+// it guards — observability, then the Events() drain — happens after that lock is
+// dropped, so a Stop returning on the flag alone would report a teardown its own
+// background workers were still inside.
+func TestHostStop_WaitsForAWatcherHeldRelease_BeforeReportingTheTeardown(t *testing.T) {
+	// Given: an unread event on the Events() subscription and a drain bound long
+	// enough that the release cannot get past it until this test's own reader takes
+	// that event. That is what holds the release open at a point a later Stop can
+	// observe, without a clock deciding for how long.
+	// The bound is set on this Host alone, never on the package-level default:
+	// another test's detached join watcher can still be inside that wait, and
+	// writing the shared var would race its read.
+	h := NewHost(HostConfig{Plugins: []PluginSpec{{Name: "p", Path: "/nonexistent"}}})
+	h.eventsDrainBound = 5 * time.Second
+
+	sup, relayDone := wireStoppableRuntime(t, h, "p")
+
+	h.publish(Event{Plugin: "p", Kind: EventReady, Time: time.Now()})
+	require.Eventually(t, func() bool { return !h.eventsQuiesced() }, 5*time.Second, time.Millisecond,
+		"the unread subscription never went non-quiescent, so nothing would hold the release open")
+
+	// A first Stop with nothing to spend cannot join the runtime, so it retains it
+	// and leaves the release to the watcher it starts.
+	spent, cancelSpent := context.WithCancel(context.Background())
+	cancelSpent()
+	require.Error(t, h.Stop(spent))
+
+	// When: that watcher claims the release once the retained Run finally joins,
+	// and is now inside the drain it cannot finish.
+	go sup.Run(context.Background())
+	awaitWorkerReleaseClaimed(t, h)
+
+	// Then: a Stop with nothing left to spend takes its own context's error rather
+	// than a success it never observed — and does not sit on the watcher's release
+	// either, which no budget of its own bounds.
+	secondSpent, cancelSecondSpent := context.WithCancel(context.Background())
+	cancelSecondSpent()
+	require.ErrorIs(t, h.Stop(secondSpent), context.Canceled)
+
+	// And: a Stop with a budget of its own reports nothing at all while that
+	// release is still running.
+	waiting := make(chan error, 1)
+	go func() { waiting <- h.Stop(context.Background()) }()
+	require.Never(t, func() bool {
+		select {
+		case <-waiting:
+			return true
+		default:
+			return false
+		}
+	}, 200*time.Millisecond, 5*time.Millisecond,
+		"a Stop reported a teardown whose worker release was still running")
+
+	// And: draining Events() lets that release finish, which is what releases the
+	// waiting Stop — by the time it returns the release is complete, not claimed.
+	drained := make(chan struct{})
+	events := h.Events()
+	go func() {
+		defer close(drained)
+		for {
+			if _, ok := <-events; !ok {
+				return
+			}
+		}
+	}()
+
+	select {
+	case err := <-waiting:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "the waiting Stop never returned after the release finished")
+	}
+	require.True(t, h.hostStopped.Load(),
+		"Stop returned while the host's worker release was still running")
+	awaitClosed(t, drained, "the Events() subscription was never ended")
+	awaitClosed(t, relayDone, "the retained runtime's relay was never torn down")
 }
 
 // wireStoppableRuntime installs one runtime for name whose Supervisor has not been
@@ -1121,6 +1598,52 @@ func awaitStopSnapshotTaken(t *testing.T, h *Host) {
 
 		return h.stopRequested && len(h.runtimes) == 0
 	}, 2*time.Second, time.Millisecond, "Stop never took its snapshot")
+}
+
+// awaitWorkerReleaseClaimed blocks until a Stop has claimed the host's one-shot
+// worker release, after which that Stop is inside the bounded waits that end them.
+func awaitWorkerReleaseClaimed(t *testing.T, h *Host) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+
+		return h.workersReleased
+	}, 2*time.Second, time.Millisecond, "no Stop ever claimed the worker release")
+}
+
+// openFifoWriteEnd opens path write-only and returns the open file, blocking
+// until whoever the test is pairing with opens the read end. That pairing is the
+// checkpoint: the open cannot return before the reader's own open does, so it
+// proves the reader reached that call with no timer or polling involved. The
+// caller closes the returned file to release the reader, which then sees EOF.
+// Bounded to five seconds so a pairing that never happens fails the test rather
+// than hanging it.
+func openFifoWriteEnd(t *testing.T, path string) *os.File {
+	t.Helper()
+
+	type result struct {
+		f   *os.File
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		ch <- result{f, err}
+	}()
+
+	select {
+	case res := <-ch:
+		require.NoError(t, res.err)
+		t.Cleanup(func() { _ = res.f.Close() })
+
+		return res.f
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "nothing ever opened the read end of the pipe")
+	}
+
+	return nil
 }
 
 // awaitClosed fails with msg if ch is not closed (or sent to) within two seconds.
