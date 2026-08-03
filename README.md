@@ -215,7 +215,7 @@ Unix domain sockets, unary and streaming RPC, supervised plugin lifecycle
 with hot-reload — and validated by a differential test suite against the
 UDS oracle, a fault-injection (chaos) suite, and a long-running leak soak.
 
-Current release: **v0.3.0** (see [CHANGELOG.md](CHANGELOG.md)). Pre-1.0: the
+Current release: **v0.3.1** (see [CHANGELOG.md](CHANGELOG.md)). Pre-1.0: the
 public Go API may still move between minor versions; the wire contracts
 ([`shm-abi.md`](docs/specs/shm-abi.md),
 [`stream-protocol.md`](docs/specs/stream-protocol.md)) are frozen and change
