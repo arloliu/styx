@@ -592,9 +592,11 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 			// orders them, and the origin keeps them from colliding with any
 			// other attempt's numbering. Generation 0: no instance was ever
 			// spawned for this attempt, so no heartbeat loop can claim it.
-			h.recordHealthEvent(spec.Name, starting, origin, 1, 0)
+			// Each event carries the revision its own apply assigned, so this
+			// pair is positioned in the record's history like any other.
+			starting.Revision = h.recordHealthEvent(spec.Name, starting, origin, 1, 0)
 			h.publish(starting)
-			h.recordHealthEvent(spec.Name, crashed, origin, 2, 0)
+			crashed.Revision = h.recordHealthEvent(spec.Name, crashed, origin, 2, 0)
 			h.publish(crashed)
 
 			return fmt.Errorf("styx: start plugin %q: %w", spec.Name, err)
@@ -785,8 +787,11 @@ func (h *Host) relayEvents(
 			// transition already retained, never a stale one still in flight
 			// behind the bus's own asynchronous fan-out. (origin, ev.Seq) — not
 			// e.Time — is what recordHealthEvent orders on, and ev.Gen is which
-			// instance the transition described; see its own doc for why.
-			h.recordHealthEvent(name, e, origin, ev.Seq, ev.Gen)
+			// instance the transition described; see its own doc for why. The
+			// revision that apply assigned is stamped onto the very Event this
+			// publishes, so a consumer can order the stream against a snapshot
+			// even where the bus's delivery order disagrees with publish order.
+			e.Revision = h.recordHealthEvent(name, e, origin, ev.Seq, ev.Gen)
 			h.publish(e)
 			// Restart and heartbeat-miss metrics are counted at their authoritative
 			// supervisor seams (OnRestart/OnHeartbeatMiss), not off this
@@ -839,10 +844,10 @@ func (h *Host) drainOnStop(name string, origin uint64, events <-chan supervisor.
 		select {
 		case ev := <-events:
 			e := translateEvent(name, ev)
-			// Same ordering rationale as relayEvents' own case above, and the
-			// same Start attempt: a drain relays what that attempt's own bus
-			// still holds.
-			h.recordHealthEvent(name, e, origin, ev.Seq, ev.Gen)
+			// Same ordering rationale, same revision stamping, and the same
+			// Start attempt as relayEvents' own case above: a drain relays what
+			// that attempt's own bus still holds.
+			e.Revision = h.recordHealthEvent(name, e, origin, ev.Seq, ev.Gen)
 			h.publish(e)
 			h.logEvent(name, ev)
 		default:
@@ -1192,6 +1197,23 @@ type HealthSnapshot struct {
 	// LastError is the same translated error the corresponding Events() event
 	// carried, or nil for a kind that carries none (e.g. EventReady).
 	LastError error
+	// Revision is the position in this plugin's transition history that this
+	// snapshot reflects: 0 before its first transition is recorded, then the
+	// Revision of the most recent one. It is what makes a snapshot comparable
+	// to the event stream — an Event whose Revision is not strictly greater
+	// than this one is a transition already reflected here — so seeding a view
+	// from a snapshot and then folding Events() needs no other ordering rule.
+	// See Event.Revision for how to fold, and for what a gap between two
+	// accepted Revisions does and does not tell you.
+	//
+	// Revision 0 and a zero LastTransition mean the same thing and always
+	// agree; prefer Revision == 0, which needs no time comparison.
+	//
+	// MissedHeartbeats is outside this numbering: it is maintained by the
+	// heartbeat path, which records no transition and does not advance
+	// Revision. A snapshot whose Revision is unchanged from the last one you
+	// took can still report a different MissedHeartbeats.
+	Revision uint64
 	// MissedHeartbeats is the CURRENT run of consecutive missed heartbeats for
 	// the instance State describes, not a lifetime total, and never another
 	// instance's run. It is maintained entirely by the heartbeat path, never by
@@ -1251,6 +1273,16 @@ type healthRecord struct {
 	// described (supervisor.Event.Gen). Paired with lastOrigin it names the
 	// instance the state half is speaking for.
 	lastEventGen uint64
+	// rev counts the transitions applied to the state half: bumped by exactly
+	// one per apply, never on a discard, and never by the count half. It is
+	// reported as HealthSnapshot.Revision and stamped onto the Event each apply
+	// publishes, which is what gives the two views one shared position.
+	//
+	// It is its own counter rather than a projection of (lastOrigin, lastSeq)
+	// for two reasons: both of those restart per Start attempt while this
+	// record outlives every attempt, and a consumer folding a lossy stream
+	// needs positions dense at assignment, which neither of them has.
+	rev uint64
 
 	missed int
 	// hookOrigin/hookGen name the instance the count half is speaking for: the
@@ -1305,6 +1337,7 @@ func (h *Host) Health(name string) (HealthSnapshot, error) {
 		State:            rec.state,
 		LastTransition:   rec.lastTransition,
 		LastError:        rec.lastErr,
+		Revision:         rec.rev,
 		MissedHeartbeats: rec.coherentMissed(),
 	}
 	rec.mu.Unlock()
@@ -1412,17 +1445,23 @@ func (h *Host) nextHealthOrigin(name string) uint64 {
 // that same loop for a beat that has not happened yet. It does record which
 // instance the transition described, which is what lets coherentMissed decide
 // whether the stored count belongs to that same instance.
-func (h *Host) recordHealthEvent(name string, e Event, origin, seq, gen uint64) {
+//
+// It returns the revision it assigned this transition — the record's count of
+// applied transitions, up to and including this one — or 0 for an event it
+// discarded and for a name it holds no record for. Callers stamp that onto the
+// Event they then publish, so Events() and Health report one shared position
+// for the same transition; see Event.Revision.
+func (h *Host) recordHealthEvent(name string, e Event, origin, seq, gen uint64) uint64 {
 	rec, ok := h.health[name]
 	if !ok {
-		return
+		return 0
 	}
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 
 	if origin < rec.lastOrigin || (origin == rec.lastOrigin && seq <= rec.lastSeq) {
-		return
+		return 0
 	}
 
 	rec.state = e.Kind
@@ -1431,6 +1470,9 @@ func (h *Host) recordHealthEvent(name string, e Event, origin, seq, gen uint64) 
 	rec.lastOrigin = origin
 	rec.lastSeq = seq
 	rec.lastEventGen = gen
+	rec.rev++
+
+	return rec.rev
 }
 
 // recordHeartbeatMiss bumps name's current missed-heartbeat run. Runs on the

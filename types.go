@@ -193,6 +193,54 @@ type Event struct {
 	Kind   EventKind
 	Time   time.Time
 	Err    error
+	// Revision is this event's position in its plugin's transition history, or
+	// 0 if it did not advance that history.
+	//
+	// A Host retains one health record per plugin and applies each transition
+	// to it exactly once, discarding any that arrives out of order — this
+	// stream does reorder, because a critical Crashed is delivered ahead of an
+	// informational Starting published before it. Revision is that record's own
+	// position: an event that advanced the record carries the position it
+	// advanced to, and one the record discarded as superseded carries 0. Both
+	// are delivered here; only the first should update a view you maintain.
+	//
+	// Fold this stream by comparing Revision against what you have already
+	// applied — the HealthSnapshot.Revision you seeded from, or the last
+	// Revision you accepted — and ignoring anything not strictly greater. That
+	// one comparison subsumes every reordering this stream can produce,
+	// including a stale Starting after a terminal GaveUp, so it replaces both a
+	// per-kind terminal latch and a re-check after seeding.
+	//
+	// Revision counts one plugin's transitions, not the stream's: it is 1 for a
+	// plugin's first applied transition and counts up by one per transition
+	// after it, for the Host's whole life — across crashes, restarts, hot
+	// reloads, and retried Starts alike. Two plugins' Revisions are unrelated
+	// numbers; compare only within one Event.Plugin.
+	//
+	// Revisions are dense where they are assigned and not where they are
+	// delivered. The record numbers each transition as it applies it, but this
+	// stream then hands critical events out ahead of informational ones queued
+	// before them, so a revision the record assigned can arrive after a higher
+	// one. Events() is bounded and drops under backpressure besides, so
+	// "exactly once" is not on offer either.
+	//
+	// A gap between one accepted Revision and the next is therefore not a
+	// count of what was lost. It means at least one of two things: transitions
+	// this stream dropped, or a lower-numbered transition still in flight
+	// behind the one that overtook it, which arrives later and the fold above
+	// then ignores. Nothing tells the two apart, and no counter reports how
+	// many events Events() dropped.
+	//
+	// What a gap does not cost you is the state: the highest Revision your
+	// fold has accepted is the newest transition the Host applied and handed
+	// over, whatever the stream reordered or dropped around it. Call Health to
+	// resynchronize a view that needs more than that — it re-reads the
+	// retained record whole.
+	//
+	// HealthSnapshot.MissedHeartbeats is outside this numbering. It is written
+	// by the heartbeat path, which records no transition, advances no Revision,
+	// and publishes no event of its own.
+	Revision uint64
 }
 
 // Transport names one of the two data-plane transports a plugin can speak: shared
