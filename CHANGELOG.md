@@ -5,7 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-03
+
+Observability and lifecycle-reporting work: a host can now say which plugin
+a failure came from, order the transitions it observes, account for what it
+drops, and size its own shared memory. Plus the teardown and crash-reporting
+fixes that writing those answers surfaced.
 
 ### Added
 
@@ -139,6 +144,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget. A waiting caller with budget left runs its own pass afterward,
   which is how it completes a join an earlier caller ran out of time for.
 
+- **`PluginCrashError.StderrTail`** could come back empty for a plugin that
+  had in fact written to stderr before dying, taking the stderr suffix
+  embedded in `Reason` with it. The tail a crash reason is built from was
+  reachable only through the same bounded queue that feeds a
+  `PluginSpec.Stdio` sink, so the queue could discard it twice over: a sink
+  falling behind dropped lines once the queue filled, and the cancellation
+  that precedes reporting a crash ended delivery with lines still queued.
+  A plugin that sprayed output before dying was then indistinguishable from
+  one that printed nothing — the exact case the tail exists for. The tail is
+  now written by the goroutine that reads the pipe, before the queue, so it
+  sees neither the drops nor the cancellation; the queue still isolates the
+  caller-supplied sink, which is the only part that needs it.
+
+  One narrower window remains: the stdio pipes are closed during process
+  teardown while the reader may still be draining them, so a plugin that
+  writes to stderr and exits in the same instant can still lose its tail.
+  Where stderr is the whole diagnosis, configure a `PluginSpec.Stdio` sink
+  and log from there as well — that path does not share this window.
+
 ## [0.2.0] - 2026-08-01
 
 Public-API additions from the first external integration of the
@@ -231,5 +255,6 @@ Initial release.
 - **Migration guide** from `hashicorp/go-plugin`
   (`docs/migration-from-go-plugin.md`).
 
+[0.3.0]: https://github.com/arloliu/styx/releases/tag/v0.3.0
 [0.2.0]: https://github.com/arloliu/styx/releases/tag/v0.2.0
 [0.1.0]: https://github.com/arloliu/styx/releases/tag/v0.1.0
