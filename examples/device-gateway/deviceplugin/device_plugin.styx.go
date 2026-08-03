@@ -244,3 +244,17 @@ func RegisterDevicePluginServer(srv *styx.PluginServer, impl DevicePluginServer)
 		},
 	}, impl)
 }
+
+func init() {
+	styx.RegisterIdentityName(devicePluginServiceID, "deviceplugin.DevicePlugin")
+	styx.RegisterIdentityName(devicePluginInitMethodID, "Init")
+	styx.RegisterIdentityName(devicePluginMetadataMethodID, "Metadata")
+	styx.RegisterIdentityName(devicePluginSetLogLevelMethodID, "SetLogLevel")
+	styx.RegisterIdentityName(devicePluginStartMethodID, "Start")
+	styx.RegisterIdentityName(devicePluginStopMethodID, "Stop")
+	styx.RegisterIdentityName(devicePluginPauseMethodID, "Pause")
+	styx.RegisterIdentityName(devicePluginHotReloadMethodID, "HotReload")
+	styx.RegisterIdentityName(devicePluginLoadRuntimeStateMethodID, "LoadRuntimeState")
+	styx.RegisterIdentityName(devicePluginSaveRuntimeStateMethodID, "SaveRuntimeState")
+	styx.RegisterIdentityName(devicePluginCollectMetricsMethodID, "CollectMetrics")
+}

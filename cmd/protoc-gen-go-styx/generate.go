@@ -168,7 +168,35 @@ func generateFile(gen *protogen.Plugin, f *protogen.File) *protogen.GeneratedFil
 		genService(g, svc)
 	}
 
+	genIdentityRegistration(g, f)
+
 	return g
+}
+
+// genIdentityRegistration emits a single init() function that maps every
+// service and method ID in f back to its name via styx.RegisterIdentityName.
+// InvokeID/InvokeIDFactory/OpenStreamID/OpenServerStreamID — every generated
+// client stub — call the host with a precomputed ID and no string name, so
+// without this a *PluginPanicError from that call could only report the ID
+// rendered as hex. Registering at package init covers the host side, which
+// never calls Register<Service>Server and so had no other place to learn the
+// name, and the plugin side alike, regardless of which one a given binary
+// links.
+func genIdentityRegistration(g *protogen.GeneratedFile, f *protogen.File) {
+	registerIdentityName := styxPackage.Ident("RegisterIdentityName")
+
+	g.P("func init() {")
+	for _, svc := range f.Services {
+		nameLower := unexport(svc.GoName)
+		fullName := string(svc.Desc.FullName())
+		g.P(registerIdentityName, "(", nameLower, "ServiceID, ", strconv.Quote(fullName), ")")
+		for _, m := range svc.Methods {
+			bareName := string(m.Desc.Name())
+			g.P(registerIdentityName, "(", nameLower, m.GoName, "MethodID, ", strconv.Quote(bareName), ")")
+		}
+	}
+	g.P("}")
+	g.P()
 }
 
 // genService emits one service's ID/version constants, its `<Service>Client`

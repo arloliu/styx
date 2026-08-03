@@ -51,7 +51,7 @@ jobs:
           GOFLAGS: -p=1
         run: make test-failpoint
 
-      - name: Run make ci (lint, vet, test, failpoint tests)
+      - name: Run make ci (lint, vet, test, failpoint tests, allocation gates)
         # -p=1 serializes test packages. The hosted runner has few CPUs and
         # the race-enabled suites carry ~1s liveness deadlines; packages
         # running in parallel starve each other and flake timing-sensitive

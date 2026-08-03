@@ -445,6 +445,32 @@ func TestRun_Succeeds_WhenTwoServicesShareAMethodName(t *testing.T) {
 	require.Equal(t, wantMethodID, hexLiteral(t, content, "serviceBGetMethodID"))
 }
 
+// Test Run emitting a single init() function that registers every service
+// and method ID in the file against its name through
+// styx.RegisterIdentityName, so a *PluginPanicError raised through a
+// precomputed-ID call (every generated client stub) can report the real
+// name instead of the ID rendered as hex.
+func TestRun_RegistersServiceAndMethodNames_InInitFunc(t *testing.T) {
+	// Given: a CodeGeneratorRequest compiled from testdata/stream.proto,
+	// whose single Streamer service mixes a unary method with all three
+	// streaming shapes.
+	gen := newTestPlugin(t, "testdata/stream.proto", "stream.proto")
+
+	// When
+	require.NoError(t, main.Run(gen))
+	content := styxFile(t, gen)
+
+	// Then: one init() registers the service ID against its full dotted name
+	// and every method ID — unary and streaming alike, since methodID hashes
+	// the bare name regardless of shape — against its bare name.
+	require.Contains(t, content, "func init() {")
+	require.Contains(t, content, `styx.RegisterIdentityName(streamerServiceID, "streamtest.Streamer")`)
+	require.Contains(t, content, `styx.RegisterIdentityName(streamerUnaryMethodID, "Unary")`)
+	require.Contains(t, content, `styx.RegisterIdentityName(streamerCollectMethodID, "Collect")`)
+	require.Contains(t, content, `styx.RegisterIdentityName(streamerFeedMethodID, "Feed")`)
+	require.Contains(t, content, `styx.RegisterIdentityName(streamerChatMethodID, "Chat")`)
+}
+
 // Test checkCollisions failing generation when two distinct service full
 // names hash to the same uint64 — the invocation-wide scope Run still
 // applies to service IDs after the per-service method-ID scoping fix

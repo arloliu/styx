@@ -260,9 +260,10 @@ func statusFromRPC(s *rpcruntime.Status) error {
 	case rpcruntime.StatusCodeHandlerPanic:
 		// The plugin recovered a handler panic and replied with the outcome so
 		// this call terminates with a plugin fault rather than vanishing. Only
-		// the recovered value crosses the wire (in Message); the structured
-		// Plugin/Service/Method names are not carried — there is no status
-		// envelope for them, and they are available in the plugin's own logs.
+		// the recovered value crosses the wire (in Message); there is no status
+		// envelope for Plugin/Service/Method, so this stays a pure function of
+		// the status and returns them empty. withPanicIdentity fills them in at
+		// the caller, from the host's own call context, once this returns.
 		return &PluginPanicError{Value: s.Message}
 	}
 
@@ -291,6 +292,75 @@ func fnv64a(s string) uint64 {
 	_, _ = h.Write([]byte(s)) // hash.Hash's Write never errors
 
 	return h.Sum64()
+}
+
+// hexIdentity renders a service/method routing hash for a *PluginPanicError's
+// Service/Method fields when no string name is available. InvokeID,
+// InvokeIDFactory, OpenStreamID, and OpenServerStreamID — every generated
+// client stub — call with the precomputed hash alone, so the plugin's compile-
+// time name is not something this call ever had; the hash is the most specific
+// identity the host can give an operator to correlate against the plugin's own
+// dispatch table. identityForID calls this as its fallback once the name
+// registry RegisterIdentityName populates has no entry for id.
+func hexIdentity(id uint64) string {
+	return fmt.Sprintf("%#x", id)
+}
+
+// withPanicIdentity fills a freshly reconstructed *PluginPanicError's
+// Plugin/Service/Method from the host's own call context. statusFromRPC only
+// has the recovered value to work with — Plugin/Service/Method never cross the
+// wire — so every entry point that DOES know which plugin, service, and method
+// it dispatched (Invoke, InvokeID, InvokeIDFactory, and the stream-open family)
+// fills them in here once the call resolves. The pointer this receives is
+// always freshly allocated by statusFromRPC and returned through exactly one
+// chain to this call, never retained or aliased elsewhere, so setting the
+// fields in place is safe. Every other error passes through unchanged.
+func withPanicIdentity(err error, plugin, service, method string) error {
+	panicErr := asPluginPanic(err)
+	if panicErr == nil {
+		return err
+	}
+	panicErr.Plugin = plugin
+	panicErr.Service = service
+	panicErr.Method = method
+
+	return err
+}
+
+// withPanicIdentityID is withPanicIdentity for a call routed by precomputed
+// FNV-1a-64 hash, which holds no string name to pass. The names are resolved
+// through identityForID only inside the branch that has a panic error to fill
+// in: an identity nothing will ever read must cost neither the registry's lock
+// nor a hex rendering, and every successful call is such a call.
+func withPanicIdentityID(err error, plugin string, serviceID, methodID uint64) error {
+	panicErr := asPluginPanic(err)
+	if panicErr == nil {
+		return err
+	}
+	panicErr.Plugin = plugin
+	panicErr.Service = identityForID(serviceID)
+	panicErr.Method = identityForID(methodID)
+
+	return err
+}
+
+// asPluginPanic returns the *PluginPanicError err carries, or nil when it
+// carries none. The nil-error test comes first and is load-bearing, not a
+// micro-optimization: errors.As takes its target as an interface, which forces
+// the local pointer to the heap, so reaching the errors.As call at all costs an
+// allocation. Only a failed call can be carrying a panic, so a nil error must
+// answer before that point.
+func asPluginPanic(err error) *PluginPanicError {
+	if err == nil {
+		return nil
+	}
+
+	var panicErr *PluginPanicError
+	if !errors.As(err, &panicErr) {
+		return nil
+	}
+
+	return panicErr
 }
 
 // connFaultDetected reports whether the read loop is exiting because THIS side
@@ -852,7 +922,9 @@ func statusFromFrame(fs *transport.FrameStatus) *rpcruntime.Status {
 // caller of Invoke — hand-calling it is supported but bypasses no safety
 // mechanism; it's a plain typed RPC call.
 func (c *ClientConn) Invoke(ctx context.Context, service, method string, req, resp proto.Message) error {
-	return c.invokeByID(ctx, fnv64a(service), fnv64a(method), req, resp)
+	err := c.invokeByID(ctx, fnv64a(service), fnv64a(method), req, resp)
+
+	return withPanicIdentity(err, c.name, service, method)
 }
 
 // InvokeID is Invoke with the FNV-1a-64 service/method routing hashes supplied
@@ -863,7 +935,9 @@ func (c *ClientConn) Invoke(ctx context.Context, service, method string, req, re
 // Hand-written code uses the name-based Invoke; both land on the identical
 // (service, method) routing, mirroring OpenStream/OpenStreamID.
 func (c *ClientConn) InvokeID(ctx context.Context, serviceID, methodID uint64, req, resp proto.Message) error {
-	return c.invokeByID(ctx, serviceID, methodID, req, resp)
+	err := c.invokeByID(ctx, serviceID, methodID, req, resp)
+
+	return withPanicIdentityID(err, c.name, serviceID, methodID)
 }
 
 // InvokeIDFactory is InvokeID for a caller that lets the runtime own the response
@@ -912,7 +986,9 @@ func (c *ClientConn) InvokeIDFactory(
 		return nil, err
 	}
 
-	return responseFromResult(&result)
+	msg, err := responseFromResult(&result)
+
+	return msg, withPanicIdentityID(err, c.name, serviceID, methodID)
 }
 
 // invokeByID is the shared core of Invoke and InvokeID: it submits and publishes a

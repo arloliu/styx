@@ -71,3 +71,8 @@ func RegisterGreeterServer(srv *styx.PluginServer, impl GreeterServer) {
 		},
 	}, impl)
 }
+
+func init() {
+	styx.RegisterIdentityName(greeterServiceID, "editionstest.Greeter")
+	styx.RegisterIdentityName(greeterGreetMethodID, "Greet")
+}

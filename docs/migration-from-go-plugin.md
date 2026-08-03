@@ -236,8 +236,13 @@ a fresh attempt is safe:
 - `*PluginPanicError` — a handler panicked. A unary caller receives it directly;
   for a streaming call the panic status is best-effort and connection teardown
   may win before it is delivered, so a streaming caller usually but not always
-  sees it. `*PluginCrashError` appears only on `host.Events()`, never as a
-  per-call error.
+  sees it. `Plugin`/`Service`/`Method` identify which handler panicked, filled
+  in from the host's own call context — real names for a name-based call
+  (`Invoke`, `OpenStream`) or for a call through the generated, precomputed-ID
+  API (every stub `protoc-gen-go-styx` emits registers its service/method
+  names against their IDs at package init), the routing hash rendered as hex
+  only for an ID nothing ever registered. `*PluginCrashError` appears only on
+  `host.Events()`, never as a per-call error.
 
 Because "open valve 42" issued twice is not something a framework can know is the
 same physical action, Styx never deduplicates or silently retries on your behalf.

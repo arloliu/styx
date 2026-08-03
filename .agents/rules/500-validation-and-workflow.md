@@ -26,9 +26,10 @@ make lint       # golangci-lint run (pinned version, .golangci.yml)
 make fmt        # gofmt + goimports (golangci-lint fmt)
 make test       # go test ./... -race (plus the tagged ring/event suites)
 make test-failpoint # the crash-window tests behind the failpoint build tag
+make test-allocs # the hot-path allocation gates, without -race (which makes them skip)
 make bench      # bench/spike benchmark suite
 make generate   # buf generate (protobuf + Styx codegen)
-make ci         # lint + vet + test + test-failpoint + bench-goplugin-check
+make ci         # lint + vet + test + test-failpoint + test-allocs + bench-goplugin-check
 make help       # list all targets
 ```
 For fuzzing or a single package, drop to the raw toolchain:

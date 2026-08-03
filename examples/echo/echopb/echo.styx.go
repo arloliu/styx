@@ -357,3 +357,13 @@ func (x *echoStreamChatServer) Recv() (*SayRequest, error) {
 }
 
 func (x *echoStreamChatServer) Context() context.Context { return x.stream.Context() }
+
+func init() {
+	styx.RegisterIdentityName(echoServiceID, "echo.Echo")
+	styx.RegisterIdentityName(echoSayMethodID, "Say")
+	styx.RegisterIdentityName(echoBlobMethodID, "Blob")
+	styx.RegisterIdentityName(echoStreamServiceID, "echo.EchoStream")
+	styx.RegisterIdentityName(echoStreamCollectMethodID, "Collect")
+	styx.RegisterIdentityName(echoStreamFeedMethodID, "Feed")
+	styx.RegisterIdentityName(echoStreamChatMethodID, "Chat")
+}
