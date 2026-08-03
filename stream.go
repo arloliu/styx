@@ -54,6 +54,19 @@ type Stream struct {
 	// on a local abort (caller-context cancel or codec failure); the accept side leaves
 	// it false and terminates through its handler's error return.
 	opener bool
+	// plugin, service, and method identify which handler this stream calls, stamped
+	// by finishOpenStream once the open call knows it — an open by precomputed ID
+	// stamps the hashes below instead. Err and driveLocal fill a
+	// panic surfacing later from this stream's terminal with them (see
+	// PluginPanicError). The accept side never reconstructs a *PluginPanicError from
+	// its own peer, so newServerStream leaves them at their empty zero value.
+	plugin, service, method string
+	// serviceID and methodID are the routing hashes an open by precomputed ID was
+	// routed by, and byID says those — not service/method — are this stream's
+	// identity. They stay unresolved until a panic error actually needs a name, so
+	// opening a stream costs no registry lookup for a name nothing may ever read.
+	serviceID, methodID uint64
+	byID                bool
 }
 
 // newClientStream wraps the opener side of a freshly opened stream with the
@@ -142,7 +155,7 @@ func (s *Stream) Err() error {
 		return nil
 	}
 
-	return StreamError(oc.Err)
+	return s.stampPanicIdentity(StreamError(oc.Err))
 }
 
 // driveLocal is the single point where SendMsg/RecvMsg/CloseSend both drive the
@@ -172,7 +185,19 @@ func (s *Stream) driveLocal(ctx context.Context, err error) error {
 		s.stream.TerminateLocal(ctx.Err())
 	}
 
-	return StreamError(err)
+	return s.stampPanicIdentity(StreamError(err))
+}
+
+// stampPanicIdentity fills a *PluginPanicError surfacing from this stream's terminal
+// with the identity its open call recorded, and passes every other error through
+// unchanged. A stream opened by precomputed ID resolves its names here, at the one
+// point they are read, rather than at open time.
+func (s *Stream) stampPanicIdentity(err error) error {
+	if s.byID {
+		return withPanicIdentityID(err, s.plugin, s.serviceID, s.methodID)
+	}
+
+	return withPanicIdentity(err, s.plugin, s.service, s.method)
 }
 
 // abortLocal drives the opener's stream terminal on a local codec failure it cannot
@@ -282,7 +307,9 @@ func WithBidiStream() StreamOption {
 func (c *ClientConn) OpenStream(
 	ctx context.Context, service, method string, opts ...StreamOption,
 ) (*Stream, error) {
-	return c.openStreamByID(ctx, fnv64a(service), fnv64a(method), opts...)
+	st, err := c.openStreamByID(ctx, fnv64a(service), fnv64a(method), opts...)
+
+	return c.finishOpenStream(st, err, service, method)
 }
 
 // OpenStreamID is OpenStream with the FNV-1a-64 service/method routing hashes
@@ -295,7 +322,9 @@ func (c *ClientConn) OpenStream(
 func (c *ClientConn) OpenStreamID(
 	ctx context.Context, serviceID, methodID uint64, opts ...StreamOption,
 ) (*Stream, error) {
-	return c.openStreamByID(ctx, serviceID, methodID, opts...)
+	st, err := c.openStreamByID(ctx, serviceID, methodID, opts...)
+
+	return c.finishOpenStreamID(st, err, serviceID, methodID)
 }
 
 // OpenServerStreamID opens a server-streaming stream by precomputed service/method
@@ -320,7 +349,37 @@ func (c *ClientConn) OpenServerStreamID(
 		return nil, fmt.Errorf("styx: open server stream: marshal request: %w", err)
 	}
 
-	return c.openStreamByID(ctx, serviceID, methodID, WithServerStreamRequest(payload))
+	st, err := c.openStreamByID(ctx, serviceID, methodID, WithServerStreamRequest(payload))
+
+	return c.finishOpenStreamID(st, err, serviceID, methodID)
+}
+
+// finishOpenStream stamps a successfully opened Stream's Plugin/Service/Method
+// identity for its later terminal (Err, driveLocal) and, symmetrically, enriches
+// an error that is ITSELF already a reconstructed *PluginPanicError: a peer fast
+// enough to panic before the STREAM_OPEN's own publish-confirm resolves surfaces
+// the panic as this call's returned error rather than through a live stream's
+// later terminal (see resolveOpenTerminal, translateStreamOutcomeErr), so both
+// surfacing points need the same fill from the one place that has the identity.
+func (c *ClientConn) finishOpenStream(st *Stream, err error, service, method string) (*Stream, error) {
+	if st != nil {
+		st.plugin, st.service, st.method = c.name, service, method
+	}
+
+	return st, withPanicIdentity(err, c.name, service, method)
+}
+
+// finishOpenStreamID is finishOpenStream for an open routed by precomputed hash: it
+// records the hashes themselves on the stream, so the names they stand for are
+// resolved only if and when a *PluginPanicError needs them (stampPanicIdentity),
+// never on an open that goes on to succeed.
+func (c *ClientConn) finishOpenStreamID(st *Stream, err error, serviceID, methodID uint64) (*Stream, error) {
+	if st != nil {
+		st.plugin, st.serviceID, st.methodID = c.name, serviceID, methodID
+		st.byID = true
+	}
+
+	return st, withPanicIdentityID(err, c.name, serviceID, methodID)
 }
 
 // openStreamByID is the shared core of OpenStream, OpenStreamID, and

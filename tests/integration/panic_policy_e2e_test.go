@@ -76,9 +76,16 @@ func TestPanicPolicy_ReturnPanicErrorThenRestart_OnHandlerPanic(t *testing.T) {
 	// When: the sentinel request panics the handler.
 	_, err = client.Say(t.Context(), &echopb.SayRequest{Message: "panic"})
 
-	// Then: the caller observes a typed panic error across the process boundary.
+	// Then: the caller observes a typed panic error across the process boundary,
+	// identified by the host's own call context rather than left blank — Say is
+	// called through the generated (ID-based) client, but echopb's init function
+	// registers echo.Echo/Say against their routing IDs, so the real names come
+	// back here rather than the hex hash; see styx.PluginPanicError's doc.
 	var panicErr *styx.PluginPanicError
 	require.ErrorAs(t, err, &panicErr)
+	require.Equal(t, "echo", panicErr.Plugin)
+	require.Equal(t, "echo.Echo", panicErr.Service)
+	require.Equal(t, "Say", panicErr.Method)
 
 	// And the default policy restarts the instance.
 	awaitEvent(t, events, styx.EventRestarting)
@@ -104,9 +111,13 @@ func TestPanicPolicy_ContinueSameInstance_WhenContinueAfterPanicOptedIn(t *testi
 	// When
 	_, err = client.Say(t.Context(), &echopb.SayRequest{Message: "panic"})
 
-	// Then: still a typed panic error for the panicking call itself.
+	// Then: still a typed panic error for the panicking call itself, identified by
+	// the real registered name rather than the routing hash.
 	var panicErr *styx.PluginPanicError
 	require.ErrorAs(t, err, &panicErr)
+	require.Equal(t, "echo", panicErr.Plugin)
+	require.Equal(t, "echo.Echo", panicErr.Service)
+	require.Equal(t, "Say", panicErr.Method)
 
 	// And the same instance keeps serving with no restart, proven by re-probing the
 	// same pid across a window strictly beyond the missed-heartbeat restart latency.
@@ -131,9 +142,13 @@ func TestPanicPolicy_StreamPanicTerminatesStream_AndContinueKeepsInstance(t *tes
 	require.NoError(t, err)
 	_, err = stream.Recv()
 
-	// Then: the stream terminates with the typed panic error.
+	// Then: the stream terminates with the typed panic error, identified by the
+	// real registered name rather than the routing hash.
 	var panicErr *styx.PluginPanicError
 	require.ErrorAs(t, err, &panicErr)
+	require.Equal(t, "echo", panicErr.Plugin)
+	require.Equal(t, "echo.EchoStream", panicErr.Service)
+	require.Equal(t, "Feed", panicErr.Method)
 
 	// And the same instance keeps serving unary calls, with no restart, across a
 	// window strictly beyond the missed-heartbeat restart latency.

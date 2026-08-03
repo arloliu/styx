@@ -302,3 +302,11 @@ func (x *streamerChatServer) Recv() (*Chunk, error) {
 }
 
 func (x *streamerChatServer) Context() context.Context { return x.stream.Context() }
+
+func init() {
+	styx.RegisterIdentityName(streamerServiceID, "streamtest.Streamer")
+	styx.RegisterIdentityName(streamerUnaryMethodID, "Unary")
+	styx.RegisterIdentityName(streamerCollectMethodID, "Collect")
+	styx.RegisterIdentityName(streamerFeedMethodID, "Feed")
+	styx.RegisterIdentityName(streamerChatMethodID, "Chat")
+}

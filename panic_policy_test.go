@@ -174,10 +174,14 @@ func TestPluginServer_TaintAndTerminate_OnUnaryHandlerPanic(t *testing.T) {
 	err := h.cc.Invoke(ctx, "panic.Svc", "Boom", wrapperspb.String("x"), &wrapperspb.StringValue{})
 
 	// Then the panicking call sees the panic outcome (the reply reached it, the call
-	// did not vanish)...
+	// did not vanish), identified by the host's own call context — Invoke's real
+	// service/method names, not just a bare recovered value...
 	var panicErr *PluginPanicError
 	require.ErrorAs(t, err, &panicErr)
 	require.Equal(t, "handler boom", panicErr.Value)
+	require.Equal(t, "p", panicErr.Plugin)
+	require.Equal(t, "panic.Svc", panicErr.Service)
+	require.Equal(t, "Boom", panicErr.Method)
 
 	// ...and the serve loop then terminated in a controlled way (sentinel returned
 	// only AFTER the reply was sent) — observed structurally, not by a sleep.
@@ -187,6 +191,30 @@ func TestPluginServer_TaintAndTerminate_OnUnaryHandlerPanic(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("serve loop must terminate after a handler panic under the default policy")
 	}
+}
+
+// Test a unary handler panic reached through the precomputed-ID entry point still
+// carrying a usable identity, even with no string name available to give it
+func TestPluginServer_IdentifyPanic_ByHexID_WhenInvokedByID(t *testing.T) {
+	// Given a default-policy serving loop with a panicking unary handler, called the
+	// way every generated client stub calls it: by precomputed routing hash, never
+	// by name.
+	h := setupUnaryPanicHarness(t, false)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	// When the client invokes the panicking method by ID.
+	serviceID, methodID := fnv64a("panic.Svc"), fnv64a("Boom")
+	err := h.cc.InvokeID(ctx, serviceID, methodID, wrapperspb.String("x"), &wrapperspb.StringValue{})
+
+	// Then the panic error carries the plugin name plus the routing hashes rendered
+	// as hex — never empty, since an empty Service/Method reproduces the exact "."
+	// rendering this identity fix exists to remove.
+	var panicErr *PluginPanicError
+	require.ErrorAs(t, err, &panicErr)
+	require.Equal(t, "p", panicErr.Plugin)
+	require.Equal(t, hexIdentity(serviceID), panicErr.Service)
+	require.Equal(t, hexIdentity(methodID), panicErr.Method)
 }
 
 // Test an opted-in server continuing to serve after a unary handler panic
@@ -236,7 +264,14 @@ type streamPanicHarness struct {
 func setupStreamPanicHarness(t *testing.T, continueAfterPanic bool) *streamPanicHarness {
 	t.Helper()
 
-	const service, method, watchMethod = "panic.Stream", "Feed", "Watch"
+	// method uses a name no generated .proto in this repo declares (unlike the
+	// generic "Feed"/"Watch" used elsewhere in this file): TestPluginServer_-
+	// IdentifyStreamPanic_ByHexID_WhenOpenedByID below asserts the ID falls
+	// back to its hex rendering, which only holds for an ID nothing ever
+	// registered a name for — a real generated stub sharing this bare method
+	// name would register it via RegisterIdentityName and make that
+	// assertion coincidentally pass for the wrong reason.
+	const service, method, watchMethod = "panic.Stream", "PanicStreamBoom", "Watch"
 	watchEntered := make(chan struct{}, 1)
 	handlers := map[streamKey]streamHandlerReg{
 		{service: fnv64a(service), method: fnv64a(method)}: {
@@ -318,10 +353,14 @@ func TestPluginServer_TerminateStream_OnStreamingHandlerPanic(t *testing.T) {
 		}
 	}
 
-	// Then the stream terminated carrying the panic outcome...
+	// Then the stream terminated carrying the panic outcome, identified by the
+	// host's own call context — OpenStream's real service/method names...
 	var panicErr *PluginPanicError
 	require.ErrorAs(t, st.Err(), &panicErr)
 	require.Equal(t, "stream handler boom", panicErr.Value)
+	require.Equal(t, "p", panicErr.Plugin)
+	require.Equal(t, h.service, panicErr.Service)
+	require.Equal(t, h.method, panicErr.Method)
 
 	// ...and the session raised its controlled-termination signal.
 	select {
@@ -330,6 +369,36 @@ func TestPluginServer_TerminateStream_OnStreamingHandlerPanic(t *testing.T) {
 		t.Fatal("a streaming handler panic under the default policy must signal termination")
 	}
 	require.True(t, h.controller.shouldTerminate())
+}
+
+// Test a streaming handler panic reached through the precomputed-ID entry point
+// still carrying a usable identity, even with no string name available to give it
+func TestPluginServer_IdentifyStreamPanic_ByHexID_WhenOpenedByID(t *testing.T) {
+	// Given a default-policy stream serve loop with a panicking handler, opened the
+	// way every generated streaming client stub opens it: by precomputed routing
+	// hash, never by name.
+	h := setupStreamPanicHarness(t, false)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	// When the client opens the stream by ID and drains it to its terminal.
+	serviceID, methodID := fnv64a(h.service), fnv64a(h.method)
+	st, err := h.cc.OpenStreamID(ctx, serviceID, methodID, WithServerStreamRequest([]byte("go")))
+	require.NoError(t, err)
+	for {
+		if _, rerr := st.RecvMsg(ctx); rerr != nil {
+			break
+		}
+	}
+
+	// Then the panic error carries the plugin name plus the routing hashes rendered
+	// as hex — never empty, since an empty Service/Method reproduces the exact "."
+	// rendering this identity fix exists to remove.
+	var panicErr *PluginPanicError
+	require.ErrorAs(t, st.Err(), &panicErr)
+	require.Equal(t, "p", panicErr.Plugin)
+	require.Equal(t, hexIdentity(serviceID), panicErr.Service)
+	require.Equal(t, hexIdentity(methodID), panicErr.Method)
 }
 
 // Test that once a streaming handler panic taints the session, the reader admits

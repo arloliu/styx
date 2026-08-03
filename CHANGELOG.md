@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`PluginPanicError`**: `Plugin`, `Service`, and `Method` are now filled in
+  from the host's own call context on every panicking unary call and stream
+  terminal, instead of staying empty — previously only `Value` was ever
+  populated, and `Error()` rendered the empty join as `"handler .panicked"`.
+  A call made through the precomputed-ID API (`InvokeID`, `InvokeIDFactory`,
+  `OpenStreamID`, `OpenServerStreamID` — every generated client stub) has no
+  string name to give, so `Service`/`Method` carry the routing hash rendered
+  as hex instead. The unused `Stack []byte` field, never populated on any
+  path, is removed.
+
 ## [0.2.0] - 2026-08-01
 
 Public-API additions from the first external integration of the

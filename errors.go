@@ -95,12 +95,23 @@ func (e *PluginCrashError) Error() string {
 // The panicking call returns *PluginPanicError directly (the runtime knows
 // definitively that its handler panicked). Other outstanding calls on the same
 // connection get ErrOutcomeUnknown wrapping a PluginCrashError, like any crash.
+//
+// Plugin, Service, and Method identify which handler panicked, filled in from the
+// host's own call context — they never cross the wire, since only the recovered
+// value does (see statusFromRPC). Service and Method carry the real name for a
+// call made through the name-based API (Invoke, OpenStream). A call made through
+// the precomputed-ID API (InvokeID, InvokeIDFactory, OpenStreamID,
+// OpenServerStreamID — every generated client stub) never had a name to give, but
+// generated code also registers its service/method names against their IDs at
+// package init (RegisterIdentityName), so Service/Method still carry the real
+// name whenever that registration ran. Only an ID with no registration — a
+// hand-called precomputed-ID API, or a plugin built with an older generator —
+// falls back to the routing hash rendered as hex, e.g. "0xedc54b402664edff".
 type PluginPanicError struct {
 	Plugin  string
 	Service string
 	Method  string
 	Value   string // fmt.Sprint(recover())
-	Stack   []byte
 }
 
 func (e *PluginPanicError) Error() string {
