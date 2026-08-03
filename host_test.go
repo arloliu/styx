@@ -527,6 +527,122 @@ func TestHost_PluginCrashErrors_OwnIndependentStderrTailCopies_FromSameCrash(t *
 		"StderrTail must be an independent copy per public error, not aliased across them")
 }
 
+// parkedStdioSink is a styx.StdioSink that parks inside WriteLine until the
+// test releases it, which is what makes it the "sink falls behind" case
+// StdioCapture's bounded-queue drop policy exists for -- forced
+// deterministically, rather than by a slow but eventually-returning sink.
+//
+// Releasing matters: a capture never joins its delivery goroutines (that is
+// what keeps a bad Sink from wedging teardown), so a Sink that never returns
+// at all holds a goroutine neither the capture nor Host.Stop can reclaim.
+type parkedStdioSink struct {
+	release chan struct{}
+}
+
+func newParkedStdioSink(t *testing.T) *parkedStdioSink {
+	t.Helper()
+
+	s := &parkedStdioSink{release: make(chan struct{})}
+	t.Cleanup(func() { close(s.release) })
+
+	return s
+}
+
+func (s *parkedStdioSink) WriteLine(string, []byte) { <-s.release }
+
+// Test a pre-handshake crash still reporting its stderr when the configured
+// PluginSpec.Stdio sink never returns a line.
+//
+// This goes through the real Host.Start -> spawn path rather than wiring a
+// capture by hand, so it is what pins the crash tail to the spawn that
+// installs it: a spawn that stopped installing it, or installed the wrong
+// one, would leave this tail empty no matter how the capture itself behaves.
+//
+// The assertion deliberately does not depend on where the line stopped. A
+// sink that never returns leaves it queued, or inside the parked call, or
+// abandoned when the capture's cancellation wins the race -- which of those
+// happens is a scheduling detail, and the tail must hold the line in every
+// one of them.
+func TestHost_Start_CarriesStderrTail_WhenTheStdioSinkNeverReturns(t *testing.T) {
+	testutil.RequireNoGoroutineLeak(t) // registered before the host: see its doc comment on ordering.
+
+	// Given: the same pre-handshake crash shape as
+	// TestHost_Start_CarriesStderrTail_MatchingReasonSuffix, but with a sink
+	// that parks in WriteLine, so nothing this plugin prints is delivered.
+	const marker = "styx-stdio-sink-test: parked-sink crash marker"
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{
+			Name:  "parkedsink",
+			Path:  "/bin/sh",
+			Args:  []string{"-c", "echo '" + marker + "' 1>&2; exit 1"},
+			Stdio: newParkedStdioSink(t),
+		}},
+	})
+	// Stopped even though Start fails: NewHost subscribes to the event bus,
+	// and only Stop unsubscribes it.
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// When
+	err := h.Start(t.Context())
+
+	// Then: the crash still carries the line, both structured and inside
+	// Reason -- a sink that cannot keep up costs that sink its own delivery,
+	// never the crash reason.
+	require.Error(t, err)
+
+	var crashErr *styx.PluginCrashError
+	require.ErrorAs(t, err, &crashErr)
+	require.Contains(t, crashErr.StderrTail, marker,
+		"a parked Stdio sink must not empty the crash tail")
+	require.Contains(t, crashErr.Reason, marker,
+		"Reason must still embed the line its own tail retained")
+}
+
+// Test a crash after Ready still reporting its stderr when the configured
+// PluginSpec.Stdio sink never returns a line -- the same guarantee as the
+// pre-handshake case above, on the other crash path, where the reason is
+// built after a full instance teardown rather than after a failed spawn.
+func TestHost_CrashEvent_CarriesStderrTail_WhenTheStdioSinkNeverReturns(t *testing.T) {
+	testutil.RequireNoGoroutineLeak(t) // registered before the host: see its doc comment on ordering.
+
+	// Given: a plugin that prints one line to stderr and then execs into the
+	// crashy fixture, whose crash goroutine is parked on a checkpoint this
+	// test controls -- so the line is captured during a normal, Ready
+	// instance and must still be there when that instance later dies. exec
+	// replaces the process image in place, so the inherited stdio pipes and
+	// control fd carry across and the handshake completes normally.
+	const marker = "styx-stdio-sink-test: post-ready parked-sink marker"
+	fifo := mkfifo(t)
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{
+			Name:    "readythencrash",
+			Path:    "/bin/sh",
+			Args:    []string{"-c", "echo '" + marker + "' 1>&2; exec " + fixtureCrashyPlugin + " startup"},
+			Env:     []string{"STYX_ECHO_CRASHY_FIFO=" + fifo},
+			Restart: styx.NoRestart,
+			Stdio:   newParkedStdioSink(t),
+		}},
+	})
+	events := h.Events()
+
+	require.NoError(t, h.Start(t.Context()))
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	require.Equal(t, "readythencrash", awaitEvent(t, events, styx.EventReady).Plugin)
+
+	// When: the checkpoint is released, so the plugin crashes from a state it
+	// provably reached.
+	openFifoOrFail(t, fifo)
+
+	// Then: the crash event's error carries the line the parked sink never
+	// took.
+	crashEv := awaitEvent(t, events, styx.EventCrashed)
+
+	var crashErr *styx.PluginCrashError
+	require.ErrorAs(t, crashEv.Err, &crashErr)
+	require.Contains(t, crashErr.StderrTail, marker,
+		"a parked Stdio sink must not empty the crash tail on the post-Ready path")
+}
+
 // stdioLineCollector is a channel-backed styx.StdioSink: a test subscribes by
 // reading from lines, so it observes a delivered line as an event rather than
 // polling shared state.
@@ -578,14 +694,6 @@ func TestHost_Start_DeliversLiveStdioLines_ToPluginSpecStdio(t *testing.T) {
 	}
 }
 
-// blackHoleStdioSink is a styx.StdioSink whose WriteLine never returns,
-// so it never drains — the "sink falls behind" case StdioCapture's own
-// bounded-queue drop policy exists for, forced deterministically rather than
-// relying on a slow but eventually-returning sink.
-type blackHoleStdioSink struct{}
-
-func (blackHoleStdioSink) WriteLine(string, []byte) { select {} }
-
 // recordingMetricsSink is a minimal observe.MetricsSink recording every
 // IncrCounter call's cumulative delta and most recent labels per metric name,
 // safe for concurrent use.
@@ -628,11 +736,16 @@ func (s *recordingMetricsSink) labelsFor(metric string) []observe.Label {
 // operator cannot tell "the plugin printed nothing" apart from "the sink fell
 // behind" -- an absent log line proves nothing by itself.
 func TestHost_Start_ReportsStdioDropped_ToConfiguredSink(t *testing.T) {
+	testutil.RequireNoGoroutineLeak(t) // registered before the host: see its doc comment on ordering.
+
 	// Given: a shell wrapper that floods stdout with far more lines than
 	// StdioCapture's delivery queue can ever hold, then execs into the real
 	// readyplugin fixture so the handshake and heartbeat loop still run.
-	// PluginSpec.Stdio never drains (blackHoleStdioSink blocks forever), so
-	// every flooded line beyond the queue bound is a real, not simulated, drop.
+	// PluginSpec.Stdio parks on its first line and never takes another, so
+	// every flooded line beyond the queue bound is a real, not simulated,
+	// drop. The sink is released in cleanup because a capture never joins its
+	// delivery goroutines: one parked in a Sink that never returns is a
+	// goroutine nothing can reclaim.
 	const floodLines = 2000
 	sink := newRecordingMetricsSink()
 	h := styx.NewHost(styx.HostConfig{
@@ -642,7 +755,7 @@ func TestHost_Start_ReportsStdioDropped_ToConfiguredSink(t *testing.T) {
 			Path: "/bin/sh",
 			Args: []string{"-c",
 				fmt.Sprintf("for i in $(seq 1 %d); do echo line-$i; done; exec %s", floodLines, fixtureReadyPlugin)},
-			Stdio: blackHoleStdioSink{},
+			Stdio: newParkedStdioSink(t),
 		}},
 	})
 

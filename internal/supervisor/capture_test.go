@@ -19,20 +19,36 @@ import (
 // letting it drain: a blocked sink drops output (counted) rather than
 // filling the pipe and blocking the plugin inside a write.
 type blockingSink struct {
-	mu    sync.Mutex
-	lines []string
-	block chan struct{} // closed to release every blocked WriteLine call
+	mu        sync.Mutex
+	lines     []string
+	block     chan struct{} // closed to release every blocked WriteLine call
+	entered   chan struct{} // closed once some line has reached WriteLine
+	enterOnce sync.Once
 }
 
 func newBlockingSink() *blockingSink {
-	return &blockingSink{block: make(chan struct{})}
+	return &blockingSink{block: make(chan struct{}), entered: make(chan struct{})}
 }
 
 func (s *blockingSink) WriteLine(stream string, line []byte) {
+	s.enterOnce.Do(func() { close(s.entered) })
 	<-s.block
 	s.mu.Lock()
 	s.lines = append(s.lines, string(line))
 	s.mu.Unlock()
+}
+
+// awaitEntered blocks until a line has actually reached WriteLine, so a test
+// that means "parked on the first line, with the next one behind it" can
+// establish that state rather than assume the scheduler produced it.
+func (s *blockingSink) awaitEntered(t *testing.T) {
+	t.Helper()
+
+	select {
+	case <-s.entered:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "no line ever reached the blocking sink")
+	}
 }
 
 // release unblocks every stalled WriteLine, so a test that stalled the sink
@@ -332,11 +348,19 @@ func TestStdioCapture_AdversarialInput_NoPanic_BoundsHold(t *testing.T) {
 	require.Positive(t, count, "the adversarial streams must still deliver at least one line")
 }
 
-// Test the crash tail keeping a line that cancellation stops the user sink
-// from ever being delivered
-func TestStdioCapture_TapKeepsLine_WhenCancellationEndsDeliveryFirst(t *testing.T) {
-	// Given: a user sink that blocks on its first line, so every line behind
-	// it stays queued and undelivered, and a tap standing in for the
+// Test the crash tail keeping a line still stranded in the delivery queue
+//
+// The queue here is wide enough to hold the second line, so this is the
+// queued-but-never-delivered case, distinct from the overflow case below
+// where the line is dropped outright. Whether the delivery goroutine then
+// ends by cancellation or by the queue closing is not what the tap depends
+// on, and this test deliberately does not turn on it -- the two public crash
+// paths cover that ordering, in the root package's
+// TestHost_Start_CarriesStderrTail_WhenTheStdioSinkNeverReturns and
+// TestHost_CrashEvent_CarriesStderrTail_WhenTheStdioSinkNeverReturns.
+func TestStdioCapture_TapKeepsLine_StrandedBehindABlockedSink(t *testing.T) {
+	// Given: a user sink that parks inside its first WriteLine, so the line
+	// after it stays queued and undelivered, and a tap standing in for the
 	// crash-reason tail.
 	user := newBlockingSink()
 	defer user.release()
@@ -349,9 +373,10 @@ func TestStdioCapture_TapKeepsLine_WhenCancellationEndsDeliveryFirst(t *testing.
 	done := make(chan struct{})
 	go func() { defer close(done); sc.Run(ctx) }()
 
-	// When: the marker is written and read, then the streams end and delivery
-	// is canceled while that marker is still stuck behind the blocked sink.
+	// When: the first line is written and the sink is confirmed parked on it,
+	// so the second provably lands in the queue with nothing draining it.
 	_, _ = fmt.Fprintln(stderrW, "wedge")
+	user.awaitEntered(t)
 	_, _ = fmt.Fprintln(stderrW, "marker")
 	require.Eventually(t, func() bool {
 		return len(tail()) == 2
@@ -361,12 +386,12 @@ func TestStdioCapture_TapKeepsLine_WhenCancellationEndsDeliveryFirst(t *testing.
 	<-done
 	cancel()
 
-	// Then: the crash tail holds the marker even though delivery never ran
-	// for it -- this is exactly what a crash reason is built from, and it is
-	// built after the same cancellation.
+	// Then: the crash tail holds both lines even though the sink completed
+	// neither -- it is still parked inside the first and never reached the
+	// second. What the tail keeps does not depend on the queue draining.
 	require.Equal(t, []string{"wedge", "marker"}, tail(),
-		"the crash tail must not depend on delivery outliving cancellation")
-	require.Empty(t, user.delivered(), "the blocked sink must not have delivered the marker")
+		"the crash tail must not depend on the delivery queue draining")
+	require.Empty(t, user.delivered(), "the parked sink must not have completed either line")
 }
 
 // Test the crash tail keeping a line the user sink's queue dropped
