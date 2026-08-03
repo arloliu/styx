@@ -91,6 +91,78 @@ type Region struct {
 	closed atomic.Bool
 }
 
+// DeriveLayout validates layout's host-chosen geometry (docs/specs/shm-abi.md
+// §1: ring_capacity, lifecycle_reserve, and each direction's size-class
+// table) and returns a fully-derived Layout — every span offset, each
+// direction's arena_bytes and class_base_offset-filled classes, and
+// region_size — computed purely from those inputs, with no memfd, mapping, or
+// other syscall.
+//
+// CreateRegion calls this for exactly the same derivation before it creates a
+// memfd, so the two can never diverge: this is the create path's own geometry
+// computation, factored out so a caller that only needs the region's size (or
+// to reject a bad geometry before spawning anything) can get it without any
+// of CreateRegion's side effects.
+// layout.Magic, layout.LayoutVersion, layout.Generation, and
+// layout.HeaderFlags are copied through unvalidated — they carry no bearing
+// on the region's size, and CreateRegion validates Generation/HeaderFlags
+// itself, before and after calling this.
+func DeriveLayout(layout Layout) (Layout, error) {
+	if err := validateRingCapacity(layout.RingCapacity); err != nil {
+		return Layout{}, err
+	}
+	if err := validateLifecycleReserve(layout.LifecycleReserve, layout.RingCapacity); err != nil {
+		return Layout{}, err
+	}
+
+	classesHP, arenaBytesHP, err := buildArenaGeometry(layout.Arenas[HostToPlugin].Classes)
+	if err != nil {
+		return Layout{}, fmt.Errorf("h->p arena: %w", err)
+	}
+	classesPH, arenaBytesPH, err := buildArenaGeometry(layout.Arenas[PluginToHost].Classes)
+	if err != nil {
+		return Layout{}, fmt.Errorf("p->h arena: %w", err)
+	}
+
+	spans, err := deriveSpans(layout.RingCapacity, arenaBytesHP, arenaBytesPH)
+	if err != nil {
+		return Layout{}, err
+	}
+
+	classTableHPOffset := uint64(classTableRecommendedOffset)
+	classTablePHOffset := classTableHPOffset + uint64(len(classesHP))*uint64(sizeClassEntrySize)
+	classTablesEnd := classTablePHOffset + uint64(len(classesPH))*uint64(sizeClassEntrySize)
+	if classTablesEnd > LayoutPageSize {
+		return Layout{}, fmt.Errorf("class tables (%d + %d entries) exceed the layout page: %w",
+			len(classesHP), len(classesPH), ErrBadGeometry)
+	}
+
+	return Layout{
+		Magic:            layout.Magic,
+		LayoutVersion:    layout.LayoutVersion,
+		HeaderFlags:      layout.HeaderFlags,
+		Generation:       layout.Generation,
+		RegionSize:       spans.regionSize,
+		RingCapacity:     layout.RingCapacity,
+		LifecycleReserve: layout.LifecycleReserve,
+		SyncPageOffset:   spans.syncPageOffset,
+		Rings: [2]RingGeometry{
+			HostToPlugin: {Offset: spans.ringHPOffset},
+			PluginToHost: {Offset: spans.ringPHOffset},
+		},
+		Arenas: [2]ArenaGeometry{
+			HostToPlugin: {
+				Offset: spans.arenaHPOffset, Bytes: arenaBytesHP,
+				ClassTableOffset: classTableHPOffset, Classes: classesHP,
+			},
+			PluginToHost: {
+				Offset: spans.arenaPHOffset, Bytes: arenaBytesPH,
+				ClassTableOffset: classTablePHOffset, Classes: classesPH,
+			},
+		},
+	}, nil
+}
+
 // CreateRegion validates input's host-chosen geometry (docs/specs/shm-abi.md
 // §1: ring_capacity, lifecycle_reserve, and each direction's size-class table),
 // computes every derived field (span offsets, arena_bytes_*, region_size) via
@@ -114,58 +186,14 @@ func CreateRegion(input Layout) (*Region, error) {
 		return nil, fmt.Errorf("shm: CreateRegion: header_flags %#x != 0 (no feature negotiation at this layer): %w",
 			input.HeaderFlags, ErrBadGeometry)
 	}
-	if err := validateRingCapacity(input.RingCapacity); err != nil {
-		return nil, fmt.Errorf("shm: CreateRegion: %w", err)
-	}
-	if err := validateLifecycleReserve(input.LifecycleReserve, input.RingCapacity); err != nil {
-		return nil, fmt.Errorf("shm: CreateRegion: %w", err)
-	}
 
-	classesHP, arenaBytesHP, err := buildArenaGeometry(input.Arenas[HostToPlugin].Classes)
-	if err != nil {
-		return nil, fmt.Errorf("shm: CreateRegion: h->p arena: %w", err)
-	}
-	classesPH, arenaBytesPH, err := buildArenaGeometry(input.Arenas[PluginToHost].Classes)
-	if err != nil {
-		return nil, fmt.Errorf("shm: CreateRegion: p->h arena: %w", err)
-	}
-
-	spans, err := deriveSpans(input.RingCapacity, arenaBytesHP, arenaBytesPH)
+	layout, err := DeriveLayout(input)
 	if err != nil {
 		return nil, fmt.Errorf("shm: CreateRegion: %w", err)
 	}
-
-	classTableHPOffset := uint64(classTableRecommendedOffset)
-	classTablePHOffset := classTableHPOffset + uint64(len(classesHP))*uint64(sizeClassEntrySize)
-	classTablesEnd := classTablePHOffset + uint64(len(classesPH))*uint64(sizeClassEntrySize)
-	if classTablesEnd > LayoutPageSize {
-		return nil, fmt.Errorf("shm: CreateRegion: class tables (%d + %d entries) exceed the layout page: %w",
-			len(classesHP), len(classesPH), ErrBadGeometry)
-	}
-
-	layout := Layout{
-		Magic:            layoutMagic,
-		LayoutVersion:    1,
-		Generation:       input.Generation,
-		RegionSize:       spans.regionSize,
-		RingCapacity:     input.RingCapacity,
-		LifecycleReserve: input.LifecycleReserve,
-		SyncPageOffset:   spans.syncPageOffset,
-		Rings: [2]RingGeometry{
-			HostToPlugin: {Offset: spans.ringHPOffset},
-			PluginToHost: {Offset: spans.ringPHOffset},
-		},
-		Arenas: [2]ArenaGeometry{
-			HostToPlugin: {
-				Offset: spans.arenaHPOffset, Bytes: arenaBytesHP,
-				ClassTableOffset: classTableHPOffset, Classes: classesHP,
-			},
-			PluginToHost: {
-				Offset: spans.arenaPHOffset, Bytes: arenaBytesPH,
-				ClassTableOffset: classTablePHOffset, Classes: classesPH,
-			},
-		},
-	}
+	layout.Magic = layoutMagic
+	layout.LayoutVersion = 1
+	layout.Generation = input.Generation
 
 	return createSealedRegion(layout)
 }

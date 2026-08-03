@@ -291,6 +291,111 @@ For the exact wire-level rules these numbers satisfy — the bounds on
 carried between host and plugin — see
 [`docs/specs/shm-abi.md`](specs/shm-abi.md) §1, §2, §6, and §18.
 
+### Capacity planning: budgeting host memory across plugins
+
+Every shared-memory region a `Host` creates is a sealed memfd mapped
+`MAP_SHARED` (`internal/shm`).
+Once a page of it is touched, that page is charged to the host process's
+memory cgroup for as long as the region exists — there is no cgroup-side
+reclaim for it.
+A container that sets a memory limit without accounting for its plugins'
+regions can start healthy, pass a smoke test that never fills the arena, and
+still be OOM-killed once real traffic touches enough of it.
+`ShmGeometry.RegionBytes()` reports the exact number to budget for a given
+geometry: the same `region_size` `CreateRegion` actually mmaps, derived from
+the same formula, not an estimate.
+
+**Per-plugin cost of the two shipped profiles.** `GeometryDefault()` costs
+65,994,752 bytes (62.9375 MiB) per plugin: the layout page, the sync page, both
+descriptor rings, and both (symmetric) payload arenas.
+`GeometryLean()` costs 671,744 bytes (about 0.64 MiB) computed the same way.
+Both figures are the whole *region*, not just the arena — the ring pair and
+the two fixed pages add a small, constant amount on top of whatever the
+size-class tables cost.
+
+**Multiple plugins.** A `Host` running four plugins all left at
+`GeometryDefault()` holds four independent regions at steady state — roughly
+251.75 MiB (4 × 62.9375 MiB) — before any of them has served a single call,
+because the mapping costs the memory, not the traffic.
+
+**The rolling-reload peak.** A hot reload spawns and validates the successor
+before it promotes routing to it, and only after promotion does it tear down
+the predecessor (`internal/lifecycle/reload.go`'s `Transaction.Run`:
+`restoreValidate` runs before `Promote`, and `old.Teardown` runs only after).
+For the span between the successor's spawn and the predecessor's reap, that
+one plugin holds two regions at once.
+For four `GeometryDefault()` plugins with exactly one of them mid-reload,
+that is five regions live at once — about 314.7 MiB (5 × 62.9375 MiB), not
+four.
+Nothing serializes reloads across *different* plugins: each plugin's
+`Supervisor` owns its own admission gate and reload channel, so reloads on
+different plugins can run concurrently.
+If more than one plugin reloads at the same moment the peak is higher still —
+up to eight regions, about 503.5 MiB, if all four reload at once — so "one
+reloading" is the minimum overlap to budget for, not the worst case.
+
+**Budget the fully-touched size, not what you observe.** A region's pages
+are lazily faulted (`MAP_SHARED` without `MAP_POPULATE`), and the arena's
+free lists are process-local Go slices built at attach time, so a freshly
+started plugin's resident memory is close to zero and climbs only as traffic
+actually uses slabs.
+No page is ever given back for the region's life.
+A capacity plan has to budget for every page in the geometry eventually
+being touched, not for whatever RSS a smoke test or a quiet period happens
+to show.
+
+**Backpressure cannot substitute for this.** Styx's own flow control counts
+*slabs*: when a size class runs out of free slabs, callers see a set-aside
+and wait.
+That counter has no notion of bytes and no notion of a cgroup limit — a
+container can be killed for memory while most of its arena's slabs are still
+free, with no set-aside ever having fired to warn about it.
+Sizing `ShmGeometry`, and the container's memory limit, to fit is the only
+thing that prevents this.
+
+**Worked example: fitting four plugins into a constrained container.** A
+container with a 300 MiB memory limit running four plugins cannot afford
+`GeometryDefault()` on all of them — 251.75 MiB steady state leaves no room
+for the reload peak, let alone the host process and the plugins' own
+non-shared memory.
+Call `RegionBytes()` while choosing a geometry rather than guessing:
+
+```go
+geo := styx.ShmGeometry{
+    RingCapacity:     512,
+    LifecycleReserve: 32,
+    HostToPlugin:     []styx.ShmSizeClass{{SlabSize: 4096 + 64, SlabCount: 64}},
+    PluginToHost:     []styx.ShmSizeClass{{SlabSize: 4096 + 64, SlabCount: 64}},
+}
+bytes, err := geo.RegionBytes() // 606208 (0.58 MiB) per plugin
+```
+
+Four of those cost about 2.31 MiB steady state and about 2.89 MiB with one
+mid-reload — set `Geometry: geo` on every `PluginSpec` that needs the
+smaller footprint.
+`PluginSpec.Geometry` is per-plugin, and its zero value silently selects
+`GeometryDefault()` if left unset, so a memory-constrained deployment has to
+set it deliberately on every plugin that needs to be smaller, not just one.
+
+**Reading RSS across processes.** The host maps every region twice: once in
+`CreateRegion` and again through the transport's own `Attach` call to
+`OpenRegion`.
+A shared page appears in the RSS of every process that has it mapped, host
+and plugin alike.
+Summing a host's reported RSS and a plugin's reported RSS therefore
+double-counts every shared page between them — RSS is not a substitute for
+`RegionBytes()` when budgeting, only a way (a confusing one) to observe what
+has actually been touched so far.
+
+This ships as information, not enforcement: `RegionBytes()` reports the
+cost, and `Host.Start` does not check it against any limit.
+An enforcing startup check that refuses a geometry the container cannot
+afford was designed and deliberately not built — it roughly doubled the cost
+of every `Start`, needed a cgroup reader and a resolved-config snapshot Styx
+does not otherwise keep, and added a new failure mode to `Reload`.
+If one is ever built, it must support cgroup v1 as well as v2 — that is a
+stated requirement for that future work, not an open question to revisit.
+
 ## Tuning liveness detection
 
 A `Host` decides one of its plugins has stopped serving in two independent

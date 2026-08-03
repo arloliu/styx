@@ -110,6 +110,37 @@ func GeometryLean() ShmGeometry {
 	}
 }
 
+// RegionBytes returns the exact number of bytes the shared-memory region this
+// geometry describes would occupy — the same region_size CreateRegion derives
+// and mmaps, not an estimate, so it cannot drift from what actually gets
+// created. This matters because the region's pages are lazily faulted but
+// never reclaimed for the plugin instance's life (shm-abi.md §1: the mapping
+// is MAP_SHARED without MAP_POPULATE, and nothing walks the arena at
+// startup), and tmpfs/memfd pages are charged to the host process's memory
+// cgroup once touched. A capacity plan for a memory-constrained deployment
+// must budget this number per plugin — the region's fully-touched size, not
+// whatever a smoke test happens to observe as resident — because Styx's own
+// backpressure is denominated in slabs, not bytes, and cannot protect a
+// container's byte-denominated memory limit.
+//
+// It reports the zero value's cost when g is the zero ShmGeometry (selects
+// GeometryDefault) and applies the same empty-direction-copies-the-other rule
+// toLayout does, so the number always matches what PluginSpec.Geometry set to
+// g would actually produce.
+//
+// It returns an error wrapping ErrInvalidConfig, as a *ConfigError with Field
+// "ShmGeometry", if g's ring capacity, lifecycle reserve, or either
+// direction's size-class table is structurally invalid, or if the derived
+// region would exceed the region ceiling — never a silently wrong number.
+func (g ShmGeometry) RegionBytes() (uint64, error) {
+	layout, err := shm.DeriveLayout(g.toLayout())
+	if err != nil {
+		return 0, &ConfigError{Field: "ShmGeometry", Reason: err.Error()}
+	}
+
+	return layout.RegionSize, nil
+}
+
 // isZero reports whether g is the zero ShmGeometry (no ring capacity and no
 // classes), which selects the default profile.
 func (g ShmGeometry) isZero() bool {

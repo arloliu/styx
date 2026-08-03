@@ -238,3 +238,115 @@ func TestGeometryLean_CarriesItsTopClass_AndRefusesTheFirstByteBeyondIt(t *testi
 	require.ErrorIs(t, err, transport.ErrPayloadTooLarge,
 		"a message past the lean profile's top class is rejected, never queued")
 }
+
+// leanLadderRegionSize is the region GeometryLean's ladder costs — the
+// layout page, sync page, both rings, and both (symmetric) arenas — verified
+// against a real CreateRegion the same way defaultLadderRegionSize is above.
+const leanLadderRegionSize = 671744
+
+// Test that RegionBytes reports the exact region size a real CreateRegion
+// mmaps for the same geometry, for both shipped profiles and a hand-built
+// asymmetric one. This is the anti-drift property RegionBytes exists for: a
+// capacity plan built from this number must never disagree with what the
+// host actually maps, so the test checks it against a real region rather
+// than trusting RegionBytes's own arithmetic.
+func TestShmGeometry_RegionBytes_MatchesTheRegionCreateRegionActuallyBuilds(t *testing.T) {
+	cases := []struct {
+		name string
+		geo  ShmGeometry
+		want uint64 // 0 means "no pinned constant for this case, only the CreateRegion comparison below"
+	}{
+		{name: "GeometryDefault", geo: GeometryDefault(), want: defaultLadderRegionSize},
+		{name: "GeometryLean", geo: GeometryLean(), want: leanLadderRegionSize},
+		{
+			name: "asymmetric custom geometry",
+			geo: ShmGeometry{
+				RingCapacity:     128,
+				LifecycleReserve: 16,
+				HostToPlugin:     []ShmSizeClass{{SlabSize: 64, SlabCount: 10}, {SlabSize: 4096, SlabCount: 3}},
+				PluginToHost:     []ShmSizeClass{{SlabSize: 4096, SlabCount: 2}},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// When
+			got, err := tc.geo.RegionBytes()
+			require.NoError(t, err)
+
+			// Then: matches the pinned constant, where the case has one.
+			if tc.want != 0 {
+				require.EqualValues(t, tc.want, got)
+			}
+
+			// And matches what a real region built from the same geometry
+			// actually costs.
+			layout := tc.geo.toLayout()
+			layout.Generation = 1
+			region, err := shm.CreateRegion(layout)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, region.Close()) })
+
+			require.EqualValues(t, region.Layout().RegionSize, got, "must match the real region's size")
+		})
+	}
+}
+
+// Test that RegionBytes handles every documented ShmGeometry form the same
+// way toLayout does — the full zero value and a custom ring with one
+// direction's class table left empty — since RegionBytes is documented to
+// price exactly what PluginSpec.Geometry set to that value would actually
+// produce.
+func TestShmGeometry_RegionBytes_HandlesZeroAndEmptyDirectionForms(t *testing.T) {
+	cases := []struct {
+		name string
+		geo  ShmGeometry
+		want uint64 // 0 means "just assert non-zero, no pinned constant"
+	}{
+		{name: "zero value selects the default profile", geo: ShmGeometry{}, want: defaultLadderRegionSize},
+		{
+			name: "one direction empty copies the other",
+			geo: ShmGeometry{
+				RingCapacity: 256, LifecycleReserve: 16,
+				HostToPlugin: []ShmSizeClass{{SlabSize: 4096, SlabCount: 16}},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// When
+			got, err := tc.geo.RegionBytes()
+
+			// Then
+			require.NoError(t, err)
+			require.NotZero(t, got)
+			if tc.want != 0 {
+				require.EqualValues(t, tc.want, got)
+			}
+		})
+	}
+}
+
+// Test that RegionBytes rejects a structurally invalid geometry with a
+// *ConfigError naming the field and matching ErrInvalidConfig, rather than
+// returning a silently wrong number.
+func TestShmGeometry_RegionBytes_RejectsInvalidGeometry(t *testing.T) {
+	// Given a geometry whose ring capacity is not a power of two.
+	geo := ShmGeometry{
+		RingCapacity: 100, LifecycleReserve: 8,
+		HostToPlugin: []ShmSizeClass{{SlabSize: 4096, SlabCount: 1}},
+	}
+
+	// When
+	got, err := geo.RegionBytes()
+
+	// Then
+	require.Zero(t, got)
+	require.ErrorIs(t, err, ErrInvalidConfig)
+
+	var cfgErr *ConfigError
+	require.ErrorAs(t, err, &cfgErr)
+	require.Equal(t, "ShmGeometry", cfgErr.Field)
+}
