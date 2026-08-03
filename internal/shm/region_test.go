@@ -289,6 +289,110 @@ func TestRegion_CreateRegion_RejectsInvalidGeometry(t *testing.T) {
 	}
 }
 
+// Test that DeriveLayout's derived Layout matches, field by field, the
+// Layout a real shm.CreateRegion builds for the identical input. This is the
+// anti-drift property DeriveLayout exists for: a caller that only needs a
+// region's size (styx.ShmGeometry.RegionBytes) must never compute a number a
+// real CreateRegion would disagree with, and the only way to prove that is to
+// check both against each other, not against a value this test invents.
+func TestRegion_DeriveLayout_MatchesCreateRegion(t *testing.T) {
+	cases := []struct {
+		name  string
+		input shm.Layout
+	}{
+		{"minimal single-class geometry", minimalLayoutInput()},
+		{"asymmetric multi-class geometry", shm.Layout{
+			Generation:       1,
+			RingCapacity:     128,
+			LifecycleReserve: 16,
+			Arenas: [2]shm.ArenaGeometry{
+				shm.HostToPlugin: {
+					Classes: []shm.SizeClass{{SlabSize: 64, SlabCount: 10}, {SlabSize: 4096, SlabCount: 3}},
+				},
+				shm.PluginToHost: {Classes: []shm.SizeClass{{SlabSize: 4096, SlabCount: 2}}},
+			},
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// When
+			derived, err := shm.DeriveLayout(tc.input)
+			require.NoError(t, err)
+
+			r, err := shm.CreateRegion(tc.input)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, r.Close()) })
+
+			// Then: every field DeriveLayout computes matches the region
+			// CreateRegion actually mapped. Generation/HeaderFlags/Magic/
+			// LayoutVersion are excluded: DeriveLayout copies those through
+			// from its input unstamped, while CreateRegion stamps them
+			// afterward, so they carry no bearing on the derivation itself.
+			created := r.Layout()
+			require.Equal(t, created.RegionSize, derived.RegionSize, "region_size")
+			require.Equal(t, created.RingCapacity, derived.RingCapacity, "ring_capacity")
+			require.Equal(t, created.LifecycleReserve, derived.LifecycleReserve, "lifecycle_reserve")
+			require.Equal(t, created.SyncPageOffset, derived.SyncPageOffset, "sync_page_offset")
+			require.Equal(t, created.Rings, derived.Rings, "ring geometries (H->P, P->H)")
+			require.Equal(t, created.Arenas, derived.Arenas, "arena geometries (H->P, P->H)")
+		})
+	}
+}
+
+// Test that DeriveLayout rejects every structural geometry violation
+// CreateRegion rejects (minus Generation/HeaderFlags, which are outside
+// DeriveLayout's scope — see its doc comment), so a caller relying on it to
+// reject a bad geometry before spawning anything gets the same verdict
+// CreateRegion would.
+func TestRegion_DeriveLayout_RejectsInvalidGeometry(t *testing.T) {
+	valid := []shm.SizeClass{{SlabSize: 4096, SlabCount: 1}}
+	baseline := func() shm.Layout {
+		return shm.Layout{
+			RingCapacity:     64,
+			LifecycleReserve: 8,
+			Arenas: [2]shm.ArenaGeometry{
+				shm.HostToPlugin: {Classes: append([]shm.SizeClass(nil), valid...)},
+				shm.PluginToHost: {Classes: append([]shm.SizeClass(nil), valid...)},
+			},
+		}
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(l shm.Layout) shm.Layout
+	}{
+		{"ring_capacity not a power of two", func(l shm.Layout) shm.Layout { l.RingCapacity = 100; return l }},
+		{"ring_capacity below the floor", func(l shm.Layout) shm.Layout { l.RingCapacity = 32; return l }},
+		{"lifecycle_reserve zero", func(l shm.Layout) shm.Layout { l.LifecycleReserve = 0; return l }},
+		{"lifecycle_reserve equals ring_capacity", func(l shm.Layout) shm.Layout { l.LifecycleReserve = 64; return l }},
+		{"empty size-class table", func(l shm.Layout) shm.Layout {
+			l.Arenas[shm.HostToPlugin].Classes = nil
+			return l
+		}},
+		{"slab_size not a multiple of CacheLine", func(l shm.Layout) shm.Layout {
+			l.Arenas[shm.HostToPlugin].Classes = []shm.SizeClass{{SlabSize: 4100, SlabCount: 1}}
+			return l
+		}},
+		{"slab_count zero", func(l shm.Layout) shm.Layout {
+			l.Arenas[shm.HostToPlugin].Classes = []shm.SizeClass{{SlabSize: 4096, SlabCount: 0}}
+			return l
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// When
+			derived, err := shm.DeriveLayout(tt.mutate(baseline()))
+
+			// Then
+			require.Error(t, err)
+			require.ErrorIs(t, err, shm.ErrBadGeometry)
+			require.Zero(t, derived)
+		})
+	}
+}
+
 // Test that OpenRegion's Phase 2 attach validation rejects every
 // structural violation shm-abi.md §1/§2 enumerate, one malformed field per
 // case against an otherwise-valid, CreateRegion-derived layout —
