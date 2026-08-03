@@ -169,15 +169,20 @@ func (p *Process) Wait() (*os.ProcessState, error) {
 // is wired, there is no Teardown to run, but a spawned child must never be left
 // as a zombie. Teardown.Run's step 5 is the normal-path reap (it keeps its own
 // *os.ProcessState on Teardown.Reaped); this is its abort-path analogue and,
-// like it, always ends in a waitpid, now surfacing the same kind of state instead
-// of discarding it. It also closes Stdout/Stderr if Spec.CaptureStdio was set
-// (a no-op since they are nil for every caller that left it false).
+// like it, always ends in a waitpid, surfacing the same kind of state instead
+// of discarding it.
+//
+// It does NOT close Stdout/Stderr. Closing a captured read end is the caller's,
+// because only the caller knows whether anything is still reading it: this
+// function returns as soon as the child is reaped, and a reader draining what
+// the child wrote on its way out is still going. Closing the read end under
+// that reader discards whatever the kernel still holds, which is exactly the
+// output a crash is diagnosed from. Reap first, let the reader finish on the
+// EOF the reap produces, then close.
 func (p *Process) Kill() (*os.ProcessState, error) {
 	_ = p.signal(unix.SIGKILL)
-	state, err := p.Wait()
-	closeIfNonNil(p.Stdout, p.Stderr)
 
-	return state, err
+	return p.Wait()
 }
 
 // signal sends sig to the process's whole process group (Spawn set Setpgid,

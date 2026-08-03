@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The last stderr a crashing plugin writes** is no longer lost when the
+  plugin exits in the same instant it prints. v0.3.0 closed the case where the
+  delivery queue discarded the crash tail, and named the remaining one: the
+  stdio read ends were closed while the readers could still be draining them.
+  That window is now closed too. Both paths that end an instance reap the child
+  first, which is what makes its output readable to the end — the host closed
+  its copy of each write end at spawn, so the readers see EOF and stop on their
+  own — and only then close the read ends they were reading.
+
+  The wait is bounded. A descendant that escaped the process-group kill can
+  hold a write end open forever, and that pipe never reaches EOF; losing a
+  crash tail is the better trade against never completing a teardown. Nothing
+  waits on this in the ordinary case, where the readers have already finished
+  by the time the close is reached.
+
 ## [0.3.0] - 2026-08-03
 
 Observability and lifecycle-reporting work: a host can now say which plugin
