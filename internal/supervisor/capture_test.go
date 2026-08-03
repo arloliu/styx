@@ -35,6 +35,19 @@ func (s *blockingSink) WriteLine(stream string, line []byte) {
 	s.mu.Unlock()
 }
 
+// release unblocks every stalled WriteLine, so a test that stalled the sink
+// on purpose does not leave its delivery goroutine parked past the test.
+func (s *blockingSink) release() { close(s.block) }
+
+// delivered reports the lines that actually reached the sink, which for a
+// stalled sink is what did NOT get stuck behind the block.
+func (s *blockingSink) delivered() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]string(nil), s.lines...)
+}
+
 // recordingSink is a Sink that never blocks and records every line
 // delivered, safe for concurrent use across the stdout/stderr goroutines.
 type recordingSink struct {
@@ -68,7 +81,7 @@ func TestStdioCapture_DeliversLinesUpToBound_AndCountsDropsBeyondIt(t *testing.T
 	stderrR, stderrW := io.Pipe()
 
 	const bufferLines = 4
-	sc := supervisor.NewStdioCapture(stdoutR, stderrR, sink, 1024, bufferLines)
+	sc := supervisor.NewStdioCapture(stdoutR, stderrR, nil, sink, 1024, bufferLines)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -112,7 +125,7 @@ func TestStdioCapture_TruncatesOverlongLine_RatherThanBlocking(t *testing.T) {
 	const maxLineBytes = 8
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
-	sc := supervisor.NewStdioCapture(stdoutR, stderrR, sink, maxLineBytes, 4)
+	sc := supervisor.NewStdioCapture(stdoutR, stderrR, nil, sink, maxLineBytes, 4)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -153,7 +166,7 @@ func TestStdioCapture_LabelsLines_ByStream(t *testing.T) {
 	sink := &recordingSink{}
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
-	sc := supervisor.NewStdioCapture(stdoutR, stderrR, sink, 1024, 4)
+	sc := supervisor.NewStdioCapture(stdoutR, stderrR, nil, sink, 1024, 4)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -209,15 +222,6 @@ func (s *boundSink) snapshot() (maxLen, count int) {
 	return s.maxLen, s.count
 }
 
-// funcSink adapts a plain func to the Sink interface, letting a test observe
-// the exact instant its WriteLine runs relative to another Sink in the same
-// composition.
-type funcSink struct {
-	fn func(stream string, line []byte)
-}
-
-func (s *funcSink) WriteLine(stream string, line []byte) { s.fn(stream, line) }
-
 // panicSink panics on a designated line and records every other line it
 // sees, safe for concurrent use across the stdout/stderr goroutines.
 type panicSink struct {
@@ -254,7 +258,7 @@ func TestStdioCapture_RecoversSinkPanic_AndStillDeliversLaterLines(t *testing.T)
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
 	_ = stderrW.Close() // unused in this test; closed up front so Run's stderr readLoop reaches EOF immediately
-	sc := supervisor.NewStdioCapture(stdoutR, stderrR, sink, 1024, 4)
+	sc := supervisor.NewStdioCapture(stdoutR, stderrR, nil, sink, 1024, 4)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -316,7 +320,7 @@ func TestStdioCapture_AdversarialInput_NoPanic_BoundsHold(t *testing.T) {
 	stderr := bytes.NewReader(stderrBuf.Bytes())
 
 	sink := &boundSink{}
-	sc := supervisor.NewStdioCapture(stdout, stderr, sink, maxLine, 8)
+	sc := supervisor.NewStdioCapture(stdout, stderr, nil, sink, maxLine, 8)
 
 	// When / Then: Run drains both streams to EOF and returns without panic.
 	require.NotPanics(t, func() { sc.Run(context.Background()) })
@@ -328,52 +332,84 @@ func TestStdioCapture_AdversarialInput_NoPanic_BoundsHold(t *testing.T) {
 	require.Positive(t, count, "the adversarial streams must still deliver at least one line")
 }
 
-// Test newSpawnSink's composition delivering one line to both the tail and the user sink in the normal case
-func TestNewSpawnSink_DeliversToTailAndUserSink_InNormalCase(t *testing.T) {
-	// Given: the exact tail-first composition newLiveInstance builds at
-	// spawn, over a plain recording sink standing in for a caller-supplied
-	// Sink.
-	user := &recordingSink{}
-	sink, tail := supervisor.NewSpawnSinkForTest(20, user)
-
-	// When
-	sink.WriteLine("stderr", []byte("one-line"))
-
-	// Then: both the tail and the user sink saw the exact same line.
-	require.Equal(t, []string{"one-line"}, tail())
-	require.Equal(t, []string{"stderr:one-line"}, user.snapshot())
-}
-
-// Test newSpawnSink's composition delivering to the tail before the user sink
-func TestNewSpawnSink_DeliversToTail_BeforeUserSink(t *testing.T) {
-	// Given: a user sink that, from inside its own WriteLine, checks whether
-	// the tail already holds the line — proving delivery order, not just
-	// that both eventually receive it.
-	var tail func() []string
-	var tailHadLineFirst bool
-	user := &funcSink{fn: func(_ string, _ []byte) {
-		tailHadLineFirst = len(tail()) == 1
-	}}
-	var sink supervisor.Sink
-	sink, tail = supervisor.NewSpawnSinkForTest(20, user)
-
-	// When
-	sink.WriteLine("stderr", []byte("one-line"))
-
-	// Then: the tail already held the line by the time the user sink ran.
-	require.True(t, tailHadLineFirst, "expected the tail to receive the line before the user sink")
-}
-
-// Test newSpawnSink's composition still delivering to the tail, and to later
-// lines, when the user sink panics
-func TestNewSpawnSink_KeepsTailLine_AndLaterLines_WhenUserSinkPanics(t *testing.T) {
-	// Given: the tail-first composition over a user sink that panics on
-	// exactly one line.
-	user := &panicSink{panicOn: "boom"}
-	sink, tail := supervisor.NewSpawnSinkForTest(20, user)
+// Test the crash tail keeping a line that cancellation stops the user sink
+// from ever being delivered
+func TestStdioCapture_TapKeepsLine_WhenCancellationEndsDeliveryFirst(t *testing.T) {
+	// Given: a user sink that blocks on its first line, so every line behind
+	// it stays queued and undelivered, and a tap standing in for the
+	// crash-reason tail.
+	user := newBlockingSink()
+	defer user.release()
+	tap, tail := supervisor.NewCrashTailForTest(20)
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
-	sc := supervisor.NewStdioCapture(stdoutR, stderrR, sink, 1024, 4)
+	sc := supervisor.NewStdioCapture(stdoutR, stderrR, tap, user, 1024, 4)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { defer close(done); sc.Run(ctx) }()
+
+	// When: the marker is written and read, then the streams end and delivery
+	// is canceled while that marker is still stuck behind the blocked sink.
+	_, _ = fmt.Fprintln(stderrW, "wedge")
+	_, _ = fmt.Fprintln(stderrW, "marker")
+	require.Eventually(t, func() bool {
+		return len(tail()) == 2
+	}, time.Second, 5*time.Millisecond, "expected the reader to have captured both lines")
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	<-done
+	cancel()
+
+	// Then: the crash tail holds the marker even though delivery never ran
+	// for it -- this is exactly what a crash reason is built from, and it is
+	// built after the same cancellation.
+	require.Equal(t, []string{"wedge", "marker"}, tail(),
+		"the crash tail must not depend on delivery outliving cancellation")
+	require.Empty(t, user.delivered(), "the blocked sink must not have delivered the marker")
+}
+
+// Test the crash tail keeping a line the user sink's queue dropped
+func TestStdioCapture_TapKeepsLine_WhenSlowSinkOverflowsTheQueue(t *testing.T) {
+	// Given: a one-line queue behind a sink that blocks forever on its first
+	// line, so everything after it is dropped rather than delivered.
+	user := newBlockingSink()
+	defer user.release()
+	tap, tail := supervisor.NewCrashTailForTest(20)
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	sc := supervisor.NewStdioCapture(stdoutR, stderrR, tap, user, 1024, 1)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); sc.Run(ctx) }()
+
+	// When: far more lines are written than the queue can hold.
+	for i := range 20 {
+		_, _ = fmt.Fprintf(stderrW, "line-%d\n", i)
+	}
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	<-done
+
+	// Then: the tail still holds the last lines, and drops were counted --
+	// a Sink falling behind must cost the Sink's own delivery, never the
+	// crash reason.
+	_, droppedStderr := sc.DroppedCount()
+	require.Positive(t, droppedStderr, "the overflowing queue must have counted drops")
+	require.Equal(t, "line-19", tail()[len(tail())-1],
+		"the crash tail must survive a Sink that cannot keep up")
+}
+
+// Test the crash tail still receiving lines when the user sink panics
+func TestStdioCapture_TapKeepsLines_WhenUserSinkPanics(t *testing.T) {
+	// Given: a tap alongside a user sink that panics on exactly one line.
+	user := &panicSink{panicOn: "boom"}
+	tap, tail := supervisor.NewCrashTailForTest(20)
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	sc := supervisor.NewStdioCapture(stdoutR, stderrR, tap, user, 1024, 4)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -384,8 +420,7 @@ func TestNewSpawnSink_KeepsTailLine_AndLaterLines_WhenUserSinkPanics(t *testing.
 	// line -- the tail sink only ever retains "stderr" lines (it is the
 	// crash-reason tail), so the panicking line must land there on that
 	// stream. StdioCapture's own deliverLine recovers the panic (see
-	// TestStdioCapture_RecoversSinkPanic_AndStillDeliversLaterLines), so
-	// this composition never has to recover a panic itself.
+	// TestStdioCapture_RecoversSinkPanic_AndStillDeliversLaterLines).
 	go func() {
 		_, _ = fmt.Fprintln(stderrW, "boom")
 		_, _ = fmt.Fprintln(stderrW, "after")
@@ -393,9 +428,9 @@ func TestNewSpawnSink_KeepsTailLine_AndLaterLines_WhenUserSinkPanics(t *testing.
 		_ = stderrW.Close()
 	}()
 
-	// Then: the panicking line still reached the tail (delivered there before
-	// the user sink panicked), and the line after it still reached the user
-	// sink.
+	// Then: the panicking line still reached the tail -- the reader wrote it
+	// there before the queue, so a Sink that panics on it cannot take it
+	// away -- and the line after it still reached the user sink.
 	require.Eventually(t, func() bool {
 		return len(user.snapshot()) > 0
 	}, time.Second, 5*time.Millisecond, "expected the line after the panic to be delivered")

@@ -33,16 +33,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stdout/stderr lines a plugin's stdio capture discarded because a
   `PluginSpec.Stdio` sink fell behind, labelled by plugin and by stream.
   Reported as a per-interval delta rather than one event per dropped line,
-  so a plugin spraying output cannot turn this counter into its own flood.
+  so a plugin spraying output cannot turn this counter into its own flood,
+  with a final delta when the instance ends so the interval a crash or a
+  shutdown cuts short is reported too — the interval a crash flood lands
+  in, and one nothing later could account for, since a restarted plugin's
+  counts start from its own capture's zero.
 - **`observe.MetricObserveDropped`** (`styx.observe.dropped.count`): counts
   metric updates or log entries a `Metrics` or `Logger` dispatcher
-  discarded under backpressure, labelled by which dispatcher (`"metrics"`
-  or `"log"`) lost them. Delivered by the dispatcher calling the sink
+  discarded under backpressure or after the producer cutoff a shutdown
+  begins with, labelled by which dispatcher (`"metrics"` or `"log"`) lost
+  them. Delivered by the dispatcher calling the sink
   directly on its own schedule rather than through the queue it reports on,
-  so the counter can never itself be part of the loss it describes. A
+  so the counter can never itself be part of the loss it describes, with a
+  final report published after that cutoff so the interval a shutdown ends
+  is reported rather than lost with the goroutine that reports it. A
   nonzero value means every other `Metrics`-sourced counter for that
   window, including `styx.heartbeat.miss.count` and `styx.timeout.count`,
-  is a lower bound rather than an exact count.
+  is a lower bound rather than an exact count. Reported by both the host
+  and a plugin process for their own dispatcher(s); a plugin has no log
+  dispatcher, so its dispatcher label is always `"metrics"`.
+- **`observe.MetricStdioSinkPanic`** (`styx.stdio.sink.panic.count`): counts
+  times a plugin's stdio capture recovered a panic from a caller-supplied
+  `StdioSink`'s `WriteLine`, labelled by plugin and by stream. Reported as
+  a per-interval delta the same way `MetricStdioDropped` is, final delta
+  included, so a panicking sink cannot turn this counter into its own
+  flood. Together
+  with `MetricStdioDropped`, it tells apart the three reasons a captured
+  line can go missing: the plugin printed nothing, the sink fell behind,
+  or the sink panicked outright.
+- **`styx.RegisterIdentityName(id uint64, name string)`**: records the name a
+  generated FNV-1a-64 routing ID hashes from. Intended for generated code —
+  `protoc-gen-go-styx` calls it once per service and per method from each
+  generated file's own `init` function — so a `*PluginPanicError` raised
+  through a precomputed-ID call can report the real name. Safe to call by
+  hand; a duplicate `(id, name)` registration is a no-op, and an `id` claimed
+  by two different names leaves that `id` permanently unresolved rather than
+  guessing which name is real.
+- **`ShmGeometry.RegionBytes() (uint64, error)`**: reports the exact
+  shared-memory region size a geometry would cost — the same `region_size`
+  `CreateRegion` mmaps for it, not an estimate, since it is derived through
+  the same `internal/shm` computation `CreateRegion` itself calls. Regions
+  are lazily faulted but never reclaimed for a plugin instance's life, and
+  the pages they touch are charged to the host's memory cgroup, so this is
+  what a capacity plan must budget per plugin. Returns an error wrapping
+  `ErrInvalidConfig` (as a `*ConfigError` naming the field `"ShmGeometry"`)
+  for a structurally invalid geometry, rather than a silently wrong number.
+  See the new capacity-planning section of
+  [`docs/configuration.md`](docs/configuration.md#capacity-planning-budgeting-host-memory-across-plugins).
 
 ### Changed
 
@@ -52,8 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   populated, and `Error()` rendered the empty join as `"handler .panicked"`.
   A call made through the precomputed-ID API (`InvokeID`, `InvokeIDFactory`,
   `OpenStreamID`, `OpenServerStreamID` — every generated client stub) has no
-  string name to give, so `Service`/`Method` carry the routing hash rendered
-  as hex instead. The unused `Stack []byte` field, never populated on any
+  string name to give at the call site, so `protoc-gen-go-styx` now also
+  emits a `styx.RegisterIdentityName` call per service/method at package
+  init, letting the host resolve the ID back to the real name; only an ID
+  nothing ever registered (a hand-called precomputed-ID API, or a plugin
+  built with an older generator) still falls back to the routing hash
+  rendered as hex. The unused `Stack []byte` field, never populated on any
   path, is removed.
 - **`Host.Stop`**: the context now bounds how long the teardown waits,
   never whether it happens. A `Stop` handed an already-canceled or expired

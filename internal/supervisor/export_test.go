@@ -11,17 +11,14 @@ import (
 	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 )
 
-// NewSpawnSinkForTest re-exports newSpawnSink itself, with a fresh
-// tailLines-line tail sink, so a capture-level test exercises the exact
-// composition newLiveInstance builds at spawn (tail first, then the
-// caller-supplied Sink) instead of constructing a fanOutSink by hand — a
-// test built the second way stays green even if newSpawnSink's ordering or
-// choice of tail sink later changes. tail reads back whatever lines the
-// tail sink retained, the same way crashReason does.
-func NewSpawnSinkForTest(tailLines int, user Sink) (sink Sink, tail func() []string) {
+// NewCrashTailForTest builds the same tail sink a spawn installs as its
+// StdioCapture tap, returning it alongside the reader crashReason itself
+// uses. A capture-level test passes the sink as the tap so it exercises the
+// real tap wiring rather than a stand-in that only behaves like it.
+func NewCrashTailForTest(tailLines int) (tap Sink, tail func() []string) {
 	ts := newTailSink(tailLines)
 
-	return newSpawnSink(ts, user), ts.tail
+	return ts, ts.tail
 }
 
 // HandshakeAndAttachForTest re-exports handshakeAndAttach for supervisor_test

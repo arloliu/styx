@@ -701,7 +701,7 @@ func setupFinalStdioHarness(t *testing.T) *finalStdioHarness {
 
 	// The Sink never returns, so every line past the queue bound is a real
 	// drop rather than a simulated one.
-	h.capture = supervisor.NewStdioCapture(stdoutR, stderrR, stdioBlackHole{}, 4096, finalStdioQueueLines)
+	h.capture = supervisor.NewStdioCapture(stdoutR, stderrR, nil, stdioBlackHole{}, 4096, finalStdioQueueLines)
 	captureCtx, cancelCapture := context.WithCancel(context.Background())
 	t.Cleanup(cancelCapture)
 	go func() { defer close(h.captureDone); h.capture.Run(captureCtx) }()
