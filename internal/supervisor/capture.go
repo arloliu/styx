@@ -120,6 +120,10 @@ func (c *StdioCapture) PanicCount() (stdout, stderr uint64) {
 func (c *StdioCapture) readLoop(stream string, r io.Reader, queue chan<- []byte, dropped *atomic.Uint64) {
 	defer close(queue)
 
+	if failpointEnabled && fpBeforeStdioRead != nil {
+		fpBeforeStdioRead(stream)
+	}
+
 	br := bufio.NewReader(r)
 	for {
 		line, err := readLine(br, c.maxLineBytes)

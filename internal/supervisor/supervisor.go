@@ -113,6 +113,19 @@ const (
 	maxCapturedLineBytes = 4096 // per-line cap for captured stdout/stderr.
 	capturedBufferLines  = 256  // per-stream pending-delivery queue bound.
 
+	// stdioDrainBound caps the wait for an instance's stdio readers to finish
+	// before their read ends are closed. It is normally not waited on at all:
+	// the host closed its copy of each write end at spawn, so once the child is
+	// reaped the readers see EOF and return, and by here the child has already
+	// been reaped on both paths that close these fds.
+	//
+	// What the bound is for is a descendant that escaped the killed process
+	// group (its own session, so the group-directed SIGKILL missed it) and
+	// still holds a write end. That pipe never reaches EOF, and without a
+	// ceiling this wait would be unbounded. Losing a crash tail is the right
+	// trade against never completing a teardown.
+	stdioDrainBound = 2 * time.Second
+
 	defaultHighWaterBytes = uint64(1) << 30 // Classify's ArenaOccupancyBytes high-water mark.
 )
 
@@ -967,6 +980,11 @@ func (s *Supervisor) newLiveInstance(
 		cancelCapture()
 		state, _ := proc.Kill()
 		_ = conn.Close()
+		// Kill reaped the child, so the readers are draining what it wrote on
+		// its way out and will stop at EOF. They must finish before their read
+		// ends close, or that output -- the whole reason this spawn failed --
+		// is discarded.
+		drainThenCloseStdio(proc, captureDone)
 		<-captureDone
 
 		// This capture's whole life is the failed spawn: no instance is returned,
@@ -1034,7 +1052,11 @@ func (s *Supervisor) newLiveInstance(
 			ShutdownDeadline: shutdownDeadline,
 			CloseFDs: func() {
 				_ = conn.Close()
-				closeStdio(proc)
+				// Teardown's step 5 reaped the child before this step, so the
+				// stdio readers are draining its last output and stop at EOF.
+				// Closing their read ends first would discard it, which is what
+				// a crash reason for this instance is built from.
+				drainThenCloseStdio(proc, captureDone)
 				// The two host eventfd wrappers are the host's to close (they are not
 				// owned by the transport); by here every goroutine that used them is
 				// joined. A no-op for uds.
@@ -1887,6 +1909,42 @@ func closeStdio(proc *lifecycle.Process) {
 	if proc.Stderr != nil {
 		_ = proc.Stderr.Close()
 	}
+}
+
+// drainThenCloseStdio waits for this instance's stdio readers to finish, then
+// closes the read ends they were reading.
+//
+// The order is the point. A reaped child's last output is still in the pipe:
+// the readers drain it and stop at the EOF the reap produced, but closing a
+// read end out from under a reader discards whatever the kernel still holds.
+// That output is what a crash reason is built from, so closing first can empty
+// a crash tail for a plugin that printed on its way out -- the case the tail
+// exists to explain. Callers must reap before calling this, or the wait is
+// just the bound.
+//
+// captureDone may be nil for an instance that never started a capture.
+func drainThenCloseStdio(proc *lifecycle.Process, captureDone <-chan struct{}) {
+	if failpointEnabled && fpStdioDrainStarted != nil {
+		fpStdioDrainStarted()
+	}
+
+	drained := true
+	if captureDone != nil {
+		timer := time.NewTimer(stdioDrainBound)
+		defer timer.Stop()
+
+		select {
+		case <-captureDone:
+		case <-timer.C:
+			drained = false
+		}
+	}
+
+	if failpointEnabled && fpBeforeStdioClose != nil {
+		fpBeforeStdioClose(drained)
+	}
+
+	closeStdio(proc)
 }
 
 // noopIfNil returns f or a no-op if f is nil.
