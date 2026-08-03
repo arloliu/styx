@@ -872,6 +872,41 @@ func TestHost_Stop_BoundedAgainstWedgedSink(t *testing.T) {
 	}
 }
 
+// Test that same wedged-sink join staying inside the budget the CALLER sized, not
+// only inside obsShutdownBound. The fixed bound is a ceiling on the wait, not an
+// overhead added to whatever ctx allowed; otherwise a consumer choosing its own
+// shutdown deadline would have to read this constant out of Styx's source to
+// predict how long Stop can really take.
+func TestHost_Stop_BoundsWedgedSinkJoin_ByCallerContext(t *testing.T) {
+	// Given the same host whose sink blocks forever inside the dispatcher the join
+	// below waits for.
+	sink := &blockingSink{entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(sink.release) })
+	h := NewHost(HostConfig{Metrics: sink})
+
+	hook := h.heartbeatMissHook("p", h.nextHealthOrigin("p"))
+	require.NotNil(t, hook)
+	hook(1)
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sink was never called")
+	}
+
+	// When Stop is given a budget far shorter than obsShutdownBound.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_ = h.Stop(ctx)
+	elapsed := time.Since(start)
+
+	// Then it returned on that budget. Half the fixed bound separates the two
+	// outcomes with room to spare in both directions: paying the bound costs the
+	// whole obsShutdownBound, honoring the budget costs 50ms.
+	require.Less(t, elapsed, obsShutdownBound/2,
+		"Stop spent the fixed observability join bound instead of the budget its caller sized")
+}
+
 // capTransport is a fake Transport exposing the shared-memory reporter
 // capabilities (ring depth, arena occupancy, wakeup syscalls) with test-controlled
 // values, so the reporter's present-capability branches can be driven directly.

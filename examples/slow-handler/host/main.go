@@ -275,7 +275,8 @@ func run() error {
 		return fmt.Errorf("start: %w", err)
 	}
 	// Stop gets a context with fresh budget rather than the one the load ran under:
-	// a Stop handed an already-expired context returns without tearing anything down.
+	// a Stop handed an already-expired context still tears every plugin down, but
+	// returns without waiting for that teardown to finish.
 	defer func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer stopCancel()

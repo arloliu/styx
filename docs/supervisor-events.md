@@ -68,32 +68,32 @@ rather than another event, so if you consume with a bare `<-host.Events()`
 inside a `select` instead of ranging, check that `ok` — otherwise your loop
 spins on zero values after `Stop`.
 
-Two cases leave the channel open, both because no teardown has completed:
+One case leaves the channel open when `Stop` returns: **a `Stop` whose
+context expired** before some plugin's supervisor joined. That plugin's
+teardown finishes on its own, and the channel stays open and carries its
+remaining events until it does, then closes — nothing has to call `Stop`
+again to get there.
 
-- **A `Stop` whose context expired** before some plugin's supervisor joined.
-  That plugin's teardown finishes later, and the channel stays open and
-  carries its remaining events until it does.
-- **A `Stop` given a context that was already canceled or expired when it
-  was called**, which returns that context's error immediately and tears
-  nothing down — no plugin reaped, no channel closed, and a `for ... range`
-  consumer waiting forever. This is easy to hit by reusing the context you
-  started with, especially one from `signal.NotifyContext`, which is
-  canceled at exactly the moment you want to shut down. Give `Stop` a
-  context with its own budget:
+A `Stop` given a context that was **already canceled or expired when it was
+called** is that same case with no waiting at all: it stops every plugin and
+returns each one's context error straight away, and the channel closes once
+those teardowns finish in the background. This is easy to hit by reusing the
+context you started with, especially one from `signal.NotifyContext`, which
+is canceled at exactly the moment you want to shut down. Nothing leaks
+either way, but only a context with its own budget makes the close
+synchronous with the call, so a `for ... range` consumer ends before `Stop`
+returns rather than shortly after:
 
-  ```go
-  stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-  defer cancel()
-  _ = host.Stop(stopCtx)
-  ```
+```go
+stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+_ = host.Stop(stopCtx)
+```
 
-  A later `Stop` with a usable context still completes the teardown and
-  closes the channel, so this is recoverable — but only if something calls
-  one.
-
-A `Host` is single-use. Once a `Stop` has completed the teardown, `Start`
-rejects with `ErrHostStopped` rather than running plugins whose events
-would go nowhere; build a new `Host` to reconnect.
+A `Host` is single-use. Once a `Stop` has begun — not merely finished —
+`Start` rejects with `ErrHostStopped` rather than running plugins whose
+events would go nowhere and whom no teardown owns; build a new `Host` to
+reconnect.
 
 ## `Health`: pull, not subscribe
 

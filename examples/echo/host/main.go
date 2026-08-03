@@ -53,8 +53,9 @@ func main() {
 	// under: that one may already be canceled or expired by shutdown time (it is
 	// here, if the work above outlasts it, and in a real host whose context comes
 	// from signal.NotifyContext it is canceled precisely when it is time to stop).
-	// A Stop handed an already-done context returns without tearing anything down —
-	// no plugin reaped, and Events() left open for its consumer forever.
+	// A Stop handed an already-done context still tears every plugin down and
+	// reaps it, but returns without waiting for that, so Events() closes shortly
+	// after the call instead of before it returns.
 	defer func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer stopCancel()

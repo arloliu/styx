@@ -352,25 +352,35 @@ var (
 	// not classify it.
 	ErrPluginAlreadyStarted = errors.New("styx: plugin already started")
 	// ErrPluginStopping reports that a Start or Reload named a plugin whose
-	// previous instance is still shutting down: a Stop deadline expired before
-	// that instance's supervisor joined, so the name is retained in a stopping
-	// state until the join completes. Starting a second instance under the same
-	// name while the first is still stopping would let two supervisors race for
-	// one name, so both Start and Reload reject it with this error until the
-	// prior instance finishes tearing down (automatically once its Run exits, or
-	// on a retried Stop). It is a lifecycle/framework error, not a per-call one,
-	// so IsRetryable does not classify it.
+	// previous instance is still shutting down, which happens two ways: a Stop
+	// deadline expired before that instance's supervisor joined, or a Start was
+	// abandoned when a Stop began and handed its supervisor on rather than
+	// waiting out a spawn while holding the host's lock. Either way the name is
+	// retained in a stopping state until the join completes. Starting a second
+	// instance under the same name while the first is still stopping would let
+	// two supervisors race for one name, so both Start and Reload reject it
+	// with this error until the prior instance finishes tearing down
+	// (automatically once its Run exits, or on a retried Stop). Retrying is
+	// what recovers a Reload; a Start of a name that a Host's own Stop is
+	// tearing down never recovers, because that Stop closed the Host to new
+	// plugins — see ErrHostStopped, which every other name reports in that
+	// state. It is a lifecycle/framework error, not a per-call one, so
+	// IsRetryable does not classify it.
 	ErrPluginStopping = errors.New("styx: plugin still stopping")
-	// ErrHostStopped reports that Start was called on a Host whose Stop already
-	// completed its teardown. A Host is single-use: that teardown releases the
-	// background workers the Host owns for its whole life — the observability
-	// dispatchers and the Events() subscription — and none of them is rebuilt, so a
-	// plugin started afterward would run with its lifecycle events going nowhere
-	// and no metrics or logs reported. Build a new Host instead; a caller that
-	// reconnects by rebuilding one is the case this protects. A Stop that returned
-	// early, or one whose plugin has not finished stopping, has not completed a
-	// teardown and does not trigger this. It is a lifecycle/framework error, not a
-	// per-call one, so IsRetryable does not classify it.
+	// ErrHostStopped reports that Start was called on a Host whose Stop has begun.
+	// A Host is single-use: that teardown releases the background workers the Host
+	// owns for its whole life — the observability dispatchers and the Events()
+	// subscription — and none of them is rebuilt, so a plugin started afterward
+	// would run with its lifecycle events going nowhere and no metrics or logs
+	// reported. A plugin admitted while the teardown is still in flight is worse
+	// still: the teardown already decided which runtimes it owns, so nothing would
+	// ever stop that one. Start therefore reports this from the moment a Stop
+	// begins, not only once one has finished, and a Start abandoned mid-spawn by an
+	// arriving Stop reports it too. Build a new Host instead; a caller that
+	// reconnects by rebuilding one is the case this protects. A name that Stop is
+	// still tearing down reports ErrPluginStopping, which is the same verdict for
+	// this Host with the specific reason attached. It is a lifecycle/framework
+	// error, not a per-call one, so IsRetryable does not classify it.
 	ErrHostStopped = errors.New("styx: host stopped")
 	// ErrUnknownPlugin reports that a call named a plugin this Host's
 	// HostConfig.Plugins never declared. It is distinct from

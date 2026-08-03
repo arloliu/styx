@@ -800,13 +800,13 @@ func TestHost_Events_ChannelClosed_AfterStopCompletes(t *testing.T) {
 	require.False(t, ok, "Events() must stay closed after Stop, not deliver again")
 }
 
-// Test a Stop handed an already-canceled context tearing nothing down — leaving
-// Events() open, since nothing was torn down to end it — and a later Stop with a
-// usable context still completing that teardown and closing the stream. Reusing
-// the context the host ran under is the easy mistake (a signal.NotifyContext is
-// canceled at exactly shutdown time), and the recovery from it is a second Stop,
-// not a new Host.
-func TestHost_Stop_TearsNothingDownOnCanceledContext_AndALaterStopStillCloses(t *testing.T) {
+// Test a Stop handed an already-canceled context still tearing the host down.
+// Reusing the context the work ran under is the easy mistake (a
+// signal.NotifyContext is canceled at exactly shutdown time), and a spent budget
+// must cost the caller the waiting it can no longer afford, never the teardown
+// itself: a host with nothing left to join finishes it here, on the first call,
+// and closes its event stream rather than needing a second Stop to recover.
+func TestHost_Stop_CompletesTeardown_OnAlreadyCanceledContext(t *testing.T) {
 	// Given: a host and a context that is already canceled.
 	h := styx.NewHost(styx.HostConfig{})
 	canceled, cancel := context.WithCancel(context.Background())
@@ -815,21 +815,61 @@ func TestHost_Stop_TearsNothingDownOnCanceledContext_AndALaterStopStillCloses(t 
 	// When
 	err := h.Stop(canceled)
 
-	// Then: Stop reports the context and ends the events stream not at all.
-	require.ErrorIs(t, err, context.Canceled)
-	select {
-	case _, ok := <-h.Events():
-		require.Fail(t, "Events() must stay live after a Stop that tore nothing down",
-			"channel closed=%v", !ok)
-	default:
-	}
-
-	// When: a Stop with budget follows.
-	require.NoError(t, h.Stop(context.Background()))
-
-	// Then: that one completes the teardown and closes the stream.
+	// Then: there was nothing to wait for, so the teardown completed and ended
+	// the stream.
+	require.NoError(t, err)
 	_, ok := <-h.Events()
-	require.False(t, ok, "a Stop with a usable context must complete the teardown and close Events()")
+	require.False(t, ok, "a Stop with no budget must still complete a teardown it never has to wait for")
+
+	// And: the host is done, exactly as after any completed teardown.
+	require.NoError(t, h.Stop(context.Background()))
+	require.ErrorIs(t, h.Start(context.Background()), styx.ErrHostStopped)
+}
+
+// Test a Stop handed an already-expired context still ending the plugin process
+// it spawned. The budget the caller no longer has buys it out of WAITING for the
+// join, not out of the teardown: leaving a child alive is the one outcome a Stop
+// must never produce, whatever context it was called with.
+func TestHost_Stop_ReapsPluginProcess_OnAlreadyExpiredContext(t *testing.T) {
+	testutil.RequireNoGoroutineOrFDLeak(t) // registered first: see its doc comment on ordering.
+
+	// Given: a plugin that tags its replies with its own PID, started and serving.
+	h := styx.NewHost(styx.HostConfig{
+		Plugins: []styx.PluginSpec{{
+			Name: "echo",
+			Path: fixtureCrashyPlugin,
+			Args: []string{"echo"},
+			Env:  []string{"STYX_ECHO_PID_TAG=1"},
+		}},
+	})
+	require.NoError(t, h.Start(t.Context()))
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	resp, err := echopb.NewEchoClient(h.Plugin("echo")).Say(t.Context(), &echopb.SayRequest{Message: "pid"})
+	require.NoError(t, err)
+	pid, _, ok := hostParsePIDTag(resp.GetMessage())
+	require.True(t, ok, "response %q is not the <pid>:<message> shape the tagged fixture emits", resp.GetMessage())
+
+	// Teardown signals the whole process group, and Spawn's Setpgid makes that
+	// group's id the child's own pid — so the group is what proves no descendant
+	// of the plugin survives either, not just the process the host spawned.
+	require.NoError(t, unix.Kill(-pid, 0), "the plugin's process group must be live before the Stop under test")
+
+	// When: Stop is handed a context with no budget left.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Then: it reports the join it did not wait for...
+	require.ErrorIs(t, h.Stop(canceled), context.Canceled)
+
+	// ...and the process group is gone. ESRCH means no member is left at all,
+	// which an exited-but-unreaped child would not satisfy: the kernel keeps
+	// answering for a zombie until someone waitpids it, so this proves the reap
+	// ran and not merely that a signal was delivered.
+	require.Eventually(t, func() bool {
+		return errors.Is(unix.Kill(-pid, 0), unix.ESRCH)
+	}, 15*time.Second, 20*time.Millisecond,
+		"the plugin's process group outlived a Stop that had no budget to wait with")
 }
 
 // Test Start refusing a host whose Stop already completed its teardown. That

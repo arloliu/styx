@@ -306,9 +306,40 @@ type Host struct {
 	// Events() forwarder: they are torn down only after Stop has been asked to and
 	// no runtime is still awaiting its join. workersReleased makes that release
 	// happen exactly once whether Stop's own tail or the last deferred watcher
-	// reaches it first.
+	// reaches it first. It also closes the host to new plugins: startOne rejects
+	// every name once it is set, under this same lock that Stop's snapshot is
+	// taken beneath, so no plugin can be admitted behind a teardown that has
+	// already decided what it owns.
 	stopRequested   bool
 	workersReleased bool
+	// workersReleaseDone is created, under h.mu, by whoever claims that release and
+	// closed once its bounded waits have finished. The claim is taken under the
+	// lock but the joining happens after the lock is dropped, so the flag alone
+	// says only that a release started — a Stop that read it as "the workers are
+	// down" would report a teardown finished while another goroutine was still
+	// joining observability and draining Events(). A Stop that finds the release
+	// already claimed therefore waits on this channel instead, inside its own
+	// budget. It is nil until the claim is made, which is also what a caller that
+	// finds the release merely deferred (a runtime is still stopping) observes:
+	// nothing to wait for.
+	workersReleaseDone chan struct{}
+	// stopInFlight is non-nil exactly while one Stop owns the host's teardown, and
+	// is closed when that Stop finishes. It serializes Stop calls: a concurrent
+	// Stop waits on it rather than snapshotting an empty host and reporting a
+	// success it never observed, and it is what makes the teardown tail — the
+	// bounded waits in maybeReleaseWorkers — the property of the one caller that
+	// owns the teardown, so a caller with no budget left cannot cut short a drain
+	// another caller is still paying for.
+	stopInFlight chan struct{}
+	// stopBegun is closed, exactly once, by the first Stop BEFORE it contends for
+	// h.mu. Start holds that mutex across a whole plugin spawn and its wait for
+	// the first Ready/GaveUp outcome, so a Stop that only ever learned of a
+	// teardown under the lock would wait out a spawn its own context has no budget
+	// for. Closing a channel is the one broadcast a Stop can make without the lock,
+	// so startOne's wait observes it and abandons the attempt instead. It is nil on
+	// a Host not built by NewHost, where there is no Start to abandon.
+	stopBegun chan struct{}
+	stopOnce  sync.Once
 	// hostStopped mirrors workersReleased for Health's own check: Health must
 	// never block on h.mu, which Start and Stop can each hold for as long as a
 	// whole plugin spawn or teardown takes — far longer than a synchronous
@@ -361,6 +392,14 @@ type Host struct {
 	events         <-chan Event
 	eventsUnsub    func()
 	eventsQuiesced func() bool
+	// eventsDrainBound is this Host's own copy of the drain ceiling, taken from
+	// the package default at NewHost. It is per-Host so that a ceiling can be
+	// changed for one Host alone: a Host's detached join watcher can still be
+	// inside this wait long after whoever built that Host has moved on, so a
+	// single mutable ceiling shared by every Host would be read by a watcher
+	// nothing is left holding. Zero means a Host not built by NewHost, which
+	// falls back to the package default.
+	eventsDrainBound time.Duration
 
 	// metricsDisp is the shared MetricsSink dispatcher, or nil when no sink is
 	// configured — the host-wide enabled gate. logDisp is the Logger dispatcher, or
@@ -438,14 +477,16 @@ func NewHost(cfg HostConfig) *Host {
 	events, unsubEvents, eventsQuiesced := bus.Subscribe()
 
 	h := &Host{
-		cfg:             cfg,
-		plugins:         make(map[string]*ClientConn),
-		health:          make(map[string]*healthRecord, len(cfg.Plugins)),
-		bus:             bus,
-		events:          events,
-		eventsUnsub:     unsubEvents,
-		eventsQuiesced:  eventsQuiesced,
-		metricsInterval: resolveMetricsInterval(cfg.MetricsInterval),
+		cfg:              cfg,
+		plugins:          make(map[string]*ClientConn),
+		health:           make(map[string]*healthRecord, len(cfg.Plugins)),
+		bus:              bus,
+		events:           events,
+		eventsUnsub:      unsubEvents,
+		eventsQuiesced:   eventsQuiesced,
+		eventsDrainBound: eventsDrainBound,
+		metricsInterval:  resolveMetricsInterval(cfg.MetricsInterval),
+		stopBegun:        make(chan struct{}),
 	}
 	// Every configured name gets a record up front, and only here: h.health is
 	// never written again after NewHost returns, so a later lookup needs no lock
@@ -503,21 +544,42 @@ func NewHost(cfg HostConfig) *Host {
 // instance's for as long as the Host owns it — after the instance has given up
 // for good as much as while it is serving — and a second Start of it is refused
 // with ErrPluginAlreadyStarted, having spawned nothing and left the earlier
-// instance untouched. A name whose prior instance is still tearing down from an
-// expired Stop is refused with ErrPluginStopping until that teardown completes.
+// instance untouched. A name whose prior instance is still tearing down — from an
+// expired Stop, or from an attempt this Host abandoned mid-spawn — is refused with
+// ErrPluginStopping until that teardown completes.
 // So a Start retried after a partial failure starts what failed and reports
 // ErrPluginAlreadyStarted for what did not: replacing a serving instance with a
 // fresh process is Reload's job, and there is no per-plugin respawn for one that
 // gave up — build a new Host.
 //
-// A Host is single-use. Once a Stop has completed the host's teardown, Start
-// rejects with ErrHostStopped and spawns nothing: that teardown ended the
-// Events() subscription and the observability workers for good, so a plugin
-// started afterward would report its lifecycle nowhere. Build a new Host.
+// A Host is single-use. Once a Stop has BEGUN — not merely completed — Start
+// rejects with ErrHostStopped and spawns nothing: that teardown owns whichever
+// plugins it snapshotted and ends the Events() subscription and the observability
+// workers when they are done, so a plugin admitted behind it would report its
+// lifecycle nowhere and no teardown would own it. A name that Stop is still
+// tearing down reports the more specific ErrPluginStopping instead, which says
+// the same thing about this Host. Build a new Host.
+//
+// A Start already inside a plugin spawn when a Stop begins abandons that attempt
+// and reports ErrHostStopped for it: Start holds the host's lock across a spawn,
+// and making the teardown wait that out would spend a budget the Stop caller sized
+// for waiting on children. Abandoning stops that attempt's supervisor at once but
+// never waits for it under that lock — a supervisor inside a spawn cannot be
+// interrupted out of one — so an attempt whose supervisor has not joined by then is
+// handed to the teardown as a stopping runtime rather than joined here. Either way
+// no process, supervisor, or subscription is left unowned; see abandonAttempt.
 func (h *Host) Start(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	// Check the binary pins before contending for h.mu, which this call then holds
+	// until it returns. Hashing a whole binary is unbounded work — it grows with
+	// the file, with how slow the filesystem is, and without limit at all for a
+	// path that never reaches EOF — and a Stop must have that lock before it can
+	// even take its snapshot. Run under it, the hash would be time charged to a
+	// teardown whose caller sized its budget for waiting on children.
+	pinErrs := h.verifyPinnedBinaries()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -527,8 +589,8 @@ func (h *Host) Start(ctx context.Context) error {
 	}
 
 	var errs []error
-	for _, spec := range h.cfg.Plugins {
-		if err := h.startOne(ctx, spec); err != nil {
+	for i, spec := range h.cfg.Plugins {
+		if err := h.startOne(ctx, spec, pinErrs[i]); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -536,24 +598,53 @@ func (h *Host) Start(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// startOne verifies spec's optional binary pin, then creates and launches
-// a Supervisor for it, blocking until its first attempt reaches Ready or
-// gives up. On success it installs the plugin's routing into h.plugins and
-// records its pluginRuntime for Stop; on any failure it leaves no
-// goroutine, subscription, or running Supervisor behind.
-func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
+// verifyPinnedBinaries checks every configured plugin's optional binary pin and
+// returns the outcomes positionally, one entry per h.cfg.Plugins entry and nil
+// for a spec that pins nothing or whose binary matched. The check reads only the
+// spec, so it needs no host state; h.cfg is fixed for the Host's whole life as of
+// NewHost, so reading it without h.mu races nothing.
+//
+// Results are positional rather than keyed by name because nothing forbids two
+// specs sharing one — startOne is what rejects the second, and it must still see
+// the pin outcome belonging to its own spec.
+func (h *Host) verifyPinnedBinaries() []error {
+	errs := make([]error, len(h.cfg.Plugins))
+	for i, spec := range h.cfg.Plugins {
+		if spec.BinarySHA256 == nil {
+			continue
+		}
+
+		errs[i] = control.VerifyBinaryIdentity(spec.Path, spec.BinarySHA256)
+	}
+
+	return errs
+}
+
+// startOne creates and launches a Supervisor for spec, blocking until its first
+// attempt reaches Ready or gives up. On success it installs the plugin's routing
+// into h.plugins and records its pluginRuntime for Stop; on any failure it stops
+// the Supervisor it created and releases that attempt's goroutine and
+// subscription, inline when the Supervisor joins and through the teardown
+// handover abandonAttempt describes when it does not.
+//
+// pinErr is the outcome of spec's optional binary pin, checked by the caller
+// before it took h.mu (see verifyPinnedBinaries). It is reported here, after the
+// admission checks below, so a name that is already started or still stopping
+// keeps saying so rather than reporting a mismatch nothing would have acted on.
+func (h *Host) startOne(ctx context.Context, spec PluginSpec, pinErr error) error {
 	// A liveness setting that cannot be honored is refused before anything is
 	// spawned, so no process, handshake, or lifecycle event ever exists for it.
 	if err := validateLivenessTuning(spec); err != nil {
 		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, err)
 	}
 
-	// Reject a name whose prior instance has not finished stopping: its
-	// supervisor did not join before an earlier Stop's deadline and may still be
-	// publishing on its retained relay. Spawning a second instance here would let
-	// two supervisors race for one name and leave the next Stop owning both. The
-	// caller retries once the prior instance's teardown completes. h.mu is held
-	// by Start across this call, so the read is safe.
+	// Reject a name whose prior instance has not finished stopping: its supervisor
+	// did not join before an earlier Stop's deadline, or before an abandoned start
+	// attempt handed it on, and may still be publishing on its retained relay.
+	// Spawning a second instance here would let two supervisors race for one name
+	// and leave the next Stop owning both. The caller retries once the prior
+	// instance's teardown completes. h.mu is held by Start across this call, so
+	// the read is safe.
 	if _, stopping := h.stopping[spec.Name]; stopping {
 		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, ErrPluginStopping)
 	}
@@ -565,10 +656,22 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	// A runtime stays registered until Stop tears it down — a terminal one that
 	// gave up included, which is why this rejects those too — so the name is taken
 	// for as long as this Host owns it. A failed attempt installs no runtime and is
-	// therefore retryable, unlike either of these. h.mu is held by Start across
-	// this call, so the read is safe.
+	// therefore retryable, unlike either of these, except while its own supervisor
+	// is still joining, which the stopping gate above covers. h.mu is held by Start
+	// across this call, so the read is safe.
 	if h.runtimeFor(spec.Name) != nil {
 		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, ErrPluginAlreadyStarted)
+	}
+
+	// A Stop has begun, so this Host admits no further plugin under any name. Stop
+	// latches stopRequested under the same h.mu Start holds across this call and
+	// beneath the same critical section its snapshot is taken in, so a name is
+	// either in that snapshot or refused here — never admitted behind it. Admitting
+	// one would leave a live supervisor no teardown owns, and maybeReleaseWorkers
+	// counts only stopping names, so it would end the Events() stream and the
+	// observability workers around a plugin that is still running.
+	if h.stopRequested {
+		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, ErrHostStopped)
 	}
 
 	// This attempt's ordering key for everything it may later write to the
@@ -578,29 +681,27 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	// nextHealthOrigin. Start holds h.mu across this call.
 	origin := h.nextHealthOrigin(spec.Name)
 
-	if spec.BinarySHA256 != nil {
-		if verr := control.VerifyBinaryIdentity(spec.Path, spec.BinarySHA256); verr != nil {
-			err := translateIncompatible(verr)
-			starting := Event{Plugin: spec.Name, Kind: EventStarting, Time: time.Now()}
-			crashed := Event{Plugin: spec.Name, Kind: EventCrashed, Time: time.Now(), Err: err}
-			// Recorded before publish, same ordering relayEvents and drainOnStop
-			// use: a caller reading Events() must never observe this crash before
-			// Health can report it. These two events never reach a
-			// supervisor.EventBus (the mismatch is caught before one is ever
-			// created for this name), so there is no bus-assigned Seq to read off
-			// them — a local pair (1, then 2) inside this attempt's own origin
-			// orders them, and the origin keeps them from colliding with any
-			// other attempt's numbering. Generation 0: no instance was ever
-			// spawned for this attempt, so no heartbeat loop can claim it.
-			// Each event carries the revision its own apply assigned, so this
-			// pair is positioned in the record's history like any other.
-			starting.Revision = h.recordHealthEvent(spec.Name, starting, origin, 1, 0)
-			h.publish(starting)
-			crashed.Revision = h.recordHealthEvent(spec.Name, crashed, origin, 2, 0)
-			h.publish(crashed)
+	if pinErr != nil {
+		err := translateIncompatible(pinErr)
+		starting := Event{Plugin: spec.Name, Kind: EventStarting, Time: time.Now()}
+		crashed := Event{Plugin: spec.Name, Kind: EventCrashed, Time: time.Now(), Err: err}
+		// Recorded before publish, same ordering relayEvents and drainOnStop
+		// use: a caller reading Events() must never observe this crash before
+		// Health can report it. These two events never reach a
+		// supervisor.EventBus (the mismatch is caught before one is ever
+		// created for this name), so there is no bus-assigned Seq to read off
+		// them — a local pair (1, then 2) inside this attempt's own origin
+		// orders them, and the origin keeps them from colliding with any
+		// other attempt's numbering. Generation 0: no instance was ever
+		// spawned for this attempt, so no heartbeat loop can claim it.
+		// Each event carries the revision its own apply assigned, so this
+		// pair is positioned in the record's history like any other.
+		starting.Revision = h.recordHealthEvent(spec.Name, starting, origin, 1, 0)
+		h.publish(starting)
+		crashed.Revision = h.recordHealthEvent(spec.Name, crashed, origin, 2, 0)
+		h.publish(crashed)
 
-			return fmt.Errorf("styx: start plugin %q: %w", spec.Name, err)
-		}
+		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, err)
 	}
 
 	cc := newUnavailableClientConn(spec.Name)
@@ -624,15 +725,26 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	select {
 	case err := <-firstOutcome:
 		startErr, fromSupervisor = err, true
+	case <-h.stopBegun:
+		// A Stop arrived after this attempt was admitted and is now contending for
+		// h.mu, which this call holds until it returns. Abandon the attempt rather
+		// than making that teardown wait out a first outcome that can take the
+		// whole restart budget: the failure path below stops this supervisor and
+		// hands it to that Stop, so nothing is left for it to miss.
+		//
+		// This is promptness, not the admission rule. An outcome already waiting
+		// can win this select instead, and that is safe for the same reason the
+		// rule itself is: the runtime is installed under the h.mu this call still
+		// holds, so the Stop contending for it snapshots the runtime and owns it.
+		startErr = ErrHostStopped
 	case <-ctx.Done():
 		startErr = ctx.Err()
 	}
 
 	if startErr != nil {
-		_ = sup.Stop(context.Background())
-		close(stopRelay)
-		<-relayDone
-		unsub()
+		h.abandonAttempt(ctx, &pluginRuntime{
+			name: spec.Name, sup: sup, unsub: unsub, stopRelay: stopRelay, relayDone: relayDone,
+		})
 
 		// Only translate an error that actually came from
 		// internal/supervisor (a GaveUp reason, possibly wrapping a bare
@@ -663,6 +775,86 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec) error {
 	}
 
 	return nil
+}
+
+// abandonAttempt ends the supervisor a failed start attempt created and releases
+// that attempt's relay and subscription, so nothing it built stays live under a
+// name no runtime owns.
+//
+// A supervisor that joins is torn down inline, which is the ordinary failed
+// start: the attempt leaves nothing registered and the name is startable again
+// straight away. One that does not is handed on instead, registered as this
+// name's stopping runtime exactly as an expired Stop registers a runtime whose
+// Run did not join. Its teardown then completes on whichever reaches it first —
+// the next Stop, inside that caller's own budget, or the detached watcher started
+// here — and the name reports ErrPluginStopping until it does.
+//
+// Handing on rather than waiting is what keeps a teardown's budget its own. Start
+// holds h.mu for its whole call and a Stop must have that lock to begin, so a join
+// waited out here is time charged to that Stop before it can even take its
+// snapshot — and a supervisor inside a spawn, which cannot be interrupted out of
+// one, can hold it there for the whole handshake deadline. Registering under the
+// same h.mu is what makes the handover total: the Stop's snapshot is taken under
+// that lock, so it cannot be taken before this registration is visible to it.
+func (h *Host) abandonAttempt(ctx context.Context, rt *pluginRuntime) {
+	if h.joinAbandonedAttempt(ctx, rt.sup) {
+		close(rt.stopRelay)
+		<-rt.relayDone
+		rt.unsub()
+
+		return
+	}
+
+	h.runtimes = append(h.runtimes, rt)
+	if h.stopping == nil {
+		h.stopping = make(map[string]struct{})
+	}
+	h.stopping[rt.name] = struct{}{}
+
+	h.watchJoin(rt)
+}
+
+// joinAbandonedAttempt stops sup and reports whether its Run joined, giving the
+// join up as soon as a Stop begins or ctx expires.
+//
+// The stop signal is delivered whatever the outcome, so a supervisor this call
+// hands on is already ending when the teardown that inherits it picks it up: its
+// child is stopped and reaped by the same sequence any other teardown runs.
+func (h *Host) joinAbandonedAttempt(ctx context.Context, sup *supervisor.Supervisor) bool {
+	// An already-spent context makes this call the signal alone: Supervisor.Stop
+	// closes its stop channel before it waits at all.
+	spent, cancelSpent := context.WithCancel(context.Background())
+	cancelSpent()
+	_ = sup.Stop(spent)
+
+	// A teardown already contending for the h.mu this call holds is the one that
+	// inherits this attempt, so it decides the outcome before the join is even
+	// attempted rather than racing it. Waiting for a supervisor that is merely
+	// about to return would still make how long that teardown waits for the lock
+	// depend on how far into a spawn the supervisor happened to be.
+	if h.stopHasBegun() {
+		return false
+	}
+
+	select {
+	case <-sup.Done():
+		return true
+	case <-h.stopBegun:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// stopHasBegun reports whether a Stop has already broadcast that a teardown is
+// starting. A Host not built by NewHost has no channel and no Stop to observe.
+func (h *Host) stopHasBegun() bool {
+	select {
+	case <-h.stopBegun:
+		return true
+	default:
+		return false
+	}
 }
 
 // supervisorConfig builds one plugin's internal supervision configuration: spec's
@@ -864,6 +1056,17 @@ func (h *Host) drainOnStop(name string, origin uint64, events <-chan supervisor.
 // within ctx have been reaped. Every plugin being torn down is held in a
 // stopping state that rejects concurrent Start or Reload of the same name.
 //
+// ctx bounds how long Stop WAITS, never whether the teardown happens. A Stop
+// handed an already-expired ctx buys no wait at all, but still stops every
+// plugin: each supervisor ends its instance through the same sequence any other
+// Stop runs — a graceful Shutdown message, SIGKILL of the whole process group if
+// the child does not exit inside that window, then a waitpid reap — so no plugin
+// process outlives the Host. What the expired budget costs is the join, and with
+// it the wait for that reap: Stop reports the context error for every plugin
+// that had not already joined and returns while their teardowns finish detached,
+// exactly as for a budget that ran out mid-teardown. Stop is therefore always
+// worth calling, whatever ctx is left.
+//
 // A plugin whose Supervisor.Run does not join before ctx expires cannot be torn
 // down safely: closing its relay now could drop a terminal event the still-running
 // Run publishes later. Stop returns that plugin's deadline error but retains the
@@ -873,40 +1076,39 @@ func (h *Host) drainOnStop(name string, origin uint64, events <-chan supervisor.
 // Stop, whichever happens first. The host's own background workers — the
 // observability dispatchers and the Events() forwarder — are released only after
 // the last such runtime is gone, so Events() stays open while one is still
-// stopping; see maybeReleaseWorkers for what ending it means for a reader.
+// stopping; see maybeReleaseWorkers for what ending it means for a reader. That
+// release's own waits are bounded by ctx as well, so a caller sizing a shutdown
+// budget never has to add Styx's internal bounds to it.
+//
+// Concurrent Stops are serialized rather than run side by side: one owns the
+// teardown and the others wait for it, so every caller returns only once a
+// teardown it actually observed has finished, or its own ctx expires. A waiting
+// caller with budget left then runs its own pass, which is what lets it complete
+// a join an earlier caller ran out of time for; a waiting caller with no budget
+// left takes its ctx's error and leaves the owner to finish — the owner still
+// stops and reaps every plugin, so no child outlives that call either. Ownership
+// also decides the teardown tail: the bounded waits below belong to the caller
+// that owns the teardown, so a Stop with a spent budget can never cut short a
+// drain a caller with budget is still paying for.
+//
+// A Start already inside a plugin spawn when Stop arrives is abandoned rather
+// than waited out: it holds h.mu across that spawn, and Stop's ctx is a budget
+// for waiting on children, not on another caller's admission. That Start reports
+// ErrHostStopped for the abandoned plugin and releases h.mu without waiting for
+// the supervisor it stopped, handing it to this Stop as a stopping runtime — so
+// the spawn is waited on here, as any other child is, and only for as long as ctx
+// allows. That is what keeps this whole call inside ctx: were the abandoned
+// attempt joined under h.mu instead, Stop would wait the spawn out before it could
+// even take its snapshot.
 func (h *Host) Stop(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
+	// Broadcast before contending for h.mu, which an in-flight Start holds.
+	h.signalStopBegun()
+
+	runtimes, done, err := h.beginStop(ctx)
+	if err != nil {
 		return err
 	}
-
-	h.mu.Lock()
-	h.stopRequested = true
-	runtimes := h.runtimes
-	h.runtimes = nil
-	h.plugins = make(map[string]*ClientConn)
-	// Gate every snapshot name for the whole teardown, not just once a join
-	// deadline has already expired. Marking each name stopping here — under the
-	// same lock that removes the runtimes — closes the window where the host
-	// would look empty and ungated while Stop waits below in Supervisor.Stop: a
-	// concurrent Start or Reload in that window would otherwise find no gate and
-	// spawn a second supervisor for a name whose predecessor is still stopping.
-	// Each name clears when its runtime tears down cleanly (completeTeardown) and
-	// persists for one whose Run has not joined (retainUnjoined), so
-	// ErrPluginStopping holds for exactly as long as the teardown is in flight.
-	//
-	// Two concurrent Stops cannot both own a runtime: this snapshot swap is
-	// atomic under h.mu, so the loser's snapshot is empty and it publishes no
-	// names — it only reaches the observability gate below, which the winner's
-	// provisional names keep closed until the winner finishes tearing down.
-	if len(runtimes) > 0 {
-		if h.stopping == nil {
-			h.stopping = make(map[string]struct{})
-		}
-		for _, rt := range runtimes {
-			h.stopping[rt.name] = struct{}{}
-		}
-	}
-	h.mu.Unlock()
+	defer h.endStop(done)
 
 	var errs []error
 	var unjoined []*pluginRuntime
@@ -927,10 +1129,97 @@ func (h *Host) Stop(ctx context.Context) error {
 
 	// Release the host's background workers once no runtime is still awaiting its
 	// join. With everything joined this fires here; with runtimes still stopping
-	// it is deferred to the last watcher (or retried Stop) that clears them.
-	h.maybeReleaseWorkers()
+	// it is deferred to the last watcher (or retried Stop) that clears them. A
+	// release a detached watcher already claimed is waited for rather than taken
+	// as done, so this call never reports a teardown those workers are still
+	// inside.
+	if err := h.maybeReleaseWorkers(ctx); err != nil {
+		errs = append(errs, err)
+	}
 
 	return errors.Join(errs...)
+}
+
+// signalStopBegun broadcasts that a teardown has started, to the one place that
+// cannot learn it under h.mu: a Start already holding that mutex across a plugin
+// spawn. Closing a channel is the only such broadcast available, and sync.Once
+// makes it safe for every Stop to call. A Host not built by NewHost has no
+// channel and no Start to abandon, so there is nothing to signal.
+func (h *Host) signalStopBegun() {
+	if h.stopBegun == nil {
+		return
+	}
+
+	h.stopOnce.Do(func() { close(h.stopBegun) })
+}
+
+// beginStop takes ownership of the host's teardown for one Stop call and returns
+// the runtimes that call owns, plus the channel endStop closes to hand ownership
+// on. A Stop that finds another one in flight waits for it instead of proceeding:
+// the in-flight caller already snapshotted every runtime, so proceeding would mean
+// reporting a teardown finished that this caller never observed, and reaching the
+// worker release with a budget the owner never agreed to. Waiting is bounded by
+// this caller's own ctx, whose error it returns — the owner's teardown still runs
+// to completion, and still reaps every child, whether this caller waits for it or
+// not.
+//
+// The wait ends by retrying rather than returning, because ownership passing back
+// does not mean the host is finished: an owner whose budget expired leaves the
+// runtimes it could not join retained, and the next caller's own pass is what
+// joins them.
+func (h *Host) beginStop(ctx context.Context) ([]*pluginRuntime, chan struct{}, error) {
+	for {
+		h.mu.Lock()
+		if inFlight := h.stopInFlight; inFlight != nil {
+			h.mu.Unlock()
+
+			select {
+			case <-inFlight:
+				continue
+			case <-ctx.Done():
+				return nil, nil, fmt.Errorf("styx: stop: %w", ctx.Err())
+			}
+		}
+
+		done := make(chan struct{})
+		h.stopInFlight = done
+		h.stopRequested = true
+		runtimes := h.runtimes
+		h.runtimes = nil
+		h.plugins = make(map[string]*ClientConn)
+		// Gate every snapshot name for the whole teardown, not just once a join
+		// deadline has already expired. Marking each name stopping here — under the
+		// same lock that removes the runtimes — closes the window where the host
+		// would look empty and ungated while Stop waits below in Supervisor.Stop: a
+		// concurrent Reload in that window would otherwise find no gate and act on a
+		// name whose supervisor is already stopping, and a Start of it would report
+		// the host stopped rather than the specific name still tearing down. Each
+		// name clears when its runtime tears down cleanly (completeTeardown) and
+		// persists for one whose Run has not joined (retainUnjoined), so
+		// ErrPluginStopping holds for exactly as long as the teardown is in flight.
+		if len(runtimes) > 0 {
+			if h.stopping == nil {
+				h.stopping = make(map[string]struct{})
+			}
+			for _, rt := range runtimes {
+				h.stopping[rt.name] = struct{}{}
+			}
+		}
+		h.mu.Unlock()
+
+		return runtimes, done, nil
+	}
+}
+
+// endStop hands the teardown on to whichever Stop is waiting for it. Ownership is
+// cleared before the channel is closed, so a waiter that wakes finds the host free
+// rather than a stale owner it would have to wait on again.
+func (h *Host) endStop(done chan struct{}) {
+	h.mu.Lock()
+	h.stopInFlight = nil
+	h.mu.Unlock()
+
+	close(done)
 }
 
 // completeTeardown tears one runtime's relay and subscription down exactly once
@@ -985,12 +1274,20 @@ func (h *Host) retainUnjoined(unjoined []*pluginRuntime) {
 // a retained plugin's Supervisor.Run to finally join, then completes the teardown
 // the expired Stop deferred and releases the host's background workers if this
 // was the last runtime a Stop was still awaiting.
+//
+// The release runs against a background context, not the expired one that
+// deferred it: the Stop that owned that budget has long returned, so there is no
+// caller left waiting to keep inside it, and the release's own fixed bounds are
+// what cap it here.
 func (h *Host) watchJoin(rt *pluginRuntime) {
 	rt.watchOnce.Do(func() {
 		go func() {
 			<-rt.sup.Done()
 			h.completeTeardown(rt)
-			h.maybeReleaseWorkers()
+			// Nothing is waiting on this goroutine, so there is no caller to report
+			// to: either it runs the release or a Stop already claimed it, and this
+			// watcher's own wait for that one is the background context's to make.
+			_ = h.maybeReleaseWorkers(context.Background())
 		}()
 	})
 }
@@ -1018,27 +1315,54 @@ func (h *Host) watchJoin(rt *pluginRuntime) {
 // receives a failure incident published moments before shutdown, whole; one that
 // is not reading costs that bound and loses what it never took. Events() documents
 // both halves.
-func (h *Host) maybeReleaseWorkers() {
+//
+// Both waits are shortened to whatever ctx still allows (remainingBound), so the
+// two fixed bounds are ceilings a Stop can never exceed rather than overhead
+// charged on top of the caller's budget: sizing a shutdown deadline stays a
+// question about the caller's own tolerance, not one that requires reading these
+// constants.
+//
+// Exactly one caller runs the waits, and its own ctx is what charges them: no
+// second caller can shorten a drain the claimant is still paying for. A Stop
+// cannot take the claim from another Stop — they are serialized, so a second one
+// waits in beginStop instead — but the detached join watcher can, on the
+// background context it runs under, and a Stop that arrives after it has does
+// not own the release it needs. Such a Stop waits for that release to finish,
+// bounded by its own ctx, and reports that ctx's error if its budget runs out
+// first: returning nil there would say the host's workers were down while they
+// were still being joined. The wait can only ever be for a release already in
+// progress, whose own waits are bounded, so it cannot outlive them.
+func (h *Host) maybeReleaseWorkers(ctx context.Context) error {
 	h.mu.Lock()
 	release := h.stopRequested && len(h.stopping) == 0 && !h.workersReleased
 	if release {
 		h.workersReleased = true
+		h.workersReleaseDone = make(chan struct{})
 	}
+	inProgress := h.workersReleaseDone
 	h.mu.Unlock()
 
 	if !release {
-		return
+		return awaitWorkerRelease(ctx, inProgress)
 	}
+
+	// Closed last, after the store below, so a caller waiting on it observes a
+	// release that has finished rather than one that is merely past its waits.
+	defer close(inProgress)
 
 	if h.obsCancel != nil {
 		h.obsCancel()
-		joinBounded(&h.obsWG, obsShutdownBound)
+		joinBounded(&h.obsWG, remainingBound(ctx, obsShutdownBound))
 	}
 
 	// A Host built by NewHost always has both; the zero Host has neither, and Stop
 	// on it is a no-op rather than a panic.
 	if h.eventsUnsub != nil {
-		waitEventsQuiesced(h.eventsQuiesced, eventsDrainBound)
+		bound := h.eventsDrainBound
+		if bound == 0 {
+			bound = eventsDrainBound
+		}
+		waitEventsQuiesced(h.eventsQuiesced, remainingBound(ctx, bound))
 		h.eventsUnsub()
 	}
 
@@ -1049,6 +1373,27 @@ func (h *Host) maybeReleaseWorkers() {
 	// Health for it; see hostStopped's own doc for the residual race this
 	// does not close.
 	h.hostStopped.Store(true)
+
+	return nil
+}
+
+// awaitWorkerRelease waits for a worker release another caller already claimed to
+// finish, for as long as ctx allows, and reports ctx's error if it does not get
+// there first. A nil channel means no release has been claimed at all — there is
+// nothing in flight to be wrong about — and a caller whose own budget is already
+// spent takes the error without waiting, so a detached watcher holding the claim
+// can never hold a Stop past its budget.
+func awaitWorkerRelease(ctx context.Context, done chan struct{}) error {
+	if done == nil {
+		return nil
+	}
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("styx: stop: %w", ctx.Err())
+	}
 }
 
 // eventsDrainBound bounds the wait for a consumer to take what the teardown
@@ -1056,14 +1401,44 @@ func (h *Host) maybeReleaseWorkers() {
 // actually covers — a handful of events handed to a consumer that is already
 // draining, which costs microseconds — and is paid in full only by a Host whose
 // Events() nothing reads, where there is nothing to wait for and no consumer to
-// notice the delay. It is a var, not a const, only so a test can shorten it.
-// Package-internal; never reassigned in production.
-var eventsDrainBound = 250 * time.Millisecond
+// notice the delay. Each Host copies it at NewHost, and a test that needs a
+// different ceiling sets that copy rather than this default, which is what lets
+// the default be a constant.
+const eventsDrainBound = 250 * time.Millisecond
 
 // eventsDrainPoll is how often that wait rechecks the subscription. Short enough
 // that a consumer draining normally adds no measurable time to Stop, long enough
 // that the wait is not a spin.
 const eventsDrainPoll = 200 * time.Microsecond
+
+// remainingBound is the shorter of bound and whatever of ctx's own budget is
+// left. The fixed bound still caps the wait on its own — it is what keeps a
+// wedged dispatcher or an unread Events() from hanging teardown forever, and
+// ctx only ever shortens it further, never extends it. A ctx already done leaves
+// nothing to spend, so the wait is skipped outright; a ctx with no deadline at
+// all is bounded by bound alone.
+//
+// Cutting a wait short only abandons it, exactly as expiring the fixed bound
+// does: whatever was being waited for keeps running on its own goroutine and
+// touches no state this teardown has released (see joinBounded), so the caller
+// trades completeness for the deadline it asked for, never safety.
+func remainingBound(ctx context.Context, bound time.Duration) time.Duration {
+	if ctx.Err() != nil {
+		return 0
+	}
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return bound
+	}
+
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0
+	}
+
+	return min(bound, remaining)
+}
 
 // waitEventsQuiesced waits until the Events() subscription has nothing queued and
 // nothing in flight, for at most bound.
@@ -1105,6 +1480,12 @@ func removeRuntime(runtimes []*pluginRuntime, target *pluginRuntime) []*pluginRu
 // A plugin whose prior instance is still stopping also reports unavailable:
 // its client mapping was removed when Stop began, and no new instance may
 // take the name until that teardown completes.
+//
+// It takes the host's lock, which a concurrent Start holds while each plugin
+// it admitted waits for that plugin's first outcome, so a call made during a
+// Start can block for the length of a spawn. It takes no context and cannot
+// be cut short. Health reports a plugin's state without that lock and is the
+// one to reach for on a path that must not block.
 func (h *Host) Plugin(name string) *ClientConn {
 	h.mu.Lock()
 	cc, ok := h.plugins[name]
@@ -1147,16 +1528,17 @@ func (h *Host) Plugin(name string) *ClientConn {
 // delivered, and a receive after the close yields the zero Event with ok=false,
 // never another event.
 //
-// Two cases leave the channel open, both because no teardown completed: a Stop
-// whose context expired before some plugin's supervisor joined (that plugin's
-// teardown finishes later, and the channel carries its remaining events until it
-// does), and a Stop handed a context that was already canceled or expired, which
-// returns that context's error without tearing anything down. Give Stop a
-// context with its own budget rather than the one the work ran under; a later
-// Stop with a usable context still completes the teardown and closes the
-// channel. Once one has, the Host is done: Start rejects with ErrHostStopped.
-// See docs/supervisor-events.md's delivery-semantics section for the
-// full accounting.
+// One case leaves the channel open: a Stop whose context expired before some
+// plugin's supervisor joined. That plugin's teardown finishes on its own, and
+// the channel carries its remaining events until it does, then closes — no
+// second Stop is needed to get there. A Stop handed a context that was already
+// canceled or expired is that same case with no wait at all: it stops every
+// plugin and reports each one's context error, and the channel closes once
+// those teardowns finish. Giving Stop a context with its own budget rather
+// than the one the work ran under is still what makes the close synchronous
+// with the call. Once the teardown has completed, the Host is done: Start
+// rejects with ErrHostStopped. See docs/supervisor-events.md's
+// delivery-semantics section for the full accounting.
 func (h *Host) Events() <-chan Event {
 	return h.events
 }

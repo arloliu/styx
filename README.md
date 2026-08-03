@@ -196,10 +196,11 @@ restarting, or given up for good. `host.Stop` closes it once it has torn the
 host down — after a brief wait for you to take what the shutdown published —
 so the `range` loop above ends with the host rather than outliving it. Give
 `Stop` a context with its own budget (not an already-canceled one, such as the
-context you started under): a `Stop` that returns before tearing anything down
-closes nothing and leaves that loop waiting forever, and a `Host` whose
-teardown has completed is done — `Start` on it fails with `ErrHostStopped`,
-so build a new one to reconnect.
+context you started under): an expired budget still tears every plugin down and
+reaps it, but `Stop` returns without waiting for that to finish, so the loop
+ends slightly after the call rather than before it. A `Host` whose teardown has
+begun is done — `Start` on it fails with `ErrHostStopped`, so build a new
+one to reconnect.
 `HostConfig.Logger` and `HostConfig.Metrics`
 cover structured diagnostics and counters for the same transitions, so a real
 host usually configures all three rather than reimplementing logging inside

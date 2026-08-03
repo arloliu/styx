@@ -63,6 +63,23 @@ regardless of `ctx`; if `ctx` expires first, `Stop` returns your `ctx`'s
 error early while that teardown keeps running detached (see
 [Stop that doesn't join in time](#stop-that-doesnt-join-in-time) below).
 
+That holds for a `ctx` that was already canceled or expired when you called
+`Stop`, too — the case you get by reusing the context the work ran under,
+such as a `signal.NotifyContext` canceled at exactly shutdown time.
+Such a `Stop` waits for nothing at all, but still stops every plugin: each
+one goes through the same six steps below, ending in the same `SIGKILL` and
+`waitpid`, so no plugin process outlives the `Host`.
+What you lose is the wait, not the teardown, and `Stop` is worth calling
+whatever context you have left.
+
+`ctx` is also the whole shutdown budget, not most of it: the fixed internal
+bounds `Stop` waits on after the last plugin joins — joining the
+observability dispatchers, and giving an `Events()` consumer a moment to
+take what the shutdown published — are each capped by whatever `ctx` still
+allows.
+Size a shutdown deadline against your own tolerance; you never have to add
+styx's internal constants to it.
+
 Tearing an instance down — for a graceful `Stop`, a crash, hot-reload's
 retired predecessor, or a poisoned region — is always the same six steps,
 whichever caller triggered it:
@@ -106,12 +123,42 @@ If a plugin's supervisor does not finish tearing down before `Stop`'s `ctx`
 expires, `Stop` returns that plugin's deadline error but keeps its runtime
 alive in the background: the name stays marked "stopping," so a concurrent
 `Start` or `Reload` for that same name fails with `ErrPluginStopping`
-rather than racing a second supervisor onto it. The retained runtime
+rather than racing a second supervisor onto it.
+
+A `Start` still inside a plugin spawn when `Stop` begins reaches that same
+retained state by a different route.
+Rather than make the teardown wait out a spawn it cannot interrupt — which
+would spend a budget you sized for waiting on children — that attempt stops
+its supervisor and hands it to the `Stop` already under way, which then owns
+it like any other child and waits for it within its own `ctx`.
+The name is marked "stopping" for that handover too, so the same
+`ErrPluginStopping` applies until the join completes.
+
+The retained runtime
 finishes tearing down on its own — via a detached watcher once the
 supervisor's `Run` actually exits, or the next time `Stop` is called and
 retries it — and the name clears once that completes. There's nothing to
 call to hurry this along beyond giving `Stop` a longer `ctx` (or
 `context.Background()`) in the first place.
+
+A `Stop` handed an already-expired `ctx` lands here for every plugin at
+once, since it waits for none of them. The retained runtimes still tear
+down and reap on their own; a longer `ctx` only buys you the certainty that
+they have, by the time `Stop` returns.
+
+### Concurrent Stop callers
+
+Concurrent `Stop`s are serialized rather than run side by side: one owns the
+teardown and the others wait for it. Every caller therefore returns only once
+a teardown it actually observed has finished, or its own `ctx` expires —
+never with a `nil` reporting a shutdown that was still in flight elsewhere. A
+caller that waits and still has budget left then runs its own pass, which is
+how it finishes a join the previous owner ran out of time for; a caller with
+nothing left to spend gets its context's error and leaves the owner to finish,
+which still stops and reaps every plugin. The bounded waits that end the
+host's background workers belong to whichever caller owns the teardown, so a
+`Stop` with a spent budget can never cut a drain another caller is paying for
+short.
 
 ## Crash and restart
 
@@ -161,11 +208,11 @@ The embedding supervisor's job, then, is to react to `EventGaveUp` by deciding w
 `Supervisor.Run` returns immediately after publishing it, and publishes nothing at all if the `Host` was stopped in the race described above.
 A retry needs a fresh `Host`, but the gave-up one has to be closed out first, in this order:
 keep draining `Events()`;
-call `Stop` on the old `Host` with a live context, not one already canceled, since a canceled context makes `Stop` return without tearing anything down;
+call `Stop` on the old `Host` with a live context, not one already canceled, since a canceled context makes `Stop` return before the teardown it started has finished;
 let `Stop` complete the teardown and close `Events()`;
 then discard the old `Host` and construct the new one.
 A `Host` is single-use
-— `Start` on a `Host` whose `Stop` already completed rejects with `ErrHostStopped`, because that completed teardown released the background workers (the observability dispatchers, the `Events()` subscription) a later `Start` on the same `Host` would need —
+— `Start` on a `Host` whose `Stop` has begun rejects with `ErrHostStopped`, because that teardown releases the background workers (the observability dispatchers, the `Events()` subscription) a later `Start` on the same `Host` would need, and already decided which plugins it owns —
 so there is no "reset" operation;
 a retry is a fresh `NewHost` plus `Start`, never a call back into the `Host` that just gave up.
 
