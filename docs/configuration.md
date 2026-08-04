@@ -389,12 +389,26 @@ has actually been touched so far.
 
 This ships as information, not enforcement: `RegionBytes()` reports the
 cost, and `Host.Start` does not check it against any limit.
-An enforcing startup check that refuses a geometry the container cannot
-afford was designed and deliberately not built — it roughly doubled the cost
-of every `Start`, needed a cgroup reader and a resolved-config snapshot Styx
-does not otherwise keep, and added a new failure mode to `Reload`.
-If one is ever built, it must support cgroup v1 as well as v2 — that is a
-stated requirement for that future work, not an open question to revisit.
+
+An enforcing startup check — one that reads the container's cgroup memory
+limit and refuses a configuration whose regions cannot fit — was designed in
+detail and deliberately not built. The blocker is not the cgroup reader; it
+is that Styx has no object whose lifetime matches a mapping's. A successful
+shared-memory attach leaves the host holding *two* mappings, the original
+region and the transport's duplicate, released on different paths and at
+different times, and a plugin's `Host`-side runtime outlives the mapping it
+would be charged for. Any running total of "what this process currently
+holds" is therefore guesswork, and a check that refuses a start on guesswork
+is worse than one that does not exist.
+
+The full reasoning, including what would have to change to make it work,
+is recorded in
+[`docs/specs/2026-08-04-memory-budget-check-decision.md`](specs/2026-08-04-memory-budget-check-decision.md).
+
+So the guidance above is the mechanism: size the container from
+`RegionBytes()` and the arithmetic in this section. If a deployment hits an
+out-of-memory kill despite doing that, the decision record is the place to
+start reopening it.
 
 ## Tuning liveness detection
 
