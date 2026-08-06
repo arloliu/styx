@@ -11,7 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/arloliu/styx/internal/arena"
 	"github.com/arloliu/styx/internal/event"
@@ -28,9 +27,6 @@ const (
 	flagCRC32CPresent uint16 = 0x0004
 	// crc32TrailerLen is the CRC32C trailer width appended after the payload.
 	crc32TrailerLen = 4
-	// faultDetailMaxBytes bounds the rendered reason a consume fault carries out.
-	// See truncateFaultDetail.
-	faultDetailMaxBytes = 512
 )
 
 // consumeFunc is the transport.ViewReceiver callback the receive path hands a
@@ -359,6 +355,26 @@ func (t *Transport) WakeupSyscalls() uint64 {
 	}
 
 	return n
+}
+
+// MaxSendPayload reports the derived outbound payload limit Send enforces: the
+// largest slab of this side's outbound direction minus the negotiated per-frame
+// overhead (the CRC32C trailer when checksum is negotiated), further lowered by
+// Config.MaxPayload when that caller ceiling is set (shm-abi.md §18). It is the
+// exact value Send's admission check applies, not a re-derivation that could
+// drift from it.
+func (t *Transport) MaxSendPayload() uint32 {
+	return t.maxPayload
+}
+
+// MaxRecvPayload reports the derived inbound payload limit the receive-side
+// conformance check applies: the largest slab of this side's inbound direction
+// minus the negotiated per-frame overhead (shm-abi.md §18). It equals the peer's
+// MaxSendPayload only when the peer applies no Config.MaxPayload ceiling of its
+// own — the two directions' derived limits differ whenever the size-class tables
+// are asymmetric.
+func (t *Transport) MaxRecvPayload() uint32 {
+	return t.maxRecvPayload
 }
 
 // producerSignal runs the §12 producer signal after each publish: it wakes a
@@ -1138,72 +1154,36 @@ func (t *Transport) advanceHead() {
 
 // protectedConsume runs this side's copy-or-decode step behind a fault barrier,
 // which is shm-abi.md §9's protected_consume: it builds the delivered frame from
-// span and, when consume is non-nil, hands that frame to it. The deferred recover
-// turns a panic anywhere in that step into an ordinary result, because the caller
-// owes a head advance in exactly that case and could not pay it while unwinding —
-// without the barrier the panic escapes the drain loop, the head store never runs,
-// and the slot and its slab are stranded for the region's lifetime.
+// span and, when consume is non-nil, hands that frame to the shared barrier every
+// transport's consume callback runs behind (transport.ProtectedConsume). The
+// deferred recover here extends that barrier over this transport's OWN frame
+// construction, because the caller owes a head advance if it panics and could not
+// pay it while unwinding — without the barrier the panic escapes the drain loop,
+// the head store never runs, and the slot and its slab are stranded for the
+// region's lifetime. That arm is therefore live on the plain Recv path too, where
+// consume is nil and no callback exists at all.
 //
 // fault is consumeNone, consumeMalformed (the peer's bytes do not decode) or
 // consumeFaulted (this side's fault); err carries the detail on both fault arms
 // and is nil otherwise. A malformed result carries errBadFrame so the caller
 // routes it through the same poison mapping as any other malformed frame.
-//
-// Which arm a callback failure lands on is decided by
-// transport.ErrPayloadMalformed and nothing else: only a callback that names that
-// sentinel blames the peer and condemns the region. Any other error, and any
-// panic, is contained. Defaulting the other way would let a callback destroy a
-// healthy connection while reporting something as ordinary as a full delivery
-// queue.
-//
-// The barrier is installed before the frame is built, not just around consume, so
-// its reach is not limited to callback code: a panic in this transport's own
-// descriptorOnlyFrame or decodedFrame is contained the same way and produces the
-// same *transport.ConsumeFaultError. That arm is therefore live on the plain Recv
-// path, where consume is nil, and the reader loop that receives such an error owes
-// the call it names the same fail-fast a declining callback would.
-//
-// Nothing the callback produced leaves this function as an object. The panic
-// value and the returned error are rendered to text here, while the frame's
-// memory is still valid and before the caller advances the head, because either
-// one may hold a slice of the payload — and §9 forbids handing such a value
-// onward past the advance, where it reads a recycled slab, or past teardown,
-// where it reads unmapped memory.
 func protectedConsume(
 	d ring.Descriptor, tk transport.FrameKind, descriptorOnly bool, span []byte, consume consumeFunc,
 ) (f transport.Frame, fault consumeFault, err error) {
-	// blamesPeer records that the callback already named the peer's bytes as the
-	// cause, so the recover below can keep that attribution. Rendering the reason
-	// re-enters callback code (its Error method), and a panic there must not
-	// silently re-attribute a peer fault to this side: attribution decides the arm
-	// (shm-abi.md §9), and losing it would leave a non-conformant region trusted.
-	//
-	// That same re-entry has a second consequence, and both arms below answer it by
-	// rendering through panics.Text rather than fmt. A render that fmt cannot
-	// complete re-raises from inside this deferred recover, where nothing is left to
-	// catch it, and the runtime answers a panic it cannot print with an
-	// unrecoverable throw — turning the barrier that exists to contain a callback
-	// panic into the thing that kills the process. The guarded render runs BEFORE the
-	// truncation, so the bound applies to text this side produced.
-	blamesPeer := false
 	defer func() {
 		r := recover()
 		if r == nil {
 			return
 		}
 		// The barrier: the panic becomes a result, never an unwind (shm-abi.md §9).
+		// The panic value is rendered through panics.Text rather than by fmt: a render
+		// fmt cannot complete re-raises from inside this deferred recover, where
+		// nothing is left to catch it.
 		f = transport.Frame{}
-		if blamesPeer {
-			fault = consumeMalformed
-			err = fmt.Errorf("%w: %w: reporting the fault panicked: %s",
-				errBadFrame, transport.ErrPayloadMalformed, truncateFaultDetail(panics.Text(r)))
-
-			return
-		}
 		fault = consumeFaulted
 		err = &transport.ConsumeFaultError{
 			CallID: d.CallID(), Kind: tk, Panicked: true,
-			Detail: truncateFaultDetail(panics.Text(r)), Stack: debug.Stack(),
+			Detail: transport.TruncateFaultDetail(panics.Text(r)), Stack: debug.Stack(),
 		}
 	}()
 
@@ -1217,48 +1197,25 @@ func protectedConsume(
 		// poisoned region means (shm-abi.md §16). Rendering keeps the diagnostic while
 		// leaving the wrap set at errBadFrame alone.
 		return transport.Frame{}, consumeMalformed,
-			fmt.Errorf("%w: %s", errBadFrame, truncateFaultDetail(err.Error()))
+			fmt.Errorf("%w: %s", errBadFrame, transport.TruncateFaultDetail(err.Error()))
 	}
 
 	if consume == nil {
 		return f, consumeNone, nil
 	}
-	if cerr := consume(f); cerr != nil {
-		blamesPeer = errors.Is(cerr, transport.ErrPayloadMalformed)
-		if blamesPeer {
-			return transport.Frame{}, consumeMalformed,
-				fmt.Errorf("%w: %w: %s", errBadFrame, transport.ErrPayloadMalformed,
-					truncateFaultDetail(cerr.Error()))
-		}
 
-		return transport.Frame{}, consumeFaulted, &transport.ConsumeFaultError{
-			CallID: d.CallID(), Kind: tk, Detail: truncateFaultDetail(cerr.Error()),
-		}
+	switch disposition, cerr := transport.ProtectedConsume(f, consume); disposition {
+	case transport.ConsumeMalformed:
+		// errBadFrame is what routes the region through the same poison mapping as
+		// any other malformed frame; the shared barrier deliberately leaves that
+		// wrap to whichever transport owns the data plane (shm-abi.md §9/§16).
+		return transport.Frame{}, consumeMalformed, fmt.Errorf("%w: %w", errBadFrame, cerr)
+	case transport.ConsumeFaulted:
+		return transport.Frame{}, consumeFaulted, cerr
+	case transport.ConsumeAccepted:
 	}
 
 	return f, consumeNone, nil
-}
-
-// truncateFaultDetail bounds a rendered consume-fault reason. A callback that
-// panics with its frame's payload renders roughly four bytes of decimal per
-// payload byte, and one that embeds the payload in its error message renders it
-// whole, so an unbounded reason turns a large frame into a multi-megabyte string
-// inside an error the caller is expected to log. The budget identifies the fault
-// and no frame size can grow it. The cut backs off to a rune start, so truncation
-// never splits a rune that was whole in the input — it does not repair an input
-// that was not valid UTF-8 to begin with — and the elision is marked so a reader
-// can tell a short reason from a clipped one.
-func truncateFaultDetail(s string) string {
-	if len(s) <= faultDetailMaxBytes {
-		return s
-	}
-
-	cut := faultDetailMaxBytes
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-
-	return s[:cut] + "... (truncated)"
 }
 
 // teardownError reports the error a torn-down region surfaces, or nil while
