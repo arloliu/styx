@@ -17,6 +17,7 @@ import (
 	"github.com/arloliu/styx/codec"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/transport"
+	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 	"github.com/arloliu/styx/internal/transport/shm/shmtest"
 )
 
@@ -207,16 +208,28 @@ func RunDifferential(ctx context.Context, w Workload) (udsResults, shmResults []
 	return udsResults, shmResults, nil
 }
 
-// runOverUDS builds a fresh uds.Transport pair from a socketpair, starts a serve
-// loop on the server end, drives w through the client end via Run, then stops
-// the serve loop and releases both ends.
+// runOverUDS builds a fresh uds.Transport pair carrying the ordinary frame
+// ceiling and replays w through it.
 func runOverUDS(ctx context.Context, w Workload) ([]Result, error) {
+	return runOverUDSCapped(ctx, w, transport.MaxFrameSize)
+}
+
+// runOverUDSCapped builds a fresh uds.Transport pair from a socketpair with both
+// ends admitting frames up to maxFrame, starts a serve loop on the server end,
+// drives w through the client end via Run, then stops the serve loop and
+// releases both ends.
+//
+// maxFrame is a parameter because the oracle has to admit whatever the arm it is
+// judging admits: a composite carries payloads above MaxFrameSize on its burst
+// socket, and an oracle that refused them would report a divergence about its own
+// configuration rather than about the transport under test.
+func runOverUDSCapped(ctx context.Context, w Workload, maxFrame uint32) ([]Result, error) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("uds socketpair: %w", err)
 	}
 
-	clientTr, err := transport.NewUDSTransport(fds[0], false)
+	clientTr, err := transport.NewUDSTransport(fds[0], false, transport.WithMaxFrame(maxFrame))
 	if err != nil {
 		_ = unix.Close(fds[0])
 		_ = unix.Close(fds[1])
@@ -225,7 +238,7 @@ func runOverUDS(ctx context.Context, w Workload) ([]Result, error) {
 	}
 	defer func() { _ = clientTr.Close() }()
 
-	serverTr, err := transport.NewUDSTransport(fds[1], false)
+	serverTr, err := transport.NewUDSTransport(fds[1], false, transport.WithMaxFrame(maxFrame))
 	if err != nil {
 		_ = unix.Close(fds[1])
 
@@ -251,6 +264,153 @@ func runOverSHM(ctx context.Context, w Workload) ([]Result, error) {
 	return runServed(ctx, pair.Plugin, func() ([]Result, error) {
 		return Run(ctx, pair.Host, w)
 	})
+}
+
+// burstArmCeiling is the negotiated burst ceiling the composite arm runs with:
+// comfortably above the in-process region's derived inline limit, so the routing
+// boundary has a burst band above it wide enough to sweep, and a size any real
+// deployment could configure.
+const burstArmCeiling uint32 = 2 << 20
+
+// compositePair is one connection carried by a composite on each side: both ends
+// of one in-process shared-memory region and both ends of one burst socketpair —
+// the wiring a burst-active attach builds, assembled here so this harness can
+// drive the composite as the black box transport.Transport it is.
+type compositePair struct {
+	host   *rpcruntime.BurstTransport
+	plugin *rpcruntime.BurstTransport
+	shm    *shmtest.Pair
+}
+
+// newCompositePair builds one composite per side over a fresh in-process
+// shared-memory pair and a fresh burst socketpair.
+//
+// The shared-memory Config leaves MaxPayload at zero so both directions derive
+// their limits from the region geometry alone, the way a real attach does
+// (host.go and pluginserver.go both pass zero). A caller ceiling below the top
+// slab class would put the SENDER's routing boundary below the RECEIVER's,
+// opening a band of sizes the sender puts on the socket that the receiver rejects
+// as belonging in the region — a property of that configuration, not of the
+// composite, and not one this harness should be judging the transport by.
+func newCompositePair() (*compositePair, error) {
+	cfg := shmtest.DefaultConfig()
+	cfg.MaxPayload = 0
+
+	shmPair, err := shmtest.NewInProcessPair(1, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build shm pair: %w", err)
+	}
+
+	hostShm, hostOK := shmPair.Host.(*shmtransport.Transport)
+	pluginShm, pluginOK := shmPair.Plugin.(*shmtransport.Transport)
+	if !hostOK || !pluginOK {
+		_ = shmPair.Close()
+
+		return nil, errors.New("shm pair did not hand over the concrete shared-memory transport")
+	}
+
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		_ = shmPair.Close()
+
+		return nil, fmt.Errorf("burst socketpair: %w", err)
+	}
+
+	hostLatch := rpcruntime.NewBurstFatalLatch()
+	hostBurst, err := transport.NewUDSTransport(fds[0], false,
+		transport.WithMaxFrame(burstArmCeiling), transport.WithFatalObserver(hostLatch.Observe))
+	if err != nil {
+		_ = unix.Close(fds[0])
+		_ = unix.Close(fds[1])
+		_ = shmPair.Close()
+
+		return nil, fmt.Errorf("wrap host burst socket: %w", err)
+	}
+
+	pluginLatch := rpcruntime.NewBurstFatalLatch()
+	pluginBurst, err := transport.NewUDSTransport(fds[1], false,
+		transport.WithMaxFrame(burstArmCeiling), transport.WithFatalObserver(pluginLatch.Observe))
+	if err != nil {
+		_ = hostBurst.Close()
+		_ = unix.Close(fds[1])
+		_ = shmPair.Close()
+
+		return nil, fmt.Errorf("wrap plugin burst socket: %w", err)
+	}
+
+	return &compositePair{
+		host: rpcruntime.NewBurstTransport(
+			hostShm, hostBurst, burstArmCeiling, rpcruntime.BurstSideHost, hostLatch),
+		plugin: rpcruntime.NewBurstTransport(
+			pluginShm, pluginBurst, burstArmCeiling, rpcruntime.BurstSidePlugin, pluginLatch),
+		shm: shmPair,
+	}, nil
+}
+
+// close releases both composites and then the shared-memory pair underneath them.
+// Each composite closes its own burst socket and its shared-memory underside; the
+// pair's own Close then releases the eventfds and the region, which no transport
+// owns.
+func (p *compositePair) close() error {
+	return errors.Join(p.host.Close(), p.plugin.Close(), p.shm.Close())
+}
+
+// BurstRun is one burst differential's inputs and both arms' outcomes, together
+// with how many frames each side of the composite actually put on its burst
+// socket.
+//
+// The routed counts are part of the result rather than an afterthought: agreement
+// between the arms proves nothing about ROUTING on its own, since a composite that
+// quietly sent everything over one underside would agree with the oracle just as
+// well. The counts are what say which side of the boundary each call took.
+type BurstRun struct {
+	Workload  Workload
+	UDS       []Result
+	Composite []Result
+
+	HostRouted   uint64
+	PluginRouted uint64
+}
+
+// RunDifferentialBurst replays one workload against a fresh uds transport pair
+// and a fresh composite pair, each served by an identically-registered scenario
+// Dispatcher, and returns both result sets for the caller to diff.
+//
+// The workload is built by the caller's build function rather than handed in
+// ready-made, because the sizes worth sweeping are the ones around the
+// composite's own routing boundary, and that boundary is derived from the region
+// geometry at attach — so it is only knowable once the pair exists. build is
+// called exactly once and the workload it returns drives BOTH arms, so the oracle
+// sees the identical calls.
+//
+// The uds run completes before the composite run starts. The oracle's frame
+// ceiling is raised to the composite's, so a payload above MaxFrameSize is one
+// both arms admit.
+func RunDifferentialBurst(ctx context.Context, build func(inlineMax, ceiling uint32) Workload) (BurstRun, error) {
+	pair, err := newCompositePair()
+	if err != nil {
+		return BurstRun{}, fmt.Errorf("difftest: build composite pair: %w", err)
+	}
+	defer func() { _ = pair.close() }()
+
+	w := build(pair.host.InlineMax(), pair.host.Ceiling())
+
+	udsResults, err := runOverUDSCapped(ctx, w, burstArmCeiling)
+	if err != nil {
+		return BurstRun{}, fmt.Errorf("difftest: uds run: %w", err)
+	}
+
+	compositeResults, err := runServed(ctx, pair.plugin, func() ([]Result, error) {
+		return Run(ctx, pair.host, w)
+	})
+	if err != nil {
+		return BurstRun{}, fmt.Errorf("difftest: composite run: %w", err)
+	}
+
+	return BurstRun{
+		Workload: w, UDS: udsResults, Composite: compositeResults,
+		HostRouted: pair.host.BurstCount(), PluginRouted: pair.plugin.BurstCount(),
+	}, nil
 }
 
 // runServed starts the scenario Dispatcher serving serverTr on a context derived
