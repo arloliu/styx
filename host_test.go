@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/arloliu/styx"
 	"github.com/arloliu/styx/examples/echo/echopb"
 	"github.com/arloliu/styx/internal/control"
+	"github.com/arloliu/styx/internal/control/controlpb"
 	"github.com/arloliu/styx/internal/testutil"
 	"github.com/arloliu/styx/observe"
 	"github.com/stretchr/testify/require"
@@ -31,6 +33,7 @@ var (
 	fixtureVersionedPlugin string
 	fixtureUDSOnlyPlugin   string
 	fixtureCrashyPlugin    string
+	fixtureBurstPlugin     string
 )
 
 // TestMain builds the cross-process plugin fixtures once (Host.Start spawns
@@ -72,6 +75,14 @@ func TestMain(m *testing.M) {
 	// The examples/echo crashy plugin in its PID-tagging echo mode: a real Echo
 	// service whose response is "<pid>:<message>", used to prove a crash-restart
 	// misdelivers nothing across the generation boundary.
+	// The burst path's echo fixture: it echoes a Blob payload of any size and
+	// reports on stderr how its serving session ended.
+	fixtureBurstPlugin = filepath.Join(dir, "burstplugin")
+	bBuild := exec.Command("go", "build", "-o", fixtureBurstPlugin, "./testdata/burstplugin")
+	if out, err := bBuild.CombinedOutput(); err != nil {
+		panic("building burstplugin fixture: " + err.Error() + "\n" + string(out))
+	}
+
 	fixtureCrashyPlugin = filepath.Join(dir, "crashyplugin")
 	cBuild := exec.Command("go", "build", "-o", fixtureCrashyPlugin, "./examples/echo/plugin/crashy")
 	if out, err := cBuild.CombinedOutput(); err != nil {
@@ -1802,4 +1813,178 @@ func TestHost_SupervisorConfig_CarriesLivenessTuning_WhenFieldsSet(t *testing.T)
 	require.Equal(t, 4*time.Second, cfg.HeartbeatInterval)
 	require.Equal(t, 2, cfg.MissedHeartbeats)
 	require.Equal(t, 11*time.Second, cfg.WedgeWindow)
+}
+
+// burstAsymmetricGeometry is an asymmetric shared-memory geometry used by the
+// burst-ceiling tests below: HostToPlugin's largest class is 4096 bytes,
+// PluginToHost's is 4160 bytes. The two are deliberately different sizes so a
+// test can tell "exceeds the larger direction's class" apart from "exceeds
+// only the smaller direction's class" -- the distinction the strictly-greater-
+// than-BOTH-directions rule exists to catch.
+func burstAsymmetricGeometry() styx.ShmGeometry {
+	return styx.ShmGeometry{
+		HostToPlugin: []styx.ShmSizeClass{{SlabSize: 4096, SlabCount: 8}},
+		PluginToHost: []styx.ShmSizeClass{{SlabSize: 4160, SlabCount: 8}},
+	}
+}
+
+// Test Host.Start refusing a non-zero PluginSpec.BurstMaxPayload that does not
+// strictly exceed the largest slab class in BOTH shared-memory directions, with
+// a *styx.ConfigError naming the field, before any plugin process is spawned.
+// Transport is pinned to uds so the geometry's own structural validity (ring
+// capacity, cache-line alignment) never enters into it -- burst.go's rule reads
+// the class tables as a ceiling reference regardless of which transport actually
+// carries data.
+func TestHost_Start_ReturnsConfigError_WhenBurstCeilingDoesNotExceedBothDirectionsLargestClass(t *testing.T) {
+	tests := []struct {
+		name    string
+		ceiling uint32
+	}{
+		{name: "equal to the smaller direction's largest class (HostToPlugin, 4096)", ceiling: 4096},
+		{name: "between the two directions' largest classes (4100)", ceiling: 4100},
+		{name: "equal to the larger direction's largest class (PluginToHost, 4160)", ceiling: 4160},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Given
+			h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+				Name:            "burst-tuned",
+				Path:            fixtureReadyPlugin,
+				Transport:       styx.TransportUDS,
+				Geometry:        burstAsymmetricGeometry(),
+				BurstMaxPayload: tt.ceiling,
+			}}})
+
+			// When
+			err := h.Start(t.Context())
+
+			// Then
+			require.ErrorIs(t, err, styx.ErrInvalidConfig)
+
+			var cfgErr *styx.ConfigError
+			require.ErrorAs(t, err, &cfgErr)
+			require.Equal(t, "PluginSpec.BurstMaxPayload", cfgErr.Field)
+			require.False(t, processFromBinaryExists(t, fixtureReadyPlugin),
+				"a refused burst ceiling must not have spawned a plugin")
+			require.NoError(t, h.Stop(t.Context()))
+		})
+	}
+}
+
+// Test Host.Start accepting a PluginSpec.BurstMaxPayload set to one byte above
+// the larger of the two directions' largest slab class -- the boundary the
+// refusal above is on the far side of -- and supervising the plugin to Ready
+// with it.
+func TestHost_Start_AcceptsBurstCeiling_OneByteAboveTheLargerDirectionsClass(t *testing.T) {
+	// Given
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+		Name:            "burst-boundary",
+		Path:            fixtureReadyPlugin,
+		Transport:       styx.TransportUDS,
+		Geometry:        burstAsymmetricGeometry(),
+		BurstMaxPayload: 4161,
+	}}})
+
+	// When
+	err := h.Start(t.Context())
+
+	// Then
+	require.NoError(t, err)
+
+	ev := awaitEvent(t, h.Events(), styx.EventReady)
+	require.Equal(t, "burst-boundary", ev.Plugin)
+	require.NoError(t, h.Stop(t.Context()))
+}
+
+// Test Host.Start accepting math.MaxUint32 as a PluginSpec.BurstMaxPayload
+// ceiling -- the top of the field's range -- against the default geometry,
+// proving the field and its validation carry the full uint32 domain rather
+// than silently narrowing it.
+func TestHost_Start_AcceptsBurstCeiling_AtMathMaxUint32(t *testing.T) {
+	// Given
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+		Name:            "burst-max",
+		Path:            fixtureReadyPlugin,
+		Transport:       styx.TransportUDS,
+		BurstMaxPayload: math.MaxUint32,
+	}}})
+
+	// When
+	err := h.Start(t.Context())
+
+	// Then
+	require.NoError(t, err)
+
+	ev := awaitEvent(t, h.Events(), styx.EventReady)
+	require.Equal(t, "burst-max", ev.Plugin)
+	require.NoError(t, h.Stop(t.Context()))
+}
+
+// Test AttachRegion.BurstMaxPayload -- the wire field PluginSpec.BurstMaxPayload
+// will ride on once a later change starts sending it -- round-tripping
+// math.MaxUint32 through a marshal/unmarshal cycle exactly, and doing so at a
+// few bytes of varint rather than a payload-sized allocation: burst_max_payload
+// is a plain scalar field, not a length-prefixed body, so a maximal grant costs
+// the same handful of wire bytes as a tiny one.
+func TestAttachRegionBurstMaxPayload_RoundTripsMathMaxUint32_WithoutABodySizedAllocation(t *testing.T) {
+	// Given
+	msg := &controlpb.AttachRegion{BurstMaxPayload: math.MaxUint32}
+
+	// When
+	data, err := msg.MarshalVT()
+	require.NoError(t, err)
+
+	// Then: the wire form stays a small fixed-shape varint, never a body sized
+	// to the value it carries.
+	require.LessOrEqual(t, len(data), 16,
+		"burst_max_payload must stay a plain scalar field regardless of its value")
+
+	var got controlpb.AttachRegion
+	require.NoError(t, got.UnmarshalVT(data))
+	require.EqualValues(t, math.MaxUint32, got.GetBurstMaxPayload())
+}
+
+// Test that a zero PluginSpec.BurstMaxPayload -- even against a geometry a
+// non-zero ceiling would be refused under -- still carries through
+// Host.supervisorConfig as the zero that keeps the burst path off. The
+// resulting host handshake offer NOT listing the burst feature flag for a zero
+// ceiling is covered directly against internal/supervisor.Config in
+// internal/supervisor/supervisor_test.go's own TestHostOffer_OffersBurst_FromConfig,
+// which owns hostOffer's construction; this only proves the value styx.Host
+// hands it.
+func TestHost_SupervisorConfig_CarriesZeroBurstMaxPayload_EvenUnderARefusingGeometry(t *testing.T) {
+	// Given
+	h := styx.NewHost(styx.HostConfig{})
+
+	// When
+	cfg := h.SupervisorConfigForTest(styx.PluginSpec{
+		Name:     "no-burst",
+		Path:     fixtureReadyPlugin,
+		Geometry: burstAsymmetricGeometry(),
+		// BurstMaxPayload left zero.
+	})
+
+	// Then
+	require.Zero(t, cfg.BurstMaxPayload,
+		"an unset BurstMaxPayload must not resolve a value at this layer")
+}
+
+// Test each configured PluginSpec.BurstMaxPayload reaching the internal
+// supervision configuration Host builds for it, the exact value hostOffer
+// reads to decide whether to offer the burst feature flag (see
+// internal/supervisor/supervisor_test.go's TestHostOffer_OffersBurst_FromConfig).
+func TestHost_SupervisorConfig_CarriesBurstMaxPayload_WhenSet(t *testing.T) {
+	// Given
+	h := styx.NewHost(styx.HostConfig{})
+
+	// When
+	cfg := h.SupervisorConfigForTest(styx.PluginSpec{
+		Name:            "with-burst",
+		Path:            fixtureReadyPlugin,
+		BurstMaxPayload: 1 << 20,
+	})
+
+	// Then
+	require.EqualValues(t, 1<<20, cfg.BurstMaxPayload)
 }

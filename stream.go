@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/arloliu/styx/codec"
@@ -811,10 +812,28 @@ func (p *streamPlane) stopWriter() {
 func stopTransportWriter(tr transport.Transport) {
 	if ws, ok := tr.(transport.WriterStopper); ok {
 		_ = ws.StopWriter()
+		notifyWriterStopped()
 
 		return
 	}
 	_ = tr.Close()
+	notifyWriterStopped()
+}
+
+// writerStoppedHook, when set, is invoked immediately after a generation's
+// data-plane writer has been stopped — teardown's third step, the first one that
+// touches the connection itself. It is a TEST SEAM: unset in production (one
+// atomic load per teardown, never on a serving path), so a test tearing an
+// instance down while a plugin handler is still running can act on the writer
+// stop having HAPPENED rather than on an earlier step that only implies it is
+// coming. It is an atomic.Pointer so the teardown goroutine's load never races
+// the test's install or restore.
+var writerStoppedHook atomic.Pointer[func()]
+
+func notifyWriterStopped() {
+	if f := writerStoppedHook.Load(); f != nil {
+		(*f)()
+	}
 }
 
 // releaseTransport releases tr's mapped resources (shm's munmap), the phase that

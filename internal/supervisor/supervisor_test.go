@@ -1465,6 +1465,148 @@ func TestHostOffer_RequiresStreaming_FromConfig(t *testing.T) {
 	require.Error(t, err, "a non-streaming plugin fails the handshake against a streaming-required host")
 }
 
+// hostOffer lists the burst feature if and only if Config.BurstMaxPayload is
+// non-zero, always as optional: a zero ceiling (styx.PluginSpec.BurstMaxPayload
+// left unset) means the burst path was never turned on, so nothing here asks a
+// plugin to support it.
+func TestHostOffer_OffersBurst_FromConfig(t *testing.T) {
+	offersBurst := func(o control.Offer) (offered, required bool) {
+		for _, f := range o.Features {
+			if f.Name == control.FeatureBurst {
+				return true, f.Required
+			}
+		}
+
+		return false, false
+	}
+
+	off := supervisor.New(supervisor.Config{}, supervisor.NewEventBus())
+	offered, _ := offersBurst(off.HostOfferForTest())
+	require.False(t, offered, "a zero BurstMaxPayload must not offer the burst feature")
+
+	on := supervisor.New(supervisor.Config{BurstMaxPayload: 1 << 20}, supervisor.NewEventBus())
+	offered, required := offersBurst(on.HostOfferForTest())
+	require.True(t, offered, "a non-zero BurstMaxPayload must offer the burst feature")
+	require.False(t, required, "the burst feature is always offered optional")
+}
+
+// attachSeen is what a scripted plugin observed on one AttachRegion: the wire
+// shape of the message and of the descriptors that rode with it. The scripted
+// side collects it and hands it back over a channel, so every assertion runs on
+// the test's own goroutine.
+type attachSeen struct {
+	fdCount     uint32
+	ceiling     uint32
+	nfds        int
+	lastSockTyp int
+	err         error
+}
+
+// scriptPluginAttachAck plays the plugin side of one shared-memory AttachRegion:
+// it receives the message plus up to maxFDs descriptors, records their shape,
+// closes every one, and acknowledges. maxFDs is what the plugin's own attach
+// would ask for, so a host attaching MORE descriptors than that trips
+// MSG_CTRUNC here exactly as it would in a real plugin.
+func scriptPluginAttachAck(conn *control.Conn, maxFDs int, out chan<- attachSeen) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	seen := attachSeen{lastSockTyp: -1}
+	msg, fds, err := conn.RecvFDs(ctx, maxFDs)
+	if err != nil {
+		seen.err = err
+		out <- seen
+
+		return
+	}
+	ar := msg.GetAttachRegion()
+	seen.fdCount = ar.GetFdCount()
+	seen.ceiling = ar.GetBurstMaxPayload()
+	seen.nfds = len(fds)
+	if len(fds) > 0 {
+		seen.lastSockTyp, _ = unix.GetsockoptInt(fds[len(fds)-1], unix.SOL_SOCKET, unix.SO_TYPE)
+	}
+	for _, fd := range fds {
+		_ = unix.Close(fd)
+	}
+
+	ackMsg := &controlpb.ControlMessage{
+		Body: &controlpb.ControlMessage_AttachRegionAck{AttachRegionAck: &controlpb.AttachRegionAck{}},
+	}
+	seen.err = conn.Send(ctx, ackMsg)
+	out <- seen
+}
+
+// Test the wire shape the shared-memory attach puts on the control socket for
+// every combination of the burst activation conjunction: the fourth descriptor
+// and the burst_max_payload ceiling appear if and only if the negotiated tuple
+// carries the burst feature AND the host has a non-zero ceiling configured.
+//
+// The count and the ceiling are asserted together because the plugin derives its
+// own expected descriptor count from the ceiling on this message: a host that
+// sent four descriptors without the ceiling (or the ceiling without the fourth
+// descriptor) would be telling the plugin two different things, and the plugin
+// would reject the attach.
+func TestSupervisor_AttachSHM_BurstActivation_FDCountAndCeiling(t *testing.T) {
+	const ceiling = 1 << 20
+
+	cases := []struct {
+		name        string
+		configured  uint32
+		featureOn   bool
+		wantFDCount uint32
+		wantCeiling uint32
+	}{
+		{name: "negotiated-and-configured", configured: ceiling, featureOn: true, wantFDCount: 4, wantCeiling: ceiling},
+		{name: "not-negotiated", configured: ceiling, featureOn: false, wantFDCount: 3, wantCeiling: 0},
+		{name: "negotiated-but-not-configured", configured: 0, featureOn: true, wantFDCount: 3, wantCeiling: 0},
+		{name: "neither", configured: 0, featureOn: false, wantFDCount: 3, wantCeiling: 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+			require.NoError(t, err)
+			hostConn := control.NewConn(fds[0], 7)
+			pluginConn := control.NewConn(fds[1], 7)
+			t.Cleanup(func() { _ = hostConn.Close(); _ = pluginConn.Close() })
+
+			sup := supervisor.New(supervisor.Config{
+				Transport: "shm", ShmLayout: leanShmLayout(), MaxDataInflight: 32,
+				BurstMaxPayload: tc.configured,
+			}, supervisor.NewEventBus())
+
+			tuple := control.Tuple{
+				Transport: "shm", LayoutVersion: 1, Codec: "proto",
+				Features: map[string]bool{control.FeatureBurst: tc.featureOn},
+			}
+
+			seenCh := make(chan attachSeen, 1)
+			go scriptPluginAttachAck(pluginConn, 4, seenCh)
+
+			fdsBefore := testutil.CountOpenFDs(t)
+			require.NoError(t, sup.AttachSHMForTest(t.Context(), hostConn, 7, tuple))
+
+			var seen attachSeen
+			select {
+			case seen = <-seenCh:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the scripted plugin never reported the AttachRegion it received")
+			}
+			require.NoError(t, seen.err)
+			require.Equal(t, tc.wantFDCount, seen.fdCount, "declared fd_count")
+			require.Equal(t, int(tc.wantFDCount), seen.nfds, "descriptors actually attached")
+			require.Equal(t, tc.wantCeiling, seen.ceiling, "burst_max_payload")
+			if tc.wantFDCount == 4 {
+				require.Equal(t, unix.SOCK_STREAM, seen.lastSockTyp,
+					"the fourth descriptor must be the burst socketpair end")
+			}
+			require.Equal(t, fdsBefore, testutil.CountOpenFDs(t),
+				"the attach leaked a host fd (both socketpair ends must end up owned or closed)")
+		})
+	}
+}
+
 // leanShmLayout is a small valid shared-memory geometry for the cross-process
 // attach tests: C = 512 ring slots, R = 32 reserved, and a 512 B / 4096 B class
 // table per direction (region ~0.6 MiB). Generation is left 0; attachSHM stamps
@@ -1487,59 +1629,76 @@ func leanShmLayout() shm.Layout {
 // and two eventfds over the control conn, both Attach, and the instance reaches
 // Ready. Tearing it down closes every host-owned fd (the original region and both
 // eventfds) with no leak — the ownership contract, exercised end to end.
+//
+// The burst subtest runs the same attach with a non-zero ceiling, which the real
+// plugin also offers: the message then carries a fourth descriptor and the
+// ceiling, both sides wrap their end of the burst socketpair, and Ready still
+// means "both ends attached". Its fd baseline covers the two extra descriptors —
+// a burst end left unowned on either side shows up here as a leak.
 func TestSupervisor_AttachesSharedMemoryCrossProcess_ThenTearsDownWithoutLeak(t *testing.T) {
-	// Given: a host pinned to the shared-memory transport with a valid geometry.
-	bus := supervisor.NewEventBus()
-	ch, unsub, _ := bus.Subscribe()
-	defer unsub()
+	for _, tc := range []struct {
+		name    string
+		ceiling uint32
+	}{
+		{name: "plain", ceiling: 0},
+		{name: "burst", ceiling: 1 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given: a host pinned to the shared-memory transport with a valid geometry.
+			bus := supervisor.NewEventBus()
+			ch, unsub, _ := bus.Subscribe()
+			defer unsub()
 
-	cfg := supervisor.Config{
-		Spec:              lifecycle.Spec{Path: fixtureReadyPlugin},
-		Restart:           supervisor.RestartPolicy{Max: 0},
-		HeartbeatInterval: 100 * time.Millisecond,
-		Transport:         "shm",
-		ShmLayout:         leanShmLayout(),
-		MaxDataInflight:   32,
-		// Mirror the styx layer's own teardown wiring (wireConnState): the
-		// transport's Close (which stops the writer, unmaps the transport's
-		// duplicate region, and closes its duplicated fd) is the caller's
-		// responsibility via ReadyHooks.JoinGoroutines. The supervisor closes the
-		// ORIGINAL region and the two eventfds itself (shmHostResources).
-		OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
-			return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
-		},
+			cfg := supervisor.Config{
+				Spec:              lifecycle.Spec{Path: fixtureReadyPlugin},
+				Restart:           supervisor.RestartPolicy{Max: 0},
+				HeartbeatInterval: 100 * time.Millisecond,
+				Transport:         "shm",
+				ShmLayout:         leanShmLayout(),
+				MaxDataInflight:   32,
+				BurstMaxPayload:   tc.ceiling,
+				// Mirror the styx layer's own teardown wiring (wireConnState): the
+				// transport's Close (which stops the writer, unmaps the transport's
+				// duplicate region, and closes its duplicated fd) is the caller's
+				// responsibility via ReadyHooks.JoinGoroutines. The supervisor closes the
+				// ORIGINAL region and the two eventfds itself (shmHostResources).
+				OnReady: func(inst supervisor.Instance) supervisor.ReadyHooks {
+					return supervisor.ReadyHooks{JoinGoroutines: func() { _ = inst.Transport.Close() }}
+				},
+			}
+			sup := supervisor.New(cfg, bus)
+
+			fdsBefore := testutil.CountOpenFDs(t)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			runDone := make(chan struct{})
+			go func() { defer close(runDone); sup.Run(ctx) }()
+
+			// When: the instance reaches Ready — the cross-process shared-memory attach
+			// (region + two eventfds over SCM_RIGHTS, both ends attached, ack-after-
+			// construct) has completed.
+			first := requireEvent(t, ch)
+			second := requireEvent(t, ch)
+			require.Equal(t, supervisor.EventStarting, first.Kind)
+			require.Equal(t, supervisor.EventReady, second.Kind,
+				"a shared-memory host and a real plugin must negotiate shm and attach cross-process")
+
+			// Then: Stop tears the instance down, Run returns, and every host-owned fd
+			// (region + two eventfds) is released — the fd count returns to its baseline.
+			require.NoError(t, sup.Stop(t.Context()))
+			select {
+			case <-runDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run did not return after Stop")
+			}
+
+			require.Eventually(t, func() bool { return testutil.CountOpenFDs(t) <= fdsBefore },
+				2*time.Second, 20*time.Millisecond,
+				"host leaked fds after shared-memory teardown (region/eventfds not closed): before=%d after=%d",
+				fdsBefore, testutil.CountOpenFDs(t))
+		})
 	}
-	sup := supervisor.New(cfg, bus)
-
-	fdsBefore := testutil.CountOpenFDs(t)
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	runDone := make(chan struct{})
-	go func() { defer close(runDone); sup.Run(ctx) }()
-
-	// When: the instance reaches Ready — the cross-process shared-memory attach
-	// (region + two eventfds over SCM_RIGHTS, both ends attached, ack-after-
-	// construct) has completed.
-	first := requireEvent(t, ch)
-	second := requireEvent(t, ch)
-	require.Equal(t, supervisor.EventStarting, first.Kind)
-	require.Equal(t, supervisor.EventReady, second.Kind,
-		"a shared-memory host and a real plugin must negotiate shm and attach cross-process")
-
-	// Then: Stop tears the instance down, Run returns, and every host-owned fd
-	// (region + two eventfds) is released — the fd count returns to its baseline.
-	require.NoError(t, sup.Stop(t.Context()))
-	select {
-	case <-runDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after Stop")
-	}
-
-	require.Eventually(t, func() bool { return testutil.CountOpenFDs(t) <= fdsBefore },
-		2*time.Second, 20*time.Millisecond,
-		"host leaked fds after shared-memory teardown (region/eventfds not closed): before=%d after=%d",
-		fdsBefore, testutil.CountOpenFDs(t))
 }
 
 // Test that each instance generation gets a FRESH shared-memory region, and that
@@ -2384,6 +2543,22 @@ func TestSupervisor_ShmPostAckCrash_ReadyThenClassifiedDead(t *testing.T) {
 // CreateRegion/OpenRegion mapping is one such line, so a leaked munmap (which the
 // fd count alone cannot catch, since Region.Close closes the fd even if Munmap
 // fails) shows up as a surviving line.
+// goroutinesSettled reports whether the live goroutine count is back at or below
+// baseline, polling for about a second so an asynchronous teardown gets a bounded
+// window without a real leak (which never clears) ever passing. It samples on the
+// caller's own goroutine deliberately: a poll helper that runs its condition in a
+// goroutine of its own would count that goroutine too and never see the baseline.
+func goroutinesSettled(baseline int) bool {
+	for range 50 {
+		if testutil.CountGoroutines() <= baseline {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	return false
+}
+
 func countRegionMappings(t *testing.T) int {
 	t.Helper()
 	data, err := os.ReadFile("/proc/self/maps")
@@ -2394,45 +2569,74 @@ func countRegionMappings(t *testing.T) int {
 
 // Test that the host-side shared-memory attach closes exactly what it owns when a
 // deterministic failure is injected after EACH construction step — region create,
-// each eventfd create, after the fd transfer, after the local attach, and at the
-// ack receive. After every per-step abort the host process's open fd count AND its
-// region mapping count both return exactly to their pre-attach values, with no
-// leak. The fd count and the mapping count are asserted separately because
-// Region.Close closes the fd even if its Munmap fails, so an fd count alone cannot
-// prove the mapping was released. The crash-window variants of these edges are the
-// chaos suite's job; these are the deterministic unit-level counts.
+// each eventfd create, the burst socketpair create, after the fd transfer, after
+// the burst wrap, after the local attach, and at the ack receive. After every
+// per-step abort the host process's open fd count AND its region mapping count
+// both return exactly to their pre-attach values, with no leak. The fd count and
+// the mapping count are asserted separately because Region.Close closes the fd
+// even if its Munmap fails, so an fd count alone cannot prove the mapping was
+// released. Goroutines are counted too: nothing the attach starts may outlive an
+// aborted attach. Every step is exercised with the burst path off and on, because
+// a burst-active attach owns two more raw descriptors across the same windows.
+// The crash-window variants of these edges are the chaos suite's job; these are
+// the deterministic unit-level counts.
 func TestSupervisor_AttachSHM_PerStepFailure_ClosesExactlyWhatItOwns(t *testing.T) {
-	steps := []string{"region-create", "hp-eventfd", "ph-eventfd", "send-fds", "attach", "ack-recv"}
-	for _, step := range steps {
-		t.Run(step, func(t *testing.T) {
-			fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
-			require.NoError(t, err)
-			hostConn := control.NewConn(fds[0], 7)
-			pluginConn := control.NewConn(fds[1], 7) // the peer socket, so SendFDs has somewhere to go
-			t.Cleanup(func() { _ = hostConn.Close(); _ = pluginConn.Close() })
+	const ceiling = 1 << 20
 
-			sup := supervisor.New(supervisor.Config{
-				Transport: "shm", ShmLayout: leanShmLayout(), MaxDataInflight: 32,
-			}, supervisor.NewEventBus())
+	plain := []string{"region-create", "hp-eventfd", "ph-eventfd", "send-fds", "attach", "ack-recv"}
+	burst := []string{
+		"region-create", "hp-eventfd", "ph-eventfd", "burst-socketpair",
+		"send-fds", "burst-wrap", "attach", "ack-recv",
+	}
 
-			injected := errors.New("attach failpoint")
-			t.Cleanup(supervisor.SetAttachSHMFailAtForTest(func(s string) error {
-				if s == step {
-					return injected
-				}
+	for _, mode := range []struct {
+		name    string
+		on      bool
+		steps   []string
+		ceiling uint32
+	}{
+		{name: "burst-off", on: false, steps: plain, ceiling: 0},
+		{name: "burst-on", on: true, steps: burst, ceiling: ceiling},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			for _, step := range mode.steps {
+				t.Run(step, func(t *testing.T) {
+					fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+					require.NoError(t, err)
+					hostConn := control.NewConn(fds[0], 7)
+					pluginConn := control.NewConn(fds[1], 7) // the peer socket, so SendFDs has somewhere to go
+					t.Cleanup(func() { _ = hostConn.Close(); _ = pluginConn.Close() })
 
-				return nil
-			}))
+					sup := supervisor.New(supervisor.Config{
+						Transport: "shm", ShmLayout: leanShmLayout(), MaxDataInflight: 32,
+						BurstMaxPayload: mode.ceiling,
+					}, supervisor.NewEventBus())
 
-			tuple := control.Tuple{Transport: "shm", LayoutVersion: 1, Codec: "proto", Features: map[string]bool{}}
+					injected := errors.New("attach failpoint")
+					t.Cleanup(supervisor.SetAttachSHMFailAtForTest(func(s string) error {
+						if s == step {
+							return injected
+						}
 
-			fdsBefore := testutil.CountOpenFDs(t)
-			mapsBefore := countRegionMappings(t)
-			aerr := sup.AttachSHMForTest(t.Context(), hostConn, 7, tuple)
+						return nil
+					}))
 
-			require.ErrorIs(t, aerr, injected, "the attach must abort at the injected step")
-			require.Equal(t, fdsBefore, testutil.CountOpenFDs(t), "step %q leaked a host fd", step)
-			require.Equal(t, mapsBefore, countRegionMappings(t), "step %q leaked a region mapping", step)
+					tuple := control.Tuple{
+						Transport: "shm", LayoutVersion: 1, Codec: "proto",
+						Features: map[string]bool{control.FeatureBurst: mode.on},
+					}
+
+					fdsBefore := testutil.CountOpenFDs(t)
+					mapsBefore := countRegionMappings(t)
+					goroutinesBefore := testutil.CountGoroutines()
+					aerr := sup.AttachSHMForTest(t.Context(), hostConn, 7, tuple)
+
+					require.ErrorIs(t, aerr, injected, "the attach must abort at the injected step")
+					require.Equal(t, fdsBefore, testutil.CountOpenFDs(t), "step %q leaked a host fd", step)
+					require.Equal(t, mapsBefore, countRegionMappings(t), "step %q leaked a region mapping", step)
+					require.True(t, goroutinesSettled(goroutinesBefore), "step %q leaked a goroutine", step)
+				})
+			}
 		})
 	}
 }

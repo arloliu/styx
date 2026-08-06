@@ -953,7 +953,9 @@ func TestPluginServer_ServeLoopKeepsServing_OnAConsumeFault(t *testing.T) {
 	fault := &transport.ConsumeFaultError{CallID: 91, Kind: transport.FrameUnaryReq, Detail: "no capacity"}
 
 	// When the serve loop disposes of it.
-	done, loopErr := styx.DisposeRecvErrForTest(fault)
+	// nil transport: a single-underside transport has no data-plane failure of its
+	// own to report, which is the case every classification below is about.
+	done, loopErr := styx.DisposeRecvErrForTest(nil, fault)
 
 	// Then the loop keeps serving and reports no failure.
 	require.False(t, done, "a consume fault leaves the connection healthy; ending the loop tears it down")
@@ -961,11 +963,11 @@ func TestPluginServer_ServeLoopKeepsServing_OnAConsumeFault(t *testing.T) {
 	require.True(t, styx.IsFrameLocalRecvErrForTest(fault), "a consume fault is confined to its frame")
 
 	// And the terminal classifications are unchanged.
-	done, loopErr = styx.DisposeRecvErrForTest(transport.ErrPoisoned)
+	done, loopErr = styx.DisposeRecvErrForTest(nil, transport.ErrPoisoned)
 	require.True(t, done, "a poisoned region still ends the loop")
 	require.Error(t, loopErr)
 
-	done, _ = styx.DisposeRecvErrForTest(transport.ErrClosed)
+	done, _ = styx.DisposeRecvErrForTest(nil, transport.ErrClosed)
 	require.True(t, done, "a closed transport still ends the loop")
 }
 

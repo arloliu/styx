@@ -919,6 +919,7 @@ type capTransport struct {
 	sent     atomic.Uint64
 	received atomic.Uint64
 	faults   atomic.Uint64
+	burst    atomic.Uint64
 	// carries is the per-class arena stall snapshot ArenaCarries reports, replaced
 	// wholesale between reporter calls so a test scripts an exact class series.
 	carries atomic.Pointer[[]transport.ArenaCarry]
@@ -938,6 +939,7 @@ func (t *capTransport) BackpressureEdges() uint64   { return t.edges.Load() }
 func (t *capTransport) BytesSent() uint64           { return t.sent.Load() }
 func (t *capTransport) BytesReceived() uint64       { return t.received.Load() }
 func (t *capTransport) ConsumeFaults() uint64       { return t.faults.Load() }
+func (t *capTransport) BurstCount() uint64          { return t.burst.Load() }
 
 func (t *capTransport) ArenaCarries() []transport.ArenaCarry {
 	if p := t.carries.Load(); p != nil {
@@ -1272,6 +1274,7 @@ func TestClientConn_Reporter_ResetsBaselinesOnGenerationChange(t *testing.T) {
 	trA.edges.Store(3)
 	trA.wakeups.Store(1000)
 	trA.faults.Store(4)
+	trA.burst.Store(2)
 	cc.state.Store(&connState{tr: trA})
 
 	repCtx, repCancel := context.WithCancel(context.Background())
@@ -1289,6 +1292,11 @@ func TestClientConn_Reporter_ResetsBaselinesOnGenerationChange(t *testing.T) {
 	require.Eventually(t, func() bool { return sink.counter(observe.MetricConsumeFault) == 4 },
 		time.Second, time.Millisecond, "generation A's consume faults are counted")
 
+	// The burst-routing count rides the same loop and resets the same way; asserted
+	// here for the same reason the consume-fault count is.
+	require.Eventually(t, func() bool { return sink.counter(observe.MetricBurstCount) == 2 },
+		time.Second, time.Millisecond, "generation A's burst-routed count is counted")
+
 	// A's wakeup baseline is established; a bump emits A's own rate (50/0.005s = 10000).
 	trA.wakeups.Store(1050)
 	require.Eventually(t, func() bool { v, ok := sink.gauge(observe.MetricWakeupSyscalls); return ok && v == 10000 },
@@ -1301,6 +1309,7 @@ func TestClientConn_Reporter_ResetsBaselinesOnGenerationChange(t *testing.T) {
 	trB.edges.Store(7)
 	trB.wakeups.Store(8000) // far above A's last wakeup sample (1050)
 	trB.faults.Store(9)
+	trB.burst.Store(11)
 	cc.state.Store(&connState{tr: trB})
 
 	// Bytes and edges count B's full counters, not B minus A's baseline.
@@ -1313,6 +1322,11 @@ func TestClientConn_Reporter_ResetsBaselinesOnGenerationChange(t *testing.T) {
 	// A's baseline, so a restart cannot make a fresh region look already faulted.
 	require.Eventually(t, func() bool { return sink.counter(observe.MetricConsumeFault) == 13 },
 		time.Second, time.Millisecond, "a fresh generation's consume faults are counted from zero")
+
+	// B's own 11 burst-routed frames are counted whole too, never B minus A's
+	// baseline (which would go negative and be clamped, silently hiding the reset).
+	require.Eventually(t, func() bool { return sink.counter(observe.MetricBurstCount) == 13 },
+		time.Second, time.Millisecond, "a fresh generation's burst-routed count is counted from zero")
 
 	// B's wakeup baseline resets to its own first sample (8000, silently), so a bump
 	// emits B's own rate (100/0.005s = 20000) — never an aliased (8000-1050)/interval
@@ -1481,6 +1495,88 @@ func TestMetricsReporter_ConsumeFaults_ReachTheSink(t *testing.T) {
 
 		// Then the plugin's sink sees them, unlabeled (the plugin has no name).
 		require.Eventually(t, func() bool { return sink.counter(observe.MetricConsumeFault) == 7 },
+			time.Second, 5*time.Millisecond)
+	})
+}
+
+// Test that the burst-routing counter actually reaches an operator's
+// MetricsSink, on both sides, and that a transport without the capability
+// (uds-shaped, or the shared-memory transport running without burst routing)
+// emits nothing.
+//
+// styx.burst.count follows the same present-capability, cumulative-read,
+// delta-submit shape as styx.bytes.moved: it exists only on a burst-active
+// transport, carries the plugin label on the host side and none on the plugin
+// side, and a zero delta submits nothing.
+func TestMetricsReporter_BurstCount_ReachesTheSink(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	t.Run("the host reporter submits the per-interval delta, labeled with the plugin", func(t *testing.T) {
+		sink := newCountingSink()
+		cc := &ClientConn{name: "echo", metrics: newMetricsDispatcher(sink, 64)}
+		go cc.metrics.Run(ctx)
+
+		// Given a transport that has routed five frames onto the burst path.
+		tr := &capTransport{}
+		tr.burst.Store(5)
+
+		// When the reporter samples it.
+		last := cc.reportBurstCount(cc.metrics, tr, 0)
+
+		// Then the operator's sink sees them, labeled with the plugin.
+		require.Equal(t, uint64(5), last)
+		plugin := observe.Label{Key: labelPlugin, Value: "echo"}
+		require.Eventually(t, func() bool { return sink.labeledCounter(observe.MetricBurstCount, plugin) == 5 },
+			time.Second, 5*time.Millisecond)
+
+		// And a second sample with no new routing submits nothing.
+		before := sink.counter(observe.MetricBurstCount)
+		require.Equal(t, last, cc.reportBurstCount(cc.metrics, tr, last))
+		require.Equal(t, before, sink.counter(observe.MetricBurstCount))
+
+		// And a further climb is added as a delta.
+		tr.burst.Store(8)
+		require.Equal(t, uint64(8), cc.reportBurstCount(cc.metrics, tr, last))
+		require.Eventually(t, func() bool { return sink.labeledCounter(observe.MetricBurstCount, plugin) == 8 },
+			time.Second, 5*time.Millisecond)
+	})
+
+	t.Run("a transport without the capability emits nothing", func(t *testing.T) {
+		sink := newCountingSink()
+		cc := &ClientConn{name: "echo", metrics: newMetricsDispatcher(sink, 64)}
+		go cc.metrics.Run(ctx)
+
+		// Given the uds-shaped transport, which has no burst path at all.
+		last := cc.reportBurstCount(cc.metrics, udsShapedTransport{}, 42)
+
+		// Then the baseline is untouched and no value is fabricated.
+		require.Equal(t, uint64(42), last, "an absent capability leaves the baseline unchanged")
+		drainMarker(t, cc.metrics, sink)
+		require.Zero(t, sink.counter(observe.MetricBurstCount))
+	})
+
+	t.Run("the plugin reporter submits them too, unlabeled", func(t *testing.T) {
+		sink := newCountingSink()
+		srv := NewPluginServer(PluginServerConfig{})
+		srv.metrics = newMetricsDispatcher(sink, 64)
+		srv.metricsInterval = 5 * time.Millisecond
+		go srv.metrics.Run(ctx)
+
+		// Given a plugin-side transport that has routed frames onto the burst path.
+		tr := &capTransport{}
+		tr.burst.Store(6)
+
+		// When the plugin's own reporter loop runs.
+		loopCtx, stop := context.WithCancel(ctx)
+		defer stop()
+		go srv.runMetricsReporter(loopCtx, tr)
+
+		// Then the plugin's sink sees them under the metric's own unlabeled series
+		// (the plugin has no name of its own to attach). labeledCounter with no
+		// labels reads exactly the series an IncrCounter call with no labels wrote
+		// to, so this is a genuine "no label" check, not merely a total.
+		require.Eventually(t, func() bool { return sink.labeledCounter(observe.MetricBurstCount) == 6 },
 			time.Second, 5*time.Millisecond)
 	})
 }

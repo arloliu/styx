@@ -61,16 +61,31 @@ func SetHeartbeatReceivedForTest(f func()) func() {
 func (s *Supervisor) AttachSHMForTest(
 	ctx context.Context, conn *control.Conn, generation uint64, tuple control.Tuple,
 ) error {
-	tr, res, err := s.attachSHM(ctx, conn, generation, tuple)
-	if tr != nil {
-		_ = tr.Close()
-	}
-	if res != nil {
-		res.closeRegion()
-		res.closeEventFDs()
-	}
+	_, release, err := s.AttachSHMTransportForTest(ctx, conn, generation, tuple)
+	release()
 
 	return err
+}
+
+// AttachSHMTransportForTest drives the host-side shared-memory attach and hands
+// back the data-plane transport it built, alongside a release func that closes
+// everything the attach produced. It is the seam for asserting WHAT the attach
+// built — a plain shared-memory transport or the burst composite over it — where
+// AttachSHMForTest reports only whether the attach succeeded.
+func (s *Supervisor) AttachSHMTransportForTest(
+	ctx context.Context, conn *control.Conn, generation uint64, tuple control.Tuple,
+) (transport.Transport, func(), error) {
+	tr, res, err := s.attachSHM(ctx, conn, generation, tuple)
+
+	return tr, func() {
+		if tr != nil {
+			_ = tr.Close()
+		}
+		if res != nil {
+			res.closeRegion()
+			res.closeEventFDs()
+		}
+	}, err
 }
 
 // FakeInstance is a test-built stand-in for one spawned instance: the control
@@ -157,8 +172,10 @@ var (
 )
 
 // HostOfferForTest re-exports hostOffer for supervisor_test (external test
-// package): the streaming-required negotiation flag is derived from
-// Config.RequireStreaming, exercised directly here without a real handshake.
+// package) and for styx's own root-package tests: the streaming-required flag
+// derived from Config.RequireStreaming and the burst flag's on/off derived
+// from Config.BurstMaxPayload, exercised directly here without a real
+// handshake.
 func (s *Supervisor) HostOfferForTest() control.Offer {
 	return s.hostOffer()
 }

@@ -299,24 +299,28 @@ func observeHostBeats(sup *supervisor.Supervisor) <-chan supervisor.HeartbeatSam
 // requireHealthyForBeats drains events and host observations until beatsToObserve
 // heartbeats have been classified by the host, failing on any Unhealthy/Crashed
 // event along the way. It proves the host processed a full span of samples, none of
-// which produced a restart verdict.
+// which produced a restart verdict. It returns those samples so a caller can assert
+// what they actually carried, rather than trusting that the span it waited out was
+// the span it meant to.
 func requireHealthyForBeats(
 	t *testing.T, ch <-chan supervisor.Event, beats <-chan supervisor.HeartbeatSample, beatsToObserve int,
-) {
+) []supervisor.HeartbeatSample {
 	t.Helper()
 
-	got := 0
-	for got < beatsToObserve {
+	observed := make([]supervisor.HeartbeatSample, 0, beatsToObserve)
+	for len(observed) < beatsToObserve {
 		select {
 		case ev := <-ch:
 			require.NotEqual(t, supervisor.EventUnhealthy, ev.Kind, "unexpected Unhealthy: %+v", ev)
 			require.NotEqual(t, supervisor.EventCrashed, ev.Kind, "unexpected Crashed: %+v", ev)
-		case <-beats:
-			got++
+		case s := <-beats:
+			observed = append(observed, s)
 		case <-time.After(5 * time.Second):
 			t.Fatal("timed out waiting for host-observed heartbeats")
 		}
 	}
+
+	return observed
 }
 
 // Test a legitimately long-running handler staying healthy across many wedge windows:
@@ -910,6 +914,197 @@ func TestSupervisor_CallsOnHeartbeatOK_OnceAtLoopEntry_BeforeAnyBeat(t *testing.
 	require.Equal(t, int64(missBudget), misses.Load())
 	require.Equal(t, int64(1), oks.Load(),
 		"OnHeartbeatOK must fire once at loop entry even when no beat ever arrives")
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// Test a plugin parked inside a destructive read of one oversize inbound frame
+// staying healthy across many wedge windows. Its consume counter cannot advance
+// (the frame is counted only once the read completes) and inbound stays readable
+// (more work queued behind it), which is the transport-wedge shape exactly — but
+// the plugin also reports that the stall is a read in flight, and that read has a
+// completion budget of its own bounding it. Restarting such a plugin would kill a
+// healthy transfer that was making progress the counters cannot express.
+//
+// The gate is host-observed: a fixed count of heartbeats the host classified,
+// spanning several windows.
+func TestSupervisor_StaysHealthy_WhileABoundedReadIsInFlight(t *testing.T) {
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	nextHB := func(seq uint64) *controlpb.Heartbeat {
+		return &controlpb.Heartbeat{
+			Sequence: seq, DescriptorsConsumedH2P: 5,
+			InboundReadable: true, BoundedReadActive: true,
+		}
+	}
+	cfg := supervisor.Config{
+		Restart:           supervisor.RestartPolicy{Max: 0},
+		HeartbeatInterval: wiringInterval,
+		MissedHeartbeats:  50,
+		WedgeWindow:       wiringWindow,
+	}
+	sup := supervisor.New(cfg, bus)
+	sup.SetSenderCadenceForTest(wiringInterval)
+	beats := observeHostBeats(sup)
+	sup.SetSpawnForTest(spawnHeartbeatPeer(t, wiringInterval, nextHB))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	requireEventOfKind(t, ch, supervisor.EventReady)
+
+	// When: the host observes several windows' worth of heartbeats, none Unhealthy.
+	observed := requireHealthyForBeats(t, ch, beats, int(wiringWindowBeats)*4)
+
+	// Then: every sample really did carry the stalled-consumer pair alongside the
+	// read report — so the run proves suppression, not an accidentally healthy peer.
+	for _, s := range observed {
+		require.True(t, s.InboundReadable, "a sample did not carry queued inbound work")
+		require.True(t, s.BoundedReadActive, "a sample did not report the read in flight")
+	}
+
+	// And: the identical pair with only the read report cleared IS a transport wedge,
+	// which is what makes the run above a property of the suppression and nothing else.
+	cleared := observed[1]
+	cleared.BoundedReadActive = false
+	class, kind := supervisor.Classify(observed[0], cleared, testHWBytes)
+	require.Equal(t, supervisor.HealthWedged, class)
+	require.Equal(t, supervisor.WedgeTransport, kind)
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// Test the suppression clearing the moment the read does. The plugin reports a
+// read in flight for several windows and is not restarted; then the read ends
+// while the consumer stays frozen with work still queued — a plugin hung past the
+// read, which nothing bounds — and the wedge verdict fires after the ordinary
+// window, measured from where the report cleared.
+//
+// This is what makes the report live state rather than a latch: a plugin that
+// reported a read once must not be exempt from the wedge check forever.
+func TestSupervisor_TransportWedged_OnceTheBoundedReadEnds(t *testing.T) {
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	var readActive atomic.Bool
+	readActive.Store(true)
+	nextHB := func(seq uint64) *controlpb.Heartbeat {
+		return &controlpb.Heartbeat{
+			Sequence: seq, DescriptorsConsumedH2P: 5,
+			InboundReadable: true, BoundedReadActive: readActive.Load(),
+		}
+	}
+	cfg := supervisor.Config{
+		Restart:           supervisor.RestartPolicy{Max: 1},
+		HeartbeatInterval: wiringInterval,
+		MissedHeartbeats:  50,
+		WedgeWindow:       wiringWindow,
+	}
+	sup := supervisor.New(cfg, bus)
+	sup.SetSenderCadenceForTest(wiringInterval)
+	beats := observeHostBeats(sup)
+	sup.SetSpawnForTest(spawnHeartbeatPeer(t, wiringInterval, nextHB))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	requireEventOfKind(t, ch, supervisor.EventReady)
+
+	// Given: several windows pass with the read in flight and no verdict.
+	requireHealthyForBeats(t, ch, beats, int(wiringWindowBeats)*3)
+
+	// When: the read returns and the consumer is still frozen with work queued.
+	readActive.Store(false)
+
+	// Then: the transport wedge fires and the instance is restarted.
+	ev := awaitUnhealthy(t, ch)
+	require.ErrorIs(t, ev.Err, supervisor.ErrTransportWedged)
+	require.ErrorIs(t, ev.Err, supervisor.ErrWedged)
+
+	var we *supervisor.WedgedError
+	require.ErrorAs(t, ev.Err, &we)
+	require.Equal(t, supervisor.WedgeTransport, we.Kind)
+
+	requireEventOfKind(t, ch, supervisor.EventRestarting)
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// Test that the one-sample skew between a read ending and the next one starting
+// never restarts a plugin. The report is sampled at one instant per heartbeat, so
+// a heartbeat can land in the gap between two reads of a multi-frame transfer and
+// carry the report cleared while the consumer is still frozen — one qualifying
+// pair, in the middle of a run that is otherwise suppressed.
+//
+// A wedge verdict warrants a restart only once it persists for the whole window,
+// and any healthy pair clears the accumulated stall, so an isolated qualifying
+// pair cannot survive to fire. That property is what makes sampling the report at
+// heartbeat cadence sound; nothing has to close the gap.
+func TestSupervisor_StaysHealthy_AcrossTheGapBetweenBoundedReads(t *testing.T) {
+	bus := supervisor.NewEventBus()
+	ch, unsub, _ := bus.Subscribe()
+	defer unsub()
+
+	// One heartbeat per window-worth of beats lands between two reads.
+	gapEvery := wiringWindowBeats
+	nextHB := func(seq uint64) *controlpb.Heartbeat {
+		return &controlpb.Heartbeat{
+			Sequence: seq, DescriptorsConsumedH2P: 5,
+			InboundReadable: true, BoundedReadActive: seq%gapEvery != 0,
+		}
+	}
+	cfg := supervisor.Config{
+		Restart:           supervisor.RestartPolicy{Max: 0},
+		HeartbeatInterval: wiringInterval,
+		MissedHeartbeats:  50,
+		WedgeWindow:       wiringWindow,
+	}
+	sup := supervisor.New(cfg, bus)
+	sup.SetSenderCadenceForTest(wiringInterval)
+	beats := observeHostBeats(sup)
+	sup.SetSpawnForTest(spawnHeartbeatPeer(t, wiringInterval, nextHB))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); sup.Run(ctx) }()
+
+	requireEventOfKind(t, ch, supervisor.EventReady)
+
+	// When
+	observed := requireHealthyForBeats(t, ch, beats, int(wiringWindowBeats)*4)
+
+	// Then: the host really did classify samples with the report cleared — several of
+	// them, each a qualifying transport-wedge pair on its own — and restarted nothing.
+	gaps := 0
+	for _, s := range observed {
+		if !s.BoundedReadActive {
+			gaps++
+		}
+	}
+	require.GreaterOrEqual(t, gaps, 2, "no heartbeat landed in the gap between two reads")
 
 	cancel()
 	select {

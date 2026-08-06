@@ -143,6 +143,7 @@ func (c *ClientConn) runMetricsReporter(
 	var lastBytes uint64
 	var lastEdges uint64
 	var lastFaults uint64
+	var lastBurst uint64
 	var lastWakeups uint64
 	var haveWakeups bool
 	var lastCarries []transport.ArenaCarry
@@ -167,11 +168,13 @@ func (c *ClientConn) runMetricsReporter(
 				// difference against the predecessor's unrelated counter.
 				lastTr, lastBytes, lastEdges, lastWakeups, haveWakeups = tr, 0, 0, 0, false
 				lastFaults = 0
+				lastBurst = 0
 				lastCarries = nil
 			}
 			lastBytes = c.reportBytesMoved(m, tr, lastBytes)
 			lastEdges = c.reportBackpressureEdges(m, tr, lastEdges)
 			lastFaults = c.reportConsumeFaults(m, tr, lastFaults)
+			lastBurst = c.reportBurstCount(m, tr, lastBurst)
 			lastCarries = c.reportArenaCarries(m, tr, lastCarries)
 			c.reportArenaOccupancy(m, tr)
 			c.reportRingDepth(m, tr)
@@ -224,6 +227,12 @@ func (c *ClientConn) reportBackpressureEdges(
 // of these faults, and the teardown's recorded reason cannot say that it did.
 // This is the signal that tells the two apart after the fact, so it has to reach
 // the operator's sink rather than stopping at the transport.
+//
+// For a burst-active transport the count read here is already the sum of its
+// shared-memory component's own consume faults and the frames its burst path
+// discarded: this reporter samples one number either way. A burst-path fault
+// never contributes to the teardown above, however many arrive back to back —
+// only the shared-memory component's own unbroken run can reach that threshold.
 func (c *ClientConn) reportConsumeFaults(
 	m *observeq.Dispatcher[observe.MetricsSink], tr transport.Transport, lastFaults uint64,
 ) uint64 {
@@ -245,6 +254,38 @@ func (c *ClientConn) reportConsumeFaults(
 	m.Submit(func(s observe.MetricsSink) {
 		//nolint:gosec // cumulative fault count; a per-interval delta never overflows int64.
 		s.IncrCounter(observe.MetricConsumeFault, int64(delta), observe.Label{Key: labelPlugin, Value: name})
+	})
+
+	return cur
+}
+
+// reportBurstCount submits the counter delta of frames the live transport
+// committed to the burst path since lastBurst, and returns the new baseline. A
+// zero delta submits nothing. Only a burst-active transport exposes the
+// capability; a plugin running the shared-memory transport alone omits it, so
+// nothing is reported over it — no value is fabricated. The baseline is keyed
+// to the transport identity by the caller, exactly as reportBytesMoved's is.
+func (c *ClientConn) reportBurstCount(
+	m *observeq.Dispatcher[observe.MetricsSink], tr transport.Transport, lastBurst uint64,
+) uint64 {
+	bc, ok := tr.(transport.BurstCounter)
+	if !ok {
+		return lastBurst
+	}
+
+	cur := bc.BurstCount()
+	delta := cur
+	if cur >= lastBurst {
+		delta = cur - lastBurst
+	}
+	if delta == 0 {
+		return cur
+	}
+
+	name := c.name
+	m.Submit(func(s observe.MetricsSink) {
+		//nolint:gosec // cumulative burst-routed count; a per-interval delta never overflows int64.
+		s.IncrCounter(observe.MetricBurstCount, int64(delta), observe.Label{Key: labelPlugin, Value: name})
 	})
 
 	return cur
@@ -445,8 +486,9 @@ func (c *ClientConn) reportWakeupRate(
 
 // runMetricsReporter is the plugin-side cold reporter goroutine. It reports the
 // shared-memory signals the live transport exposes: arena occupancy, ring depth,
-// and eventfd wakeup rate as gauges, and backpressure edges, consume faults, and
-// per-size-class arena stalls as per-interval counter deltas.
+// and eventfd wakeup rate as gauges, and backpressure edges, consume faults,
+// per-size-class arena stalls, and (for a burst-active transport) the burst
+// routing count as per-interval counter deltas.
 // The uds serve-path transport exposes none of them,
 // so nothing is reported over it (no value is fabricated). The plugin has no name
 // of its own, so plugin-side signals carry no plugin label. It returns when ctx is
@@ -455,7 +497,11 @@ func (c *ClientConn) reportWakeupRate(
 // The plugin reports consume faults for the same reason the host does, and the
 // two counts are not redundant: each side counts only the frames IT could not
 // consume, while a teardown one side's run triggers stops both. A region torn
-// down this way therefore shows the climb on one side only.
+// down this way therefore shows the climb on one side only. For a burst-active
+// transport the count already folds in the frames its burst path discarded;
+// those are scoped to the one call each names and never escalate on their
+// own — only the shared-memory component's own unbroken run can reach the
+// threshold that tears the region down.
 func (s *PluginServer) runMetricsReporter(ctx context.Context, tr transport.Transport) {
 	ticker := time.NewTicker(s.metricsInterval)
 	defer ticker.Stop()
@@ -466,8 +512,10 @@ func (s *PluginServer) runMetricsReporter(ctx context.Context, tr transport.Tran
 	wc, haveWakeups := tr.(transport.WakeupSyscallCounter)
 	cf, haveFaults := tr.(transport.ConsumeFaultCounter)
 	ca, haveCarries := tr.(transport.ArenaCarryCounter)
+	bc, haveBurst := tr.(transport.BurstCounter)
 	var lastEdges uint64
 	var lastFaults uint64
+	var lastBurst uint64
 	var lastWakeups uint64
 	var lastCarries []transport.ArenaCarry
 	var haveBaseline bool
@@ -506,6 +554,18 @@ func (s *PluginServer) runMetricsReporter(ctx context.Context, tr transport.Tran
 					})
 				} else {
 					lastFaults = cur // establish or re-establish (after a reset) the baseline.
+				}
+			}
+			if haveBurst {
+				cur := bc.BurstCount()
+				if delta := cur - lastBurst; cur >= lastBurst && delta != 0 {
+					lastBurst = cur
+					//nolint:gosec // cumulative burst-routed count; a per-interval delta never overflows int64.
+					s.metrics.Submit(func(sink observe.MetricsSink) {
+						sink.IncrCounter(observe.MetricBurstCount, int64(delta))
+					})
+				} else {
+					lastBurst = cur // establish or re-establish (after a reset) the baseline.
 				}
 			}
 			if haveCarries {

@@ -185,6 +185,35 @@ func (g ShmGeometry) toLayout() shm.Layout {
 	}
 }
 
+// largestClasses reports the largest slab size configured in each direction --
+// the ceiling PluginSpec.BurstMaxPayload's Start-time validation compares
+// against. It resolves g exactly as toLayout does (the default profile for a
+// zero geometry, one direction's classes copied to an empty other), so the two
+// values always match what toLayout would actually hand the shared-memory
+// transport.
+func (g ShmGeometry) largestClasses() (hostToPlugin, pluginToHost uint32) {
+	layout := g.toLayout()
+	hostToPlugin = largestSlabSize(layout.Arenas[shm.HostToPlugin].Classes)
+	pluginToHost = largestSlabSize(layout.Arenas[shm.PluginToHost].Classes)
+
+	return hostToPlugin, pluginToHost
+}
+
+// largestSlabSize returns the largest SlabSize among classes. A direction's
+// classes ascend by construction (ShmSizeClass's own doc), but this scans
+// rather than trusting that order, so it stays correct even fed a table that
+// has not yet passed structural validation.
+func largestSlabSize(classes []shm.SizeClass) uint32 {
+	var largest uint32
+	for _, c := range classes {
+		if c.SlabSize > largest {
+			largest = c.SlabSize
+		}
+	}
+
+	return largest
+}
+
 // toSizeClasses projects the public size-class table into the internal one.
 // ClassBaseOffset is left 0: CreateRegion derives every class's offset from the
 // contiguous, unpadded arena layout (shm-abi.md §2).
