@@ -17,6 +17,7 @@ import (
 	"github.com/arloliu/styx/internal/control/controlpb"
 	"github.com/arloliu/styx/internal/event"
 	"github.com/arloliu/styx/internal/lifecycle"
+	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/transport"
 	shmtransport "github.com/arloliu/styx/internal/transport/shm"
@@ -78,6 +79,16 @@ const (
 // the supervisor's senderCadence must both come from the negotiated value; neither
 // may be silently coupled to the host's configurable Config.HeartbeatInterval.
 const DefaultHeartbeatInterval = time.Second
+
+// DefaultWedgeWindow is how long a wedge condition must persist continuously
+// before it warrants a restart, and Config.WedgeWindow's default (5s).
+//
+// Exported because it is one half of a relationship that must hold across
+// packages: while the plugin reports a bounded read in flight the wedge verdict is
+// withheld, so the only watchdog left over that read is the transport's own
+// receive budget, and that budget must outlast this window. The two are configured
+// at unrelated call sites, so the relationship is asserted rather than assumed.
+const DefaultWedgeWindow = 5 * time.Second
 
 // heartbeatSpacingToleranceDivisor sets how far below a cadence the plugin sender's
 // spacing guard admits a build.
@@ -325,6 +336,13 @@ type Config struct {
 	// offers streaming as optional.
 	RequireStreaming bool
 
+	// BurstMaxPayload is the host-selected burst-path ceiling
+	// (styx.PluginSpec.BurstMaxPayload): the largest payload the burst socket
+	// will carry. hostOffer offers the burst feature flag if and only if this is
+	// non-zero -- zero (the default) keeps the burst path off and the flag
+	// unoffered, matching today's behavior.
+	BurstMaxPayload uint32
+
 	// Transport selects the data-plane transport this host offers.
 	// "shm" pins the shared-memory transport (a plugin that cannot speak it fails
 	// handshake, never a silent downgrade).
@@ -516,7 +534,7 @@ func applyDefaults(cfg *Config) {
 		cfg.MissedHeartbeats = 3
 	}
 	if cfg.WedgeWindow <= 0 {
-		cfg.WedgeWindow = 5 * time.Second
+		cfg.WedgeWindow = DefaultWedgeWindow
 	}
 	if cfg.Restart.Backoff == nil {
 		cfg.Restart.Backoff = func(int) time.Duration { return 0 }
@@ -1471,6 +1489,9 @@ func (s *Supervisor) handshakeAndAttach(
 // The transport's own duplicate Region is released by Transport.Close in the
 // teardown's join step; these are the resources left over.
 // nil for a uds instance.
+// The host end of the burst socketpair is deliberately NOT here: the composite
+// built over it at attach owns it, and closes it as part of its own Close in the
+// teardown's join step. A second owner here would close it twice.
 type shmHostResources struct {
 	region *shm.Region    // original mapping + memfd fd
 	hpEFD  *event.EventFD // host->plugin: host's outbound, plugin's inbound
@@ -1568,6 +1589,11 @@ func (s *Supervisor) attachUDS(
 // It creates a fresh region for this generation and two eventfds, transfers all
 // three fds over the control conn via SCM_RIGHTS, waits for the ack, and attaches
 // the host end.
+// With the burst path active for this generation (control.BurstActive over the
+// tuple and Config.BurstMaxPayload) it also creates a socketpair, sends the
+// plugin's end as a fourth fd and the ceiling on the same message, wraps its own
+// end before the ack wait, and returns the composite over both undersides rather
+// than the shared-memory transport alone.
 // The plugin sees the ack only after it has fully constructed its own end, so a
 // returned transport means both ends are attached to the same generation's region.
 //
@@ -1671,19 +1697,17 @@ func (s *Supervisor) attachSHM(
 		},
 	}
 
-	// SendFDs retains ownership of the caller's descriptors (it never closes them).
-	// The plugin receives fresh SCM_RIGHTS dups.
-	// The three fds travel in a fixed order the plugin mirrors: region,
-	// host->plugin eventfd, plugin->host eventfd.
-	sctx, cancel := context.WithTimeout(ctx, control.ReplyDeadlines[control.KindAttachRegion])
-	sendErr := conn.SendFDs(sctx, attachMsg, []int{region.FD(), hpEFD.FD(), phEFD.FD()})
-	cancel()
-	if sendErr != nil {
-		return nil, nil, fmt.Errorf("supervisor: handshake: send AttachRegion: %w", sendErr)
+	// The three shared-memory fds travel in a fixed order the plugin mirrors:
+	// region, host->plugin eventfd, plugin->host eventfd.
+	burst, serr := s.sendAttachRegion(ctx, conn, attachMsg, []int{region.FD(), hpEFD.FD(), phEFD.FD()}, tuple)
+	if serr != nil {
+		return nil, nil, serr
 	}
-	if err = attachFailStep("send-fds"); err != nil {
-		return nil, nil, err
-	}
+	defer func() {
+		if err != nil && burst.tr != nil {
+			_ = burst.tr.Close()
+		}
+	}()
 
 	// The host attaches its own end BEFORE waiting for the ack.
 	// Attach is local and cannot depend on the plugin, and doing it here means a
@@ -1718,7 +1742,147 @@ func (s *Supervisor) attachSHM(
 		return nil, nil, fmt.Errorf("supervisor: handshake: recv AttachRegionAck: %w", aerr)
 	}
 
-	return hostTr, &shmHostResources{region: region, hpEFD: hpEFD, phEFD: phEFD}, nil
+	res = &shmHostResources{region: region, hpEFD: hpEFD, phEFD: phEFD}
+	if burst.tr == nil {
+		return hostTr, res, nil
+	}
+
+	// From here the composite is the generation's one data-plane transport and the
+	// sole owner of both undersides: its Close closes the socket and releases the
+	// shared-memory mapping, in that order, so the teardown step that closes the
+	// transport keeps releasing everything exactly once. Built before the caller
+	// starts a read loop, so no frame can arrive on either underside first.
+	return rpcruntime.NewBurstTransport(
+		hostTr, burst.tr, burst.ceiling, rpcruntime.BurstSideHost, burst.latch,
+	), res, nil
+}
+
+// hostBurstEnd is the host end of one generation's burst socketpair: the wrapped
+// socket, the latch its fatal observer feeds, and the ceiling both the socket's
+// frame limit and the composite's routing boundary come from. The three travel
+// together because a composite built with any one of them from a different source
+// than the other two would route or validate against a limit its own socket does
+// not enforce. tr is nil when the burst path is off for this generation.
+type hostBurstEnd struct {
+	tr      *transport.UDSTransport
+	latch   *rpcruntime.BurstFatalLatch
+	ceiling uint32
+}
+
+// sendAttachRegion transfers one AttachRegion and the descriptors that ride with
+// it, establishing the burst socketpair first when the burst path is active for
+// this generation: the pair's plugin end travels as a fourth descriptor and the
+// ceiling travels in the message body, so the plugin derives the same required
+// count from the same two inputs the host used. It returns the host's end of that
+// socketpair, already wrapped and owning its fd, with the latch and ceiling the
+// composite is built from — an end with no transport when the burst path is
+// off for this generation; the ceiling field is informational there, since
+// callers gate on tr == nil rather than on ceiling.
+// shmFDs are the caller's region and eventfd descriptors, which the caller keeps:
+// SendFDs never closes what it is given, and the plugin receives fresh dups.
+//
+// Ownership of the socketpair, in handshake order: the host owns both raw ends
+// from creation; the plugin's end is closed on the send's return, success or
+// failure alike, because by then the plugin holds its own dup or never will; the
+// host's end is wrapped here, before the caller waits for the ack, so a
+// construction failure is caught before the host commits to the plugin's answer.
+// Every failure path leaves nothing open — a non-nil error means no descriptor
+// and no transport survives this call.
+func (s *Supervisor) sendAttachRegion(
+	ctx context.Context, conn *control.Conn, attachMsg *controlpb.ControlMessage,
+	shmFDs []int, tuple control.Tuple,
+) (burst hostBurstEnd, err error) {
+	hostFD, pluginFD := -1, -1
+	// wrapped tracks the burst transport for the cleanup below. It is deliberately
+	// not the named result: a failing return zeroes that result, which would leave
+	// the cleanup with nothing to close.
+	var wrapped *transport.UDSTransport
+	defer func() {
+		// pluginFD is -1 once the send has returned and its copy was closed; this
+		// covers every path that leaves before the send happens at all.
+		if pluginFD >= 0 {
+			_ = unix.Close(pluginFD)
+		}
+		if err == nil {
+			return
+		}
+		// hostFD is -1 once the transport owns it; until then an aborted attach
+		// closes it here, and past then the transport is what has to be released.
+		if hostFD >= 0 {
+			_ = unix.Close(hostFD)
+		}
+		if wrapped != nil {
+			_ = wrapped.Close()
+		}
+	}()
+
+	sendFDs := shmFDs
+	// One read of the configured ceiling serves the wire field, the socket's frame
+	// limit, and the composite's routing boundary, so the three can never disagree.
+	ceiling := s.cfg.BurstMaxPayload
+	var latch *rpcruntime.BurstFatalLatch
+	if control.BurstActive(tuple, ceiling) {
+		pair, perr := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		if perr != nil {
+			return hostBurstEnd{}, fmt.Errorf("supervisor: handshake: burst socketpair: %w", perr)
+		}
+		hostFD, pluginFD = pair[0], pair[1]
+		sendFDs = append(append(make([]int, 0, len(shmFDs)+1), shmFDs...), pluginFD)
+		ar := attachMsg.GetAttachRegion()
+		ar.FdCount = uint32(len(sendFDs)) //nolint:gosec // four, a fixed count
+		ar.BurstMaxPayload = ceiling
+	}
+	if err = attachFailStep("burst-socketpair"); err != nil {
+		return hostBurstEnd{}, err
+	}
+
+	sctx, cancel := context.WithTimeout(ctx, control.ReplyDeadlines[control.KindAttachRegion])
+	sendErr := conn.SendFDs(sctx, attachMsg, sendFDs)
+	cancel()
+	if pluginFD >= 0 {
+		_ = unix.Close(pluginFD)
+		pluginFD = -1
+	}
+	if sendErr != nil {
+		return hostBurstEnd{}, fmt.Errorf("supervisor: handshake: send AttachRegion: %w", sendErr)
+	}
+	if err = attachFailStep("send-fds"); err != nil {
+		return hostBurstEnd{}, err
+	}
+
+	// hostFD is negative exactly when this generation has no burst socket, so the
+	// wrap is skipped and the caller gets no transport.
+	if hostFD >= 0 {
+		// The latch is created first because the socket's fatal observer is fixed at
+		// construction: a poison the socket detects mid-frame is published there,
+		// before the abort's close is observable to anyone, and the composite built
+		// over the same latch reports it as the whole connection's failure.
+		//
+		// streaming=false fixes the burst socket's header shape regardless of the
+		// tuple's streaming feature: the only frame kinds legal on it never carry the
+		// stream control word, so both sides derive the shorter header from that rule
+		// rather than from negotiated state that does not apply to this socket.
+		//
+		// The receive budget is this side's own policy on the socket it receives on,
+		// at its defaults: a peer that stops mid-frame cannot park this host's
+		// receiver forever. The shared-memory data plane has no such stage and passes
+		// none.
+		latch = rpcruntime.NewBurstFatalLatch()
+		bt, berr := transport.NewUDSTransport(hostFD, false,
+			transport.WithMaxFrame(ceiling),
+			transport.WithFatalObserver(latch.Observe),
+			transport.WithReceiveBudget(transport.ReceiveBudget{}))
+		if berr != nil {
+			return hostBurstEnd{}, fmt.Errorf("supervisor: handshake: wrap burst transport: %w", berr)
+		}
+		hostFD = -1 // bt owns it now
+		wrapped = bt
+	}
+	if err = attachFailStep("burst-wrap"); err != nil {
+		return hostBurstEnd{}, err // the deferred cleanup releases the transport just built
+	}
+
+	return hostBurstEnd{tr: wrapped, latch: latch, ceiling: ceiling}, nil
 }
 
 // shmMaxDataInflight resolves the host-selected peak concurrency.
@@ -1757,15 +1921,23 @@ func (s *Supervisor) shmConfig(maxInflight int, tuple control.Tuple) shmtranspor
 // A host whose generated client has streaming methods declares the feature required,
 // so a plugin that cannot stream fails handshake at startup rather than at the
 // first OpenStream.
+// The burst feature is offered, always optional, if and only if
+// Config.BurstMaxPayload is non-zero -- a zero ceiling means the burst path was
+// never configured on, so nothing here asks a plugin to support it.
 func (s *Supervisor) hostOffer() control.Offer {
 	transports, layoutVersions := s.offeredTransports()
+
+	features := []control.FeatureFlag{{Name: featureStreaming, Required: s.cfg.RequireStreaming}}
+	if s.cfg.BurstMaxPayload > 0 {
+		features = append(features, control.FeatureFlag{Name: control.FeatureBurst, Required: false})
+	}
 
 	return control.Offer{
 		ProtocolMin:    m1ProtocolVersion,
 		ProtocolMax:    m1ProtocolVersion,
 		Transports:     transports,
 		Codecs:         []string{codecProto},
-		Features:       []control.FeatureFlag{{Name: featureStreaming, Required: s.cfg.RequireStreaming}},
+		Features:       features,
 		Services:       s.cfg.Services,
 		LayoutVersions: layoutVersions,
 	}
@@ -1835,7 +2007,8 @@ func ackHeartbeat(ctx context.Context, conn *control.Conn, sequence uint64) erro
 
 // heartbeatSampleFromMessage converts a wire Heartbeat into a HeartbeatSample.
 // Every quantity the verdict rests on is the plugin's own report, carried on the
-// wire (consume/produce counters, InboundReadable, the unleased inflight_count).
+// wire (consume/produce counters, InboundReadable, BoundedReadActive, the unleased
+// inflight_count).
 // Stall persistence is measured on the plugin's Sequence (the sender's own timebase),
 // so host receipt time is deliberately not captured here.
 func heartbeatSampleFromMessage(hb *controlpb.Heartbeat) HeartbeatSample {
@@ -1856,6 +2029,7 @@ func heartbeatSampleFromMessage(hb *controlpb.Heartbeat) HeartbeatSample {
 		ArenaOccupancyBytes:    hb.GetArenaOccupancyBytes(),
 		Leases:                 leases,
 		InboundReadable:        hb.GetInboundReadable(),
+		BoundedReadActive:      hb.GetBoundedReadActive(),
 	}
 }
 

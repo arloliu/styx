@@ -72,6 +72,20 @@ type HeartbeatSample struct {
 	// A plugin that cannot probe its inbound queue reports false and is never
 	// transport-wedged.
 	InboundReadable bool
+
+	// BoundedReadActive is the plugin's report that its receive is inside a
+	// destructive read of one inbound frame — a read the transport's own
+	// completion budget bounds.
+	// It is captured in the same snapshot as DescriptorsConsumedH2P and
+	// InboundReadable, so the three describe one instant of the plugin's state.
+	// It is live state, not a latch: it is true only while that read is running,
+	// and a read that completed, expired, or was poisoned clears it.
+	// It is false during delivery of the frame the read produced, because nothing
+	// bounds a consume callback and the frame is already counted by then — a hung
+	// delivery must classify as the transport wedge it is.
+	// A plugin whose transport cannot be inside such a read reports false, which
+	// is every plugin that does not carry oversize frames over a socket.
+	BoundedReadActive bool
 }
 
 // Classify determines the health verdict for two consecutive heartbeat samples.
@@ -81,9 +95,24 @@ type HeartbeatSample struct {
 //
 // Transport-wedged occurs when the plugin's consume counter is frozen
 // (cur.DescriptorsConsumedH2P == prev.DescriptorsConsumedH2P) AND the plugin
-// still sees unconsumed inbound work (cur.InboundReadable).
-// Both facts come from the plugin's one snapshot, judged on a single clock.
+// still sees unconsumed inbound work (cur.InboundReadable) AND it is not inside a
+// bounded read (!cur.BoundedReadActive).
+// All three facts come from the plugin's one snapshot, judged on a single clock.
 // Handler leases are irrelevant: a live handler does not excuse a stalled consumer.
+//
+// The bounded read is excluded because a receive parked inside the destructive
+// read of one oversize frame presents exactly the wedged shape and is not wedged:
+// the frame is counted only when the read completes, and anything queued behind it
+// keeps inbound readable, so a transfer that outruns the wedge window would be
+// restarted mid-flight. That read carries a completion bound of its own — the
+// transport's receive budget, which is longer than the wedge window — so a read
+// that truly never completes is still recovered, by the watchdog that can tell a
+// slow transfer from a dead one. Recovery of a stuck read therefore moves out to
+// the budget, in exchange for never killing a healthy one.
+// The exclusion covers the read and nothing past it: the report is false during
+// delivery, so a hung consume callback is still the transport wedge it is.
+// It also suppresses only the transport verdict; a response owed with no handler
+// running for it is a different fault on a different counter and still fires.
 //
 // Dispatch-wedged occurs when the plugin reports at least one response obligation
 // with no live handler lease (cur.InflightCount > 0) AND the produce counter
@@ -101,18 +130,20 @@ type HeartbeatSample struct {
 // active drain/shutdown when the caller suspends progress checks.
 //
 // Both wedge tests read only the plugin's reported quantities with no cross-clock
-// pairing. InboundReadable travels in the same snapshot as the consume count,
-// so a backlog cannot fabricate a wedge: a drained plugin reports false in every
-// heartbeat built after draining. The unleased inflight_count is computed on the
-// plugin side where both obligation and lease sets live, enforcing the per-call rule:
-// a fresh lease with a closed obligation cannot mask a different call's response.
+// pairing. InboundReadable and BoundedReadActive travel in the same snapshot as
+// the consume count, so a backlog cannot fabricate a wedge: a drained plugin
+// reports false in every heartbeat built after draining, and a plugin whose read
+// has ended reports the bounded read false in every heartbeat built after it.
+// The unleased inflight_count is computed on the plugin side where both obligation
+// and lease sets live, enforcing the per-call rule: a fresh lease with a closed
+// obligation cannot mask a different call's response.
 func Classify(
 	prev, cur HeartbeatSample, highWaterBytes uint64,
 ) (HealthClass, WedgeKind) {
 	consumeStalled := cur.DescriptorsConsumedH2P == prev.DescriptorsConsumedH2P
 	produceStalled := cur.DescriptorsProducedP2H == prev.DescriptorsProducedP2H
 
-	transportWedged := consumeStalled && cur.InboundReadable
+	transportWedged := consumeStalled && cur.InboundReadable && !cur.BoundedReadActive
 	dispatchWedged := produceStalled && cur.InflightCount > 0
 
 	if transportWedged {

@@ -645,6 +645,10 @@ func incompatibleReason(err error) string {
 // own (shm.AttachParams), which the plugin closes at teardown after the transport
 // has been released. The received raw region fd is not here: it is closed
 // immediately after shm.Attach dups it. nil for a uds instance.
+//
+// The plugin end of the burst socketpair is deliberately NOT here: the composite
+// built over it at attach owns it, and closes it as part of its own Close when the
+// serving session releases the transport. A second owner here would close it twice.
 type pluginShmResources struct {
 	hpEFD *event.EventFD // host->plugin: the plugin's inbound
 	phEFD *event.EventFD // plugin->host: the plugin's outbound
@@ -690,8 +694,19 @@ func (s *PluginServer) pluginAttachUDS(
 	if err != nil {
 		return nil, err
 	}
-	// RecvFDs already cross-checked the declared fd_count (1) against the
-	// received count, so exactly one fd is present here.
+	// RecvFDs cross-checked the declared fd_count against the received count, and
+	// asking for one bounds it from above. That still admits a message declaring
+	// none and attaching none, so the count the uds tuple requires is checked here
+	// before the fd is touched by position — the same rule the shared-memory
+	// attach applies, for the same reason.
+	if len(fds) != 1 {
+		for _, fd := range fds {
+			_ = unix.Close(fd)
+		}
+
+		return nil, fmt.Errorf("styx: attach: negotiated tuple requires 1 fd, received %d: %w",
+			len(fds), control.ErrProtocolViolation)
+	}
 	dataFD := fds[0]
 
 	tr, err := transport.NewUDSTransport(dataFD, streaming)
@@ -724,11 +739,15 @@ func (s *PluginServer) pluginAttachUDS(
 // both sides admit identically; the per-direction payload limit is derived from
 // the region header (no wire field). The ack is sent last, after full construction
 // and teardown-ownership installation (the ready-ack linearization).
+// With the burst path active for this generation a fourth fd arrives with them
+// and is wrapped before the ack too; how many fds the message must carry is
+// derived from the negotiated tuple and checked before any fd is used by
+// position.
 // pluginAttachSHMFailAt, when non-nil, is called after each named construction
 // step of pluginAttachSHM; a non-nil return aborts the attach at that step so a
 // test can assert the exact per-step cleanup. nil in production, adding only
-// negligible cold-path overhead: six nil-checked hook calls on the attach path
-// per attach (the five pre-ack steps plus post-ack, after the ack is sent), and
+// negligible cold-path overhead: seven nil-checked hook calls on the attach path
+// per attach (the six pre-ack steps plus post-ack, after the ack is sent), and
 // nothing else. Set only via the test seam.
 var pluginAttachSHMFailAt func(step string) error
 
@@ -761,21 +780,147 @@ func (s *PluginServer) shmConfig(maxInflight int, tuple control.Tuple) shmtransp
 	}
 }
 
+// attachFDs are the descriptors one AttachRegion carried, in the fixed order both
+// sides use, after their count has been checked against the negotiated tuple.
+// burst is -1 when the burst path is off for this generation.
+type attachFDs struct {
+	region, hp, ph, burst int
+}
+
+// rawSet returns the descriptors that no owner holds yet, as the attach's
+// still-raw set: a failure before one is handed to its wrapper closes exactly
+// what has not been taken over.
+func (a attachFDs) rawSet() map[int]bool {
+	raw := map[int]bool{a.region: true, a.hp: true, a.ph: true}
+	if a.burst >= 0 {
+		raw[a.burst] = true
+	}
+
+	return raw
+}
+
+// recvAttachFDs receives the AttachRegion and the descriptors that ride with it,
+// and checks how many arrived against how many the negotiated tuple requires —
+// three for plain shared memory, four when the burst path is active — before any
+// of them is used by position.
+//
+// RecvFDs cross-checks the message's own declared fd_count against how many
+// actually arrived, and that is self-consistency only: a message declaring three
+// and attaching three passes it even on a tuple whose fourth descriptor is
+// mandatory, and indexing the absent fourth would panic. Asking for the tuple's
+// maximum also bounds the count from above, since anything beyond what is asked
+// for trips MSG_CTRUNC inside RecvFDs. Whether the fourth is REQUIRED depends on
+// the ceiling, which arrives on this very message, so that comparison happens
+// here rather than in the ask.
+//
+// On any failure every descriptor received is closed and the error is a protocol
+// violation, the same close-on-reject discipline RecvFDs applies to its own.
+func recvAttachFDs(
+	ctx context.Context, conn *control.Conn, tuple control.Tuple,
+) (*controlpb.AttachRegion, attachFDs, error) {
+	maxFDs := 3
+	if tuple.Transport == control.TransportSHM && tuple.Features[control.FeatureBurst] {
+		maxFDs = 4
+	}
+	msg, fds, err := recvControlFDs(ctx, conn, control.StateAttaching, control.KindAttachRegion, maxFDs,
+		control.ReplyDeadlines[control.KindAttachRegion])
+	if err != nil {
+		return nil, attachFDs{}, err
+	}
+
+	ar := msg.GetAttachRegion()
+	want := 3
+	if control.BurstActive(tuple, ar.GetBurstMaxPayload()) {
+		want = 4
+	}
+	if len(fds) != want {
+		for _, fd := range fds {
+			_ = unix.Close(fd)
+		}
+
+		return nil, attachFDs{}, fmt.Errorf("styx: attach: negotiated tuple requires %d fds, received %d: %w",
+			want, len(fds), control.ErrProtocolViolation)
+	}
+
+	// Fixed order, mirroring the host's SendFDs: region, host->plugin eventfd,
+	// plugin->host eventfd, and the burst socket end when the burst path is active.
+	afds := attachFDs{region: fds[0], hp: fds[1], ph: fds[2], burst: -1}
+	if want == 4 {
+		afds.burst = fds[3]
+	}
+
+	return ar, afds, nil
+}
+
+// pluginBurstEnd is the plugin's end of one generation's burst socketpair: the
+// wrapped socket, the latch its fatal observer feeds, and the ceiling that fixes
+// both the socket's frame limit and the composite's routing boundary. The three
+// travel together because a composite built with any one of them from a different
+// source than the other two would route or validate against a limit its own
+// socket does not enforce. tr is nil when the burst path is off for this
+// generation.
+type pluginBurstEnd struct {
+	tr      *transport.UDSTransport
+	latch   *rpcruntime.BurstFatalLatch
+	ceiling uint32
+}
+
+// wrapPluginBurstEnd wraps the received burst descriptor, or answers with an
+// empty end when the burst path is off for this generation (fd < 0). On failure
+// the caller still owns the descriptor and closes it with the rest.
+//
+// The latch is created first because the socket's fatal observer is fixed at
+// construction: a poison the socket detects mid-frame is published there, before
+// the abort's close is observable to anyone, and the composite built over the same
+// latch reports it as the whole connection's failure.
+//
+// streaming=false fixes the burst socket's header shape regardless of the tuple's
+// streaming feature — the only kinds legal on it never carry the stream control
+// word — and the ceiling comes from the wire, so both sides enforce the one value
+// the host chose.
+//
+// The receive budget is this side's own policy on the socket it receives on, at
+// its defaults: a host that stops mid-frame cannot park the serving loop forever.
+// The shared-memory data plane has no such stage and passes none.
+func wrapPluginBurstEnd(fd int, ceiling uint32) (pluginBurstEnd, error) {
+	if fd < 0 {
+		return pluginBurstEnd{}, nil
+	}
+
+	latch := rpcruntime.NewBurstFatalLatch()
+	bt, err := transport.NewUDSTransport(fd, false,
+		transport.WithMaxFrame(ceiling),
+		transport.WithFatalObserver(latch.Observe),
+		transport.WithReceiveBudget(transport.ReceiveBudget{}))
+	if err != nil {
+		return pluginBurstEnd{}, fmt.Errorf("wrap burst transport: %w", err)
+	}
+
+	return pluginBurstEnd{tr: bt, latch: latch, ceiling: ceiling}, nil
+}
+
+// compose returns the transport this generation's serving session receives on:
+// the composite over both undersides when the burst path is active, and the
+// shared-memory transport itself when it is not.
+func (b pluginBurstEnd) compose(shmTr *shmtransport.Transport) transport.Transport {
+	if b.tr == nil {
+		return shmTr
+	}
+
+	return rpcruntime.NewBurstTransport(shmTr, b.tr, b.ceiling, rpcruntime.BurstSidePlugin, b.latch)
+}
+
 func (s *PluginServer) pluginAttachSHM(
 	ctx context.Context, conn *control.Conn, tuple control.Tuple,
 ) (tr transport.Transport, res *pluginShmResources, err error) {
-	msg, fds, rerr := recvControlFDs(ctx, conn, control.StateAttaching, control.KindAttachRegion, 3,
-		control.ReplyDeadlines[control.KindAttachRegion])
+	ar, afds, rerr := recvAttachFDs(ctx, conn, tuple)
 	if rerr != nil {
 		return nil, nil, rerr
 	}
-	// RecvFDs transferred ownership of all three fds to us and cross-checked the
-	// declared fd_count (3). Fixed order, mirroring the host's SendFDs: region,
-	// host->plugin eventfd, plugin->host eventfd.
-	regionFD, hpFD, phFD := fds[0], fds[1], fds[2]
+	regionFD, hpFD, phFD := afds.region, afds.hp, afds.ph
 	// Until each fd is handed to an owner below, this holds the still-raw ones so
 	// an early return closes exactly what has not yet been taken over.
-	rawOpen := map[int]bool{regionFD: true, hpFD: true, phFD: true}
+	rawOpen := afds.rawSet()
 	defer func() {
 		for fd, open := range rawOpen {
 			if open {
@@ -815,7 +960,25 @@ func (s *PluginServer) pluginAttachSHM(
 		return nil, nil, err
 	}
 
-	ar := msg.GetAttachRegion()
+	// The burst end is wrapped before the ack, like everything else the ack
+	// promises: the host may treat an acknowledged generation as fully attached.
+	// What the wrapper is given, and why, is in wrapPluginBurstEnd.
+	burst, berr := wrapPluginBurstEnd(afds.burst, ar.GetBurstMaxPayload())
+	if berr != nil {
+		return nil, nil, berr
+	}
+	if burst.tr != nil {
+		rawOpen[afds.burst] = false // the burst transport owns it now
+		defer func() {
+			if err != nil {
+				_ = burst.tr.Close()
+			}
+		}()
+	}
+	if err = pluginAttachFailStep("burst-wrap"); err != nil {
+		return nil, nil, err
+	}
+
 	cfg := s.shmConfig(int(ar.GetMaxDataInflight()), tuple)
 	pluginTr, terr := shmtransport.Attach(shmtransport.AttachParams{
 		RegionFD:     regionFD,
@@ -832,9 +995,21 @@ func (s *PluginServer) pluginAttachSHM(
 	if terr != nil {
 		return nil, nil, fmt.Errorf("attach shm plugin: %w", terr)
 	}
+
+	// From here the composite is this generation's one data-plane transport and the
+	// sole owner of both undersides: its Close closes the socket and releases the
+	// shared-memory mapping, in that order. It is built before the ack, so a host
+	// that observes the ack and immediately sends on either underside is sending to
+	// a transport that already exists.
+	dataTr := burst.compose(pluginTr)
+	// One deferred release for whichever transport this generation ended up with.
+	// It runs BEFORE the burst socket's own cleanup above (defers run last-registered
+	// first), which matters because only the composite's Close joins the readiness
+	// pump; the underside closes that follow are idempotent and become no-ops.
+	// Without a burst path dataTr is the shared-memory transport itself.
 	defer func() {
 		if err != nil {
-			_ = pluginTr.Close()
+			_ = dataTr.Close()
 		}
 	}()
 	if err = pluginAttachFailStep("attach"); err != nil {
@@ -865,7 +1040,7 @@ func (s *PluginServer) pluginAttachSHM(
 		return nil, nil, err
 	}
 
-	return pluginTr, &pluginShmResources{hpEFD: hpEFD, phEFD: phEFD}, nil
+	return dataTr, &pluginShmResources{hpEFD: hpEFD, phEFD: phEFD}, nil
 }
 
 // serviceVersions projects the registered services into the version list the
@@ -915,7 +1090,15 @@ func pluginBaseOffer(transports []string, requireStreaming bool) control.Offer {
 		ProtocolMax: m1ProtocolVersion,
 		Transports:  transports,
 		Codecs:      []string{codecProto},
-		Features:    []control.FeatureFlag{{Name: featureStreaming, Required: requireStreaming}},
+		// The burst feature is always offered, always optional: a plugin built with
+		// support for it can wrap whatever burst socket a host chooses to establish,
+		// and asks nothing of a host that never offers it (the flag then resolves
+		// false, as it does against any older peer). The ceiling is the host's
+		// alone, so there is nothing here to configure.
+		Features: []control.FeatureFlag{
+			{Name: featureStreaming, Required: requireStreaming},
+			{Name: control.FeatureBurst, Required: false},
+		},
 	}
 	if slices.Contains(transports, control.TransportSHM) {
 		offer.LayoutVersions = []uint32{control.ShmLayoutVersion}
@@ -964,6 +1147,14 @@ var errServeLoopPoisoned = errors.New("styx: serve loop poisoned the data plane"
 // instance, but it names the panic-taint case rather than a data-plane poison.
 var errServeLoopHandlerPanicked = errors.New("styx: serve loop terminated after a handler panic")
 
+// errServeLoopDataPlaneFailed is runServeLoop's non-nil return when the data
+// plane failed as a whole under a control plane that is still healthy — one
+// underside of a multi-underside transport closed or faulted while the other kept
+// serving. Like errServeLoopPoisoned it fails the whole instance, but it names a
+// failure the peer or the kernel handed over rather than a desync this side
+// detected. It wraps the underlying cause.
+var errServeLoopDataPlaneFailed = errors.New("styx: serve loop data plane failed")
+
 // runServeLoop reads data-plane frames and dispatches each to the registered
 // handler, sending back any response frame. Dispatch is currently inline
 // (a slow handler blocks the reader); a future concurrent serving loop
@@ -971,10 +1162,12 @@ var errServeLoopHandlerPanicked = errors.New("styx: serve loop terminated after 
 //
 // It returns nil when the transport was closed under it (Serve's teardown, the
 // host going away, or the host poisoning its own end), errServeLoopPoisoned when
-// it poisoned the data plane itself, and errServeLoopHandlerPanicked when it
-// terminated the instance after a unary handler panic under the default policy —
-// the cases runServing must distinguish (see each sentinel). panicPolicy carries
-// that policy and may be nil for a caller that does not exercise panic recovery.
+// it poisoned the data plane itself, errServeLoopDataPlaneFailed when the data
+// plane died as a whole while one of its undersides kept serving, and
+// errServeLoopHandlerPanicked when it terminated the instance after a unary
+// handler panic under the default policy — the cases runServing must distinguish
+// (see each sentinel). panicPolicy carries that policy and may be nil for a
+// caller that does not exercise panic recovery.
 func runServeLoop(
 	ctx context.Context, tr transport.Transport, cdc codec.Codec, d *rpcruntime.Dispatcher, srv *streamServer,
 	panicPolicy *panicController, coord *drainCoordinator,
@@ -1143,8 +1336,10 @@ func recvReserving(ctx context.Context, tr transport.Transport, reserve func()) 
 // drainCoordinator invariant: open-then-retire (a unary request or STREAM_OPEN
 // opens its keyed obligation before this returns), and error-then-retire for the
 // local-error/stale/EOF/poison edges.
-// disposeRecvErr maps a RecvReserving error to the serve loop's exit decision.
-func disposeRecvErr(err error) (done bool, loopErr error) {
+// disposeRecvErr maps a RecvReserving error to the serve loop's exit decision. tr
+// is the transport that produced it, consulted for a data-plane failure the error
+// alone does not name (see the composite arm below).
+func disposeRecvErr(tr transport.Transport, err error) (done bool, loopErr error) {
 	if isFrameLocalRecvErr(err) {
 		// Frame-local (a malformed status body or an unimplemented-kind frame from a
 		// buggy/hostile peer, or a consume fault this side owns): the stream is still
@@ -1171,13 +1366,79 @@ func disposeRecvErr(err error) (done bool, loopErr error) {
 		// waiting out a budget §4 permits to be zero (no deadline).
 		return false, nil
 	}
+
+	return terminalLoopExit(tr, err)
+}
+
+// terminalLoopExit maps an error that ended a transport operation past saving —
+// a receive that was not frame-local, or a send whose frame will never reach the
+// peer — to the serve loop's exit decision.
+//
+// Both callers share it because the question is the same one: this session is
+// over, and what runServing does about it depends on whether the data plane
+// merely closed or actually FAILED. Splitting the two would leave one of them
+// answering a peer close on a failed data plane with the quiet exit, which is
+// exactly the state the instance must not keep heartbeating in.
+//
+// err alone cannot answer it. A transport carrying the connection over more than
+// one underside fails fast off its RECORDED failure, so every operation after the
+// failure reports that cause — an EOF, an I/O errno — with nothing on it to say
+// the connection as a whole is gone. tr is what says so.
+func terminalLoopExit(tr transport.Transport, err error) (done bool, loopErr error) {
 	if errors.Is(err, transport.ErrPoisoned) {
-		// A torn/invalid inbound frame poisoned the transport: the data plane desynced
-		// under a possibly-healthy control plane. Fail the whole instance (like a
+		// A torn/invalid frame poisoned the transport: the data plane desynced under a
+		// possibly-healthy control plane. Fail the whole instance (like a
 		// self-initiated conformance poison) so the host supervisor observes the process
 		// die and restarts it (the design-of-record's poison teardown), rather
 		// than parking on the still-live control loop.
 		return true, errServeLoopPoisoned
+	}
+
+	// A data plane that failed as a whole while one of its undersides was still
+	// healthy: the burst socket faulted on its own, and exiting quietly would leave
+	// the instance heartbeating over a data plane that can no longer carry a large
+	// response. Fail the instance instead, exactly as a poison does, so the host
+	// supervisor observes the process die and restarts it.
+	//
+	// A CLEAN peer close is deliberately not in that set, on this side. The host's
+	// own teardown closes its end of the burst socket while this plugin is still
+	// serving — the teardown steps release the data plane before the graceful
+	// Shutdown reaches the control plane — so an orderly close is what an ordinary
+	// shutdown and a reload retirement both produce here, not evidence of a fault.
+	// Reading it as one makes every graceful retirement of a burst-active instance
+	// exit non-zero, and makes WHICH underside the receiver happens to look at first
+	// decide the exit status. It is the peer's own instruction, and the control plane
+	// says what it means: a host that is tearing this instance down delivers
+	// Shutdown, and a host that died takes the control socket with it.
+	//
+	// Be clear about what the quiet exit costs while that resolution is pending.
+	// This loop is the only reader of EITHER underside, so from here until the
+	// control plane resolves, the instance has no reader at all and keeps
+	// heartbeating (runServing parks on the control loop for a serve loop that
+	// reported nothing — see its readDone arm). That window is bounded only by
+	// something else ending the instance, and two things do: the host's own read
+	// loop records the same peer close on its end of the socket and escalates it —
+	// this side is rescued by the host's escalation, not by its own — and the
+	// supervisor's wedge classifier catches a plugin whose consume progress has
+	// frozen with work still readable. Removing either leaves a plugin that is
+	// permanently wedged and advertising itself as healthy, which is why this side
+	// can afford to be quiet and the host cannot.
+	//
+	// This is where the two sides differ: the host escalates every class, because it
+	// is the owner that acts on a fault; this side hands the decision to the control
+	// loop it is about to park on.
+	//
+	// A local close records no failure at all, which is what keeps this side's own
+	// teardown on the quiet exit below.
+	switch class, failure := dataPlaneFailure(tr); class {
+	case rpcruntime.BurstFailurePoisoned:
+		// A poison the operation's own error did not carry, because a fault an
+		// underside's watcher observed can win the terminal transition against it. It is
+		// still the desync every operation on this connection is already reporting.
+		return true, errServeLoopPoisoned
+	case rpcruntime.BurstFailureIOError:
+		return true, fmt.Errorf("%w: %w", errServeLoopDataPlaneFailed, failure)
+	case rpcruntime.BurstFailurePeerClosed, rpcruntime.BurstFailureNone:
 	}
 
 	return true, nil // peer close / ErrClosed / ctx: not a self-initiated poison
@@ -1211,9 +1472,17 @@ func disposeRecvErr(err error) (done bool, loopErr error) {
 // max_payload (ErrPayloadTooLarge) — is the case that would otherwise reinstate
 // exactly the wait this function exists to end, on a connection kept healthy and a
 // call nothing else reaps. Ending the session converts it into a teardown the host
-// sees, which fails the call. A poison is reported as one so the supervisor
-// restarts the instance; every other failure is the quiet exit a peer close or a
-// done context takes.
+// sees, which fails the call. How it ends is the receive path's own
+// classification, shared rather than restated (terminalLoopExit): a poison, or a
+// data plane that failed as a whole, fails the instance so the supervisor
+// restarts it; every other failure is the quiet exit a peer close or a done
+// context takes.
+//
+// Sharing it is load-bearing, not tidiness. The fault that reaches here is
+// frame-local — it records no failure of its own — so a burst socket that died
+// while this frame was being disposed of is visible ONLY on the transport, and a
+// quiet exit here would park the serving phase on a still-live control loop with
+// a dead data plane under it.
 func answerDeclinedRequest(ctx context.Context, deps *serveDeps, err error) (done bool, loopErr error) {
 	var fault *transport.ConsumeFaultError
 	if !errors.As(err, &fault) || fault.Kind != transport.FrameUnaryReq {
@@ -1230,14 +1499,12 @@ func answerDeclinedRequest(ctx context.Context, deps *serveDeps, err error) (don
 	if serr == nil {
 		return false, nil
 	}
-	if errors.Is(serr, transport.ErrPoisoned) {
-		// A partially-written refusal desynced the data plane: fail the instance so
-		// the supervisor restarts it, rather than reading the poison as a benign peer
-		// close (design §9's poison teardown).
-		return true, errServeLoopPoisoned
-	}
 
-	return true, nil // peer close / ErrClosed / ctx / a refusal the ring would not take
+	// A partially-written refusal that desynced the data plane is reported as the
+	// poison it is rather than read as a benign peer close (design §9's poison
+	// teardown); a refusal the ring would not take, a peer close, or a done context
+	// takes the quiet exit — unless the transport itself has failed.
+	return terminalLoopExit(deps.tr, serr)
 }
 
 func serveOneFrame(ctx context.Context, deps *serveDeps) (done bool, loopErr error) {
@@ -1258,7 +1525,7 @@ func serveOneFrame(ctx context.Context, deps *serveDeps) (done bool, loopErr err
 			return sendDone, sendErr
 		}
 
-		return disposeRecvErr(err)
+		return disposeRecvErr(deps.tr, err)
 	}
 	f, req := deps.frame, deps.req
 	tr, srv, panicPolicy := deps.tr, deps.srv, deps.panicPolicy
@@ -1761,6 +2028,32 @@ type heartbeatProgress struct {
 	leases *rpcruntime.LeaseTable
 }
 
+// boundedReadReporter is the optional capability a transport implements when a
+// receive of its own can be parked inside a destructive read whose completion
+// something else bounds. It is probed for exactly like the other optional
+// transport capabilities the heartbeat reads (transport.FrameCounter,
+// transport.InboundQueueProber): a transport that does not implement it leaves
+// the report false, which is what every plugin reported before an oversize frame
+// could be carried over a socket at all.
+//
+// It is declared here rather than in internal/transport for the same reason
+// burstFaultReporter is: it is not a property a transport implementation is free
+// to offer. Whether a stalled consumer is excused rests on this answer, and a
+// second implementer would mean a second, unaudited way for a plugin to opt out
+// of the wedge check.
+type boundedReadReporter interface {
+	// BoundedReadActive reports whether such a read is in flight right now. It must
+	// be live state, not a latch, and must not extend past the read into anything
+	// unbounded that follows it.
+	BoundedReadActive() bool
+}
+
+// The composite is the one implementation, pinned at compile time: the heartbeat
+// reaches it only through the probe, so a rename or a signature change would
+// otherwise degrade silently into "this plugin is never inside a bounded read",
+// restarting healthy oversize transfers with nothing to point at.
+var _ boundedReadReporter = (*rpcruntime.BurstTransport)(nil)
+
 // newHeartbeatProgress wires the serving components a Heartbeat reports from.
 func newHeartbeatProgress(tr transport.Transport, leases *rpcruntime.LeaseTable) *heartbeatProgress {
 	return &heartbeatProgress{tr: tr, leases: leases}
@@ -1797,6 +2090,17 @@ func (p *heartbeatProgress) heartbeat(seq uint64, now time.Time) *controlpb.Hear
 		// never transport-wedged, the same safe degradation as an older plugin build.
 		if pr, ok := p.tr.(transport.InboundQueueProber); ok {
 			hb.InboundReadable = pr.ReadableNow()
+		}
+		// The third member of the same snapshot: whether the receive is parked
+		// inside a destructive read of one inbound frame. Consume frozen with
+		// inbound still readable is what a stalled consumer looks like AND what an
+		// oversize transfer in flight looks like, and only this report tells the
+		// two apart — so it is taken here, immediately after the other two, and not
+		// on some later pass whose answer would describe a different instant. A
+		// transport with no such read omits the capability and the report stays
+		// false, which is the pre-burst behavior exactly.
+		if br, ok := p.tr.(boundedReadReporter); ok {
+			hb.BoundedReadActive = br.BoundedReadActive()
 		}
 		hb.DescriptorsProducedP2H = fc.FramesSent()
 	}

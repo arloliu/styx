@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/arloliu/styx/internal/supervisor"
+	"github.com/arloliu/styx/internal/transport"
 	"github.com/stretchr/testify/require"
 )
 
@@ -151,6 +152,46 @@ func TestClassify_TruthTable(t *testing.T) {
 			wantClass: supervisor.HealthOK,
 			wantWedge: supervisor.WedgeNone,
 		},
+		{
+			// The plugin is inside a destructive read it cannot interrupt: the frame is
+			// not counted until it completes, and work queued behind it keeps inbound
+			// readable. That is a transfer in progress, not a stalled consumer, and the
+			// read has its own completion budget bounding it.
+			name: "healthy: a bounded read in flight is not a stalled consumer",
+			prev: supervisor.HeartbeatSample{DescriptorsConsumedH2P: 10},
+			cur: supervisor.HeartbeatSample{
+				DescriptorsConsumedH2P: 10, InboundReadable: true, BoundedReadActive: true,
+			},
+			wantClass: supervisor.HealthOK,
+			wantWedge: supervisor.WedgeNone,
+		},
+		{
+			// The read is over and the frame is counted; the plugin is hung somewhere
+			// past it with work still queued. Nothing bounds that, so it is the
+			// transport wedge it looks like.
+			name: "transport wedged: no bounded read covers the stall",
+			prev: supervisor.HeartbeatSample{DescriptorsConsumedH2P: 10},
+			cur: supervisor.HeartbeatSample{
+				DescriptorsConsumedH2P: 10, InboundReadable: true, BoundedReadActive: false,
+			},
+			wantClass: supervisor.HealthWedged,
+			wantWedge: supervisor.WedgeTransport,
+		},
+		{
+			// The bounded read excuses the consumer only. A response owed with no
+			// handler running for it is a different fault on a different counter, and a
+			// read in flight says nothing about it.
+			name: "dispatch wedged: a bounded read does not excuse an owed response",
+			prev: supervisor.HeartbeatSample{
+				DescriptorsConsumedH2P: 10, DescriptorsProducedP2H: 8, InflightCount: 1,
+			},
+			cur: supervisor.HeartbeatSample{
+				DescriptorsConsumedH2P: 10, DescriptorsProducedP2H: 8, InflightCount: 1,
+				InboundReadable: true, BoundedReadActive: true,
+			},
+			wantClass: supervisor.HealthWedged,
+			wantWedge: supervisor.WedgeDispatch,
+		},
 	}
 
 	for _, tt := range tests {
@@ -190,4 +231,21 @@ func TestClassify_ReturnsTransportWedge_WhenBothWedgeConditionsHold(t *testing.T
 	// Then
 	require.Equal(t, supervisor.HealthWedged, class)
 	require.Equal(t, supervisor.WedgeTransport, wedge)
+}
+
+// Test the ordering the bounded-read suppression rests on: while the plugin
+// reports a read in flight the wedge verdict is withheld, so the only thing left
+// watching that read is the socket's own completion budget. The budget's header
+// stage must therefore be the longer of the two, and it is — which is exactly the
+// trade the suppression makes. A read that never completes is recovered when the
+// budget expires, LATER than a wedge verdict would have restarted it, and in
+// exchange a healthy slow transfer is never restarted at all.
+//
+// The two constants are configured at different call sites for different reasons,
+// so nothing but this pin keeps the relationship: a wedge window lengthened past
+// the budget would leave the suppression watching nothing during the gap, and a
+// budget shortened below the window would make the suppression pointless.
+func TestWedgeWindow_IsShorterThanTheBudgetWatchingASuppressedRead(t *testing.T) {
+	require.Less(t, supervisor.DefaultWedgeWindow, transport.DefaultReceiveSlack,
+		"the socket's completion budget must outlast the wedge window it suppresses")
 }

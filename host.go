@@ -147,6 +147,22 @@ type PluginSpec struct {
 	// The zero value selects the default profile (GeometryDefault).
 	Geometry ShmGeometry
 
+	// BurstMaxPayload is the burst-path ceiling: the largest payload the burst
+	// socket will carry. It is enforced on the burst path by both sides --
+	// send-side before any byte leaves, receive-side before any allocation.
+	// Burst is opt-in per plugin: this Host offers the burst feature only when
+	// this is non-zero, and setting it is a deliberate memory grant this Host
+	// should size on purpose, not raise defensively. One value governs both
+	// directions; there is no separate host-to-plugin and plugin-to-host
+	// ceiling.
+	//
+	// Zero (the default) leaves the burst path off -- today's behavior,
+	// unchanged. A non-zero value must exceed the largest slab class configured
+	// in BOTH directions of Geometry (Geometry.HostToPlugin and
+	// Geometry.PluginToHost may differ); Start refuses anything else with a
+	// *ConfigError naming this field, before any plugin process is spawned.
+	BurstMaxPayload uint32
+
 	// MaxDataInflight is the peak number of concurrent data calls.
 	// Carried to the plugin so both sides admit identically.
 	// Ignored for the uds transport.
@@ -637,6 +653,9 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec, pinErr error) erro
 	if err := validateLivenessTuning(spec); err != nil {
 		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, err)
 	}
+	if err := validateBurstCeiling(spec); err != nil {
+		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, err)
+	}
 
 	// Reject a name whose prior instance has not finished stopping: its supervisor
 	// did not join before an earlier Stop's deadline, or before an abandoned start
@@ -883,6 +902,7 @@ func (h *Host) supervisorConfig(spec PluginSpec, cc *ClientConn, origin uint64) 
 		ShmLayout:       spec.Geometry.toLayout(),
 		MaxDataInflight: spec.MaxDataInflight,
 		StrictCapacity:  spec.StrictCapacity,
+		BurstMaxPayload: spec.BurstMaxPayload,
 
 		// The names differ on purpose: both sides mean the host's own wait for the
 		// next heartbeat, but "Interval" reads publicly as the plugin's send cadence,
@@ -943,6 +963,38 @@ func validateLivenessTuning(spec PluginSpec) error {
 		return &ConfigError{
 			Field:  "PluginSpec.WedgeWindow",
 			Reason: fmt.Sprintf("%s is negative; leave it zero for the default", spec.WedgeWindow),
+		}
+	}
+
+	return nil
+}
+
+// validateBurstCeiling refuses a PluginSpec.BurstMaxPayload this Host cannot
+// honor. Zero is never an error: it is how the field asks for the burst path
+// to stay off, so an unset spec passes unchanged.
+//
+// A non-zero ceiling must strictly exceed the largest slab class configured in
+// BOTH shared-memory directions (spec.Geometry's class tables may differ per
+// direction). The comparison is against the raw largest class, not the derived
+// shared-memory payload limit RegionBytes would compute: checksum overhead is
+// unknown at Start, and the raw class upper-bounds the derived limit in every
+// negotiation outcome, so this check needs no second pass once the checksum is
+// known and clamps nothing silently.
+func validateBurstCeiling(spec PluginSpec) error {
+	if spec.BurstMaxPayload == 0 {
+		return nil
+	}
+
+	hostToPlugin, pluginToHost := spec.Geometry.largestClasses()
+	largest := max(hostToPlugin, pluginToHost)
+	if spec.BurstMaxPayload <= largest {
+		return &ConfigError{
+			Field: "PluginSpec.BurstMaxPayload",
+			Reason: fmt.Sprintf(
+				"%d does not exceed %d, the largest slab class configured across both shared-memory "+
+					"directions; the burst ceiling must be strictly greater than the largest class in "+
+					"either direction",
+				spec.BurstMaxPayload, largest),
 		}
 	}
 

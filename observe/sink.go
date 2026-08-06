@@ -19,7 +19,9 @@ import "time"
 // The shared-memory transport implements the backpressure-edge capability
 // (zero until reject mode is negotiated), along with ring depth, arena
 // utilization, arena set-asides and resumes, wakeup syscalls, and consume
-// faults.
+// faults. A plugin whose burst routing was negotiated additionally reports the
+// burst-routing count, and its consume-fault count folds in the frames its
+// burst path discarded.
 const (
 	// MetricRPCLatency is the wall-clock duration of one host-side unary call,
 	// observed as a latency distribution.
@@ -83,6 +85,24 @@ const (
 	// MetricWakeupSyscalls is the eventfd wakeup rate, reported as a gauge
 	// (shared-memory transport only).
 	MetricWakeupSyscalls = "styx.wakeup.syscalls_per_sec"
+	// MetricBurstCount counts frames a plugin's transport committed to the burst
+	// path — the large-payload socket a burst-active tuple carries alongside its
+	// shared-memory data plane. It counts routing attempts, not wire use: a
+	// frame counts the moment routing selects the burst path and its size
+	// clears the negotiated ceiling, before the send that follows is attempted.
+	// A payload refused for exceeding the ceiling was never routed and is not
+	// counted; a payload that clears it counts once whatever the send that
+	// follows does — a pre-byte failure, one torn mid-frame, a caller that gave
+	// up waiting for the send path, or a fill that failed outright all still
+	// count, because the routing decision already answered the question this
+	// metric asks.
+	// It carries no direction label of its own: a host-side sample carries the
+	// plugin label naming which plugin, a plugin-side sample carries none, the
+	// same convention MetricBytesMoved follows.
+	// Reported only for a plugin whose burst routing was negotiated; a plugin
+	// running the shared-memory transport alone has no such path and reports
+	// nothing.
+	MetricBurstCount = "styx.burst.count"
 	// MetricConsumeFault counts inbound frames a side discarded because its own
 	// copy-or-decode step failed, rather than because the peer's bytes were bad.
 	// Each one fails the single call it names and leaves the connection healthy,
@@ -96,6 +116,15 @@ const (
 	// than on any nonzero value, and note that it is reported per side: the side
 	// whose run fired shows the climb, and its peer, torn down by the same event,
 	// may show nothing at all.
+	//
+	// For a plugin whose burst routing was negotiated, the count is the sum of
+	// its shared-memory component's own consume faults and the frames its burst
+	// path discarded. The two do not carry the same weight: a burst-path fault
+	// is scoped to the single call it names and never escalates on its own,
+	// however many arrive back to back, because only the shared-memory
+	// component runs the unbroken-run rule above. A climb in the sum is still
+	// worth watching, but a teardown it precedes is always the shared-memory
+	// component's doing.
 	MetricConsumeFault = "styx.consume.fault.count"
 	// MetricStdioDropped counts captured stdout/stderr lines a plugin's stdio
 	// capture discarded because its delivery queue was full: the downstream

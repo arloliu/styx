@@ -363,18 +363,58 @@ func asPluginPanic(err error) *PluginPanicError {
 	return panicErr
 }
 
-// connFaultDetected reports whether the read loop is exiting because THIS side
-// detected a data-plane fault that must escalate to the supervisor: a conformance
-// poison (cause == ErrPoisoned), or a connection-fatal terminal-CANCEL publication
-// failure the stream engine recorded (stream-protocol.md §9). A graceful local
-// teardown or an ordinary peer close is not a detected fault — the supervisor's
-// own control-plane monitoring owns those.
-func (state *connState) connFaultDetected(cause error) bool {
+// connFaultDetected reports whether the read loop is exiting because the data
+// plane failed in a way that must escalate to the supervisor, and the error every
+// PUBLISHED call is failed with when it does.
+//
+// Three sources answer it, and each has something the others cannot see:
+//   - a conformance poison this side detected (cause == ErrPoisoned);
+//   - a connection-fatal terminal-CANCEL publication failure the stream engine
+//     recorded (stream-protocol.md §9);
+//   - a data plane that failed as a whole while one of its undersides stayed
+//     healthy — a burst socket that closed or faulted alone, which no
+//     control-plane monitoring and no other reader can observe.
+//
+// A graceful local teardown escalates through none of them: the supervisor owns
+// its own shutdown, and re-triggering would double the teardown.
+//
+// The peer-close arm below carries a second load: it is what ends a plugin that
+// took the quiet exit on the same fault. That side deliberately does not fail its
+// instance on an orderly close of the burst socket — an ordinary teardown
+// manufactures exactly one, and it cannot tell the two apart — so it stops reading
+// and keeps heartbeating until something else ends it (terminalLoopExit in
+// pluginserver.go says so, and why). Dropping this arm leaves that plugin
+// permanently wedged and advertising itself as healthy, with only the supervisor's
+// wedge classifier left to catch it.
+//
+// The escalations differ in what they hand the calls they end. A poison and a
+// stream fatal fail published calls with the bare ErrOutcomeUnknown they have
+// always been failed with. A peer close or an I/O fault on the data plane is a
+// cause a caller can act on, so it is threaded through: the call reports an
+// unknown outcome WRAPPING the failure that produced it, since a bare sentinel
+// discards the answer at the one point that promised to carry it.
+func (state *connState) connFaultDetected(cause error) (bool, error) {
 	if errors.Is(cause, ErrPoisoned) {
-		return true
+		return true, ErrOutcomeUnknown
+	}
+	if state.streams != nil && state.streams.fatalErr() != nil {
+		return true, ErrOutcomeUnknown
 	}
 
-	return state.streams != nil && state.streams.fatalErr() != nil
+	// Read from the transport's own recorded failure rather than from the loop's
+	// exit error: a local Close racing a fault ends this loop with ErrClosed while
+	// the connection is genuinely failed, and the recorded cause is the one that
+	// says so. A local close records no failure at all, which is what keeps an
+	// ordinary teardown out of this branch.
+	switch class, failure := dataPlaneFailure(state.tr); class {
+	case rpcruntime.BurstFailurePoisoned:
+		return true, ErrOutcomeUnknown
+	case rpcruntime.BurstFailurePeerClosed, rpcruntime.BurstFailureIOError:
+		return true, terminalConnErr(failure)
+	case rpcruntime.BurstFailureNone:
+	}
+
+	return false, nil
 }
 
 // escalatePoison escalates a data-plane poison OpenStream detected on its
@@ -453,15 +493,21 @@ func runReadLoop(state *connState) {
 			state.streams.teardown(ErrOutcomeUnknown, ErrPluginUnavailable)
 		}
 
-		// If this side DETECTED a data-plane fault — a conformance poison, or a
-		// connection-fatal terminal-CANCEL failure the stream engine recorded —
-		// escalate to the connection owner (stream-protocol.md §9; design §9's poison
-		// teardown): fail in-flight unary calls so parked Invokes wake, and notify the
-		// supervisor so its restart policy runs. A graceful local teardown (ErrClosed)
-		// or an ordinary peer close does NOT escalate here — the supervisor already
-		// owns those, and re-triggering would double the teardown.
-		if state.connFaultDetected(cause) {
-			state.table.FailAll(ErrOutcomeUnknown, ErrPluginUnavailable)
+		// If the data plane FAILED — a conformance poison, a connection-fatal
+		// terminal-CANCEL failure the stream engine recorded, or a data plane that
+		// died while one of its undersides stayed healthy — escalate to the connection
+		// owner (stream-protocol.md §9; design §9's poison teardown): fail in-flight
+		// unary calls so parked Invokes wake, and notify the supervisor so its restart
+		// policy runs. A graceful local teardown (ErrClosed) does NOT escalate here —
+		// the supervisor already owns it, and re-triggering would double the teardown.
+		//
+		// dispatched is what a PUBLISHED call is failed with, and it varies by what
+		// failed: a poison keeps the bare ErrOutcomeUnknown, while a peer close or an
+		// I/O fault carries its own cause inside it. A SUBMITTED-but-unpublished call
+		// is retryable whatever ended the connection, so it is always
+		// ErrPluginUnavailable and never acquires a failure it provably never met.
+		if escalate, dispatched := state.connFaultDetected(cause); escalate {
+			state.table.FailAll(dispatched, ErrPluginUnavailable)
 			if state.notifyConnLost != nil {
 				state.notifyConnLost()
 			}
@@ -825,8 +871,17 @@ func translateReadLoopExit(err error) error {
 		// Local teardown closed the transport (graceful shutdown / hot-reload).
 		return ErrPluginUnavailable
 	default:
-		return fmt.Errorf("styx: connection closed: %w: %w", err, ErrOutcomeUnknown)
+		return terminalConnErr(err)
 	}
+}
+
+// terminalConnErr renders a not-locally-initiated end of the connection: the
+// failure that ended it, marked as an unknown outcome. The mark is what a caller
+// classifies retryability by — the call may have executed on the peer — and the
+// wrapped cause is what says why nobody can tell. Both must be reachable by
+// errors.Is, which is why it is one error wrapping two rather than a message.
+func terminalConnErr(err error) error {
+	return fmt.Errorf("styx: connection closed: %w: %w", err, ErrOutcomeUnknown)
 }
 
 // isFrameLocalRecvErr reports whether a transport.Recv error is confined to the

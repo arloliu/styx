@@ -343,15 +343,28 @@ func SetPluginAttachSHMFailAtForTest(f func(step string) error) func() {
 // test) and returning only the error. With a failpoint installed it exercises a
 // single partial-construction edge; the caller asserts fd/mapping counts around it.
 func (s *PluginServer) PluginAttachSHMForTest(ctx context.Context, conn *control.Conn, tuple control.Tuple) error {
-	tr, res, err := s.pluginAttachSHM(ctx, conn, tuple)
-	if tr != nil {
-		_ = tr.Close()
-	}
-	if res != nil {
-		res.close()
-	}
+	_, release, err := s.PluginAttachSHMTransportForTest(ctx, conn, tuple)
+	release()
 
 	return err
+}
+
+// PluginAttachSHMTransportForTest drives the plugin-side shared-memory attach and
+// hands back the data-plane transport it built, alongside a release func that
+// closes everything the attach produced. It is the seam for asserting WHAT the
+// attach built — a plain shared-memory transport or the burst composite over it —
+// where PluginAttachSHMForTest reports only whether the attach succeeded.
+func (s *PluginServer) PluginAttachSHMTransportForTest(
+	ctx context.Context, conn *control.Conn, tuple control.Tuple,
+) (transport.Transport, func(), error) {
+	tr, res, err := s.pluginAttachSHM(ctx, conn, tuple)
+
+	return tr, func() {
+		if tr != nil {
+			_ = tr.Close()
+		}
+		res.close()
+	}, err
 }
 
 // SetDuplicateUnaryResponseHookForTest installs a hook fired when a unary response (or
@@ -372,9 +385,11 @@ func SetDuplicateUnaryResponseHookForTest(f func(callID uint64)) func() {
 
 // DisposeRecvErrForTest exposes the serve loop's Recv-error disposition so a test
 // can assert which errors end the loop and which are skipped. done reports whether
-// the loop exits.
-func DisposeRecvErrForTest(err error) (done bool, loopErr error) {
-	return disposeRecvErr(err)
+// the loop exits. tr may be nil to stand for a transport with no data-plane
+// failure of its own to report, which is what every single-underside transport
+// answers.
+func DisposeRecvErrForTest(tr transport.Transport, err error) (done bool, loopErr error) {
+	return disposeRecvErr(tr, err)
 }
 
 // IsFrameLocalRecvErrForTest exposes the reader loops' shared frame-local
@@ -390,4 +405,29 @@ func IsFrameLocalRecvErrForTest(err error) bool {
 // directly, without a handshake or a real region.
 func (s *PluginServer) ShmConfigForTest(maxInflight int, tuple control.Tuple) shmtransport.Config {
 	return s.shmConfig(maxInflight, tuple)
+}
+
+// SetWriterStoppedHookForTest installs a hook invoked immediately after a
+// generation's data-plane writer has been stopped, and returns a restore func.
+// Test-only; unset in production.
+//
+// It exists because that step is the first thing a teardown does TO the
+// connection, and nothing outside the host can observe it. A test that tears an
+// instance down while a plugin handler is still running has to release that
+// handler after the writer stop, not merely after a step that implies one is
+// coming: the steps before it end calls and close admission, and a handler
+// released on either of those can return before the connection is touched at
+// all, which is the ordering such a test exists to exclude.
+//
+// The hook fires for EVERY generation this process tears down, so install it
+// before the teardown under test and restore it after.
+func SetWriterStoppedHookForTest(f func()) (restore func()) {
+	prev := writerStoppedHook.Load()
+	if f == nil {
+		writerStoppedHook.Store(nil)
+	} else {
+		writerStoppedHook.Store(&f)
+	}
+
+	return func() { writerStoppedHook.Store(prev) }
 }
