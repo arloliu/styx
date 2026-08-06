@@ -2,9 +2,12 @@ package difftest
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -844,4 +847,106 @@ func TestRunServeLoop_TakesTheBorrowedViewPath_OnlyOnSharedMemory(t *testing.T) 
 		require.Len(t, results, len(w.Calls))
 		require.Zero(t, viewed.Load(), "a transport with nothing to lend receives the ordinary way")
 	})
+}
+
+// burstPerSize is how many calls the boundary sweep issues at each of its five
+// payload sizes. It is small because the sizes, not the volume, are what this
+// sweep is about — and because every call above the boundary is a multi-megabyte
+// payload copied through a socket. More than one per size still matters: it makes
+// a size's calls concurrent with each other as well as with the other sizes.
+const burstPerSize = 2
+
+// Test that a composite routing by size over shared memory and a burst socket
+// agrees call for call with the pure uds oracle across its whole routing
+// boundary, and that the boundary really is where it says it is.
+//
+// The oracle has one data path and cannot route anything anywhere, so every
+// answer it gives is the answer the composite owes for the same call whichever
+// underside it chose. The agreement alone would still pass over a composite that
+// put every call on one underside, which is what the routed counts are for: only
+// the sizes ABOVE the inline limit may appear on the socket, and all of them must
+// — in both directions, since the plugin echoes each payload back at its own size.
+func TestRunDifferentialBurst_ProducesIdenticalResults_AcrossTheRoutingBoundary(t *testing.T) {
+	// Given a workload straddling the composite's own routing boundary.
+	var sizes []int
+	build := func(inlineMax, ceiling uint32) Workload {
+		sizes = BurstBoundarySizes(inlineMax, ceiling)
+
+		return GenerateBurstBoundaryWorkload(101, inlineMax, ceiling, burstPerSize)
+	}
+
+	// When replayed against the oracle and the composite.
+	run, err := RunDifferentialBurst(t.Context(), build)
+	require.NoError(t, err)
+
+	// Then the two arms agree call for call.
+	require.Len(t, run.UDS, len(run.Workload.Calls))
+	require.Len(t, run.Composite, len(run.Workload.Calls))
+	requireResultsEqual(t, run.UDS, run.Composite)
+
+	// And every call really succeeded with its own payload echoed, so the agreement
+	// above is between two working transports rather than two identically broken
+	// ones.
+	// Results come back in completion order; call IDs are assigned in Calls order
+	// before any call is issued (see Run's doc), so sorting by ID restores it.
+	inOrder := slices.SortedFunc(slices.Values(run.Composite),
+		func(a, b Result) int { return cmp.Compare(a.CallID, b.CallID) })
+	for i, spec := range run.Workload.Calls {
+		require.NoError(t, inOrder[i].Err, "call %d of %d bytes", i, len(spec.Payload))
+		require.Equal(t, spec.Payload, inOrder[i].Payload, "call %d of %d bytes", i, len(spec.Payload))
+	}
+
+	// And exactly the calls above the inline limit travelled the socket, in both
+	// directions: the size AT the limit stayed in the region, and the one a byte
+	// above it did not.
+	require.Len(t, sizes, 5, "the boundary sweep must cover all five sizes")
+	require.Equal(t, uint64(3*burstPerSize), run.HostRouted,
+		"only the three sizes above the inline limit may be routed onto the burst socket")
+	require.Equal(t, uint64(3*burstPerSize), run.PluginRouted,
+		"the plugin echoes each payload at its own size, so it must route the same calls back")
+}
+
+// Test that the error classes a call can end in agree between the composite and
+// the uds oracle when the call's payload is one only the burst socket can carry.
+//
+// A payload above the inline limit reaches the plugin over a different underside,
+// and every answer to it — an application status, a method that does not exist, a
+// service that does not exist — travels back over shared memory, since none of
+// those answers carries a payload at all. That mixed round trip is exactly where a
+// composite could mislabel an outcome, and the oracle is what says what each one
+// should have been.
+func TestRunDifferentialBurst_AgreesOnErrorClasses_ForPayloadsOnlyTheSocketCarries(t *testing.T) {
+	// Given one giant call per outcome class: a successful echo, an application
+	// error, an unknown method, and an unknown service.
+	build := func(inlineMax, _ uint32) Workload {
+		//nolint:gosec // deterministic test workload generation, not a security context
+		rng := rand.New(rand.NewSource(202))
+		giant := func() []byte {
+			p := make([]byte, int(inlineMax)+1)
+			_, _ = rng.Read(p)
+
+			return p
+		}
+
+		return Workload{Seed: 202, Calls: []CallSpec{
+			{Service: knownServiceID, Method: methodEcho, Payload: giant(), Kind: transport.FrameUnaryReq},
+			{Service: knownServiceID, Method: methodAppErr, Payload: giant(), Kind: transport.FrameUnaryReq},
+			{Service: knownServiceID, Method: methodUnknown, Payload: giant(), Kind: transport.FrameUnaryReq},
+			{Service: unknownServiceID, Method: methodEcho, Payload: giant(), Kind: transport.FrameUnaryReq},
+		}}
+	}
+
+	// When replayed against the oracle and the composite.
+	run, err := RunDifferentialBurst(t.Context(), build)
+	require.NoError(t, err)
+
+	// Then the two arms agree on every outcome, error classes included.
+	requireResultsEqual(t, run.UDS, run.Composite)
+
+	// And each request did travel the socket, while none of the answers did: every
+	// one of these outcomes but the echo is a status with no payload.
+	require.Equal(t, uint64(len(run.Workload.Calls)), run.HostRouted,
+		"every request here is above the inline limit")
+	require.Equal(t, uint64(1), run.PluginRouted,
+		"only the echoed answer is large enough to need the socket")
 }
