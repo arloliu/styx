@@ -115,10 +115,12 @@ type ResponseEnvelope struct {
 // check ctx.Done() runs to completion, per ordinary context.Context semantics.
 // Dispatch invokes the handler inline and returns the Frame(s) to send; it never
 // touches the Transport.
-// The caller (the single reader goroutine) is expected to run each Dispatch on
-// its own goroutine and hand the returned Frames to the single writer goroutine,
-// which preserves both the single-reader and single-writer invariants while
-// letting a CANCEL Frame be processed concurrently with the handler it cancels.
+// The only production caller (pluginserver.go's runServeLoop) calls Dispatch
+// inline on its single reader goroutine, not on a goroutine of its own: a slow
+// handler blocks that reader until it returns, so unary handlers execute
+// serially, in transport arrival order. A CANCEL Frame naming the running call
+// is not even read until the handler returns, which is why cancellation is
+// best-effort rather than preemptive (see the Dispatcher doc above).
 type Dispatcher struct {
 	mu       sync.Mutex
 	services map[uint64]ServiceHandler     // keyed by FNV-64 service ID (assigned by generated code)
