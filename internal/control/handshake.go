@@ -24,6 +24,29 @@ const (
 	TransportUDS = "uds"
 )
 
+// FeatureBurst is the stable handshake feature-flag name for routing an
+// oversize unary payload over a second, negotiated socket instead of the
+// region. It resolves true only when both sides offer it (the usual
+// both-sides-offer rule); an old peer that never offers it resolves false.
+// Feature resolution is independent of transport selection: a tuple may
+// resolve burst=true on the shared-memory transport as well as uds, and the
+// flag alone does not put burst routing into use.
+const FeatureBurst = "burst"
+
+// BurstActive reports whether burst routing is in use for one generation, given
+// that generation's acknowledged tuple and the burst_max_payload the host put on
+// its AttachRegion. It is a conjunction, not a flag: the feature must have
+// resolved true, the transport must be shared memory (the only transport with an
+// inline path to route against), and the ceiling must be non-zero.
+//
+// Both sides evaluate it from the same two inputs so they agree on how many
+// descriptors the attach carries and whether a burst socket exists at all. On a
+// uds tuple the feature is dormant by construction: the uds attach carries no
+// ceiling, so this is false however the feature resolved.
+func BurstActive(tuple Tuple, burstMaxPayload uint32) bool {
+	return tuple.Transport == TransportSHM && tuple.Features[FeatureBurst] && burstMaxPayload != 0
+}
+
 // ShmLayoutVersion is the shared-memory region layout version this build speaks.
 // An Offer that lists the shared-memory transport advertises this value; Negotiate
 // selects the highest version common to both sides.

@@ -208,6 +208,68 @@ func TestNegotiate_AllowsUnsupportedOptionalFeature(t *testing.T) {
 	require.False(t, tuple.Features["checksum"])
 }
 
+// Test Negotiate resolving the burst feature flag under every offer
+// combination: it reads true only when both sides offer it, and an old peer
+// that never offers it resolves false rather than erroring (burst is never
+// required by either side here, matching an old peer that has no idea the
+// flag exists).
+func TestNegotiate_ResolvesBurstFlag_AcrossOfferCombinations(t *testing.T) {
+	base := func(offersBurst bool) control.Offer {
+		o := control.Offer{ProtocolMin: 1, ProtocolMax: 1, Transports: []string{"uds"}, Codecs: []string{"proto"}}
+		if offersBurst {
+			o.Features = []control.FeatureFlag{{Name: control.FeatureBurst}}
+		}
+
+		return o
+	}
+
+	cases := []struct {
+		name                     string
+		hostOffers, pluginOffers bool
+		wantResolved             bool
+	}{
+		{name: "both sides offer burst", hostOffers: true, pluginOffers: true, wantResolved: true},
+		{name: "host offers burst, plugin does not", hostOffers: true, pluginOffers: false, wantResolved: false},
+		{name: "plugin offers burst, host does not", hostOffers: false, pluginOffers: true, wantResolved: false},
+		{name: "neither side offers burst", hostOffers: false, pluginOffers: false, wantResolved: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// When
+			tuple, err := control.Negotiate(base(tc.hostOffers), base(tc.pluginOffers), nil)
+
+			// Then
+			require.NoError(t, err)
+			require.Equal(t, tc.wantResolved, tuple.Features[control.FeatureBurst])
+		})
+	}
+}
+
+// Test that burst activation is the full conjunction and not the flag alone.
+// The flag resolves independently of transport selection, so a legal
+// uds-with-burst tuple exists and must stay dormant: no burst socket, no fourth
+// attach descriptor, today's wiring on both sides. A zero ceiling means the same
+// for the generation, whatever the flag says. Both sides call this to agree on
+// how many descriptors the attach carries, so a rule that fired on any narrower
+// input would put one side's expectation out of step with the other's.
+func TestBurstActive_RequiresFlagAndSharedMemoryAndCeiling(t *testing.T) {
+	tuple := func(transport string, flag bool) control.Tuple {
+		return control.Tuple{Transport: transport, Features: map[string]bool{control.FeatureBurst: flag}}
+	}
+
+	require.True(t, control.BurstActive(tuple(control.TransportSHM, true), 1<<20),
+		"shared memory + the negotiated flag + a ceiling activates the burst path")
+	require.False(t, control.BurstActive(tuple(control.TransportSHM, true), 0),
+		"a zero ceiling leaves the burst path off for this generation")
+	require.False(t, control.BurstActive(tuple(control.TransportSHM, false), 1<<20),
+		"a ceiling without the negotiated flag activates nothing")
+	require.False(t, control.BurstActive(tuple(control.TransportUDS, true), 1<<20),
+		"the flag is dormant on a uds tuple: there is no inline path to route against")
+	require.False(t, control.BurstActive(control.Tuple{Transport: control.TransportSHM}, 1<<20),
+		"a tuple with no feature map resolves the flag false")
+}
+
 // Test the nonce round-trip: OfferToHello embeds a caller-supplied nonce and
 // VerifyNonce rejects a HelloAck whose echoed nonce does not match, returning
 // ErrProtocolViolation (guards against attaching to a stale/foreign
