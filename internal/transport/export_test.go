@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -17,6 +18,16 @@ func SetPeekSyscallForTest(
 	peekSyscall = fn
 
 	return func() { peekSyscall = prev }
+}
+
+// SetWriteSyscallForTest swaps the frame write path's write(2) syscall seam so a
+// transport_test can inject a fault mid-frame, and returns a restore func. Test-only;
+// not part of the package's public API.
+func SetWriteSyscallForTest(fn func(fd int, p []byte) (int, error)) (restore func()) {
+	prev := writeSyscall
+	writeSyscall = fn
+
+	return func() { writeSyscall = prev }
 }
 
 // SetSetsockoptTimevalForTest swaps the socket-timeout syscall seam and
@@ -63,4 +74,24 @@ func EncodeHeaderForTest(f Frame, payloadLen uint32, streaming bool) []byte {
 // of the package's public API.
 func (t *UDSTransport) FD() int {
 	return t.fd
+}
+
+// BodyBudgetForTest re-exports the body stage's budget derivation, normalization
+// included, so a test can pin the exact deadline a declared size buys — including
+// the ceiling of its rate term — without going through the wire. Test-only; not
+// part of the package's public API.
+func BodyBudgetForTest(b ReceiveBudget, size uint32) time.Duration {
+	return b.normalized().bodyBudget(size)
+}
+
+// SetReceiveDeadlineArmHookForTest installs a hook invoked with each receive stage's
+// deadline as that stage arms it, and returns a restore func. It lets a test wait for
+// the very deadline it is about to cross, so it crosses one the receive provably
+// holds — and a receive that arms nothing fails that wait promptly instead of parking
+// the test. Test-only; nil in production.
+func SetReceiveDeadlineArmHookForTest(fn func(deadline time.Time)) (restore func()) {
+	prev := receiveDeadlineArmHook
+	receiveDeadlineArmHook = fn
+
+	return func() { receiveDeadlineArmHook = prev }
 }

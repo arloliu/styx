@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1358,4 +1359,753 @@ func TestNewUDSTransport_ReturnsError_WhenInitialTimeoutProgrammingFails(t *test
 	// of the caller's. A still-open fd answers getsockopt without error.
 	_, sockErr := unix.GetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_TYPE)
 	require.NoError(t, sockErr, "the constructor must not close the caller-owned fd on failure")
+}
+
+// newTransportPairWithOpts builds a connected uds transport pair, both ends
+// constructed with the same options, so a per-connection frame limit set on
+// one end matches what the other end expects to send or receive.
+func newTransportPairWithOpts(t *testing.T, opts ...transport.UDSOption) (a, b *transport.UDSTransport) {
+	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	a, err = transport.NewUDSTransport(fds[0], false, opts...)
+	require.NoError(t, err)
+	b, err = transport.NewUDSTransport(fds[1], false, opts...)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+
+	return a, b
+}
+
+// Test that WithMaxFrame raises the per-connection frame ceiling above the
+// package-wide MaxFrameSize default, so a payload that would be rejected on
+// a default-constructed transport round-trips intact on this one.
+func TestUDSTransport_WithMaxFrame_RoundTripsPayloadAboveDefaultLimit(t *testing.T) {
+	// Given: a pair constructed with a 4 MiB per-connection limit, and a
+	// 2 MiB payload — above the 1 MiB default, below the raised ceiling.
+	// 2 MiB is far larger than the default kernel socket buffers, so Send
+	// must run concurrently with Recv or it blocks forever on a full send
+	// buffer nobody is draining.
+	a, b := newTransportPairWithOpts(t, transport.WithMaxFrame(4<<20))
+	payload := make([]byte, 2<<20)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	f := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: payload}
+
+	// When
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- a.Send(t.Context(), f) }()
+	got, recvErr := b.Recv(t.Context())
+
+	// Then
+	require.NoError(t, <-sendErr)
+	require.NoError(t, recvErr)
+	require.Equal(t, payload, got.Payload)
+}
+
+// Test that a declared length above a raised per-connection limit still
+// poisons the connection instead of draining an untrusted length — the same
+// poison-don't-drain mechanism the package default uses, just against the
+// per-connection bound rather than the package constant.
+func TestUDSTransport_WithMaxFrame_RejectsDeclaredLengthAboveLimit_Poisons(t *testing.T) {
+	// Given: a pair constructed with a 4 MiB limit, and a peer that declares
+	// one byte more than that limit without ever sending payload bytes.
+	a, b := newTransportPairWithOpts(t, transport.WithMaxFrame(4<<20))
+	oversizedFrame := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq}
+	header := transport.EncodeHeaderForTest(oversizedFrame, 4<<20+1, false)
+	_, err := unix.Write(a.FD(), header)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	// When
+	_, err = b.Recv(ctx)
+
+	// Then: rejected before blocking on payload bytes that were never sent.
+	require.Error(t, err)
+	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+	require.NotErrorIs(t, err, context.DeadlineExceeded,
+		"must reject the declared length before blocking on payload bytes that were never sent")
+
+	// And: the connection is poisoned, not merely desynchronized-and-recovered.
+	_, err = b.Recv(t.Context())
+	require.ErrorIs(t, err, transport.ErrClosed)
+}
+
+// Test that a default-constructed transport (no WithMaxFrame option) still
+// enforces exactly MaxFrameSize on the send side, bit-for-bit as before this
+// option existed — a peer that never negotiated burst gets today's tight guard.
+func TestUDSTransport_DefaultConstructed_StillRejectsSendAboveMaxFrameSize(t *testing.T) {
+	// Given: a transport built with no options at all.
+	a, _ := newTransportPairWithOpts(t)
+	f := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: make([]byte, transport.MaxFrameSize+1)}
+
+	// When
+	err := a.Send(t.Context(), f)
+
+	// Then
+	require.Error(t, err)
+	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+}
+
+// Test that a default-constructed transport (no WithMaxFrame option) still
+// enforces exactly MaxFrameSize on the receive side's declared-length bound,
+// poisoning on an over-limit declaration exactly as before this option existed.
+func TestUDSTransport_DefaultConstructed_StillRejectsDeclaredLengthAboveMaxFrameSize(t *testing.T) {
+	// Given: a transport pair built with no options, and a peer that declares
+	// one byte more than MaxFrameSize.
+	a, b := newTransportPairWithOpts(t)
+	oversizedFrame := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq}
+	header := transport.EncodeHeaderForTest(oversizedFrame, transport.MaxFrameSize+1, false)
+	_, err := unix.Write(a.FD(), header)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	// When
+	_, err = b.Recv(ctx)
+
+	// Then
+	require.Error(t, err)
+	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+	require.NotErrorIs(t, err, context.DeadlineExceeded,
+		"must reject the declared length before blocking on payload bytes that were never sent")
+}
+
+// newTransportPairWithFatalObserver builds a connected uds transport pair like
+// newTestTransportPair, except a is constructed with a fatal observer so a test can
+// assert on its ErrPoisoned-wrapping call. The peer end is only kept alive so a's
+// socket stays connected; callers that don't need it get just a back.
+func newTransportPairWithFatalObserver(t *testing.T, observer func(error)) (a *transport.UDSTransport) {
+	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	a, err = transport.NewUDSTransport(fds[0], false, transport.WithFatalObserver(observer))
+	require.NoError(t, err)
+	b, err := transport.NewUDSTransport(fds[1], false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+
+	return a
+}
+
+// Test that a write fault injected mid-frame runs the fatal observer with the
+// ErrPoisoned-wrapping error, and — the load-bearing assertion — that the observer's
+// call completes before Close publishes closed=true to any other goroutine. A
+// concurrent WaitReadable call (the same call a routing pump would make) is used as
+// the outside observer: while the fatal observer is held on its own barrier,
+// WaitReadable must still be blocked, never having seen closed=true; only after the
+// barrier releases may it return ErrClosed.
+func TestUDSTransport_Send_WriteFault_ObserverCompletesBeforeCloseIsObservable(t *testing.T) {
+	// Given
+	inObserver := make(chan struct{})
+	releaseObserver := make(chan struct{})
+	var observerCalls atomic.Int32
+	var observedErr error
+	a := newTransportPairWithFatalObserver(t, func(err error) {
+		observerCalls.Add(1)
+		observedErr = err
+		close(inObserver)
+		<-releaseObserver
+	})
+
+	injected := errors.New("injected write fault")
+	var writeCalls atomic.Int32
+	restore := transport.SetWriteSyscallForTest(func(fd int, p []byte) (int, error) {
+		if writeCalls.Add(1) == 1 {
+			return unix.Write(fd, p) // let the header reach the wire for real: started becomes true
+		}
+
+		return 0, injected // fault on the body write, mid-frame
+	})
+	t.Cleanup(restore)
+
+	f := transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: make([]byte, 4096)}
+
+	// When
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- a.Send(t.Context(), f) }()
+
+	<-inObserver // abortFrame has published the poison to the observer, but not yet called Close
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- a.WaitReadable(t.Context()) }()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("WaitReadable returned %v while the fatal observer still held the barrier; "+
+			"Close must never be observable before the observer completes", err)
+	case <-time.After(100 * time.Millisecond):
+		// still blocked, as required: closed=true is not yet published
+	}
+
+	close(releaseObserver)
+
+	// Then
+	require.ErrorIs(t, <-sendErr, transport.ErrPoisoned)
+	require.Equal(t, int32(1), observerCalls.Load(), "the observer runs at most once")
+	require.ErrorIs(t, observedErr, transport.ErrPoisoned,
+		"the observer receives the error abortFrame returns, wrapping ErrPoisoned")
+
+	select {
+	case err := <-waitDone:
+		require.ErrorIs(t, err, transport.ErrClosed)
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitReadable did not observe the close within 2s of the observer releasing")
+	}
+}
+
+// Test that an ordinary Close (no poisoning involved) never invokes the fatal
+// observer: the observer is a poison-only seam, and firing it on a routine
+// shutdown would make a composite transport treat clean teardown as terminal
+// failure.
+func TestUDSTransport_Close_DoesNotInvokeFatalObserver(t *testing.T) {
+	// Given
+	var calls atomic.Int32
+	a := newTransportPairWithFatalObserver(t, func(error) { calls.Add(1) })
+
+	// When
+	require.NoError(t, a.Close())
+
+	// Then
+	require.Zero(t, calls.Load(), "a plain Close must not invoke the fatal observer")
+}
+
+// Test that WaitReadable wakes on an inbound frame without consuming it: the frame
+// remains fully intact for a subsequent Recv, proving WaitReadable is the same
+// non-destructive MSG_PEEK wait RecvReserving's reserve callback relies on, not a
+// destructive read.
+func TestUDSTransport_WaitReadable_WakesWithoutConsumingFrame(t *testing.T) {
+	// Given
+	a, b := newTestTransportPair(t)
+	require.NoError(t, a.Send(t.Context(),
+		transport.Frame{CallID: 3, Kind: transport.FrameUnaryReq, Payload: []byte("payload")}))
+
+	// When
+	require.NoError(t, b.WaitReadable(t.Context()))
+
+	// Then: the frame is still there, untouched, for Recv to deliver.
+	got, err := b.Recv(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), got.CallID)
+	require.Equal(t, []byte("payload"), got.Payload)
+}
+
+// Test that WaitReadable returns the context's error, not a timeout or a
+// transport error, when ctx is canceled while it is parked in the readiness peek.
+func TestUDSTransport_WaitReadable_ReturnsCtxErr_OnCancel(t *testing.T) {
+	// Given
+	_, b := newTestTransportPair(t)
+	ctx, cancel := context.WithCancel(t.Context())
+
+	entered := make(chan struct{})
+	var enterOnce sync.Once
+	restore := transport.SetReadinessWaitHookForTest(func() {
+		enterOnce.Do(func() { close(entered) })
+	})
+	t.Cleanup(restore)
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- b.WaitReadable(ctx) }()
+	<-entered // b is now parked in the readiness peek
+
+	// When
+	cancel()
+
+	// Then
+	select {
+	case err := <-waitErr:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitReadable did not observe context cancellation within 2s")
+	}
+}
+
+// Test that WaitReadable returns the transport's terminal error, ErrClosed, once
+// the transport has been closed — matching every other wait/read entry point's
+// convention (recvCore, writeFull, fdReader.Read all report ErrClosed the same way).
+func TestUDSTransport_WaitReadable_ReturnsErrClosed_AfterClose(t *testing.T) {
+	// Given
+	_, b := newTestTransportPair(t)
+	require.NoError(t, b.Close())
+
+	// When
+	err := b.WaitReadable(t.Context())
+
+	// Then
+	require.ErrorIs(t, err, transport.ErrClosed)
+}
+
+// budgetTestBase is the instant every receive-budget test starts its manual clock
+// at, so an armed deadline is an exact, printable value rather than "now plus
+// something".
+var budgetTestBase = time.Date(2026, time.August, 5, 12, 0, 0, 0, time.UTC)
+
+// manualClock is the transport.Clock a receive-budget test drives by hand: the
+// receive path observes exactly the instant the test last set, so a stage's
+// budget boundary is crossed deliberately instead of waited out in wall time.
+type manualClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newManualClock() *manualClock { return &manualClock{now: budgetTestBase} }
+
+func (c *manualClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.now
+}
+
+func (c *manualClock) set(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = now
+}
+
+// budgetArms records, in order, every stage deadline a receive arms: the first is
+// the header stage's, the second the body stage's. A test waits for the arm it is
+// about to cross, so it advances the clock past a deadline the receive provably
+// holds — and a receive that arms no deadline at all fails that wait in seconds
+// instead of parking the test until the suite's timeout.
+type budgetArms struct {
+	mu    sync.Mutex
+	seen  []time.Time
+	armed chan time.Time
+}
+
+func newBudgetArms(t *testing.T) *budgetArms {
+	t.Helper()
+	a := &budgetArms{armed: make(chan time.Time, 16)}
+	t.Cleanup(transport.SetReceiveDeadlineArmHookForTest(a.record))
+
+	return a
+}
+
+func (a *budgetArms) record(deadline time.Time) {
+	a.mu.Lock()
+	a.seen = append(a.seen, deadline)
+	a.mu.Unlock()
+	a.armed <- deadline
+}
+
+// next returns the next armed deadline, failing the test if none arrives.
+func (a *budgetArms) next(t *testing.T) time.Time {
+	t.Helper()
+	select {
+	case d := <-a.armed:
+		return d
+	case <-time.After(2 * time.Second):
+		t.Fatal("the receive armed no stage deadline within 2s")
+
+		return time.Time{}
+	}
+}
+
+// count reports how many stage deadlines have been armed so far. Call it only
+// once the receive under test has returned, when no further arm can race it.
+func (a *budgetArms) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return len(a.seen)
+}
+
+// newBudgetedTransportPair builds a connected pair whose recv end carries budget
+// (and observer, when non-nil); peer is the raw-writing stalling peer, driven
+// through its fd so a test can send a header with no body behind it.
+func newBudgetedTransportPair(
+	t *testing.T, budget transport.ReceiveBudget, observer func(error),
+) (peer, recv *transport.UDSTransport) {
+	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	peer, err = transport.NewUDSTransport(fds[0], false)
+	require.NoError(t, err)
+
+	opts := []transport.UDSOption{transport.WithReceiveBudget(budget)}
+	if observer != nil {
+		opts = append(opts, transport.WithFatalObserver(observer))
+	}
+	recv, err = transport.NewUDSTransport(fds[1], false, opts...)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = peer.Close(); _ = recv.Close() })
+
+	return peer, recv
+}
+
+// recvOutcome is one Recv call's complete result, ferried off the reader goroutine.
+type recvOutcome struct {
+	frame transport.Frame
+	err   error
+}
+
+// recvAsync runs one Recv on its own goroutine so the test can advance the clock
+// while the receive is parked mid-frame.
+func recvAsync(ctx context.Context, tr *transport.UDSTransport) <-chan recvOutcome {
+	out := make(chan recvOutcome, 1)
+	go func() {
+		f, err := tr.Recv(ctx)
+		out <- recvOutcome{frame: f, err: err}
+	}()
+
+	return out
+}
+
+// awaitRecv returns the pending receive's outcome, failing the test rather than
+// blocking forever if the bound under test never fires.
+func awaitRecv(t *testing.T, out <-chan recvOutcome) recvOutcome {
+	t.Helper()
+	select {
+	case o := <-out:
+		return o
+	case <-time.After(3 * time.Second):
+		t.Fatal("Recv did not return within 3s of its budget expiring")
+
+		return recvOutcome{}
+	}
+}
+
+// writeRaw writes every byte of b to fd, looping over short writes.
+func writeRaw(t *testing.T, fd int, b []byte) {
+	t.Helper()
+	for len(b) > 0 {
+		n, err := unix.Write(fd, b)
+		require.NoError(t, err)
+		b = b[n:]
+	}
+}
+
+// Test the body-stage budget derivation: slack plus a rate term that always
+// rounds up, so no declared size — one byte least of all — buys a zero-cost
+// body, and the largest declarable size still derives an exact budget.
+func TestReceiveBudget_DerivesBodyBudget_WithCeilingRateTerm(t *testing.T) {
+	defaults := transport.ReceiveBudget{}
+	tests := []struct {
+		name   string
+		budget transport.ReceiveBudget
+		size   uint32
+		want   time.Duration
+	}{
+		{"empty body costs slack alone", defaults, 0, 30 * time.Second},
+		{"one byte still costs a whole rate term", defaults, 1, 31 * time.Second},
+		{"64 KiB fits inside one rate term", defaults, 64 << 10, 31 * time.Second},
+		{"exactly one rate unit costs one term", defaults, 1 << 20, 31 * time.Second},
+		{"one byte past a rate unit rounds up to two", defaults, (1 << 20) + 1, 32 * time.Second},
+		{"the largest declarable size", defaults, math.MaxUint32, 30*time.Second + 4096*time.Second},
+		{
+			"custom slack and rate",
+			transport.ReceiveBudget{Slack: 5 * time.Second, MinRate: 1000},
+			1500,
+			7 * time.Second,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given the budget and declared size of this case
+
+			// When
+			got := transport.BodyBudgetForTest(tc.budget, tc.size)
+
+			// Then
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// Test the body-stage budget saturating instead of wrapping when its slack and
+// rate terms together exceed what a time.Duration can hold — a wrapped sum would
+// arm a deadline in the past and tear every frame instantly.
+func TestReceiveBudget_SaturatesBodyBudget_WhenSlackPlusRateTermOverflows(t *testing.T) {
+	// Given
+	budget := transport.ReceiveBudget{Slack: time.Duration(math.MaxInt64), MinRate: 1}
+
+	// When
+	got := transport.BodyBudgetForTest(budget, math.MaxUint32)
+
+	// Then
+	require.Equal(t, time.Duration(math.MaxInt64), got)
+}
+
+// Test a body that completes just inside its stage budget being delivered whole:
+// the contract is a completion bound, so a transfer whose average rate is far
+// under MinRate still succeeds as long as it finishes before the derived deadline.
+func TestUDSTransport_Recv_DeliversFrame_WhenBodyCompletesInsideBudget(t *testing.T) {
+	// Given
+	clock := newManualClock()
+	arms := newBudgetArms(t)
+	budget := transport.ReceiveBudget{Clock: clock}
+	peer, recv := newBudgetedTransportPair(t, budget, nil)
+
+	const declared = 64 << 10
+	payload := make([]byte, declared)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	writeRaw(t, peer.FD(), transport.EncodeHeaderForTest(
+		transport.Frame{CallID: 7, Kind: transport.FrameUnaryReq}, declared, false))
+	writeRaw(t, peer.FD(), payload[:128]) // a body prefix; the rest arrives late, but in time
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+
+	// When
+	out := recvAsync(ctx, recv)
+	headerDeadline := arms.next(t)
+	bodyDeadline := arms.next(t)
+	clock.set(bodyDeadline.Add(-time.Nanosecond)) // one tick inside the body budget
+	writeRaw(t, peer.FD(), payload[128:])
+
+	// Then
+	got := awaitRecv(t, out)
+	require.NoError(t, got.err)
+	require.Equal(t, payload, got.frame.Payload)
+	require.Equal(t, budgetTestBase.Add(transport.DefaultReceiveSlack), headerDeadline)
+	require.Equal(t, budgetTestBase.Add(transport.BodyBudgetForTest(budget, declared)), bodyDeadline)
+	require.Equal(t, 2, arms.count())
+}
+
+// Test a body that stalls past its stage budget tearing the frame: the body-stage
+// deadline (not the header's, and not the caller's far-later one) expires, the
+// abort latches poison through the fatal observer, and the connection is closed.
+func TestUDSTransport_Recv_PoisonsTransport_WhenBodyBudgetExpires(t *testing.T) {
+	// Given
+	clock := newManualClock()
+	arms := newBudgetArms(t)
+	observed := make(chan error, 4)
+	budget := transport.ReceiveBudget{Clock: clock}
+	peer, recv := newBudgetedTransportPair(t, budget, func(err error) { observed <- err })
+
+	const declared = 64 << 10
+	writeRaw(t, peer.FD(), transport.EncodeHeaderForTest(
+		transport.Frame{CallID: 7, Kind: transport.FrameUnaryReq}, declared, false))
+	writeRaw(t, peer.FD(), make([]byte, 128)) // a body prefix, then the peer stops
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute) // far later than the budget
+	defer cancel()
+
+	// When
+	out := recvAsync(ctx, recv)
+	headerDeadline := arms.next(t)
+	bodyDeadline := arms.next(t)
+	clock.set(bodyDeadline.Add(time.Nanosecond)) // one tick past the body budget
+
+	// Then
+	got := awaitRecv(t, out)
+	require.ErrorIs(t, got.err, transport.ErrReceiveBudgetExpired)
+	require.ErrorIs(t, got.err, transport.ErrPoisoned)
+	require.Equal(t, budgetTestBase.Add(transport.DefaultReceiveSlack), headerDeadline)
+	require.Equal(t, budgetTestBase.Add(transport.BodyBudgetForTest(budget, declared)), bodyDeadline)
+	require.Equal(t, 2, arms.count())
+
+	select {
+	case err := <-observed:
+		require.ErrorIs(t, err, transport.ErrReceiveBudgetExpired)
+		require.ErrorIs(t, err, transport.ErrPoisoned)
+	default:
+		t.Fatal("the fatal observer was not invoked for a budget-torn frame")
+	}
+
+	require.ErrorIs(t, recv.Send(t.Context(), transport.Frame{CallID: 8, Kind: transport.FrameUnaryReq}),
+		transport.ErrClosed)
+}
+
+// Test a peer that stalls mid-header tearing the frame on the header stage's own
+// budget: one consumed byte is enough to make the abort fatal, and the body stage
+// never arms because no declared size was ever decoded.
+func TestUDSTransport_Recv_PoisonsTransport_WhenHeaderBudgetExpiresMidHeader(t *testing.T) {
+	// Given
+	clock := newManualClock()
+	arms := newBudgetArms(t)
+	observed := make(chan error, 4)
+	budget := transport.ReceiveBudget{Slack: 10 * time.Second, Clock: clock}
+	peer, recv := newBudgetedTransportPair(t, budget, func(err error) { observed <- err })
+
+	writeRaw(t, peer.FD(), []byte{0x00}) // one header byte, then the peer stops
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute) // far later than the budget
+	defer cancel()
+
+	// When
+	out := recvAsync(ctx, recv)
+	headerDeadline := arms.next(t)
+	clock.set(headerDeadline.Add(time.Nanosecond)) // one tick past the header budget
+
+	// Then
+	got := awaitRecv(t, out)
+	require.ErrorIs(t, got.err, transport.ErrReceiveBudgetExpired)
+	require.ErrorIs(t, got.err, transport.ErrPoisoned)
+	require.Equal(t, budgetTestBase.Add(10*time.Second), headerDeadline)
+	require.Equal(t, 1, arms.count(), "the body stage must not arm before a header decodes")
+
+	select {
+	case err := <-observed:
+		require.ErrorIs(t, err, transport.ErrPoisoned)
+	default:
+		t.Fatal("the fatal observer was not invoked for a budget-torn header")
+	}
+}
+
+// Test the header stage's budget expiring before any byte was consumed being
+// non-fatal: nothing was consumed and nothing reserved, so the connection stays
+// usable and the fatal observer never runs.
+func TestUDSTransport_Recv_ReturnsBudgetExpiry_WithoutPoison_WhenNothingConsumed(t *testing.T) {
+	// Given
+	clock := newManualClock()
+	arms := newBudgetArms(t)
+	observed := make(chan error, 4)
+	budget := transport.ReceiveBudget{Slack: 10 * time.Second, Clock: clock}
+	peer, recv := newBudgetedTransportPair(t, budget, func(err error) { observed <- err })
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute) // far later than the budget
+	defer cancel()
+
+	// When
+	out := recvAsync(ctx, recv)
+	headerDeadline := arms.next(t)
+	clock.set(headerDeadline.Add(time.Nanosecond))
+
+	// Then
+	got := awaitRecv(t, out)
+	require.ErrorIs(t, got.err, transport.ErrReceiveBudgetExpired)
+	require.NotErrorIs(t, got.err, transport.ErrPoisoned)
+	require.Empty(t, observed, "an expiry that consumed nothing is not a fatal event")
+
+	// The connection survived: a frame sent afterwards still round-trips.
+	clock.set(budgetTestBase) // a fresh receive gets a fresh budget
+	require.NoError(t, peer.Send(t.Context(), transport.Frame{
+		CallID: 9, Kind: transport.FrameUnaryReq, Payload: []byte("after"),
+	}))
+	next := awaitRecv(t, recvAsync(ctx, recv))
+	require.NoError(t, next.err)
+	require.Equal(t, []byte("after"), next.frame.Payload)
+}
+
+// Test the caller's own deadline winning when it is earlier than the internal
+// budget, in both the pre-first-byte (non-fatal) and mid-frame (poisoning) cases:
+// the effective deadline is the earlier of the two, and an expiry the budget did
+// not cause is never reported as a budget expiry.
+func TestUDSTransport_Recv_PrefersCallerDeadline_WhenItIsEarlierThanBudget(t *testing.T) {
+	t.Run("before the first destructive byte", func(t *testing.T) {
+		// Given
+		clock := newManualClock() // never advanced: the 30s budget cannot expire
+		arms := newBudgetArms(t)
+		observed := make(chan error, 4)
+		budget := transport.ReceiveBudget{Clock: clock}
+		peer, recv := newBudgetedTransportPair(t, budget, func(err error) { observed <- err })
+
+		ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+		defer cancel()
+
+		// When
+		got := awaitRecv(t, recvAsync(ctx, recv))
+
+		// Then
+		require.ErrorIs(t, got.err, context.DeadlineExceeded)
+		require.NotErrorIs(t, got.err, transport.ErrReceiveBudgetExpired)
+		require.NotErrorIs(t, got.err, transport.ErrPoisoned)
+		require.Empty(t, observed)
+		require.Equal(t, budgetTestBase.Add(transport.DefaultReceiveSlack), arms.next(t))
+
+		// The connection survived the caller's own deadline.
+		require.NoError(t, peer.Send(t.Context(), transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq}))
+		next := awaitRecv(t, recvAsync(t.Context(), recv))
+		require.NoError(t, next.err)
+	})
+
+	t.Run("after a byte was consumed", func(t *testing.T) {
+		// Given
+		clock := newManualClock() // never advanced: the 30s budget cannot expire
+		arms := newBudgetArms(t)
+		observed := make(chan error, 4)
+		budget := transport.ReceiveBudget{Clock: clock}
+		peer, recv := newBudgetedTransportPair(t, budget, func(err error) { observed <- err })
+		writeRaw(t, peer.FD(), []byte{0x00}) // one header byte, then the peer stops
+
+		ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+		defer cancel()
+
+		// When
+		got := awaitRecv(t, recvAsync(ctx, recv))
+
+		// Then
+		require.ErrorIs(t, got.err, context.DeadlineExceeded)
+		require.ErrorIs(t, got.err, transport.ErrPoisoned)
+		require.NotErrorIs(t, got.err, transport.ErrReceiveBudgetExpired)
+		require.Equal(t, budgetTestBase.Add(transport.DefaultReceiveSlack), arms.next(t))
+		require.NotEmpty(t, observed, "a torn frame is fatal whichever clock tore it")
+	})
+}
+
+// Test a transport constructed without a receive budget arming no deadline at
+// all: a plain uds connection is still bound only by its caller's context and its
+// own close, exactly as before the budget existed.
+func TestUDSTransport_Recv_ArmsNoDeadline_WhenConstructedWithoutBudget(t *testing.T) {
+	// Given
+	arms := newBudgetArms(t)
+	peer, recv := newTestTransportPair(t)
+	writeRaw(t, peer.FD(), []byte{0x00}) // one header byte, then the peer stops
+
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancel()
+
+	// When
+	got := awaitRecv(t, recvAsync(ctx, recv))
+
+	// Then
+	require.ErrorIs(t, got.err, context.DeadlineExceeded)
+	require.NotErrorIs(t, got.err, transport.ErrReceiveBudgetExpired)
+	require.ErrorIs(t, got.err, transport.ErrPoisoned) // torn mid-header, as it always was
+	require.Zero(t, arms.count())
+}
+
+// Test that a receive budget arms only after the reserving path's readiness wait: an
+// idle connection parks in that wait indefinitely instead of expiring on the header
+// stage the way a bare Recv does. The two entry points differ exactly here, and a
+// caller that parks on one while polling the other depends on the difference.
+func TestUDSTransport_RecvReserving_ArmsNoBudget_WhileParkedInReadinessWait(t *testing.T) {
+	// Given
+	clock := newManualClock()
+	arms := newBudgetArms(t)
+	budget := transport.ReceiveBudget{Slack: 10 * time.Second, Clock: clock}
+	peer, recv := newBudgetedTransportPair(t, budget, nil)
+
+	parked := make(chan struct{}, 1)
+	t.Cleanup(transport.SetReadinessWaitHookForTest(func() {
+		select {
+		case parked <- struct{}{}:
+		default: // the readiness wait polls; one signal is enough
+		}
+	}))
+
+	out := make(chan recvOutcome, 1)
+	go func() {
+		f, err := recv.RecvReserving(t.Context(), func() {})
+		out <- recvOutcome{frame: f, err: err}
+	}()
+
+	select {
+	case <-parked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the reserving receive never reached the readiness wait")
+	}
+
+	// When: the clock jumps far past any header-stage budget while the socket is idle
+	// and the reader is provably parked before its first destructive read.
+	clock.set(budgetTestBase.Add(time.Hour))
+
+	// Then
+	require.Zero(t, arms.count(), "no stage may arm before readiness commits")
+
+	// The parked reader is alive, not expired: a frame sent now is still delivered.
+	require.NoError(t, peer.Send(t.Context(), transport.Frame{
+		CallID: 3, Kind: transport.FrameUnaryReq, Payload: []byte("late"),
+	}))
+	got := awaitRecv(t, out)
+	require.NoError(t, got.err)
+	require.Equal(t, []byte("late"), got.frame.Payload)
 }

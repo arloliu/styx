@@ -2404,6 +2404,66 @@ func TestTransport_PayloadAboveOneMiB_RoundTrips_WhenGeometryAllows(t *testing.T
 	require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
 }
 
+// asymmetricPayloadLayout gives the two directions different largest slabs (4096
+// for H->P, 8192 for P->H), so a test can tell each side's send limit from its
+// receive limit instead of the two coinciding by accident.
+func asymmetricPayloadLayout() shm.Layout {
+	return shm.Layout{
+		Generation:       9,
+		RingCapacity:     64,
+		LifecycleReserve: 8,
+		Arenas: [2]shm.ArenaGeometry{
+			shm.HostToPlugin: {Classes: []shm.SizeClass{{SlabSize: 64, SlabCount: 8}, {SlabSize: 4096, SlabCount: 4}}},
+			shm.PluginToHost: {Classes: []shm.SizeClass{{SlabSize: 64, SlabCount: 8}, {SlabSize: 8192, SlabCount: 4}}},
+		},
+	}
+}
+
+// Test that MaxSendPayload and MaxRecvPayload report exactly the derived
+// per-direction limits Send and the receive-side conformance check use, on an
+// asymmetric geometry where the two directions' limits differ: MaxSendPayload is
+// the precise boundary at which Send flips from accept to ErrPayloadTooLarge, and
+// each side's MaxRecvPayload equals the peer's MaxSendPayload, since both derive
+// from the same shared region geometry (shm-abi.md §18). Checked with the
+// checksum feature off and on, since the 4-byte CRC32C trailer changes both
+// derived limits identically and must not break the cross-side equality.
+func TestTransport_MaxPayloadAccessors_MatchSendBoundaryAndPeerLimit(t *testing.T) {
+	for _, checksum := range []bool{false, true} {
+		t.Run(fmt.Sprintf("checksum=%v", checksum), func(t *testing.T) {
+			// MaxPayload 0 => derive the per-direction limit from the geometry, with
+			// no caller ceiling to obscure it.
+			cfg := Config{MaxInflight: 56, DataQueueDepth: 8, LifecycleQueueDepth: 8, Checksum: checksum}
+			ep := newEndpoints(t, asymmetricPayloadLayout(), cfg)
+
+			overhead := uint32(0)
+			if checksum {
+				overhead = crc32TrailerLen
+			}
+			require.Equal(t, uint32(4096)-overhead, ep.host.MaxSendPayload())
+			require.Equal(t, uint32(8192)-overhead, ep.plugin.MaxSendPayload())
+
+			// Each side's inbound limit is the peer's outbound limit: both derive from
+			// the same region geometry, with no wire field carrying it.
+			require.Equal(t, ep.plugin.MaxSendPayload(), ep.host.MaxRecvPayload())
+			require.Equal(t, ep.host.MaxSendPayload(), ep.plugin.MaxRecvPayload())
+
+			// A payload exactly at the reported send limit is accepted...
+			atLimit := make([]byte, ep.host.MaxSendPayload())
+			require.NoError(t, ep.host.Send(t.Context(),
+				transport.Frame{CallID: 1, Kind: transport.FrameUnaryReq, Payload: atLimit}))
+			got := recvOne(t, ep.plugin)
+			require.Equal(t, atLimit, got.Payload)
+
+			// ...one byte over it is not: MaxSendPayload is the exact boundary, not an
+			// approximation.
+			overLimit := make([]byte, ep.host.MaxSendPayload()+1)
+			err := ep.host.Send(t.Context(),
+				transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq, Payload: overLimit})
+			require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+		})
+	}
+}
+
 // Test that Transport.Close is idempotent and never double-closes the duplicated
 // region fd, even after that fd number has been reused by a later open. The
 // sync.Once guard makes the second Close a no-op, so it cannot close an unrelated
@@ -3704,7 +3764,7 @@ func TestTransport_RecvViewConsume_BoundsTheFaultDetail_WhenTheCallbackPanicsWit
 	// Then the reason is clipped to the budget, marked as clipped, and still UTF-8.
 	var fault *transport.ConsumeFaultError
 	require.ErrorAs(t, err, &fault)
-	require.LessOrEqual(t, len(fault.Detail), faultDetailMaxBytes+len("... (truncated)"))
+	require.LessOrEqual(t, len(fault.Detail), transport.FaultDetailMaxBytes+len("... (truncated)"))
 	require.Contains(t, fault.Detail, "(truncated)")
 	require.True(t, utf8.ValidString(fault.Detail))
 	require.Equal(t, uint64(1), ep.plugin.lastSeen, "bounding the reason does not change the disposition")

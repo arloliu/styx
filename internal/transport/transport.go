@@ -28,8 +28,10 @@ var ErrUnimplementedFrameKind = errors.New("transport: unimplemented frame kind"
 // ErrPayloadTooLarge is returned when a payload exceeds the limit the transport
 // bounds it by, always before any write or allocation for that payload:
 //
-//   - Send, when a Frame's Payload exceeds MaxFrameSize;
-//   - Recv, when a peer's declared payload length exceeds MaxFrameSize;
+//   - Send, when a Frame's Payload exceeds the transport's frame limit
+//     (MaxFrameSize by default);
+//   - Recv, when a peer's declared payload length exceeds the transport's frame
+//     limit (MaxFrameSize by default);
 //   - PayloadFillSender.SendPayloadFill, when the declared size exceeds the
 //     transport's per-direction max payload — which is derived from the
 //     transport's own geometry and may be ABOVE MaxFrameSize, so the sentinel
@@ -674,10 +676,42 @@ type WakeupSyscallCounter interface {
 // these, and the recorded teardown reason cannot say so. Without this count an
 // operator cannot tell such a teardown from an ordinary one. Only the shared-memory
 // transport has that behavior; uds omits this capability.
+//
+// A burst-active composite reports the sum of two sources: its shared-memory
+// component's own consume faults, plus the frames its large-payload socket path
+// discarded. The two sources do not behave alike. Every socket-path fault is
+// scoped to the single call it names and never escalates, however many arrive
+// back to back — only the shared-memory component runs the run-based teardown
+// rule described above, so a climb that reaches it is always the shared-memory
+// component's doing.
 type ConsumeFaultCounter interface {
 	// ConsumeFaults reports the cumulative consumer-owned consume-fault count as a
 	// cheap snapshot.
 	ConsumeFaults() uint64
+}
+
+// BurstCounter is an optional Transport capability exposing the cumulative count
+// of frames a burst-capable transport committed to its large-payload socket
+// path, the giant-payload channel it carries alongside its ordinary
+// shared-memory data plane. Only a burst-active composite implements it; every
+// other transport, including the shared-memory transport on its own, omits the
+// capability.
+//
+// It counts routing attempts, not wire use: a frame counts the moment the
+// routing decision selects the socket path and its size clears admission
+// (at or below the negotiated ceiling), before any send is attempted. A
+// payload refused for exceeding the ceiling was never routed and is not
+// counted. Everything after that point counts once whatever the send that
+// follows does — a send that fails before a byte moves, one torn mid-frame, a
+// caller that gave up waiting for the send path before its fill ran, or a
+// fill that failed outright — because the question this metric answers, how
+// often a payload this size occurs, is already answered by the routing
+// decision alone. Counts are cumulative and monotonic within one transport
+// instance; a decrease signals a fresh transport after restart.
+type BurstCounter interface {
+	// BurstCount reports the cumulative count of frames routed onto the burst
+	// path as a cheap snapshot.
+	BurstCount() uint64
 }
 
 // ArenaCarry is one outbound size class's arena-exhaustion stall counts.
