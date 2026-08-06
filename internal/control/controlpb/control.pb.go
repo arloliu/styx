@@ -794,6 +794,11 @@ type AttachRegion struct {
 	// MaxInflight (shm-abi.md §18's deadlock-freedom bound is C - R; the host may
 	// select any value at or below it). Carried only on a shared-memory attach.
 	MaxDataInflight uint32 `protobuf:"varint,5,opt,name=max_data_inflight,json=maxDataInflight,proto3" json:"max_data_inflight,omitempty"`
+	// burst_max_payload is the host-selected byte ceiling above which a unary
+	// payload routes over the burst socket instead of the region, when the
+	// burst feature flag has resolved true. Zero means the host did not select
+	// a value (burst dormant on this attach even if the flag resolved true).
+	BurstMaxPayload uint32 `protobuf:"varint,6,opt,name=burst_max_payload,json=burstMaxPayload,proto3" json:"burst_max_payload,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -859,6 +864,13 @@ func (x *AttachRegion) GetFdCount() uint32 {
 func (x *AttachRegion) GetMaxDataInflight() uint32 {
 	if x != nil {
 		return x.MaxDataInflight
+	}
+	return 0
+}
+
+func (x *AttachRegion) GetBurstMaxPayload() uint32 {
+	if x != nil {
+		return x.BurstMaxPayload
 	}
 	return 0
 }
@@ -975,8 +987,17 @@ type Heartbeat struct {
 	// build, or a transport that cannot probe its inbound queue) reports false and is
 	// never transport-wedged.
 	InboundReadable bool `protobuf:"varint,7,opt,name=inbound_readable,json=inboundReadable,proto3" json:"inbound_readable,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// bounded_read_active is the plugin's own report, taken in the same
+	// snapshot as inbound_readable, of live state, not a latch: true only
+	// while the destructive read of a burst frame is in progress, and false
+	// again once that read completes, including for the whole time the frame
+	// spends in delivery (the consume callback runs with this bit already
+	// false). It lets the host distinguish a plugin blocked reading a burst
+	// payload from one that is actually wedged. A plugin that never sets it
+	// (an older build, or burst dormant) reports false.
+	BoundedReadActive bool `protobuf:"varint,8,opt,name=bounded_read_active,json=boundedReadActive,proto3" json:"bounded_read_active,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Heartbeat) Reset() {
@@ -1054,6 +1075,13 @@ func (x *Heartbeat) GetLeases() []*ActiveHandlerLease {
 func (x *Heartbeat) GetInboundReadable() bool {
 	if x != nil {
 		return x.InboundReadable
+	}
+	return false
+}
+
+func (x *Heartbeat) GetBoundedReadActive() bool {
+	if x != nil {
+		return x.BoundedReadActive
 	}
 	return false
 }
@@ -1669,7 +1697,7 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\bservices\x18\n" +
 	" \x03(\v2\x1c.styx.control.ServiceVersionR\bservices\x12/\n" +
 	"\x13incompatible_reason\x18\v \x01(\tR\x12incompatibleReason\x126\n" +
-	"\fplugin_offer\x18\f \x01(\v2\x13.styx.control.HelloR\vpluginOffer\"\xbd\x01\n" +
+	"\fplugin_offer\x18\f \x01(\v2\x13.styx.control.HelloR\vpluginOffer\"\xe9\x01\n" +
 	"\fAttachRegion\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\x04R\n" +
@@ -1678,12 +1706,13 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"layoutSize\x12%\n" +
 	"\x0elayout_version\x18\x03 \x01(\rR\rlayoutVersion\x12\x19\n" +
 	"\bfd_count\x18\x04 \x01(\rR\afdCount\x12*\n" +
-	"\x11max_data_inflight\x18\x05 \x01(\rR\x0fmaxDataInflight\"\x11\n" +
+	"\x11max_data_inflight\x18\x05 \x01(\rR\x0fmaxDataInflight\x12*\n" +
+	"\x11burst_max_payload\x18\x06 \x01(\rR\x0fburstMaxPayload\"\x11\n" +
 	"\x0fAttachRegionAck\"\x8c\x01\n" +
 	"\x12ActiveHandlerLease\x12\x17\n" +
 	"\acall_id\x18\x01 \x01(\x04R\x06callId\x12&\n" +
 	"\x0fstart_unix_nano\x18\x02 \x01(\x03R\rstartUnixNano\x125\n" +
-	"\x17lease_renewed_unix_nano\x18\x03 \x01(\x03R\x14leaseRenewedUnixNano\"\xdb\x02\n" +
+	"\x17lease_renewed_unix_nano\x18\x03 \x01(\x03R\x14leaseRenewedUnixNano\"\x8b\x03\n" +
 	"\tHeartbeat\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x128\n" +
 	"\x18descriptors_consumed_h2p\x18\x02 \x01(\x04R\x16descriptorsConsumedH2p\x128\n" +
@@ -1691,7 +1720,8 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\x0einflight_count\x18\x04 \x01(\x04R\rinflightCount\x122\n" +
 	"\x15arena_occupancy_bytes\x18\x05 \x01(\x04R\x13arenaOccupancyBytes\x128\n" +
 	"\x06leases\x18\x06 \x03(\v2 .styx.control.ActiveHandlerLeaseR\x06leases\x12)\n" +
-	"\x10inbound_readable\x18\a \x01(\bR\x0finboundReadable\"*\n" +
+	"\x10inbound_readable\x18\a \x01(\bR\x0finboundReadable\x12.\n" +
+	"\x13bounded_read_active\x18\b \x01(\bR\x11boundedReadActive\"*\n" +
 	"\fHeartbeatAck\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\"5\n" +
 	"\x05Drain\x12,\n" +

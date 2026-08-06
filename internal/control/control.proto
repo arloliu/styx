@@ -99,6 +99,11 @@ message AttachRegion {
   // MaxInflight (shm-abi.md §18's deadlock-freedom bound is C - R; the host may
   // select any value at or below it). Carried only on a shared-memory attach.
   uint32 max_data_inflight = 5;
+  // burst_max_payload is the host-selected byte ceiling above which a unary
+  // payload routes over the burst socket instead of the region, when the
+  // burst feature flag has resolved true. Zero means the host did not select
+  // a value (burst dormant on this attach even if the flag resolved true).
+  uint32 burst_max_payload = 6;
 }
 message AttachRegionAck {}
 
@@ -122,6 +127,15 @@ message Heartbeat {
   // build, or a transport that cannot probe its inbound queue) reports false and is
   // never transport-wedged.
   bool inbound_readable = 7;
+  // bounded_read_active is the plugin's own report, taken in the same
+  // snapshot as inbound_readable, of live state, not a latch: true only
+  // while the destructive read of a burst frame is in progress, and false
+  // again once that read completes, including for the whole time the frame
+  // spends in delivery (the consume callback runs with this bit already
+  // false). It lets the host distinguish a plugin blocked reading a burst
+  // payload from one that is actually wedged. A plugin that never sets it
+  // (an older build, or burst dormant) reports false.
+  bool bounded_read_active = 8;
 }
 message HeartbeatAck { uint64 sequence = 1; }
 

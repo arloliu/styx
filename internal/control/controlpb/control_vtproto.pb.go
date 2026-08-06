@@ -896,6 +896,11 @@ func (m *AttachRegion) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.BurstMaxPayload != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.BurstMaxPayload))
+		i--
+		dAtA[i] = 0x30
+	}
 	if m.MaxDataInflight != 0 {
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.MaxDataInflight))
 		i--
@@ -1034,6 +1039,16 @@ func (m *Heartbeat) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 	if m.unknownFields != nil {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
+	}
+	if m.BoundedReadActive {
+		i--
+		if m.BoundedReadActive {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x40
 	}
 	if m.InboundReadable {
 		i--
@@ -2001,6 +2016,9 @@ func (m *AttachRegion) SizeVT() (n int) {
 	if m.MaxDataInflight != 0 {
 		n += 1 + protohelpers.SizeOfVarint(uint64(m.MaxDataInflight))
 	}
+	if m.BurstMaxPayload != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.BurstMaxPayload))
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -2062,6 +2080,9 @@ func (m *Heartbeat) SizeVT() (n int) {
 		}
 	}
 	if m.InboundReadable {
+		n += 2
+	}
+	if m.BoundedReadActive {
 		n += 2
 	}
 	n += len(m.unknownFields)
@@ -4206,6 +4227,25 @@ func (m *AttachRegion) UnmarshalVT(dAtA []byte) error {
 					break
 				}
 			}
+		case 6:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field BurstMaxPayload", wireType)
+			}
+			m.BurstMaxPayload = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.BurstMaxPayload |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -4565,6 +4605,26 @@ func (m *Heartbeat) UnmarshalVT(dAtA []byte) error {
 				}
 			}
 			m.InboundReadable = bool(v != 0)
+		case 8:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field BoundedReadActive", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.BoundedReadActive = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
