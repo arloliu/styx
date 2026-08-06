@@ -33,6 +33,7 @@ to a reasonable value:
 | `Geometry`          | zero value (selects `GeometryDefault()`) | The shape of the shared-memory region, when the shared-memory transport is used. See [Shared-memory geometry](#shared-memory-geometry). |
 | `MaxDataInflight`   | `0` (derived from `Geometry`) | The peak number of concurrent data calls this host admits. |
 | `StrictCapacity`    | `false`        | Opts into an extra, up-front capacity check described in [Shared-memory geometry](#shared-memory-geometry). |
+| `BurstMaxPayload`   | `0` (burst path off) | The ceiling, in bytes, on a payload routed over the burst socket instead of the shared-memory region. See [The burst path for oversize payloads](#the-burst-path-for-oversize-payloads). |
 | `HeartbeatTimeout`  | `0` (one second) | How long the host waits for the plugin's next heartbeat before counting a miss. See [Tuning liveness detection](#tuning-liveness-detection). |
 | `MissedHeartbeatThreshold` | `0` (three) | How many consecutive missed heartbeats declare the instance unhealthy. |
 | `WedgeWindow`       | `0` (five seconds) | How long a stalled data plane must keep stalling before the instance is declared unhealthy for it. |
@@ -409,6 +410,73 @@ So the guidance above is the mechanism: size the container from
 `RegionBytes()` and the arithmetic in this section. If a deployment hits an
 out-of-memory kill despite doing that, the decision record is the place to
 start reopening it.
+
+## The burst path for oversize payloads
+
+`Geometry`'s size-class tables cap what a shared-memory call can carry: a
+unary payload larger than the largest configured slab in its direction is
+rejected outright rather than served from an oversized class. `BurstMaxPayload`
+raises that ceiling for the calls that need it, by routing anything too big
+for the region over a second, dedicated Unix domain socket instead.
+
+```go
+styx.PluginSpec{
+    Name:            "reporter",
+    Path:            "/opt/plugins/reporter",
+    BurstMaxPayload: 8 << 20, // up to 8 MiB, above the region's own ceiling
+}
+```
+
+`BurstMaxPayload` is the burst-path ceiling: the largest payload the burst
+socket will carry. It is enforced on the burst path by both sides — send-side
+before any byte leaves, receive-side before any allocation. Burst is opt-in
+per plugin: a `Host` offers the burst feature to a plugin only when this field
+is non-zero, and setting it is a deliberate memory grant this host should size
+on purpose, not raise defensively. One value governs both directions; there is
+no separate host-to-plugin and plugin-to-host ceiling.
+
+Zero (the default) leaves the burst path off — today's behavior, unchanged.
+Every unary payload above the region's ceiling still fails with
+`ErrPayloadTooLarge`, exactly as it did before this field existed.
+
+A non-zero value must exceed the largest slab class configured in **both**
+directions of `Geometry` (`Geometry.HostToPlugin` and `Geometry.PluginToHost`
+may differ). `Start` refuses anything else with a `*ConfigError` naming
+`PluginSpec.BurstMaxPayload`, before any plugin process is spawned — a burst
+ceiling that does not sit strictly above the region's own ceiling could never
+be reached, since anything that fits the region is routed there first.
+
+Routing itself needs no configuration: a payload at or under the sending
+direction's largest shared-memory slab class, less any negotiated per-frame
+overhead, goes through the region as before; a larger one, up to
+`BurstMaxPayload`, goes over the burst socket; a payload above
+`BurstMaxPayload` is refused up front with `ErrPayloadTooLarge`, before
+anything is published. The burst socket carries only oversize unary request
+and response payloads — every stream frame, and every unary payload within
+the region's own ceiling, stays on shared memory unchanged.
+
+### Receive-budget defaults on the burst socket
+
+Each side bounds how long it will wait for a burst payload to finish arriving,
+so a peer that sends a header and then stalls cannot park the receiver
+indefinitely. The bound has two stages: a header stage with a fixed budget,
+and a body stage whose budget grows with the declared payload size. The
+documented defaults are:
+
+- **30 seconds of slack** — the header stage's whole budget, and the constant
+  term added to the body stage's budget.
+- **A 1 MiB/s rate floor** — the divisor behind the body stage's size-derived
+  term, so a larger declared payload buys a proportionally larger budget on
+  top of the slack.
+
+These are receiver-local policy, not negotiated between host and plugin: each
+side enforces only its own inbound reads, so a version mismatch in them is
+harmless asymmetry (the stricter reader gives up on a stalled frame sooner)
+rather than a protocol disagreement. Because of that, the documented defaults
+are the tightest budget a sender may ever be held to: a future release may
+only loosen them — more slack, a lower rate floor — because tightening them
+would retroactively make a conforming sender nonconforming, and doing that
+requires a new feature flag rather than a silent default change.
 
 ## Tuning liveness detection
 

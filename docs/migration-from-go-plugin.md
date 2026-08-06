@@ -278,6 +278,42 @@ rung's 8 slabs — so a STRICT host on the default profile is admitted only at a
 `PluginSpec.Geometry` with class counts matched to the bound it wants
 certified.
 
+## Call ordering
+
+Cross-call ordering between separate unary `Invoke`s is not a contract, and
+was never one to rely on. A unary `Invoke` blocks its caller until the
+response arrives, so the only order a caller can actually construct between
+two calls is causal — await the first call's response, then send the
+second — and causal order survives however each call happens to be routed
+internally, because the second call's request cannot be sent before the
+first call's response exists. Two calls issued from concurrent goroutines
+race on their own send admission; their relative arrival order was never
+derivable by the application in the first place, so nothing about routing
+takes anything away that a caller could previously depend on.
+
+Handler concurrency does not change: the plugin runs one serve loop and
+dispatches one handler at a time, in the order requests arrive, exactly as
+before. What can change is only which of two causally-unrelated requests a
+plugin happens to pick up first, when they are eligible to arrive by
+different paths (for example, a small payload carried inline versus a large
+one carried on the burst socket described in
+[docs/configuration.md](configuration.md#the-burst-path-for-oversize-payloads)).
+Since those two requests had no derivable order to begin with, this is not a
+new source of nondeterminism, only a new reason an existing one can occur.
+
+Cancellation gains one more best-effort window from the same cause. A
+`CANCEL` for a request that was itself carried on the burst socket can now
+arrive at the plugin before that request has been recorded in the plugin's
+in-flight-call table; when that happens, the `CANCEL` finds nothing to
+cancel and is silently ignored, and the plugin runs the handler for that
+request to completion instead of stopping partway through. The caller's own
+outcome is unaffected either way — it already treated its call as canceled
+locally, and a response that arrives afterward is discarded rather than
+delivered. This is not a new kind of unreliability: cancellation was always
+best-effort (a handler that never checks its context runs to completion
+regardless), and this is one additional window in which that best effort
+does not land.
+
 ## Streaming
 
 Both frameworks support gRPC-style streaming. In Styx the generated code gives you
