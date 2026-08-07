@@ -5,6 +5,55 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-07
+
+Adds the burst path: oversize unary payloads stop being a hard limit.
+
+### Added
+
+- **Size-based transport routing for oversize unary payloads.** A message
+  larger than the shared-memory limit was rejected outright, and the only
+  remedy — sizing a slab class for rare giants — converted the reservation
+  into permanently resident memory and let one parked giant head-of-line
+  block its whole direction. Set the new `PluginSpec.BurstMaxPayload`
+  ceiling and such a message now travels a second, generation-scoped
+  Unix-socket byte stream whose memory cost is transient: allocated per
+  transfer, garbage on completion, region RSS untouched. Zero (the
+  default) keeps today's behavior exactly; a message above the ceiling is
+  still rejected with `ErrPayloadTooLarge` before any byte moves.
+
+  The shared-memory ABI is unchanged — no layout field, no descriptor
+  flag, no `layout_version` bump. The path is negotiated per plugin, so a
+  peer built before this release simply keeps today's behavior. Only
+  unary request and response frames are eligible; streaming, lifecycle,
+  and status frames always travel shared memory, which is what keeps
+  every ordering guarantee intact. The receiver enforces the routing
+  rule: nonconforming traffic on the burst socket condemns the connection
+  before any call or stream state can observe it.
+
+  Every burst failure lands in an existing error class with its existing
+  meaning. A transfer a peer stalls is bounded by a receive-completion
+  budget (30-second slack plus a 1 MiB/s rate floor; the documented
+  defaults may only loosen in future releases) and restarts the instance
+  instead of parking it, and a slow-but-conforming giant no longer risks
+  a false transport-wedge restart.
+
+- **`styx.burst.count` metric** — messages routed to the burst path,
+  counted at the routing decision. A rising rate is the signal that
+  giants are frequent enough to deserve a larger shared-memory geometry
+  instead of routing.
+
+### Changed
+
+- **Cross-call unary ordering is now explicitly documented as not a
+  contract** (`docs/migration-from-go-plugin.md`). The only order a
+  caller can construct is causal — await one call's response before
+  sending the next — and causal order is preserved regardless of which
+  transport each call takes. The already-best-effort nature of
+  cancellation gains one documented window: a cancel can arrive before
+  the routed request it names, in which case the handler runs to
+  completion while the caller keeps its local cancelled outcome.
+
 ## [0.3.1] - 2026-08-03
 
 Closes the stderr-loss window v0.3.0 shipped with and named.
@@ -276,6 +325,7 @@ Initial release.
 - **Migration guide** from `hashicorp/go-plugin`
   (`docs/migration-from-go-plugin.md`).
 
+[0.4.0]: https://github.com/arloliu/styx/releases/tag/v0.4.0
 [0.3.1]: https://github.com/arloliu/styx/releases/tag/v0.3.1
 [0.3.0]: https://github.com/arloliu/styx/releases/tag/v0.3.0
 [0.2.0]: https://github.com/arloliu/styx/releases/tag/v0.2.0
