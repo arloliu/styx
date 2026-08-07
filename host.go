@@ -249,6 +249,22 @@ type PluginSpec struct {
 	// real stall at the one-second send cadence; anything from 876ms through 1.75s
 	// costs two beats, not one. Zero selects the default (five seconds).
 	WedgeWindow time.Duration
+
+	// chunkMaxPayload is the internal carrier for the stream-chunking ceiling
+	// this Host announces on the attach message: the largest reassembled logical
+	// stream message the connection may carry (stream-protocol.md §13.6). Zero
+	// leaves the feature out of the Host's offer entirely, so this field alone
+	// decides whether a Host asks a plugin to chunk at all.
+	//
+	// The ceiling is derived, never stated. It is one of the values an
+	// intent-level payload bound resolves, alongside the geometry and the burst
+	// ceiling, so every route to a chunking connection writes this same carrier:
+	// a derivation from that bound, and the conformance matrix's test-only
+	// writer, which needs a real host and a real plugin on a connection where
+	// the feature is genuinely active. Keeping the carrier unexported is what
+	// keeps the activation decision in one place instead of turning it into a
+	// knob an adopter could set against the geometry it has to agree with.
+	chunkMaxPayload uint32
 }
 
 // PluginHeartbeatInterval is the fixed cadence at which a plugin sends heartbeats to
@@ -903,6 +919,7 @@ func (h *Host) supervisorConfig(spec PluginSpec, cc *ClientConn, origin uint64) 
 		MaxDataInflight: spec.MaxDataInflight,
 		StrictCapacity:  spec.StrictCapacity,
 		BurstMaxPayload: spec.BurstMaxPayload,
+		ChunkMaxPayload: spec.chunkMaxPayload,
 
 		// The names differ on purpose: both sides mean the host's own wait for the
 		// next heartbeat, but "Interval" reads publicly as the plugin's send cadence,

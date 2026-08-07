@@ -31,9 +31,15 @@ test:
 	go test -tags ringhook ./internal/ring/... -race -timeout=$(TEST_TIMEOUT)
 	go test -tags eventhook ./internal/event/... ./internal/transport/shm/... -race -timeout=$(TEST_TIMEOUT)
 
-## test-failpoint: Run the crash-window tests behind the failpoint build tag
+## test-failpoint: Run the crash-window and fragment-boundary tests behind the failpoint build tag
+# The root package and tests/soak are filtered by -run rather than run whole: both
+# already run in full under `make test`, and re-running either entirely under the tag
+# would double their cost for the sake of the few tests the tag actually adds. The
+# filters match the names those tagged files use (ChunkFragment..., ChunkSoak...).
 test-failpoint:
 	go test -tags failpoint ./internal/transport/shm ./internal/supervisor -race -timeout=$(TEST_TIMEOUT)
+	go test -tags failpoint . -run 'ChunkFragment' -race -count=1 -timeout=$(TEST_TIMEOUT)
+	go test -tags failpoint ./tests/soak -run 'ChunkSoak' -race -count=1 -timeout=$(TEST_TIMEOUT)
 
 ## test-allocs: Run the hot-path allocation gates without the race detector (they skip themselves under the -race of make test, which shifts testing.AllocsPerRun's counts, so this is the run that actually executes them)
 test-allocs:

@@ -69,18 +69,19 @@ func (s *Stream) sendChunked(ctx context.Context, payload []byte, policy ChunkPo
 	buf := make([]byte, len(payload))
 	copy(buf, payload)
 
-	if err := s.sendFirstFragment(ctx, buf[:limit], seq); err != nil {
+	if err := s.sendFirstFragment(ctx, buf[:limit], seq, len(buf) == limit); err != nil {
 		return err
 	}
 
-	for off := limit; off < len(buf); off += limit {
+	for off, index := limit, 1; off < len(buf); off, index = off+limit, index+1 {
 		end := min(off+limit, len(buf))
+		last := end == len(buf)
 		kind := transport.FrameStreamChunk
-		if end == len(buf) {
+		if last {
 			kind = transport.FrameStreamMsg
 		}
 		seq = s.sendSeq.Add(1)
-		if err := s.sendFragmentRetrying(ctx, buf[off:end], seq, kind); err != nil {
+		if err := s.sendFragmentRetrying(ctx, buf[off:end], seq, kind, index, last); err != nil {
 			return s.failVisibleTrain(ctx, err)
 		}
 	}
@@ -99,8 +100,8 @@ func (s *Stream) sendChunked(ctx context.Context, payload []byte, policy ChunkPo
 // only on the rollback-eligible branch: the visible-train failure classes are
 // routed to failVisibleTrain from here and from the fragment loop, so
 // handleSendErr's rollback can never run behind a published fragment.
-func (s *Stream) sendFirstFragment(ctx context.Context, frag []byte, seq uint64) error {
-	err := s.sendFragment(ctx, frag, seq, transport.FrameStreamChunk)
+func (s *Stream) sendFirstFragment(ctx context.Context, frag []byte, seq uint64, last bool) error {
+	err := s.sendFragment(ctx, frag, seq, transport.FrameStreamChunk, 0, last)
 	switch {
 	case err == nil:
 		return nil
@@ -118,10 +119,12 @@ func (s *Stream) sendFirstFragment(ctx context.Context, frag []byte, seq uint64)
 // train may neither skip it, reorder around it, nor release its reservation.
 // The only exit besides acceptance is the send context ending, which is shape 2
 // — retry exhaustion is not a distinct outcome, so there is no attempt bound.
-func (s *Stream) sendFragmentRetrying(ctx context.Context, frag []byte, seq uint64, kind transport.FrameKind) error {
+func (s *Stream) sendFragmentRetrying(
+	ctx context.Context, frag []byte, seq uint64, kind transport.FrameKind, index int, last bool,
+) error {
 	delay := chunkRetryInitial
 	for {
-		err := s.sendFragment(ctx, frag, seq, kind)
+		err := s.sendFragment(ctx, frag, seq, kind, index, last)
 		if !errors.Is(err, transport.ErrBackpressure) {
 			return err
 		}
@@ -138,7 +141,19 @@ func (s *Stream) sendFragmentRetrying(ctx context.Context, frag []byte, seq uint
 // control word (stream-protocol.md §13.2). The Send runs under the same merged
 // context an unchunked send uses, so the stream's deadline bounds it and a
 // post-admission caller cancellation is still observed.
-func (s *Stream) sendFragment(callerCtx context.Context, frag []byte, seq uint64, kind transport.FrameKind) error {
+//
+// The two failpoint calls bracket the transport's answer, so a test can inject
+// at either acceptance boundary of any chosen fragment. Both compile away
+// entirely in a normal build. The before-admission seam RETURNS INSTEAD of
+// sending, so an injected pre-acceptance error is honest: nothing of that
+// fragment reached the transport, exactly as the error it stands in for claims.
+func (s *Stream) sendFragment(
+	callerCtx context.Context, frag []byte, seq uint64, kind transport.FrameKind, index int, last bool,
+) error {
+	if err := chunkFragmentFailpoint(ChunkFragmentBeforeAdmission, index, last, seq); err != nil {
+		return err
+	}
+
 	f := transport.Frame{
 		CallID:  s.callID,
 		Kind:    kind,
@@ -151,8 +166,11 @@ func (s *Stream) sendFragment(callerCtx context.Context, frag []byte, seq uint64
 	sendCtx, cancel := s.sendContext(callerCtx)
 	err := s.tbl.tr.Send(sendCtx, f)
 	cancel()
+	if err != nil {
+		return err
+	}
 
-	return err
+	return chunkFragmentFailpoint(ChunkFragmentAfterAccept, index, last, seq)
 }
 
 // waitChunkRetry parks for d between backpressure retries, ending early — and

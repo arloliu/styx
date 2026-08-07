@@ -252,6 +252,16 @@ func (h *Host) SupervisorConfigForTest(spec PluginSpec) supervisor.Config {
 	return h.supervisorConfig(spec, newUnavailableClientConn(spec.Name), h.nextHealthOrigin(spec.Name))
 }
 
+// SetChunkMaxPayloadForTest writes the internal stream-chunking ceiling carrier
+// on spec — the same field a derivation from an intent-level payload bound
+// resolves, and the field the attach message is stamped from. It is the
+// sanctioned way for a test to put a real host and a real plugin on a connection
+// where the feature is genuinely active, which is otherwise settled by that
+// derivation alone.
+func SetChunkMaxPayloadForTest(spec *PluginSpec, ceiling uint32) {
+	spec.chunkMaxPayload = ceiling
+}
+
 // DroppedInformationalEventCounts re-exports h.bus's informational-event
 // drop counters for host_test (external test package): it lets a test
 // assert directly that Host's own fan-in actually counted a drop under a
