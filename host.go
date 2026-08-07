@@ -1994,7 +1994,7 @@ func wireConnState(cc *ClientConn, inst supervisor.Instance) supervisor.ReadyHoo
 	// un-negotiated connection leaves streams nil, so OpenStream fails closed with
 	// ErrIncompatible and any inbound STREAM_* frame poisons (§11.2).
 	if inst.Streaming {
-		state.streams = newStreamPlane(inst.Transport)
+		state.streams = newStreamPlane(inst.Transport, withChunkPolicy(inst.ChunkPolicy))
 	}
 	cc.state.Store(state)
 	cc.admission.Open()

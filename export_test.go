@@ -383,6 +383,24 @@ func SetDuplicateUnaryResponseHookForTest(f func(callID uint64)) func() {
 	return func() { duplicateUnaryResponseHook.Store(prev) }
 }
 
+// SetBeforeStreamDispatchHookForTest installs a hook fired with the exact frame
+// handleInboundFrame is about to hand to dispatchStreamFrame — after the
+// borrow-copy decision has already run — and returns a restore func. It lets a
+// test observe the bytes dispatch will see and prove they do not alias the
+// lender's memory, for a frame kind whose dispatch outcome never reads far
+// enough into Payload to reveal a missing copy on its own. Test-only; nil in
+// production.
+func SetBeforeStreamDispatchHookForTest(f func(transport.Frame)) func() {
+	prev := beforeStreamDispatchHook.Load()
+	if f == nil {
+		beforeStreamDispatchHook.Store(nil)
+	} else {
+		beforeStreamDispatchHook.Store(&f)
+	}
+
+	return func() { beforeStreamDispatchHook.Store(prev) }
+}
+
 // DisposeRecvErrForTest exposes the serve loop's Recv-error disposition so a test
 // can assert which errors end the loop and which are skipped. done reports whether
 // the loop exits. tr may be nil to stand for a transport with no data-plane
@@ -403,8 +421,10 @@ func IsFrameLocalRecvErrForTest(err error) bool {
 // the host's wire-carried admission bound into the shared-memory transport's own
 // configuration, so the knobs it must carry across that boundary are exercised
 // directly, without a handshake or a real region.
-func (s *PluginServer) ShmConfigForTest(maxInflight int, tuple control.Tuple) shmtransport.Config {
-	return s.shmConfig(maxInflight, tuple)
+func (s *PluginServer) ShmConfigForTest(
+	maxInflight int, chunkMaxPayload uint32, tuple control.Tuple,
+) shmtransport.Config {
+	return s.shmConfig(maxInflight, chunkMaxPayload, tuple)
 }
 
 // SetWriterStoppedHookForTest installs a hook invoked immediately after a

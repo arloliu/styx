@@ -740,6 +740,59 @@ func TestSHM_FrameUnaryErr_OversizedStatus_RejectedAtSend(t *testing.T) {
 	require.ErrorIs(t, recvErr, context.DeadlineExceeded)
 }
 
+// Test that Send rejects a FrameStreamChunk before publication on a
+// connection where stream-chunking is not active (Config.ChunkingActive
+// false, the default) — the producer-side half of the feature's
+// per-connection assignment rule (stream-protocol.md §13.1): a misrouted
+// fragment must never reach the ring on a dormant connection, where a peer
+// would poison on it.
+func TestSHM_FrameStreamChunk_RejectedAtSend_WhenChunkingDormant(t *testing.T) {
+	// Given a host and plugin negotiated with chunking dormant (the zero
+	// Config.ChunkingActive default).
+	ep := newEndpoints(t, roundTripLayout(), validConfig(false))
+
+	// When a FrameStreamChunk is sent.
+	err := ep.host.Send(t.Context(), transport.Frame{
+		CallID: 5, Kind: transport.FrameStreamChunk, Payload: []byte("fragment"), Control: 1,
+	})
+
+	// Then Send rejects it before publication, and the rejection is in the
+	// frozen proven-never-published set (stream-protocol.md §13.4): an
+	// unimplemented frame kind, checked before the descriptor is built.
+	require.ErrorIs(t, err, errUnsupportedKind)
+	require.True(t, transport.NeverPublished(err))
+
+	// And nothing was admitted: the plugin's Recv sees no frame at all.
+	recvCtx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, recvErr := ep.plugin.Recv(recvCtx)
+	require.ErrorIs(t, recvErr, context.DeadlineExceeded)
+}
+
+// Test that a FrameStreamChunk sends and round-trips on a connection where
+// stream-chunking IS active on both ends: kind 9's per-connection admission
+// (stream-protocol.md §13.1) is symmetric with every other implemented
+// kind once the feature resolved active, even though nothing yet reassembles
+// what it carries.
+func TestSHM_FrameStreamChunk_RoundTrips_WhenChunkingActive(t *testing.T) {
+	// Given a host and plugin both configured with chunking active.
+	cfg := validConfig(false)
+	cfg.ChunkingActive = true
+	ep := newEndpoints(t, roundTripLayout(), cfg)
+
+	// When a FrameStreamChunk is sent and received.
+	require.NoError(t, ep.host.Send(t.Context(), transport.Frame{
+		CallID: 5, Kind: transport.FrameStreamChunk, Payload: []byte("fragment"), Control: 1,
+	}))
+	f, err := ep.plugin.Recv(t.Context())
+
+	// Then it arrives intact, admitted like any other implemented kind.
+	require.NoError(t, err)
+	require.Equal(t, transport.FrameStreamChunk, f.Kind)
+	require.Equal(t, []byte("fragment"), f.Payload)
+	require.EqualValues(t, 1, f.Control)
+}
+
 // Test that a FrameUnaryErr whose encoded status is exactly at the negotiated
 // MaxPayload is admitted and round-trips with its Status intact.
 func TestSHM_FrameUnaryErr_StatusAtMaxPayload_RoundTrips(t *testing.T) {
@@ -783,7 +836,7 @@ func TestTransport_Recv_RejectsConformanceFaults(t *testing.T) {
 	t.Run("unassigned kind surfaces errBadFrame", func(t *testing.T) {
 		ep := newEndpoints(t, roundTripLayout(), validConfig(false))
 		producer := hpProducer(t, ep.region)
-		bad := makeDesc(ring.FrameKind(9), 1, 7) // 9 is unassigned under layout_version 1
+		bad := makeDesc(ring.FrameKind(10), 1, 7) // 10 is unassigned under layout_version 1
 		require.NoError(t, producer.Push(bad))
 
 		_, err := ep.plugin.Recv(t.Context())
@@ -839,6 +892,9 @@ func TestTransport_Recv_ActuatesPoison_OnConformanceFault(t *testing.T) {
 	})
 
 	t.Run("bad frame poisons with POISON_BAD_FRAME", func(t *testing.T) {
+		// Kind 9 (STREAM_CHUNK) on a connection where stream-chunking is not
+		// active (validConfig leaves ChunkingActive false) is exactly the
+		// dormant-attach case stream-protocol.md §13.1 requires poisoned.
 		ep := newEndpoints(t, roundTripLayout(), validConfig(false))
 		producer := hpProducer(t, ep.region)
 		require.NoError(t, producer.Push(makeDesc(ring.FrameKind(9), 1, 7)))

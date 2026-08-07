@@ -16,24 +16,26 @@ func TestMapKind_MapsLiveKinds(t *testing.T) {
 	cases := []struct {
 		name           string
 		in             transport.FrameKind
+		chunkingActive bool
 		wantKind       ring.FrameKind
 		descriptorOnly bool
 	}{
-		{"unary request", transport.FrameUnaryReq, ring.KindUnaryReq, false},
-		{"unary response", transport.FrameUnaryResp, ring.KindUnaryResp, false},
-		{"unary error", transport.FrameUnaryErr, ring.KindUnaryErr, false},
-		{"cancel", transport.FrameCancel, ring.KindCancel, true},
-		{"stream open", transport.FrameStreamOpen, ring.KindStreamOpen, false},
-		{"stream msg", transport.FrameStreamMsg, ring.KindStreamMsg, false},
-		{"stream ack", transport.FrameStreamAck, ring.KindStreamAck, true},
-		{"stream close", transport.FrameStreamClose, ring.KindStreamClose, false},
-		{"stream err", transport.FrameStreamErr, ring.KindStreamErr, false},
+		{"unary request", transport.FrameUnaryReq, false, ring.KindUnaryReq, false},
+		{"unary response", transport.FrameUnaryResp, false, ring.KindUnaryResp, false},
+		{"unary error", transport.FrameUnaryErr, false, ring.KindUnaryErr, false},
+		{"cancel", transport.FrameCancel, false, ring.KindCancel, true},
+		{"stream open", transport.FrameStreamOpen, false, ring.KindStreamOpen, false},
+		{"stream msg", transport.FrameStreamMsg, false, ring.KindStreamMsg, false},
+		{"stream ack", transport.FrameStreamAck, false, ring.KindStreamAck, true},
+		{"stream close", transport.FrameStreamClose, false, ring.KindStreamClose, false},
+		{"stream err", transport.FrameStreamErr, false, ring.KindStreamErr, false},
+		{"stream chunk, chunking active", transport.FrameStreamChunk, true, ring.KindStreamChunk, false},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// When
-			rk, descriptorOnly, err := mapKind(tc.in)
+			rk, descriptorOnly, err := mapKind(tc.in, tc.chunkingActive)
 
 			// Then
 			require.NoError(t, err)
@@ -46,12 +48,27 @@ func TestMapKind_MapsLiveKinds(t *testing.T) {
 // Test that mapKind fails closed on a kind this writer does not emit under
 // layout_version = 1, rather than forwarding an out-of-range value.
 func TestMapKind_RejectsUnsupportedKind(t *testing.T) {
-	// Given a kind outside the nine live kinds 0-8 (kind 9 is the first
+	// Given a kind outside the ten live kinds 0-9 (kind 10 is the first
 	// reserved/unassigned byte).
-	const unassigned = transport.FrameKind(9)
+	const unassigned = transport.FrameKind(10)
 
 	// When
-	_, _, err := mapKind(unassigned)
+	_, _, err := mapKind(unassigned, false)
+
+	// Then
+	require.ErrorIs(t, err, errUnsupportedKind)
+}
+
+// Test that mapKind rejects a FrameStreamChunk intent on a connection where
+// stream-chunking is not active, before any descriptor is built — the
+// producer-side half of the feature's per-connection assignment rule
+// (stream-protocol.md §13.1): a misrouted fragment must never reach the ring
+// on a dormant connection, where a peer would poison on it.
+func TestMapKind_RejectsStreamChunk_WhenChunkingInactive(t *testing.T) {
+	// Given a FrameStreamChunk intent and chunking inactive on this connection.
+
+	// When
+	_, _, err := mapKind(transport.FrameStreamChunk, false)
 
 	// Then
 	require.ErrorIs(t, err, errUnsupportedKind)

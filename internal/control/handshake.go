@@ -47,6 +47,29 @@ func BurstActive(tuple Tuple, burstMaxPayload uint32) bool {
 	return tuple.Transport == TransportSHM && tuple.Features[FeatureBurst] && burstMaxPayload != 0
 }
 
+// FeatureStreamChunking is the stable handshake feature-flag name for
+// splitting an oversize STREAM_MSG payload into ladder-sized fragments that
+// ride the same shared-memory ring instead of failing with
+// ErrPayloadTooLarge (stream-protocol.md §13.1). It is a boolean flag and
+// nothing else; its one numeric input, the chunk ceiling, travels on the
+// attach message (AttachRegion.chunk_max_payload), not in the flag.
+const FeatureStreamChunking = "stream-chunking"
+
+// ChunkingActive reports whether stream-chunking is in use for one
+// generation, given that generation's acknowledged tuple and the
+// chunk_max_payload the host put on its AttachRegion. It is a conjunction,
+// mirroring BurstActive exactly: the feature must have resolved true, the
+// transport must be shared memory (chunking never runs on uds, regardless of
+// the streaming flag), and the ceiling must be non-zero.
+//
+// Both sides evaluate it from the same two inputs so they agree on whether
+// frame kind 9 (STREAM_CHUNK) is assigned on this connection. On a uds tuple
+// the feature is dormant by construction: the uds attach carries no ceiling,
+// so this is false however the feature resolved.
+func ChunkingActive(tuple Tuple, chunkMaxPayload uint32) bool {
+	return tuple.Transport == TransportSHM && tuple.Features[FeatureStreamChunking] && chunkMaxPayload != 0
+}
+
 // ShmLayoutVersion is the shared-memory region layout version this build speaks.
 // An Offer that lists the shared-memory transport advertises this value; Negotiate
 // selects the highest version common to both sides.

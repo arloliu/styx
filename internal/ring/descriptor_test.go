@@ -32,6 +32,26 @@ func TestFrameKind_WireValues_MatchABI(t *testing.T) {
 	require.Equal(t, FrameKind(6), KindStreamClose)
 	require.Equal(t, FrameKind(7), KindStreamErr)
 	require.Equal(t, FrameKind(8), KindUnaryErr)
+	require.Equal(t, FrameKind(9), KindStreamChunk)
+}
+
+// Test that KindStreamChunk (9) round-trips through SetKind/Kind/KindWord
+// exactly like every other kind: a clean low-byte word with the reserved high
+// byte zeroed. KindStreamChunk is the first value assigned from shm-abi.md
+// §5's reserved 9..255 range (behind the stream-chunking feature), so this
+// pins that assigning it changed nothing about how the descriptor encodes or
+// decodes a kind.
+func TestDescriptor_Kind_RoundTripsStreamChunk(t *testing.T) {
+	// Given
+	var d Descriptor
+
+	// When
+	d.SetKind(KindStreamChunk)
+
+	// Then
+	require.Equal(t, KindStreamChunk, d.Kind())
+	require.Equal(t, uint16(0x0009), d.KindWord(), "SetKind must leave the reserved high byte 0")
+	require.Zero(t, d.KindWord()>>8, "the reserved high byte must be 0 after SetKind")
 }
 
 // descriptorField describes one writable descriptor field for the round-trip

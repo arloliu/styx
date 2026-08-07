@@ -178,6 +178,31 @@ func TestPrepareInboundFrame_CopiesABorrowedStreamPayload(t *testing.T) {
 	require.Same(t, &private[0], &out.Payload[0], "a private payload is not copied a second time")
 }
 
+// Test that a borrowed STREAM_CHUNK fragment gets the identical copy
+// prepareInboundFrame gives every other stream kind (isStreamKind covers
+// FrameStreamChunk exactly as it does FrameStreamMsg): reassembly is a later
+// change, but a fragment's bytes must never alias reclaimed transport memory
+// from the moment they are received, whether or not anything consumes them yet.
+func TestPrepareInboundFrame_CopiesABorrowedStreamChunkPayload(t *testing.T) {
+	// Given a borrowed STREAM_CHUNK frame.
+	deps := newViewTestDeps(t, codec.Proto{}, nil)
+	lent := []byte("a fragment the lender will reclaim")
+	f := transport.Frame{CallID: 2, Kind: transport.FrameStreamChunk, Control: 1, Payload: lent}
+
+	// When it is prepared.
+	out, _ := prepareInboundFrame(deps, f, true)
+
+	// Then the payload is copied out, not aliased...
+	require.Equal(t, lent, out.Payload, "the copy must say what arrived")
+	require.NotSame(t, &lent[0], &out.Payload[0], "a queued fragment must not alias the lender's memory")
+
+	// ...proven by the lender overwriting its buffer leaving the copy intact.
+	for i := range lent {
+		lent[i] = 0xEE
+	}
+	require.Equal(t, []byte("a fragment the lender will reclaim"), out.Payload)
+}
+
 // Test a frame whose service or method resolves to nothing skipping the decode
 // entirely — not decoding into a throwaway message, and not reading the payload
 // at all.

@@ -149,13 +149,14 @@ func TestUDSTransport_Send_RejectsOversizedPayload(t *testing.T) {
 }
 
 // Test UDSTransport rejecting an out-of-range frame kind (a corrupt or foreign
-// peer's unassigned byte). The five streaming kinds are now carried, so a
-// genuinely unassigned value — one past FrameUnaryErr — is what must still be
-// rejected.
+// peer's unassigned byte). The nine original kinds plus FrameStreamChunk (9,
+// rejected unconditionally on uds — see the dedicated test below) are now
+// carried, so a genuinely unassigned value — one past FrameStreamChunk — is
+// what must still be rejected.
 func TestUDSTransport_Send_RejectsUnimplementedFrameKind(t *testing.T) {
 	// Given
 	a, _ := newTestTransportPair(t)
-	f := transport.Frame{CallID: 1, Kind: transport.FrameKind(9)} // one past FrameUnaryErr (8)
+	f := transport.Frame{CallID: 1, Kind: transport.FrameKind(10)} // one past FrameStreamChunk (9)
 
 	// When
 	err := a.Send(t.Context(), f)
@@ -164,14 +165,64 @@ func TestUDSTransport_Send_RejectsUnimplementedFrameKind(t *testing.T) {
 	require.ErrorIs(t, err, transport.ErrUnimplementedFrameKind)
 }
 
+// Test UDSTransport.Send rejecting frame kind 9 (STREAM_CHUNK) unconditionally,
+// even on a connection with the streaming flag active: stream-chunking is a
+// shared-memory-only feature (stream-protocol.md §13.1), so the ordinary
+// streaming flag never enables it on uds.
+func TestUDSTransport_Send_RejectsStreamChunk_EvenWithStreamingActive(t *testing.T) {
+	// Given
+	a, _ := newTransportPairStreaming(t, true)
+	f := transport.Frame{CallID: 1, Kind: transport.FrameStreamChunk}
+
+	// When
+	err := a.Send(t.Context(), f)
+
+	// Then
+	require.ErrorIs(t, err, transport.ErrUnimplementedFrameKind)
+}
+
+// Test UDSTransport.Recv failing the connection closed on an inbound frame
+// kind 9 (STREAM_CHUNK), injected via the export_test.go test-only
+// WriteFrameUnchecked (bypassing Send's own guard, which never emits kind 9
+// in the first place). This proves the reader path does not ride past kind 9
+// as the ordinary frame-local unsupported-kind skip: the connection poisons
+// and every subsequent call on it observes ErrPoisoned/ErrClosed, and a
+// second, unrelated frame is never delivered.
+func TestUDSTransport_Recv_FailsClosed_OnInboundStreamChunk(t *testing.T) {
+	// Given a chunk frame with a legitimate, unrelated frame right behind it
+	// on the wire.
+	a, b := newTestTransportPair(t)
+	chunk := transport.Frame{CallID: 1, Kind: transport.FrameStreamChunk, Payload: []byte("fragment")}
+	require.NoError(t, a.WriteFrameUnchecked(t.Context(), chunk))
+	next := transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq, Payload: []byte("next")}
+	require.NoError(t, a.WriteFrameUnchecked(t.Context(), next))
+
+	// When
+	_, err := b.Recv(t.Context())
+
+	// Then: connection-fatal, not the frame-local ErrUnimplementedFrameKind path
+	// the reader loops would otherwise skip and keep serving on.
+	require.ErrorIs(t, err, transport.ErrStreamChunkOnUDS)
+	require.ErrorIs(t, err, transport.ErrPoisoned)
+	require.NotErrorIs(t, err, transport.ErrUnimplementedFrameKind)
+	require.False(t, transport.IsFrameLocalRecvErr(err),
+		"the reader loops' own frame-local predicate must not classify this connection-fatal error as skippable")
+
+	// And: the connection stays failed for any further use -- the legitimate
+	// frame waiting right behind the chunk on the wire is never delivered.
+	_, err = b.Recv(t.Context())
+	require.ErrorIs(t, err, transport.ErrClosed)
+}
+
 // Test UDSTransport.Recv independently rejecting an out-of-range frame kind
 // that reached the wire (bypassing Send's own guard via the export_test.go
 // test-only WriteFrameUnchecked), proving Recv enforces the same rule rather
 // than relying solely on Send never producing one.
 func TestUDSTransport_Recv_RejectsUnimplementedFrameKind(t *testing.T) {
-	// Given
+	// Given: kind 10, a genuinely unassigned byte (kind 9 is STREAM_CHUNK,
+	// which uds classifies connection-fatal rather than this frame-local rejection).
 	a, b := newTestTransportPair(t)
-	f := transport.Frame{CallID: 1, Kind: transport.FrameKind(9)}
+	f := transport.Frame{CallID: 1, Kind: transport.FrameKind(10)}
 
 	// When
 	err := a.WriteFrameUnchecked(t.Context(), f)
@@ -314,9 +365,10 @@ func TestUDSTransport_FramesSent_UnchangedOnRejectedSend(t *testing.T) {
 // next Recv on the same connection still gets a clean frame, instead of
 // misreading the drained frame's payload bytes as the next frame's header.
 func TestUDSTransport_Recv_DrainsPayload_AfterRejectingUnimplementedFrameKind(t *testing.T) {
-	// Given
+	// Given: kind 10, a genuinely unassigned byte (kind 9 is STREAM_CHUNK,
+	// which uds classifies connection-fatal rather than draining and continuing).
 	a, b := newTestTransportPair(t)
-	rejected := transport.Frame{CallID: 1, Kind: transport.FrameKind(9), Payload: []byte("bad-payload")}
+	rejected := transport.Frame{CallID: 1, Kind: transport.FrameKind(10), Payload: []byte("bad-payload")}
 	next := transport.Frame{CallID: 2, Kind: transport.FrameUnaryReq, Payload: []byte("next")}
 
 	// When

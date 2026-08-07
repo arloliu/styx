@@ -290,7 +290,7 @@ func kindName(k transport.FrameKind) string {
 		transport.FrameCancel: "cancel", transport.FrameStreamOpen: "stream-open",
 		transport.FrameStreamMsg: "stream-msg", transport.FrameStreamAck: "stream-ack",
 		transport.FrameStreamClose: "stream-close", transport.FrameStreamErr: "stream-err",
-		transport.FrameUnaryErr: "unary-err",
+		transport.FrameUnaryErr: "unary-err", transport.FrameStreamChunk: "stream-chunk",
 	}
 	if n, ok := names[k]; ok {
 		return n
@@ -299,9 +299,12 @@ func kindName(k transport.FrameKind) string {
 	return "unknown"
 }
 
-// allFrameKinds is every wire frame kind the transports carry, each built with the
-// content its kind requires (the two status-bearing kinds carry a Status, never a
-// Payload). Used to prove the ingress reservation covers every kind uniformly.
+// allFrameKinds is every wire frame kind uds delivers uniformly through Recv,
+// each built with the content its kind requires (the two status-bearing kinds
+// carry a Status, never a Payload). Used to prove the ingress reservation
+// covers every kind uniformly. FrameStreamChunk is deliberately absent: uds
+// never delivers it at all (ErrStreamChunkOnUDS fails the connection closed),
+// so it has no reservation-then-delivery behavior to include here.
 func allFrameKinds() []transport.Frame {
 	st := &transport.FrameStatus{Code: 13, Message: "x"}
 
@@ -358,14 +361,18 @@ func requireReservedAndRetired(t *testing.T, coord *drainCoordinator) {
 }
 
 // rawFrameLocalHeader builds a non-streaming wire header (37 bytes) declaring a zero
-// payload and an out-of-range frame kind (9, past FrameUnaryErr). UDSTransport.Recv
-// reserves on the readiness commit, reads the whole header, and rejects the kind with
-// ErrUnimplementedFrameKind WITHOUT poisoning — a frame-local error the serve loop
-// skips, keeping the reservation balanced.
+// payload and an out-of-range frame kind (10, past FrameStreamChunk; kind 9 itself is
+// FrameStreamChunk, which uds classifies connection-fatal rather than frame-local).
+// UDSTransport.Recv reserves on the readiness commit, reads the whole header, and
+// rejects the kind with ErrUnimplementedFrameKind WITHOUT poisoning — a frame-local
+// error the serve loop skips, keeping the reservation balanced.
 func rawFrameLocalHeader() []byte {
 	const nonStreamingHeaderSize = 4 + 8 + 1 + 8 + 8 + 8
 	h := make([]byte, nonStreamingHeaderSize)
-	h[12] = 9 // Kind byte (see encodeHeader): 9 is past every implemented kind.
+	// Kind byte (see encodeHeader): 10 is past every implemented kind,
+	// including FrameStreamChunk (9), which uds classifies connection-fatal
+	// rather than this frame-local rejection.
+	h[12] = 10
 
 	return h
 }

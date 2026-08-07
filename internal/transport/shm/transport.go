@@ -191,9 +191,13 @@ type Transport struct {
 	// package var.
 	clock func() time.Time
 
-	gen        shm.Generation
-	checksum   bool
-	maxPayload uint32
+	gen      shm.Generation
+	checksum bool
+	// chunkingActive records whether the stream-chunking feature resolved
+	// active for this connection (Config.ChunkingActive); classify's own half
+	// of unmapKind's per-connection admission for FrameStreamChunk (kind 9).
+	chunkingActive bool
+	maxPayload     uint32
 	// maxRecvPayload is the largest payload_length an inbound present slab may
 	// carry: slab_size[last](inbound) − overhead (shm-abi.md §18). A received
 	// payload_length above it is a conformance fault (§9).
@@ -590,6 +594,7 @@ func newTransport(region regionHandle, layout shm.Layout, p AttachParams) (*Tran
 		clock:             clock,
 		gen:               gen,
 		checksum:          p.Config.Checksum,
+		chunkingActive:    p.Config.ChunkingActive,
 		maxPayload:        maxPayload,
 		maxRecvPayload:    slabSizeLast(layout.Arenas[inDir]) - overhead,
 	}, nil
@@ -1271,7 +1276,7 @@ func (t *Transport) classify(d ring.Descriptor) (tk transport.FrameKind, descrip
 	if d.KindWord()>>8 != 0 {
 		return 0, false, errBadFrame
 	}
-	tk, descriptorOnly, ok := unmapKind(d.Kind())
+	tk, descriptorOnly, ok := unmapKind(d.Kind(), t.chunkingActive)
 	if !ok {
 		return 0, false, errBadFrame
 	}
@@ -1655,9 +1660,14 @@ func (t *Transport) Close() error {
 // kinds (stream-protocol.md §2.1); a STREAM_* frame for an unknown or closed
 // stream is disposed above the transport by the RPC runtime, not poisoned here.
 // STREAM_ACK is descriptor-only (like CANCEL); the other four are
-// payload-bearing. Only a genuinely out-of-range byte reports ok=false, which
-// the caller treats as a conformance fault.
-func unmapKind(k ring.FrameKind) (tk transport.FrameKind, descriptorOnly, ok bool) {
+// payload-bearing.
+//
+// KindStreamChunk classifies only when chunkingActive — this connection's own
+// admission policy for the stream-chunking feature (§13.1) — is true; on a
+// dormant connection it falls through with every other genuinely unassigned
+// byte to ok=false, which the caller (classify) treats as a conformance fault
+// and poisons the region on, exactly as §5 requires for an unassigned kind.
+func unmapKind(k ring.FrameKind, chunkingActive bool) (tk transport.FrameKind, descriptorOnly, ok bool) {
 	switch k {
 	case ring.KindUnaryReq:
 		return transport.FrameUnaryReq, false, true
@@ -1677,6 +1687,12 @@ func unmapKind(k ring.FrameKind) (tk transport.FrameKind, descriptorOnly, ok boo
 		return transport.FrameStreamClose, false, true
 	case ring.KindStreamErr:
 		return transport.FrameStreamErr, false, true
+	case ring.KindStreamChunk:
+		if !chunkingActive {
+			return 0, false, false
+		}
+
+		return transport.FrameStreamChunk, false, true
 	default:
 		return 0, false, false
 	}

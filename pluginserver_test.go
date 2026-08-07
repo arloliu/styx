@@ -1484,11 +1484,37 @@ func TestPluginServer_ShmConfig_CarriesTheConsumeFaultRunThreshold(t *testing.T)
 	thresholdFor := func(configured int) int {
 		s := styx.NewPluginServer(styx.PluginServerConfig{ConsumeFaultRunThreshold: configured})
 
-		return s.ShmConfigForTest(16, tuple).Escalation.ConsumeFaultRunThreshold
+		return s.ShmConfigForTest(16, 0, tuple).Escalation.ConsumeFaultRunThreshold
 	}
 
 	require.Equal(t, 4096, thresholdFor(4096), "an explicit threshold must reach the transport unchanged")
 	require.Negative(t, thresholdFor(styx.ConsumeFaultEscalationDisabled),
 		"the disable sentinel must stay negative, or an operator's off switch is silently re-enabled")
 	require.Zero(t, thresholdFor(0), "an unset threshold must stay zero so the transport picks its own default")
+}
+
+// Test that shmConfig resolves ChunkingActive from the negotiated tuple and
+// the announced chunk ceiling exactly as control.ChunkingActive defines it,
+// so the shared-memory transport admits frame kind 9 on precisely the
+// connections the feature negotiation says it should.
+func TestPluginServer_ShmConfig_ResolvesChunkingActive(t *testing.T) {
+	// Given a plugin server and a tuple with the feature resolved.
+	s := styx.NewPluginServer(styx.PluginServerConfig{})
+	active := control.Tuple{
+		Transport: control.TransportSHM, Features: map[string]bool{control.FeatureStreamChunking: true},
+	}
+
+	// When / Then: a non-zero ceiling activates chunking.
+	require.True(t, s.ShmConfigForTest(16, 1<<20, active).ChunkingActive)
+
+	// When / Then: a zero ceiling leaves chunking dormant even with the flag resolved.
+	require.False(t, s.ShmConfigForTest(16, 0, active).ChunkingActive,
+		"a zero ceiling leaves chunking dormant even with the flag resolved")
+
+	// Given a tuple with the feature unresolved.
+	unresolved := control.Tuple{Transport: control.TransportSHM, Features: map[string]bool{}}
+
+	// When / Then: an unresolved flag leaves chunking dormant even with a non-zero ceiling.
+	require.False(t, s.ShmConfigForTest(16, 1<<20, unresolved).ChunkingActive,
+		"an unresolved flag leaves chunking dormant even with a non-zero ceiling")
 }

@@ -528,6 +528,15 @@ func (t *UDSTransport) recvCore(ctx context.Context, reserve func()) (Frame, err
 	// same declared bytes, read just as destructively.
 	r.armBodyBudget(payloadLen)
 
+	if f.Kind == FrameStreamChunk {
+		// Connection-fatal fail-closed, not the frame-local unsupported-kind
+		// skip below: stream-chunking never runs on uds (ErrStreamChunkOnUDS's
+		// doc), so an inbound kind 9 here is a protocol violation from a peer
+		// that should never have emitted it, not an ordinary version gap this
+		// side can drain past and keep serving.
+		return Frame{}, t.abortFrame(ErrStreamChunkOnUDS, r.started)
+	}
+
 	if err := checkImplementedKind(f.Kind); err != nil {
 		// Drain the payload so a rejected frame doesn't tear the stream.
 		// Only a drain failure poisons; a completed drain resyncs the connection.

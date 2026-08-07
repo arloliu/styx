@@ -203,6 +203,12 @@ type writer struct {
 	// (shm-abi.md §5).
 	checksum bool
 
+	// chunkingActive records whether the stream-chunking feature resolved
+	// active on this connection (stream-protocol.md §13.1); it is this
+	// writer's own half of mapKind's per-connection admission for
+	// FrameStreamChunk (kind 9).
+	chunkingActive bool
+
 	// maxStored is the largest stored length (payload plus per-frame overhead) this
 	// writer's outbound arena can hold — its largest slab_size (shm-abi.md §18). The
 	// build-time payload guard bounds the message against it (minus overhead) rather
@@ -394,6 +400,7 @@ func newRegionWriter(
 	w := newWriterFromParts(r, a, cfg.DataQueueDepth, cfg.LifecycleQueueDepth, admitBlock)
 	w.gen = gen
 	w.checksum = cfg.Checksum
+	w.chunkingActive = cfg.ChunkingActive
 	w.signal = signal
 	w.poison = poison
 	w.handleTable = make([]slabRef, capacity)
@@ -1275,7 +1282,7 @@ func (w *writer) build(i intent) (ring.Descriptor, buildStatus) {
 		return d, buildFailed
 	}
 
-	rk, descriptorOnly, err := mapKind(i.frame.Kind)
+	rk, descriptorOnly, err := mapKind(i.frame.Kind, w.chunkingActive)
 	if err != nil {
 		w.report(i, err)
 

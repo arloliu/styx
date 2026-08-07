@@ -13,6 +13,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Test that transport.FrameStreamChunk's wire value is exactly 9, matching
+// ring.KindStreamChunk: the two are independent enums that share values by
+// the ABI (shm-abi.md §5), not by a Go dependency, so this pins the value
+// both a uds peer puts on the wire and an shm descriptor's kind byte must
+// agree on, mirroring the pin ring's own descriptor_test.go keeps for its
+// side of the same ABI-shared numbering.
+func TestFrameStreamChunk_WireValueIs9_AndMatchesRingKindStreamChunk(t *testing.T) {
+	// Given / When: the two constants as declared.
+
+	// Then
+	require.EqualValues(t, 9, transport.FrameStreamChunk)
+	require.EqualValues(t, transport.FrameStreamChunk, ring.KindStreamChunk)
+}
+
 // Test NeverPublished matching exactly the three sentinels it is documented to
 // classify as proof a Send failed before the peer could ever observe the
 // frame — each wrapped the way a real call site actually wraps it — and

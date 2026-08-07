@@ -1,5 +1,5 @@
 // Streaming RPC public seam: OpenStream / RegisterStreamHandler, the reader-loop
-// routing for the five STREAM_* kinds and stream-teardown CANCEL, rejection-frame
+// routing for the six STREAM_* kinds and stream-teardown CANCEL, rejection-frame
 // emission, and the status-code -> styx-sentinel translation. The connection-level
 // streaming engine lives in internal/rpcruntime; this file wires it into the
 // public styx package, where the transport-specific imports it needs are legal.
@@ -725,6 +725,12 @@ type streamPlane struct {
 	streams *rpcruntime.StreamTable
 	tr      transport.Transport
 
+	// chunkPolicy is this connection's stream-chunking policy (§13), set by
+	// a streamPlaneOption before streams is constructed and threaded into it
+	// via rpcruntime.WithChunkPolicy. Its zero value (chunking inactive) is
+	// what every construction site that supplies no option gets.
+	chunkPolicy rpcruntime.ChunkPolicy
+
 	// fatalStop/fatalDone bound the connection-fatal watcher goroutine (§9): it
 	// waits on StreamTable.Fatal() and, when a terminal-CANCEL publication
 	// definitively fails, stops the transport writer so the reader loop exits and
@@ -741,15 +747,31 @@ type streamPlane struct {
 	drainOwed bool
 }
 
+// streamPlaneOption configures a streamPlane at construction, mirroring
+// rpcruntime.StreamTableOption's shape. See withChunkPolicy.
+type streamPlaneOption func(*streamPlane)
+
+// withChunkPolicy installs this connection's stream-chunking policy, read by
+// newStreamPlane before it constructs the plane's underlying StreamTable.
+// Omitted, a streamPlane's policy is the zero rpcruntime.ChunkPolicy —
+// chunking inactive — which is what every construction site predating this
+// option gets.
+func withChunkPolicy(p rpcruntime.ChunkPolicy) streamPlaneOption {
+	return func(sp *streamPlane) { sp.chunkPolicy = p }
+}
+
 // newStreamPlane builds a streaming half over tr, capped at S_max, and starts the
 // connection-fatal watcher (stream-protocol.md §9).
-func newStreamPlane(tr transport.Transport) *streamPlane {
+func newStreamPlane(tr transport.Transport, opts ...streamPlaneOption) *streamPlane {
 	p := &streamPlane{
-		streams:   rpcruntime.NewStreamTable(maxOpenStreams, tr),
 		tr:        tr,
 		fatalStop: make(chan struct{}),
 		fatalDone: make(chan struct{}),
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	p.streams = rpcruntime.NewStreamTable(maxOpenStreams, tr, rpcruntime.WithChunkPolicy(p.chunkPolicy))
 	go p.watchFatal()
 
 	return p
@@ -843,29 +865,34 @@ func releaseTransport(tr transport.Transport) {
 	_ = tr.Close()
 }
 
-// isStreamDataFrame reports whether a frame kind is one of the four inbound
+// isStreamDataFrame reports whether a frame kind is one of the five inbound
 // STREAM_* kinds routed to StreamTable.Dispatch (stream-protocol.md §8.1). A
 // STREAM_OPEN is handled separately (accept side), not dispatched.
+// FrameStreamChunk (STREAM_CHUNK, §13) routes here too: reassembly is a later
+// change, so today Dispatch answers it with the same conformance-violation
+// path an unhandled frame already gets, never a silent drop.
 func isStreamDataFrame(k transport.FrameKind) bool {
-	//exhaustive:ignore -- only the four dispatchable STREAM_* kinds return true; every
+	//exhaustive:ignore -- only the five dispatchable STREAM_* kinds return true; every
 	// other kind (unary, CANCEL, STREAM_OPEN) is routed elsewhere and returns false.
 	switch k {
 	case transport.FrameStreamMsg, transport.FrameStreamAck,
-		transport.FrameStreamClose, transport.FrameStreamErr:
+		transport.FrameStreamClose, transport.FrameStreamErr, transport.FrameStreamChunk:
 		return true
 	default:
 		return false
 	}
 }
 
-// isStreamKind reports whether a frame kind is one of the five STREAM_* kinds
-// (stream-protocol.md §2.1). Feature enforcement uses it: without acknowledged
-// streaming, any STREAM_* kind on the wire poisons the connection (§11.2).
+// isStreamKind reports whether a frame kind is one of the six STREAM_* kinds
+// (stream-protocol.md §2.1, §13). Feature enforcement uses it: without
+// acknowledged streaming, any STREAM_* kind on the wire poisons the
+// connection (§11.2) — FrameStreamChunk included, since chunking is inert
+// without streaming (§13.1).
 func isStreamKind(k transport.FrameKind) bool {
-	//exhaustive:ignore -- the five stream kinds return true; every other kind is not a stream frame.
+	//exhaustive:ignore -- the six stream kinds return true; every other kind is not a stream frame.
 	switch k {
 	case transport.FrameStreamOpen, transport.FrameStreamMsg, transport.FrameStreamAck,
-		transport.FrameStreamClose, transport.FrameStreamErr:
+		transport.FrameStreamClose, transport.FrameStreamErr, transport.FrameStreamChunk:
 		return true
 	default:
 		return false
@@ -874,7 +901,7 @@ func isStreamKind(k transport.FrameKind) bool {
 
 // isFeatureAbsentStreamFrame reports whether f is a streaming frame that a
 // connection WITHOUT negotiated streaming must poison on (stream-protocol.md
-// §11.2): any of the five STREAM_* kinds, or a stream-teardown CANCEL (a CANCEL
+// §11.2): any of the six STREAM_* kinds, or a stream-teardown CANCEL (a CANCEL
 // carrying a nonzero control word, which is only legal as a stream teardown).
 func isFeatureAbsentStreamFrame(f transport.Frame) bool {
 	return isStreamKind(f.Kind) || isStreamTeardownCancel(f)
@@ -887,13 +914,14 @@ func isStreamTeardownCancel(f transport.Frame) bool {
 	return f.Kind == transport.FrameCancel && f.Control != 0
 }
 
-// dispatchStreamFrame routes an inbound STREAM_MSG/ACK/CLOSE/ERR to the stream
-// table, or maps a stream-teardown CANCEL to the terminal transition its paired
-// STREAM_ERR would drive (stream-protocol.md §9.1: either frame of the pair alone
-// determines the outcome, so a CANCEL that arrives without — or before — its
-// STREAM_ERR still terminates the stream). It returns rpcruntime.ErrStreamConformance
-// when the frame is a conformance violation on a LIVE stream, so the reader loop
-// poisons the connection (§8.1).
+// dispatchStreamFrame routes an inbound STREAM_MSG/ACK/CLOSE/ERR/CHUNK to the
+// stream table, or maps a stream-teardown CANCEL to the terminal transition
+// its paired STREAM_ERR would drive (stream-protocol.md §9.1: either frame of
+// the pair alone determines the outcome, so a CANCEL that arrives without —
+// or before — its STREAM_ERR still terminates the stream). It returns
+// rpcruntime.ErrStreamConformance when the frame is a conformance violation
+// on a LIVE stream — which a STREAM_CHUNK always is today, since reassembly
+// is a later change — so the reader loop poisons the connection (§8.1).
 func (p *streamPlane) dispatchStreamFrame(f transport.Frame) error {
 	if f.Kind == transport.FrameCancel {
 		// A CANCEL routed here names a live stream (the reader decided this by
@@ -1027,9 +1055,10 @@ func (s *streamServer) setPanicController(pc *panicController) {
 //nolint:unparam // cdc is the codec seam; see doc above — proto is the only codec today.
 func newStreamServer(
 	tr transport.Transport, handlers map[streamKey]streamHandlerReg, cdc codec.Codec, leases *rpcruntime.LeaseTable,
+	opts ...streamPlaneOption,
 ) *streamServer {
 	srv := &streamServer{
-		plane:    newStreamPlane(tr),
+		plane:    newStreamPlane(tr, opts...),
 		handlers: handlers,
 		codec:    cdc,
 		leases:   leases,

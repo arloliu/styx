@@ -28,6 +28,13 @@ const (
 	KindStreamClose FrameKind = 6 // STREAM_CLOSE: reserved half-close
 	KindStreamErr   FrameKind = 7 // STREAM_ERR: reserved stream error status
 	KindUnaryErr    FrameKind = 8 // UNARY_ERR: error response carrying a status payload
+	// KindStreamChunk is a non-final fragment of an oversize STREAM_MSG,
+	// assigned from shm-abi.md §5's reserved 9..255 range behind the
+	// stream-chunking feature (stream-protocol.md §13). Unlike kinds 0..8 it
+	// is not unconditionally carried: a receiver accepts it only on a
+	// connection where the feature resolved active, and poisons on it
+	// otherwise (§5, §13.1).
+	KindStreamChunk FrameKind = 9
 )
 
 // Descriptor is one fixed 64-byte ring slot (one cache line), the unit both

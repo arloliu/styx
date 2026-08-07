@@ -504,6 +504,70 @@ func TestConnState_HandleInboundFrame_CopiesABorrowedStreamPayload_BeforeQueuein
 	require.Equal(t, "delivered bytes", string(got))
 }
 
+// Test that a borrowed STREAM_CHUNK fragment is copied before
+// dispatchStreamFrame ever sees it, causally: isStreamDataFrame routes
+// FrameStreamChunk through the identical copy-before-dispatch branch a
+// STREAM_MSG takes, but nothing yet delivers a fragment's bytes anywhere a
+// test could read them back from (Dispatch's own conformance-violation
+// disposition for STREAM_CHUNK never reads Payload, so a test that only
+// checked that disposition would stay green even if the clonePayload call
+// were deleted). The beforeStreamDispatchHook test seam captures the frame
+// at the exact point dispatchStreamFrame receives it, so the copy is
+// verified directly, the same way TestPrepareInboundFrame_CopiesABorrowedStreamPayload
+// verifies it for the plugin's receive path.
+func TestConnState_HandleInboundFrame_CopiesABorrowedStreamChunkPayload_BeforeDispatch(t *testing.T) {
+	// Given STREAM_CHUNK routed through the same borrow-copy branch as STREAM_MSG.
+	require.True(t, isStreamDataFrame(transport.FrameStreamChunk),
+		"STREAM_CHUNK must route through the same borrow-copy branch as STREAM_MSG")
+
+	// Given a generation with a streaming half and one live stream.
+	_, tr := newStreamingTransportPairForTest(t)
+	plane := newStreamPlane(tr)
+	t.Cleanup(func() { plane.teardown(ErrPluginUnavailable, ErrPluginUnavailable) })
+
+	st, err := plane.streams.Open(1, rpcruntime.ClientStream,
+		rpcruntime.StreamConfig{Credits: 4, Deadline: 10 * time.Second})
+	require.NoError(t, err)
+	require.True(t, st.Publish())
+
+	state := &connState{
+		table:        rpcruntime.NewTable(firstGeneration),
+		tr:           tr,
+		codec:        codec.Proto{},
+		streams:      plane,
+		readLoopDone: make(chan struct{}),
+	}
+
+	// Given an observation seam capturing the exact frame dispatchStreamFrame
+	// is about to receive.
+	var observed transport.Frame
+	restore := SetBeforeStreamDispatchHookForTest(func(f transport.Frame) { observed = f })
+	defer restore()
+
+	// When a borrowed STREAM_CHUNK arrives on the live stream.
+	lent := []byte("fragment bytes")
+	fault := state.handleInboundFrame(transport.Frame{
+		CallID: 1, Kind: transport.FrameStreamChunk, Control: 1, Payload: lent,
+	}, true)
+
+	// Then: reassembly does not exist yet, so the frame is the conformance
+	// violation an unhandled fragment already is.
+	require.Equal(t, inboundStreamConformance, fault)
+
+	// And the frame dispatch actually received is a copy, not an alias of
+	// the lender's memory...
+	require.Equal(t, "fragment bytes", string(observed.Payload))
+	require.NotSame(t, &lent[0], &observed.Payload[0],
+		"a fragment handed to dispatch must not alias the lender's memory")
+
+	// ...proven by the lender overwriting its buffer leaving the observed
+	// copy intact.
+	for i := range lent {
+		lent[i] = 0xEE
+	}
+	require.Equal(t, []byte("fragment bytes"), observed.Payload)
+}
+
 // Test that a frame the receive path discarded fails the call it named only when
 // that call could be in this table: a unary response or error response. Any other
 // kind names something else — a stream is registered in the stream table, and a
