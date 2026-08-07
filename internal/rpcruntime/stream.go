@@ -774,6 +774,7 @@ func (s *Stream) admit(ctx context.Context) error {
 		if s.sendCredit.reserve() {
 			return nil
 		}
+		notifyCreditWait()
 		select {
 		case <-s.sendWake:
 			if s.sendClosed.Load() {

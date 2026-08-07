@@ -3,6 +3,8 @@ package styx
 import (
 	"context"
 	"errors"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -562,4 +564,645 @@ func TestOpenStream_ReportsPoisonAndEscalates_OnPoisonedRegion(t *testing.T) {
 	// And: the stream's admission slot is released, not held until its deadline.
 	require.Equal(t, 0, state.streams.streams.Len(),
 		"an open refused by the region frees its admission slot immediately")
+}
+
+// The asymmetric geometry the chunking tests below run on. The two directions'
+// top size classes differ deliberately: the split rule is defined against the
+// SENDING direction's inline limit and the receiver's canonical-length check
+// against the RECEIVING one (stream-protocol.md §13.2), so a symmetric ladder
+// could not tell a correct implementation from one that read the wrong
+// direction's number. Both sizes are 64-byte granular, which shm-abi.md §2
+// requires of every slab size.
+const (
+	shmChunkHostToPluginSlab uint32 = 8192
+	shmChunkPluginToHostSlab uint32 = 4096
+	// shmChunkCRCTrailer is the whole per-frame overhead the checksum feature
+	// adds under layout_version 1: the 4-byte CRC32C trailer stored after the
+	// payload (shm-abi.md §5/§18). It is the only thing that separates a
+	// direction's inline limit L from its top slab size.
+	shmChunkCRCTrailer uint32 = 4
+	// shmChunkCeiling is the announced chunk_max_payload (stream-protocol.md
+	// §13.6). It sits well above twice either direction's inline limit, so no
+	// payload these tests send is accidentally a ceiling case.
+	shmChunkCeiling uint32 = 1 << 20
+)
+
+// shmChunkLayout is the asymmetric geometry above, with enough slabs in each
+// top class that a fragment train never stalls on the arena — the starved
+// geometry that deliberately does stall is shmChunkStarvedLayout.
+func shmChunkLayout() internalshm.Layout {
+	return internalshm.Layout{
+		Generation:       firstGeneration,
+		RingCapacity:     256,
+		LifecycleReserve: 32,
+		Arenas: [2]internalshm.ArenaGeometry{
+			internalshm.HostToPlugin: {Classes: []internalshm.SizeClass{
+				{SlabSize: 64, SlabCount: 16},
+				{SlabSize: shmChunkHostToPluginSlab, SlabCount: 32},
+			}},
+			internalshm.PluginToHost: {Classes: []internalshm.SizeClass{
+				{SlabSize: 64, SlabCount: 16},
+				{SlabSize: shmChunkPluginToHostSlab, SlabCount: 32},
+			}},
+		},
+	}
+}
+
+// shmChunkConfig is the admission configuration a chunking connection is really
+// built from. MaxPayload is zero and must stay zero: an outbound clamp lowers
+// only this side's limit while the peer keeps validating every non-final
+// fragment against its own inbound one, so a clamped sender would split into
+// non-canonical fragments and poison the connection on the first oversize
+// message (stream-protocol.md §13.2). ValidateChunkingClamp is what enforces
+// that, and TestChunkingClamp_RefuseAnOutboundPayloadClamp_WhenChunkingIsActive
+// pins it.
+func shmChunkConfig(checksum bool) shmtransport.Config {
+	return shmtransport.Config{
+		MaxInflight:         224, // RingCapacity - LifecycleReserve
+		MaxPayload:          0,
+		DataQueueDepth:      32,
+		LifecycleQueueDepth: 16,
+		Checksum:            checksum,
+		ChunkingActive:      true,
+	}
+}
+
+// shmChunkPayload builds an n-byte payload whose every byte is derived from its
+// own position, so a reassembly that spliced fragments in the wrong order,
+// repeated one, or dropped one shows up as a content mismatch and not only as a
+// length mismatch. 251 is the largest prime below 256, so the pattern's period
+// shares no factor with any fragment length these tests use.
+func shmChunkPayload(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i%251 + 1)
+	}
+
+	return b
+}
+
+// shmChunkHarness is one chunking connection observed from both ends in this
+// process: a real shared-memory pair, a StreamTable per end carrying that end's
+// own real chunk policy, and one pump goroutine per direction feeding every
+// frame the transport delivers into the opposite table's Dispatch.
+type shmChunkHarness struct {
+	pair         *shmtest.Pair
+	hostTbl      *rpcruntime.StreamTable
+	pluginTbl    *rpcruntime.StreamTable
+	hostPolicy   rpcruntime.ChunkPolicy
+	pluginPolicy rpcruntime.ChunkPolicy
+
+	// pluginChunks and hostChunks count the STREAM_CHUNK (kind 9) frames each
+	// end has been handed, incremented on the pump goroutine before the frame is
+	// dispatched. A read taken after the completing STREAM_MSG has been delivered
+	// therefore already includes every fragment of that logical message.
+	pluginChunks atomic.Int64
+	hostChunks   atomic.Int64
+
+	// dispatchErrs collects conformance violations the pumps saw. A frame the
+	// receiving table refuses is exactly what a mis-split train produces, so an
+	// entry here is a failure even when the bytes eventually arrive.
+	dispatchErrs chan error
+}
+
+// setupShmChunkTestHelper builds the harness over the asymmetric geometry, with
+// the checksum feature on or off. Nothing in this repo offers the checksum
+// feature in a real handshake, so an in-process pair built straight from
+// shmtransport.Config is the only seam where a fragment train can be observed
+// crossing the CRC32C trailer path.
+func setupShmChunkTestHelper(t *testing.T, checksum bool) *shmChunkHarness {
+	t.Helper()
+
+	pair, err := shmtest.NewInProcessPairWithLayout(shmChunkLayout(), shmChunkConfig(checksum))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pair.Close() })
+
+	h := &shmChunkHarness{
+		pair:         pair,
+		hostPolicy:   rpcruntime.ChunkPolicyFor(pair.Host, true, shmChunkCeiling),
+		pluginPolicy: rpcruntime.ChunkPolicyFor(pair.Plugin, true, shmChunkCeiling),
+		dispatchErrs: make(chan error, 8),
+	}
+	h.hostTbl = rpcruntime.NewStreamTable(maxOpenStreams, pair.Host, rpcruntime.WithChunkPolicy(h.hostPolicy))
+	h.pluginTbl = rpcruntime.NewStreamTable(maxOpenStreams, pair.Plugin, rpcruntime.WithChunkPolicy(h.pluginPolicy))
+	t.Cleanup(func() {
+		_ = h.hostTbl.Close()
+		_ = h.pluginTbl.Close()
+	})
+
+	// The pumps are bounded by t.Context(), which the testing package cancels
+	// before any cleanup runs, and joined by the cleanup registered last (so it
+	// runs first): neither goroutine can outlive the test or touch the region
+	// after Close unmaps it.
+	var pumps sync.WaitGroup
+	pumps.Add(2)
+	go h.pump(t.Context(), &pumps, pair.Plugin, h.pluginTbl, &h.pluginChunks)
+	go h.pump(t.Context(), &pumps, pair.Host, h.hostTbl, &h.hostChunks)
+	t.Cleanup(pumps.Wait)
+
+	return h
+}
+
+// pump is one direction's connection reader: every frame that arrives on from is
+// counted (when it is a fragment) and handed to the peer table's Dispatch, which
+// is where reassembly happens. It exits on the first receive error, which is what
+// the bounding context's cancellation produces.
+func (h *shmChunkHarness) pump(
+	ctx context.Context, wg *sync.WaitGroup, from transport.Transport,
+	to *rpcruntime.StreamTable, chunks *atomic.Int64,
+) {
+	defer wg.Done()
+
+	for {
+		f, err := from.Recv(ctx)
+		if err != nil {
+			return
+		}
+		if f.Kind == transport.FrameStreamChunk {
+			chunks.Add(1)
+		}
+		if derr := to.Dispatch(f); derr != nil {
+			select {
+			case h.dispatchErrs <- derr:
+			default:
+			}
+		}
+	}
+}
+
+// openPair opens the two ends of one logical stream on callID — the sender's
+// opener-side stream and the peer's accepting stream — and publishes both. No
+// STREAM_OPEN travels: this harness drives the data plane directly, so each end
+// is established locally and the frames under test are the fragments themselves.
+func (h *shmChunkHarness) openPair(t *testing.T, callID uint64) (client, server *rpcruntime.Stream) {
+	t.Helper()
+
+	cfg := rpcruntime.StreamConfig{Credits: 4, Deadline: time.Minute}
+	client, err := h.hostTbl.Open(callID, rpcruntime.ClientStream, cfg)
+	require.NoError(t, err)
+	require.True(t, client.Publish())
+
+	server, err = h.pluginTbl.Open(callID, rpcruntime.ServerStream, cfg)
+	require.NoError(t, err)
+	require.True(t, server.Publish())
+
+	return client, server
+}
+
+// requireNoDispatchFault fails if either pump saw a frame the receiving table
+// refused. It is read only after a message has been delivered, so every fragment
+// that carried that message has already been dispatched.
+func (h *shmChunkHarness) requireNoDispatchFault(t *testing.T) {
+	t.Helper()
+
+	select {
+	case err := <-h.dispatchErrs:
+		require.NoError(t, err, "a pumped frame was refused as a conformance violation")
+	default:
+	}
+}
+
+// shmChunkDirection is one direction of a chunking connection under test: the
+// stream that sends, the stream that receives, that direction's own inline limit
+// L, and the counter of STREAM_CHUNK frames arriving at its receiving end.
+//
+// The pair exists because the split rule reads the SENDING direction's limit and
+// the canonical-length check the RECEIVING one (stream-protocol.md §13.2). With
+// the two limits deliberately different, running the identical size table down
+// both directions is what catches an implementation that read the wrong side's
+// number: every boundary size is derived from the direction's own L, so a
+// crossed limit turns a legal message into a non-canonical fragment and the
+// receiving table refuses it.
+type shmChunkDirection struct {
+	name   string
+	send   *rpcruntime.Stream
+	recv   *rpcruntime.Stream
+	inline int
+	chunks *atomic.Int64
+}
+
+// directions returns the two directions of one opened stream pair.
+func (h *shmChunkHarness) directions(client, server *rpcruntime.Stream) []shmChunkDirection {
+	return []shmChunkDirection{
+		{
+			name: "host_to_plugin", send: client, recv: server,
+			inline: int(h.hostPolicy.SendInline), chunks: &h.pluginChunks,
+		},
+		{
+			name: "plugin_to_host", send: server, recv: client,
+			inline: int(h.pluginPolicy.SendInline), chunks: &h.hostChunks,
+		},
+	}
+}
+
+// requireExactDelivery sends one logical message of n bytes down d and asserts
+// it arrives whole and byte-exact, carried by exactly the fragment count the
+// split rule prescribes: ceil(n/L) fragments, of which all but the completing
+// STREAM_MSG ride kind 9 (stream-protocol.md §13.2).
+//
+// The fragment count is asserted as a delta against a reading taken before the
+// send, because the counters are cumulative over the whole connection. It is
+// what separates "the bytes arrived" from "the bytes arrived the way the
+// contract says they travel": a sender that split against the wrong limit, or
+// that chunked a message small enough to ride one frame, delivers identical
+// bytes and a different count.
+func (h *shmChunkHarness) requireExactDelivery(t *testing.T, d shmChunkDirection, n int) {
+	t.Helper()
+
+	before := d.chunks.Load()
+	want := shmChunkPayload(n)
+	require.NoError(t, d.send.SendMsg(t.Context(), want))
+
+	got, err := d.recv.RecvMsg(t.Context())
+	require.NoError(t, err)
+	require.Len(t, got, n)
+	require.Equal(t, want, got, "the reassembled message is not the bytes that were split")
+
+	wantChunks := int64((n+d.inline-1)/d.inline) - 1
+	require.Equal(t, wantChunks, d.chunks.Load()-before,
+		"a %d-byte message on a %d-byte limit rides %d STREAM_CHUNKs then the completing STREAM_MSG",
+		n, d.inline, wantChunks)
+	h.requireNoDispatchFault(t)
+}
+
+// shmChunkBoundarySizes are the logical-message lengths a direction's inline
+// limit L makes interesting: one byte under it, exactly it, one byte over (the
+// smallest train), exactly two fragments, one byte past that, and the announced
+// ceiling itself. Every off-by-one in the split rule, in the canonical-length
+// check, or in the ceiling comparison falls inside this set.
+func shmChunkBoundarySizes(inline int) []int {
+	return []int{inline - 1, inline, inline + 1, 2 * inline, 2*inline + 1, int(shmChunkCeiling)}
+}
+
+// Test that each end of a shared-memory pair carries its OWN direction's inline
+// limit into the chunk policy, and that the checksum feature's CRC32C trailer
+// moves every one of the four numbers (stream-protocol.md §13.2, shm-abi.md §18).
+func TestChunkPolicy_CarryEachEndsOwnInlineLimits_OnAnAsymmetricShmPair(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		checksum bool
+	}{
+		{name: "checksum_off", checksum: false},
+		{name: "checksum_on", checksum: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given: a real pair over the asymmetric geometry, with the checksum
+			// feature resolved as this case says.
+			pair, err := shmtest.NewInProcessPairWithLayout(shmChunkLayout(), shmChunkConfig(tc.checksum))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = pair.Close() })
+
+			hostShm, ok := pair.Host.(*shmtransport.Transport)
+			require.True(t, ok, "expected a real shm transport on the host end")
+			pluginShm, ok := pair.Plugin.(*shmtransport.Transport)
+			require.True(t, ok, "expected a real shm transport on the plugin end")
+
+			// When: the per-frame overhead is exactly the CRC32C trailer with the
+			// feature on and nothing at all with it off (shm-abi.md §18).
+			overhead := uint32(0)
+			if tc.checksum {
+				overhead = shmChunkCRCTrailer
+			}
+			wantHostSend := shmChunkHostToPluginSlab - overhead
+			wantHostRecv := shmChunkPluginToHostSlab - overhead
+
+			// Then: each end reports its own outbound and inbound direction, and the
+			// two ends are exact mirrors of each other.
+			require.Equal(t, wantHostSend, hostShm.MaxSendPayload(),
+				"the host sends into the host->plugin direction's top class")
+			require.Equal(t, wantHostRecv, hostShm.MaxRecvPayload(),
+				"the host receives out of the plugin->host direction's top class")
+			require.Equal(t, wantHostRecv, pluginShm.MaxSendPayload(),
+				"the plugin's outbound limit is the host's inbound limit for that direction")
+			require.Equal(t, wantHostSend, pluginShm.MaxRecvPayload(),
+				"the plugin's inbound limit is the host's outbound limit for that direction")
+
+			// And: the resolved policy carries those same two numbers into the split
+			// and canonical-length rules on each end (stream-protocol.md §13.2).
+			require.Equal(t, rpcruntime.ChunkPolicy{
+				Active: true, Ceiling: shmChunkCeiling,
+				SendInline: wantHostSend, RecvInline: wantHostRecv,
+			}, rpcruntime.ChunkPolicyFor(pair.Host, true, shmChunkCeiling))
+			require.Equal(t, rpcruntime.ChunkPolicy{
+				Active: true, Ceiling: shmChunkCeiling,
+				SendInline: wantHostRecv, RecvInline: wantHostSend,
+			}, rpcruntime.ChunkPolicyFor(pair.Plugin, true, shmChunkCeiling))
+		})
+	}
+}
+
+// Test that the chunk policy is the zero (inactive) value whenever the feature
+// did not resolve or the attach announced no ceiling (stream-protocol.md §13.1).
+func TestChunkPolicyFor_ReturnTheInactivePolicy_OnAZeroCeilingOrAnInactiveFeature(t *testing.T) {
+	// Given: a transport that could carry the feature.
+	pair, err := shmtest.NewInProcessPairWithLayout(shmChunkLayout(), shmChunkConfig(false))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pair.Close() })
+
+	// When / Then: a dormant attach — the flag resolved but the announced
+	// chunk_max_payload is zero — leaves the feature inactive, so no policy can
+	// exist that claims the feature is on while rejecting every oversize message.
+	require.Equal(t, rpcruntime.ChunkPolicy{}, rpcruntime.ChunkPolicyFor(pair.Host, true, 0))
+
+	// And: a tuple in which the flag did not resolve leaves it inactive even
+	// though a ceiling was announced.
+	require.Equal(t, rpcruntime.ChunkPolicy{}, rpcruntime.ChunkPolicyFor(pair.Host, false, shmChunkCeiling))
+
+	// And: the root's own resolver agrees, which is what wires the policy into a
+	// connection's stream plane.
+	plane := newStreamPlane(pair.Host, withChunkPolicy(rpcruntime.ChunkPolicyFor(pair.Host, false, shmChunkCeiling)))
+	t.Cleanup(func() {
+		plane.stopFatalWatch()
+		_ = plane.streams.Close()
+	})
+	require.Equal(t, rpcruntime.ChunkPolicy{}, plane.chunkPolicy)
+}
+
+// Test the whole boundary set crossing a real shared-memory region in BOTH
+// directions, with the CRC32C trailer on every fragment and with it off: each
+// logical message is split against its own direction's inline limit, reassembled
+// byte-exact, and delivered whole (stream-protocol.md §13.2/§13.5).
+//
+// Checksum on is the reason this runs in process. No production offer lists the
+// checksum feature, so a real handshake can never resolve it, and a pair built
+// straight from shmtransport.Config is the only seam where a fragment train can
+// be watched crossing the trailer path. The trailer moves every inline limit by
+// four bytes, so every boundary below is a DIFFERENT length in the two cases —
+// which is exactly why the set has to run twice rather than once.
+func TestStreamChunk_ReassembleTheExactBytes_OverARealShmPair(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		checksum bool
+	}{
+		{name: "checksum_off", checksum: false},
+		{name: "checksum_on", checksum: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given: one connection observed from both ends, and one stream on it.
+			h := setupShmChunkTestHelper(t, tc.checksum)
+			client, server := h.openPair(t, 11)
+
+			require.Less(t, int(h.pluginPolicy.SendInline), int(h.hostPolicy.SendInline),
+				"the geometry's two directions must differ, or a crossed limit could not be detected")
+
+			for _, d := range h.directions(client, server) {
+				t.Run(d.name, func(t *testing.T) {
+					require.Positive(t, d.inline)
+
+					for _, size := range shmChunkBoundarySizes(d.inline) {
+						t.Run(strconv.Itoa(size), func(t *testing.T) {
+							// When / Then: the message arrives whole, byte-exact, and
+							// carried by exactly the fragments the split rule prescribes
+							// — none at all at or below the limit.
+							h.requireExactDelivery(t, d, size)
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+// Test the ceiling refusing a logical message one byte past it in either
+// direction, definitively and before the wire, with the stream left alive
+// (stream-protocol.md §13.6).
+//
+// The row runs with the checksum feature on as well as off because the ceiling
+// is announced independently of the trailer: it bounds the REASSEMBLED message,
+// not a fragment, so the same number must refuse the same length whatever the
+// per-frame overhead is.
+func TestStreamChunk_RefuseTheOversizeMessage_OverARealShmPair(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		checksum bool
+	}{
+		{name: "checksum_off", checksum: false},
+		{name: "checksum_on", checksum: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			h := setupShmChunkTestHelper(t, tc.checksum)
+			client, server := h.openPair(t, 12)
+
+			for _, d := range h.directions(client, server) {
+				t.Run(d.name, func(t *testing.T) {
+					before := d.chunks.Load()
+
+					// When a message one byte past the ceiling is sent.
+					err := d.send.SendMsg(t.Context(), shmChunkPayload(int(shmChunkCeiling)+1))
+
+					// Then it is refused definitively, with no fragment built: the
+					// check runs while the train is still invisible, so nothing of it
+					// reached the region (stream-protocol.md §13.4).
+					require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+					require.Equal(t, before, d.chunks.Load(), "a refused message emits no fragment")
+
+					// And the stream survives the refusal: the credit unit and the
+					// sequence reservation rolled back, so the next message goes
+					// through on the same stream.
+					h.requireExactDelivery(t, d, d.inline+1)
+				})
+			}
+		})
+	}
+}
+
+// Test that a configuration pairing active chunking with an outbound payload
+// clamp is refused, and that the configuration a real chunking pair is built
+// from carries no clamp (stream-protocol.md §13.2).
+func TestChunkingClamp_RefuseAnOutboundPayloadClamp_WhenChunkingIsActive(t *testing.T) {
+	// Given: the configuration a chunking connection is really built from. Its
+	// MaxPayload is zero, which is not incidental — a lowered outbound clamp moves
+	// only THIS side's limit, while the peer keeps checking every non-final
+	// fragment against its own inbound limit, which the clamp does not move. The
+	// sender would then split into fragments the peer reads as non-canonical and
+	// poison the connection on the first oversize message.
+	active := shmChunkConfig(false)
+	require.Zero(t, active.MaxPayload)
+	require.NoError(t, shmtransport.ValidateChunkingClamp(active))
+
+	// And: a real pair built from it derives its outbound limit from the geometry
+	// alone, so the split rule and the peer's canonical-length check are the same
+	// number (stream-protocol.md §13.2).
+	pair, err := shmtest.NewInProcessPairWithLayout(shmChunkLayout(), active)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pair.Close() })
+	hostShm, ok := pair.Host.(*shmtransport.Transport)
+	require.True(t, ok)
+	require.Equal(t, shmChunkHostToPluginSlab, hostShm.MaxSendPayload(),
+		"an unclamped chunking config leaves the outbound limit at the geometry's own maximum")
+
+	// When: the stock test configuration — whose MaxPayload is non-zero — is asked
+	// to run chunking.
+	clamped := shmtest.DefaultConfig()
+	require.NotZero(t, clamped.MaxPayload, "the stock config's clamp is what makes this case real")
+	clamped.ChunkingActive = true
+
+	// Then: it is refused before any transport is constructed.
+	require.ErrorIs(t, shmtransport.ValidateChunkingClamp(clamped), shmtransport.ErrChunkingSendClamp)
+
+	// And: the same clamp stays legal with the feature dormant — the clamp is not
+	// wrong, only its combination with chunking is.
+	require.NoError(t, shmtransport.ValidateChunkingClamp(shmtest.DefaultConfig()))
+}
+
+// shmChunkStarvedLayout is a deliberately tiny geometry for the arena set-aside
+// path: its top class holds exactly two slabs, so a three-fragment train fills
+// the class with its first two fragments and the third cannot allocate while the
+// peer consumes nothing. The middle class is sized so the train's short
+// remainder still lands in the exhausted top class rather than escaping into a
+// smaller one, and the ring is far larger than the arena so the arena, not the
+// ring window, is the binding backpressure.
+func shmChunkStarvedLayout() internalshm.Layout {
+	classes := []internalshm.SizeClass{
+		{SlabSize: 512, SlabCount: 8},
+		{SlabSize: shmChunkPluginToHostSlab, SlabCount: 2},
+	}
+
+	return internalshm.Layout{
+		Generation:       firstGeneration,
+		RingCapacity:     64,
+		LifecycleReserve: 8,
+		Arenas: [2]internalshm.ArenaGeometry{
+			internalshm.HostToPlugin: {Classes: classes},
+			internalshm.PluginToHost: {Classes: classes},
+		},
+	}
+}
+
+// shmChunkStarvedConfig is shmChunkConfig re-admitted against the starved
+// geometry's much smaller ring: the deadlock-freedom bound is
+// max_data_inflight <= C - R (shm-abi.md §18). MaxPayload stays zero for the
+// same reason it does there.
+func shmChunkStarvedConfig() shmtransport.Config {
+	cfg := shmChunkConfig(false)
+	cfg.MaxInflight = 56 // RingCapacity - LifecycleReserve
+	cfg.DataQueueDepth = 8
+	cfg.LifecycleQueueDepth = 8
+
+	return cfg
+}
+
+// Test that a fragment train outrunning the arena resolves as a typed terminal
+// with no partial logical message delivered — arena exhaustion under a chunked
+// train is ordinary typed backpressure, never a safety violation
+// (stream-protocol.md §13.9, shm-abi.md §18).
+//
+// The set-aside is PROVEN, not waited for: the writer's stuck-carry observer
+// fires only when a data intent is enqueued and cannot publish because its size
+// class has no free slab, and nothing can free one while the peer consumes
+// nothing. The send is then ended by cancelling its context, which is
+// §13.8 shape 2 — so the outcome asserted here is a determinate terminal, not
+// whichever of several races happened to win.
+func TestStreamChunk_TerminateWithoutPartialDelivery_WhenTheArenaSetsAFragmentAside(t *testing.T) {
+	// Given: a pair whose host->plugin top class holds two slabs, and a peer that
+	// consumes nothing.
+	pair, err := shmtest.NewInProcessPairWithLayout(shmChunkStarvedLayout(), shmChunkStarvedConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pair.Close() })
+
+	// The drain below is started only after the assertions, once the starved
+	// premise has done its work: the tables' own teardown frames still have to
+	// reach the transport, and a permanently full arena would park the emitter.
+	// It is joined before the region is unmapped, and after both tables close.
+	drainCtx, stopDrain := context.WithCancel(context.Background())
+	var drain sync.WaitGroup
+	t.Cleanup(func() {
+		stopDrain()
+		drain.Wait()
+	})
+
+	hostShm, ok := pair.Host.(*shmtransport.Transport)
+	require.True(t, ok, "expected a real shm transport to observe the writer")
+
+	policy := rpcruntime.ChunkPolicyFor(pair.Host, true, shmChunkCeiling)
+	require.Equal(t, shmChunkPluginToHostSlab, policy.SendInline)
+
+	hostTbl := rpcruntime.NewStreamTable(maxOpenStreams, pair.Host, rpcruntime.WithChunkPolicy(policy))
+	peerTbl := rpcruntime.NewStreamTable(maxOpenStreams, pair.Plugin,
+		rpcruntime.WithChunkPolicy(rpcruntime.ChunkPolicyFor(pair.Plugin, true, shmChunkCeiling)))
+	t.Cleanup(func() {
+		_ = hostTbl.Close()
+		_ = peerTbl.Close()
+	})
+
+	cfg := rpcruntime.StreamConfig{Credits: 4, Deadline: time.Minute}
+	client, err := hostTbl.Open(21, rpcruntime.ClientStream, cfg)
+	require.NoError(t, err)
+	require.True(t, client.Publish())
+	server, err := peerTbl.Open(21, rpcruntime.ServerStream, cfg)
+	require.NoError(t, err)
+	require.True(t, server.Publish())
+
+	stuck := make(chan struct{}, 1)
+	hostShm.SetWriterStuckObserverForTest(func() {
+		select {
+		case stuck <- struct{}{}:
+		default:
+		}
+	})
+
+	// When: a three-fragment train is sent. Its first two fragments take the top
+	// class's two slabs; its 600-byte remainder is too large for the 512-byte
+	// class, so it needs the exhausted one and the writer sets it aside.
+	inline := int(policy.SendInline)
+	sendCtx, cancelSend := context.WithCancel(context.Background())
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- client.SendMsg(sendCtx, shmChunkPayload(2*inline+600)) }()
+
+	select {
+	case <-stuck:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the writer never parked with a fragment set aside; the arena did not stall the train")
+	}
+
+	// And: the send's context ends while that fragment is still set aside.
+	cancelSend()
+
+	// Then: the send resolves as the locally-initiated cancel of a visible train
+	// (stream-protocol.md §13.8 shape 2) — a typed terminal, never a hang.
+	select {
+	case err := <-sendErr:
+		require.ErrorIs(t, err, rpcruntime.ErrCanceledLocally)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the send never returned after its context ended over a set-aside fragment")
+	}
+	oc, done := client.Outcome()
+	require.True(t, done, "a visible train that cannot complete leaves the stream terminal")
+	require.Equal(t, rpcruntime.OutcomeCanceled, oc.Code)
+
+	// And: exactly the two fragments that fit the arena reached the peer, each of
+	// them a canonical non-final fragment of exactly L bytes (§13.2). The
+	// completing STREAM_MSG is never emitted for a train that cannot finish
+	// (§13.8), so the peer holds an accumulation and delivers nothing.
+	for i := range 2 {
+		f, recvErr := pair.Plugin.Recv(t.Context())
+		require.NoError(t, recvErr)
+		require.Equal(t, transport.FrameStreamChunk, f.Kind, "fragment %d rides frame kind 9", i+1)
+		require.Len(t, f.Payload, inline, "a non-final fragment carries exactly the inline limit")
+		require.NoError(t, peerTbl.Dispatch(f), "a canonical fragment is not a conformance violation")
+	}
+
+	noWait, cancelNoWait := context.WithCancel(context.Background())
+	cancelNoWait()
+	_, recvErr := server.RecvMsg(noWait)
+	require.ErrorIs(t, recvErr, context.Canceled,
+		"a logical message is delivered whole or not at all; a partial train delivers nothing")
+
+	// And: the set-aside the writer performed is visible in the diagnostic a
+	// deployment sizing for oversize stream traffic watches
+	// (styx.arena.setaside.count, stream-protocol.md §13.9). The numbers are
+	// observed and logged, not gated: what is asserted is the qualitative
+	// outcome above.
+	for _, c := range hostShm.ArenaCarries() {
+		t.Logf("styx.arena.setaside.count slab_size=%d set_aside=%d resumed=%d", c.SlabSize, c.SetAside, c.Resumed)
+	}
+
+	drain.Go(func() {
+		for {
+			if _, e := pair.Plugin.Recv(drainCtx); e != nil {
+				return
+			}
+		}
+	})
 }

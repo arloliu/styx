@@ -34,6 +34,7 @@ var (
 	fixtureUDSOnlyPlugin   string
 	fixtureCrashyPlugin    string
 	fixtureBurstPlugin     string
+	fixtureChunkPlugin     string
 )
 
 // TestMain builds the cross-process plugin fixtures once (Host.Start spawns
@@ -81,6 +82,14 @@ func TestMain(m *testing.M) {
 	bBuild := exec.Command("go", "build", "-o", fixtureBurstPlugin, "./testdata/burstplugin")
 	if out, err := bBuild.CombinedOutput(); err != nil {
 		panic("building burstplugin fixture: " + err.Error() + "\n" + string(out))
+	}
+
+	// The stream-chunking matrix's fixture: three raw-byte streaming shapes over
+	// exact logical-message lengths, reporting what it observed to a file.
+	fixtureChunkPlugin = filepath.Join(dir, "chunkplugin")
+	chunkBuild := exec.Command("go", "build", "-o", fixtureChunkPlugin, "./testdata/chunkplugin")
+	if out, err := chunkBuild.CombinedOutput(); err != nil {
+		panic("building chunkplugin fixture: " + err.Error() + "\n" + string(out))
 	}
 
 	fixtureCrashyPlugin = filepath.Join(dir, "crashyplugin")
