@@ -124,3 +124,39 @@ func TestValidateCapacityInvariant_ChecksArenaFitPerDirection(t *testing.T) {
 	// Then the plugin-to-host direction's arena-fit failure is reported.
 	require.ErrorIs(t, err, ErrCapacity)
 }
+
+// Test that the outbound payload clamp and active stream chunking are refused
+// together: the clamp lowers only this side's send limit, while the peer keeps
+// validating every non-final fragment against its own unclamped inbound limit
+// (stream-protocol.md §13.2).
+func TestValidateChunkingClamp_RejectsAClampedSenderWithChunkingActive(t *testing.T) {
+	tests := []struct {
+		name       string
+		chunking   bool
+		maxPayload uint32
+		wantErr    bool
+	}{
+		{name: "chunking active with the clamp disengaged", chunking: true, maxPayload: 0, wantErr: false},
+		{name: "chunking active with the clamp engaged", chunking: true, maxPayload: 4096, wantErr: true},
+		{name: "clamp engaged with chunking dormant", chunking: false, maxPayload: 4096, wantErr: false},
+		{name: "neither", chunking: false, maxPayload: 0, wantErr: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			cfg := Config{MaxInflight: 8, MaxPayload: tc.maxPayload, ChunkingActive: tc.chunking}
+
+			// When
+			err := ValidateChunkingClamp(cfg)
+
+			// Then
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrChunkingSendClamp)
+				require.ErrorContains(t, err, "4096", "the refusal names the conflicting clamp")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

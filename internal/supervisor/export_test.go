@@ -268,8 +268,18 @@ var ExitStatusFromState = exitStatusFromState
 // package): it is the pure host-side mapping from Config into the shared-memory
 // transport's own configuration, so the knobs it must carry across that boundary
 // are exercised directly here, without a real region, handshake, or child process.
-func (s *Supervisor) ShmConfigForTest(maxInflight int, tuple control.Tuple) shmtransport.Config {
+func (s *Supervisor) ShmConfigForTest(maxInflight int, tuple control.Tuple) (shmtransport.Config, error) {
 	return s.shmConfig(maxInflight, tuple)
+}
+
+// SetShmConfigAdjusterForTest installs the candidate-configuration adjuster
+// shmConfig applies just before validating. It lets a test present the mapping
+// with a shared-memory configuration no production path builds today — the
+// outbound payload clamp under active chunking — so the refusal is observed
+// coming out of the production seam rather than out of a predicate the test
+// called itself.
+func (s *Supervisor) SetShmConfigAdjusterForTest(f func(*shmtransport.Config)) {
+	s.adjustShmConfigForTest = f
 }
 
 // StoppedForTest re-exports stopped for the crash-to-give-up gap failpoint

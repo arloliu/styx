@@ -22,6 +22,7 @@ import (
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/testutil"
+	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 	pubsupervisor "github.com/arloliu/styx/supervisor"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -2688,8 +2689,10 @@ func TestSupervisor_ShmConfig_CarriesTheConsumeFaultRunThreshold(t *testing.T) {
 	thresholdFor := func(t *testing.T, configured int) int {
 		t.Helper()
 		s := supervisor.New(supervisor.Config{ConsumeFaultRunThreshold: configured}, supervisor.NewEventBus())
+		cfg, err := s.ShmConfigForTest(16, tuple)
+		require.NoError(t, err)
 
-		return s.ShmConfigForTest(16, tuple).Escalation.ConsumeFaultRunThreshold
+		return cfg.Escalation.ConsumeFaultRunThreshold
 	}
 
 	t.Run("an explicit threshold reaches the transport unchanged", func(t *testing.T) {
@@ -2720,18 +2723,58 @@ func TestSupervisor_ShmConfig_ResolvesChunkingActive(t *testing.T) {
 	}
 	unresolved := control.Tuple{Transport: control.TransportSHM, Features: map[string]bool{}}
 
+	chunkingActive := func(s *supervisor.Supervisor, tuple control.Tuple) bool {
+		t.Helper()
+		cfg, err := s.ShmConfigForTest(16, tuple)
+		require.NoError(t, err)
+
+		return cfg.ChunkingActive
+	}
+
 	// Given a supervisor configured with a non-zero chunk ceiling.
 	on := supervisor.New(supervisor.Config{ChunkMaxPayload: 1 << 20}, supervisor.NewEventBus())
 
 	// When / Then: the resolved flag activates chunking, the unresolved one does not.
-	require.True(t, on.ShmConfigForTest(16, active).ChunkingActive)
-	require.False(t, on.ShmConfigForTest(16, unresolved).ChunkingActive,
+	require.True(t, chunkingActive(on, active))
+	require.False(t, chunkingActive(on, unresolved),
 		"an unresolved flag leaves chunking dormant even with a non-zero configured ceiling")
 
 	// Given a supervisor with no configured chunk ceiling.
 	off := supervisor.New(supervisor.Config{}, supervisor.NewEventBus())
 
 	// When / Then: a resolved flag still leaves chunking dormant with a zero ceiling.
-	require.False(t, off.ShmConfigForTest(16, active).ChunkingActive,
+	require.False(t, chunkingActive(off, active),
 		"a zero configured ceiling leaves chunking dormant even with the flag resolved")
+}
+
+// Test that the host-side mapping never hands the shared-memory transport an
+// outbound payload clamp while chunking is active. The clamp lowers only this
+// side's send limit; the peer keeps validating every non-final fragment against
+// its own unclamped inbound limit, so a clamped chunking sender would poison the
+// region on its first oversize stream message.
+func TestSupervisor_ShmConfig_NeverClampsTheOutboundPayloadUnderChunking(t *testing.T) {
+	// Given a host whose chunk ceiling is configured and whose tuple resolved
+	// the feature, so the mapping produces an active-chunking config.
+	active := control.Tuple{
+		Transport: control.TransportSHM, Features: map[string]bool{control.FeatureStreamChunking: true},
+	}
+	s := supervisor.New(supervisor.Config{ChunkMaxPayload: 1 << 20}, supervisor.NewEventBus())
+
+	// When the mapping runs.
+	cfg, err := s.ShmConfigForTest(16, active)
+
+	// Then it succeeds precisely because the clamp is disengaged: the transport
+	// derives both directions from the region geometry, so the two sides agree on
+	// the canonical fragment length.
+	require.NoError(t, err)
+	require.True(t, cfg.ChunkingActive)
+	require.Zero(t, cfg.MaxPayload,
+		"an engaged clamp here would desynchronize the split from the peer's length check")
+
+	// And the mapping is what refuses the conflict, not merely a bystander to it:
+	// presented with a clamped candidate — the shape a future ceiling would
+	// produce here — it fails rather than handing that configuration to Attach.
+	s.SetShmConfigAdjusterForTest(func(c *shmtransport.Config) { c.MaxPayload = 4096 })
+	_, clampErr := s.ShmConfigForTest(16, active)
+	require.ErrorIs(t, clampErr, shmtransport.ErrChunkingSendClamp)
 }

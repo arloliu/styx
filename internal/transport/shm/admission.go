@@ -15,6 +15,30 @@ import (
 // errors.Is.
 var ErrCapacity = errors.New("shm: config over-admits the region geometry")
 
+// ErrChunkingSendClamp is returned when a configuration pairs active stream
+// chunking with a non-zero Config.MaxPayload. The two are mutually exclusive:
+// MaxPayload lowers only THIS side's outbound limit, while the peer validates
+// every non-final fragment against its own inbound limit, which the clamp does
+// not move (stream-protocol.md §13.2's canonical fragment length). A clamped
+// sender would therefore split into fragments the peer reads as non-canonical
+// and poison the connection on the first oversize message. Callers match it
+// with errors.Is.
+var ErrChunkingSendClamp = errors.New("shm: stream chunking cannot run with an outbound payload clamp")
+
+// ValidateChunkingClamp refuses a configuration whose outbound payload clamp
+// would desynchronize the chunk split from the peer's canonical-length check
+// (ErrChunkingSendClamp). It is called by the attach seams that assemble this
+// Config, before any transport is constructed, so the conflict can never reach
+// a stream: no code path sets a non-zero MaxPayload today, and this is what
+// keeps that true.
+func ValidateChunkingClamp(cfg Config) error {
+	if cfg.ChunkingActive && cfg.MaxPayload != 0 {
+		return fmt.Errorf("%w: max_payload=%d", ErrChunkingSendClamp, cfg.MaxPayload)
+	}
+
+	return nil
+}
+
 // Config bundles the per-launch parameters a control plane has already
 // negotiated, which admission control validates against a region's geometry
 // (shm-abi.md §18). This package consumes it and never produces it.

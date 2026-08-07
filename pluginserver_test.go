@@ -20,6 +20,7 @@ import (
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/transport"
+	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 )
 
 // Test NewPluginServer rejecting an unknown transport name at construction, so a
@@ -1483,8 +1484,10 @@ func TestPluginServer_ShmConfig_CarriesTheConsumeFaultRunThreshold(t *testing.T)
 	tuple := control.Tuple{Features: map[string]bool{}}
 	thresholdFor := func(configured int) int {
 		s := styx.NewPluginServer(styx.PluginServerConfig{ConsumeFaultRunThreshold: configured})
+		cfg, err := s.ShmConfigForTest(16, 0, tuple)
+		require.NoError(t, err)
 
-		return s.ShmConfigForTest(16, 0, tuple).Escalation.ConsumeFaultRunThreshold
+		return cfg.Escalation.ConsumeFaultRunThreshold
 	}
 
 	require.Equal(t, 4096, thresholdFor(4096), "an explicit threshold must reach the transport unchanged")
@@ -1504,17 +1507,57 @@ func TestPluginServer_ShmConfig_ResolvesChunkingActive(t *testing.T) {
 		Transport: control.TransportSHM, Features: map[string]bool{control.FeatureStreamChunking: true},
 	}
 
+	chunkingActive := func(chunkMaxPayload uint32, tuple control.Tuple) bool {
+		t.Helper()
+		cfg, err := s.ShmConfigForTest(16, chunkMaxPayload, tuple)
+		require.NoError(t, err)
+
+		return cfg.ChunkingActive
+	}
+
 	// When / Then: a non-zero ceiling activates chunking.
-	require.True(t, s.ShmConfigForTest(16, 1<<20, active).ChunkingActive)
+	require.True(t, chunkingActive(1<<20, active))
 
 	// When / Then: a zero ceiling leaves chunking dormant even with the flag resolved.
-	require.False(t, s.ShmConfigForTest(16, 0, active).ChunkingActive,
+	require.False(t, chunkingActive(0, active),
 		"a zero ceiling leaves chunking dormant even with the flag resolved")
 
 	// Given a tuple with the feature unresolved.
 	unresolved := control.Tuple{Transport: control.TransportSHM, Features: map[string]bool{}}
 
 	// When / Then: an unresolved flag leaves chunking dormant even with a non-zero ceiling.
-	require.False(t, s.ShmConfigForTest(16, 1<<20, unresolved).ChunkingActive,
+	require.False(t, chunkingActive(1<<20, unresolved),
 		"an unresolved flag leaves chunking dormant even with a non-zero ceiling")
+}
+
+// Test that the plugin-side mapping never hands the shared-memory transport an
+// outbound payload clamp while chunking is active. The clamp lowers only this
+// side's send limit; the host keeps validating every non-final fragment against
+// its own unclamped inbound limit, so a clamped chunking sender would poison the
+// region on its first oversize stream message.
+func TestPluginServer_ShmConfig_NeverClampsTheOutboundPayloadUnderChunking(t *testing.T) {
+	// Given a plugin server adopting a non-zero announced ceiling on a tuple that
+	// resolved the feature, so the mapping produces an active-chunking config.
+	s := styx.NewPluginServer(styx.PluginServerConfig{})
+	active := control.Tuple{
+		Transport: control.TransportSHM, Features: map[string]bool{control.FeatureStreamChunking: true},
+	}
+
+	// When the mapping runs.
+	cfg, err := s.ShmConfigForTest(16, 1<<20, active)
+
+	// Then it succeeds precisely because the clamp is disengaged: the transport
+	// derives both directions from the region geometry, so the two sides agree on
+	// the canonical fragment length.
+	require.NoError(t, err)
+	require.True(t, cfg.ChunkingActive)
+	require.Zero(t, cfg.MaxPayload,
+		"an engaged clamp here would desynchronize the split from the host's length check")
+
+	// And the mapping is what refuses the conflict, not merely a bystander to it:
+	// presented with a clamped candidate — the shape a future ceiling would
+	// produce here — it fails rather than handing that configuration to Attach.
+	s.SetShmConfigAdjusterForTest(func(c *shmtransport.Config) { c.MaxPayload = 4096 })
+	_, clampErr := s.ShmConfigForTest(16, 1<<20, active)
+	require.ErrorIs(t, clampErr, shmtransport.ErrChunkingSendClamp)
 }

@@ -423,8 +423,18 @@ func IsFrameLocalRecvErrForTest(err error) bool {
 // directly, without a handshake or a real region.
 func (s *PluginServer) ShmConfigForTest(
 	maxInflight int, chunkMaxPayload uint32, tuple control.Tuple,
-) shmtransport.Config {
+) (shmtransport.Config, error) {
 	return s.shmConfig(maxInflight, chunkMaxPayload, tuple)
+}
+
+// SetShmConfigAdjusterForTest installs the candidate-configuration adjuster
+// shmConfig applies just before validating. It lets a test present the mapping
+// with a shared-memory configuration no production path builds today — the
+// outbound payload clamp under active chunking — so the refusal is observed
+// coming out of the production seam rather than out of a predicate the test
+// called itself.
+func (s *PluginServer) SetShmConfigAdjusterForTest(f func(*shmtransport.Config)) {
+	s.adjustShmConfigForTest = f
 }
 
 // SetWriterStoppedHookForTest installs a hook invoked immediately after a
