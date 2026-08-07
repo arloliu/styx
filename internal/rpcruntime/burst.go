@@ -268,6 +268,16 @@ type BurstTransport struct {
 	pumpState     burstPumpState
 	lastServed    burstChannel
 	interrupt     *burstInterrupt
+	// shmContestedTurn marks the receive attempt in flight as one the alternation
+	// awarded shared memory over a socket frame already pending, and that has
+	// committed no service yet. Committed service clears it, so an attempt still
+	// carrying it when the interrupt brings it back produced nothing at all.
+	shmContestedTurn bool
+	// shmForfeitsTurn makes the next choice read the shared-memory probe as false
+	// for one round, after an attempt spent a contested turn on that probe and
+	// produced nothing. It is consumed by the choice it decides and cleared by any
+	// committed shared-memory service.
+	shmForfeitsTurn bool
 	// pumpDone is closed when the readiness pump has returned. Close joins it before
 	// releasing the shared-memory mapping.
 	pumpDone chan struct{}
@@ -296,6 +306,11 @@ type BurstTransport struct {
 	// pumpPublishHook, when set, runs on the pump's goroutine immediately before it
 	// takes the mutex to publish readiness. Test seam; nil in production.
 	pumpPublishHook func()
+	// pumpRefireHook, when set, runs on the pump's goroutine under the mutex, each
+	// time it invokes the installed interrupt again over readiness that is still
+	// unserviced — never for the publication's own invocation. Test seam; nil in
+	// production.
+	pumpRefireHook func()
 	// recvDecideHook, when set, runs under the mutex inside a receive attempt,
 	// after the attempt has found no pending readiness and before it installs its
 	// interrupt handle. Test seam; nil in production.

@@ -1166,6 +1166,8 @@ func TestBurstReceive_TakesTurns_WhenBothChannelsHaveWork(t *testing.T) {
 				h.b.pumpState = burstPumpPending
 			}
 			h.b.lastServed = tc.lastServed
+			// The call consumes any forfeited turn, so these cases are the honest ones
+			// by construction: no forfeit stands on a composite nothing has received on.
 			got := h.b.chooseChannelLocked()
 			h.b.mu.Unlock()
 
@@ -1210,6 +1212,171 @@ func TestBurstReceive_NeverServesTheSocketTwice_WhileSharedMemoryHasWork(t *test
 	}
 	h.require.Equal(perChannel, countOriginAbove(got, burstOriginBurst))
 	h.require.Equal(perChannel, countOriginBelow(got, burstOriginBurst))
+}
+
+// Test that a pending socket frame is served even when the shared-memory probe
+// reports work that underside cannot produce: the receiver parks in shared memory
+// on the strength of that probe, and nothing but the pump's re-fire and the
+// forfeited turn gets it back out.
+func TestBurstReceive_ServesThePendingSocketFrame_WhenTheSharedMemoryProbeOverreports(t *testing.T) {
+	// Given
+	h := setupBurstReceiveTestHelper(t)
+	// The overreporting probe: readable with an empty queue, so a receive that
+	// believes it parks until its context ends and produces nothing.
+	h.shm.readable = true
+
+	h.b.mu.Lock()
+	h.b.lastServed = burstChannelBurst // the alternation awards the turn to shared memory
+	h.b.mu.Unlock()
+
+	h.burst.deliver(h.frame(burstOriginBurst))
+	h.waitPending(t)
+
+	// When
+	served := make(chan transport.Frame, 1)
+	go func() {
+		if f, err := h.b.Recv(t.Context()); err == nil {
+			served <- f
+		}
+	}()
+
+	// Then: the wake is owed within one re-fire interval, and the bound is a small
+	// multiple of it — enough headroom for a loaded machine, tight enough that a
+	// frame served only by some later accident of traffic still fails.
+	select {
+	case f := <-served:
+		h.require.Equal(burstOriginBurst, f.CallID)
+	case <-time.After(8 * burstPumpRefireInterval):
+		t.Fatal("the pending socket frame was never served: the receive stayed parked in shared memory")
+	}
+}
+
+// Test that the pump's re-fire cannot cost a shared-memory frame already in hand:
+// the interrupt is advisory, so the frame is delivered and its turn counts.
+func TestBurstReceive_DeliversTheSharedMemoryFrame_WhenTheRefireRacesIt(t *testing.T) {
+	// Given
+	h := setupBurstReceiveTestHelper(t)
+	refired := make(chan struct{}, 1)
+	h.b.pumpRefireHook = func() {
+		select {
+		case refired <- struct{}{}:
+		default:
+		}
+	}
+
+	h.b.mu.Lock()
+	h.b.lastServed = burstChannelBurst // the alternation awards the turn to shared memory
+	h.b.mu.Unlock()
+
+	h.shm.deliver(h.frame(burstOriginShm))
+	h.burst.deliver(h.frame(burstOriginBurst))
+	h.waitPending(t)
+
+	// The frame is produced and not yet arbitrated: the attempt is held here until
+	// the pump has re-fired the interrupt it is still holding.
+	h.b.shmDeliveryHold = func() {
+		h.b.shmDeliveryHold = nil
+		select {
+		case <-refired:
+		case <-time.After(2 * time.Second):
+			t.Error("the pump never re-fired the interrupt while its readiness went unserviced")
+		}
+	}
+
+	// When
+	f, err := h.b.Recv(t.Context())
+
+	// Then
+	h.require.NoError(err)
+	h.require.Equal(burstOriginShm, f.CallID, "the re-fire discarded a frame that had already won its attempt")
+	h.requireTurnCommitted()
+
+	next, err := h.b.Recv(t.Context())
+	h.require.NoError(err)
+	h.require.Equal(burstOriginBurst, next.CallID, "the socket frame pending throughout was not served next")
+}
+
+// Test which interrupted attempts hand their turn to the socket: only one that
+// spent a turn the alternation awarded it over a socket frame, produced nothing
+// with it, and came back to that frame still waiting.
+func TestBurstReceive_ForfeitsTheTurn_OnlyForAWastedContestedAttempt(t *testing.T) {
+	cases := []struct {
+		name string
+		// armedUnder is the pump state the attempt installed its interrupt under. A
+		// pending one makes the turn contested: it was awarded over a socket frame
+		// already waiting.
+		armedUnder burstPumpState
+		// served marks an attempt that committed shared-memory service before the
+		// interrupt reached it.
+		served bool
+		// pumpAtReturn is the pump state when the interrupted attempt comes back.
+		pumpAtReturn burstPumpState
+		want         bool
+	}{
+		{"a contested turn wasted while the socket frame still waits", burstPumpPending, false, burstPumpPending, true},
+		{"a turn taken with no socket frame waiting", burstPumpWaiting, false, burstPumpPending, false},
+		{"a contested turn that delivered a frame", burstPumpPending, true, burstPumpPending, false},
+		{"a contested turn whose readiness was serviced meanwhile", burstPumpPending, false, burstPumpWaiting, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			h := setupBurstReceiveTestHelper(t)
+			h.b.mu.Lock()
+			h.b.pumpState = tc.armedUnder
+			h.b.armInterruptLocked(&burstInterrupt{cancel: func() {}})
+			if tc.served {
+				h.b.recordServiceLocked(burstChannelShm)
+			}
+			h.b.pumpState = tc.pumpAtReturn
+			h.b.mu.Unlock()
+
+			// When
+			h.b.forfeitWastedTurn()
+
+			// Then
+			h.b.mu.Lock()
+			defer h.b.mu.Unlock()
+
+			h.require.Equal(tc.want, h.b.shmForfeitsTurn)
+			h.require.False(h.b.shmContestedTurn, "the attempt's own mark outlived it")
+		})
+	}
+}
+
+// Test that no turn is forfeited while both undersides answer honestly: every
+// attempt produces a frame, so the alternation alone decides whose turn it is.
+func TestBurstReceive_NeverForfeitsTheTurn_WhileSharedMemoryHasWork(t *testing.T) {
+	// Given
+	h := setupBurstReceiveTestHelper(t)
+	const perChannel = 8
+	for i := range perChannel {
+		h.burst.deliver(h.frameID(burstOriginBurst + uint64(i)))
+		h.shm.deliver(h.frameID(burstOriginShm + uint64(i)))
+	}
+
+	// When
+	run, burstSeen := 0, 0
+	for range 2 * perChannel {
+		if burstSeen < perChannel {
+			h.waitPending(t)
+		}
+		f, err := h.b.Recv(t.Context())
+		h.require.NoError(err)
+
+		// Then
+		h.requireNoStandingForfeit()
+		if f.CallID < burstOriginBurst {
+			run = 0
+
+			continue
+		}
+		burstSeen++
+		run++
+		h.require.LessOrEqual(run, 1, "the socket was served twice in a row while shared memory had work")
+	}
+	h.require.Equal(perChannel, burstSeen)
 }
 
 // Test that the bounded-read bit is set only while the destructive socket read
@@ -1443,6 +1610,29 @@ func (h *burstRecvHarness) waitPending(t *testing.T) {
 
 		return h.b.pumpState == burstPumpPending
 	}, 5*time.Second, time.Millisecond, "the pump published no readiness")
+}
+
+// requireTurnCommitted asserts a shared-memory service was accounted as one: the
+// turn is recorded, and nothing about the attempt is left standing that would
+// hand the next turn away.
+func (h *burstRecvHarness) requireTurnCommitted() {
+	h.b.mu.Lock()
+	defer h.b.mu.Unlock()
+
+	h.require.Equal(burstChannelShm, h.b.lastServed, "a delivered shared-memory frame did not take its turn")
+	h.require.False(h.b.shmForfeitsTurn, "a committed service forfeited the next turn")
+	h.require.False(h.b.shmContestedTurn, "a committed service left its attempt marked as unspent")
+}
+
+// requireNoStandingForfeit asserts no turn is forfeited while the shared-memory
+// underside genuinely has work: that would hand the socket a turn the alternation
+// awarded shared memory.
+func (h *burstRecvHarness) requireNoStandingForfeit() {
+	h.b.mu.Lock()
+	defer h.b.mu.Unlock()
+
+	h.require.False(h.b.shmForfeitsTurn && h.shm.ReadableNow(),
+		"a turn was forfeited while shared memory had work")
 }
 
 // requireInterruptDetached asserts no interrupt token outlived its attempt.
