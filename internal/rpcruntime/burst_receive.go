@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/arloliu/styx/internal/transport"
 )
@@ -57,6 +58,32 @@ import (
 //	           any              -> stopped           the terminal transition, or a failed readiness wait
 //	lastServed unchanged        -> shm | burst       only on committed service: a frame delivered, or a
 //	                                                 frame-local result fully accounted
+//
+// Published readiness is an EDGE, and the frame it announces is already in the
+// socket's queue: no later edge fires for it, so the publication's own invocation
+// of the interrupt is the only wake that frame would otherwise get. A receiver
+// that parked in shared memory anyway has none left — an underside probe that
+// answers "readable" over descriptors it then finds undeliverable is enough to put
+// it there — and the frame would sit until unrelated traffic, the caller's
+// context, or a terminal event moved it. Two mechanisms close that:
+//
+//   - the pump re-invokes the installed interrupt on a coarse tick for as long as
+//     its readiness stands unserviced, so a receiver parked on the wrong channel is
+//     reached however it got there;
+//   - an attempt that comes back through the interrupt having committed no service
+//     forfeits the next contested turn, so the choice that follows is the
+//     one-channel case rather than the same park again.
+//
+// What the forfeit turns on is the tick, not the underside's honesty: a turn is
+// handed over when an attempt produced nothing across a whole re-fire interval, so
+// a probe that produces within one keeps every turn the alternation gives it,
+// while one that answers "readable" and then takes longer than the interval to
+// produce loses a turn it would have won. Nothing is lost by that — the frame it
+// was working on is still delivered by the attempt that follows.
+//
+// The interrupt stays advisory throughout: a frame that won its attempt is
+// delivered, and the turn it took is recorded, whatever landed on the attempt
+// afterwards.
 //
 // A terminal transition wakes both participants exactly once: it stops the pump,
 // detaches and cancels the interrupt token so a receive parked in shared memory
@@ -138,6 +165,22 @@ const (
 	burstChannelBurst
 )
 
+// burstPumpRefireInterval bounds how long the pump waits for the service
+// handshake before invoking the installed interrupt again. It is what makes the
+// wake of a receiver parked on the other channel independent of an edge that has
+// already fired and will not fire again for the same frame.
+//
+// The value mirrors the burst socket's own readiness granularity: that socket
+// polls on a 50 ms receive timeout, so a wake bounded by one such tick adds no
+// timer regime the connection does not already run on. It is a mirror and not a
+// reference — the socket's constant is private to its package — so the two can
+// drift apart without anything failing: nothing here depends on the numbers being
+// equal, only on this one being coarse. It needs no tuning knob either, since it
+// bounds a state the connection is only in while a published frame is unserviced,
+// and the interrupt it drives is advisory, so a tick that was not needed costs one
+// extra receive attempt and nothing else.
+const burstPumpRefireInterval = 50 * time.Millisecond
+
 // errBurstInterrupted is the composite's own interrupt: a shared-memory attempt
 // the pump cut short so the receiver could look at the socket. It never reaches a
 // caller — the attempt loop consumes it and tries again — and it is distinct from
@@ -201,6 +244,20 @@ func (b *BurstTransport) runPump() {
 // lost-wake race: a receiver that checked pending and found none cannot then park
 // in shared memory without having installed the handle this publication invokes,
 // because there is no window between the two for a publication to land in.
+//
+// The park is bounded while the readiness is UNSERVICED, and the interrupt is
+// invoked again on every tick it stays that way. The publication's own invocation
+// reaches only a handle that is installed when it runs, and a receiver can park in
+// shared memory after it — on a probe that answers "readable" and then produces
+// nothing — with no further edge coming for a frame that is already queued.
+// Re-invoking is what that receiver is reached by; it is not a retry of the
+// publication, which happened once and stands.
+//
+// The service park that follows is unbounded again, and deliberately: by then a
+// receiver is inside the destructive read, there is nothing left to invoke, and
+// that read is exactly the state that can last — a giant payload is what this
+// socket carries. A tick there would buy nothing and cost a timer per tick for
+// the whole transfer.
 func (b *BurstTransport) publishReadiness() bool {
 	if b.pumpPublishHook != nil {
 		b.pumpPublishHook()
@@ -216,18 +273,69 @@ func (b *BurstTransport) publishReadiness() bool {
 	}
 
 	b.pumpState = burstPumpPending
-	if b.interrupt != nil {
-		// The frame is already in the socket's queue, so no later edge will fire for
-		// it: a receive parked in shared memory has to be told, or it waits on the
-		// wrong channel indefinitely.
-		b.interrupt.cancel()
-	}
+	// The frame is already in the socket's queue, so no later edge will fire for
+	// it: a receive parked in shared memory has to be told, or it waits on the
+	// wrong channel indefinitely.
+	b.fireInterruptLocked()
 
 	for b.pumpState == burstPumpPending || b.pumpState == burstPumpParkedForService {
-		b.pumpWake.Wait()
+		if b.pumpState == burstPumpParkedForService {
+			// The receiver is inside the destructive read, so this readiness has been
+			// serviced and there is nothing left to re-invoke for. Waking on a tick here
+			// would only cost a timer per tick for as long as a giant takes to read.
+			b.pumpWake.Wait()
+
+			continue
+		}
+
+		b.waitPumpWakeLocked()
+
+		if b.pumpState != burstPumpPending {
+			continue
+		}
+		if b.pumpRefireHook != nil {
+			b.pumpRefireHook()
+		}
+		b.fireInterruptLocked()
 	}
 
 	return b.pumpState != burstPumpStopped
+}
+
+// fireInterruptLocked invokes the interrupt handle a receive attempt has
+// installed, if one is installed at all. It is advisory: an attempt that already
+// has a frame delivers it, and an attempt that is between two of its own steps has
+// no handle here to reach.
+func (b *BurstTransport) fireInterruptLocked() {
+	if b.interrupt != nil {
+		b.interrupt.cancel()
+	}
+}
+
+// waitPumpWakeLocked waits for the receiver to move the pump's state, for at most
+// burstPumpRefireInterval. The bound is the pump's own liveness: the state is
+// moved by the service handshake and by the terminal transition, and a receiver
+// parked on the other channel over this readiness performs neither.
+//
+// The timer broadcasts under the mutex rather than bare. A bare broadcast can land
+// in the window between the pump re-checking its state and re-entering the wait,
+// where it is lost and the bound with it; taking the mutex confines it to the wait
+// itself, which is the only place it means anything.
+//
+// Stopping it with the mutex held is safe for the same reason it is not obviously
+// so: Stop never waits for a callback that is already running, it only reports
+// that it did not prevent one. A Stop that blocked on the callback would deadlock
+// here, since that callback wants this mutex.
+func (b *BurstTransport) waitPumpWakeLocked() {
+	timer := time.AfterFunc(burstPumpRefireInterval, func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+
+		b.pumpWake.Broadcast()
+	})
+	defer timer.Stop()
+
+	b.pumpWake.Wait()
 }
 
 // endPump ends the pump for the reason its readiness wait reported. A wait that
@@ -309,13 +417,26 @@ func (b *BurstTransport) receiveOnce(ctx context.Context, req burstRecvRequest) 
 // where the interrupt can reach it.
 //
 // It reads the shared-memory underside's own probe rather than any state of the
-// composite's, so "has work" is the underside's answer, and a channel that reports
-// work either produces a frame or reports an error without parking.
+// composite's, so "has work" is the underside's answer. A probe is not believed
+// twice over the same socket frame: an attempt that spent a contested turn on one
+// and produced nothing for a whole re-fire interval forfeits the next such turn,
+// which puts the choice back in the case where only one channel claims work. That
+// is bounded to the one round it was earned in, and a probe that produces within
+// the interval never earns it, so the alternation above is what decides the turns
+// between two undersides answering at the speed the interval assumes.
+//
+// It is not a pure query: it CONSUMES that forfeit, so a caller that asks without
+// then committing to the answer spends it. Production has one such caller, the
+// attempt in receiveOnce, which asks exactly once and commits.
 func (b *BurstTransport) chooseChannelLocked() burstChannel {
 	if b.pumpState != burstPumpPending {
 		return burstChannelShm
 	}
-	if !b.shm.ReadableNow() {
+
+	forfeited := b.shmForfeitsTurn
+	b.shmForfeitsTurn = false
+
+	if forfeited || !b.shm.ReadableNow() {
 		return burstChannelBurst
 	}
 	if b.lastServed == burstChannelBurst {
@@ -335,9 +456,16 @@ func (b *BurstTransport) beginBurstServiceLocked() {
 
 // armInterruptLocked installs this attempt's interrupt handle and takes the
 // receiver from idle to waiting on shared memory.
+//
+// It also marks whether the turn this attempt is spending was CONTESTED: a park
+// taken while a socket frame is already pending is one the alternation awarded
+// shared memory over that frame, and it is the only kind of turn a forfeit can be
+// earned in. The mark is per attempt — set here, cleared by service — so the
+// attempt that installed it is the one it answers for.
 func (b *BurstTransport) armInterruptLocked(tok *burstInterrupt) {
 	b.interrupt = tok
 	b.recvState = burstRecvShmWaiting
+	b.shmContestedTurn = b.pumpState == burstPumpPending
 }
 
 // serveBurst performs the destructive read the published readiness handed this
@@ -657,7 +785,19 @@ func (b *BurstTransport) endDelivery(ch burstChannel) {
 	defer b.mu.Unlock()
 
 	b.recvState = burstRecvIdle
+	b.recordServiceLocked(ch)
+}
+
+// recordServiceLocked records ch's turn as taken. Committed shared-memory service
+// is also what clears the contested-turn mark and any standing forfeit: a turn
+// that produced something is not a wasted one, whatever reaches the attempt
+// afterwards, and a probe that just produced a frame is not one to disbelieve.
+func (b *BurstTransport) recordServiceLocked(ch burstChannel) {
 	b.lastServed = ch
+	if ch == burstChannelShm {
+		b.shmContestedTurn = false
+		b.shmForfeitsTurn = false
+	}
 }
 
 // resolveShmErr answers a failed shared-memory attempt, telling the composite's
@@ -670,6 +810,8 @@ func (b *BurstTransport) resolveShmErr(ctx, ictx context.Context, err error) err
 		if errors.Is(context.Cause(ictx), errBurstInterrupted) {
 			// The interrupt reached this attempt first, so this is not an answer at
 			// all: the next attempt reports whatever the interrupt was about.
+			b.forfeitWastedTurn()
+
 			return errBurstInterrupted
 		}
 		if ctx.Err() != nil {
@@ -684,6 +826,28 @@ func (b *BurstTransport) resolveShmErr(ctx, ictx context.Context, err error) err
 	}
 
 	return b.resolveFailure(ctx, err, burstChannelShm)
+}
+
+// forfeitWastedTurn hands the next contested turn to the socket when the attempt
+// just interrupted spent one and produced nothing at all.
+//
+// Both conditions are read from state rather than inferred. The contested mark is
+// this attempt's own and is cleared by any committed service, so an attempt still
+// carrying it delivered no frame and accounted for no frame-local result; and the
+// readiness has to be standing still, since a forfeit is owed to a socket frame
+// that is waiting, not to one already served.
+//
+// What it hands over is one round of the alternation and nothing more. The choice
+// it decides consumes it, so a shared-memory underside that answers honestly on
+// the next attempt keeps every turn the alternation gives it.
+func (b *BurstTransport) forfeitWastedTurn() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.shmContestedTurn && b.pumpState == burstPumpPending {
+		b.shmForfeitsTurn = true
+	}
+	b.shmContestedTurn = false
 }
 
 // resolveFailure answers a receive error from either underside and publishes the
@@ -718,7 +882,7 @@ func (b *BurstTransport) commitService(ch burstChannel) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.lastServed = ch
+	b.recordServiceLocked(ch)
 }
 
 // failConnection publishes err as this connection's terminal failure, classified
