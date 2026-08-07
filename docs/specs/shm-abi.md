@@ -617,11 +617,23 @@ Numeric values are **frozen** and identical to `internal/transport`'s
 | `STREAM_CLOSE` | 6 | maybe | reserved; half-close. |
 | `STREAM_ERR` | 7 | yes | reserved; stream error status. |
 | `UNARY_ERR` | 8 | yes | error response carrying a status payload (code, message, details) instead of a normal payload (design §14, §17). |
+| `STREAM_CHUNK` | 9 | yes | **feature-gated: `stream-chunking`** — non-final fragment of a chunked stream message, assigned per §19's additive rules only where that negotiated feature is active (`stream-protocol.md` §13); unassigned everywhere else (below). |
 
 Values 9..255 (low byte) are **reserved/unassigned** and MUST NOT be written
 under `layout_version = 1`; a receiver that reads an unassigned `kind` MUST treat
 the frame as a conformance violation and poison the region (§16). The high byte
 of `kind` (bits 8..15) is reserved and MUST be 0.
+
+**Feature-scoped assignment of value 9 (per §19).** Value 9 is assigned as
+`STREAM_CHUNK` — the non-final-fragment marker of the negotiated
+`stream-chunking` feature (`stream-protocol.md` §13) — through §19's additive
+category (*"assigning a **reserved frame-kind** value (§5, 9..255)"*), with no
+`layout_version` bump. The assignment is feature-scoped exactly as §19
+defines: on a connection where `stream-chunking` is **not** active — every
+attach that did not resolve the flag together with a non-zero chunk ceiling,
+and every UDS connection — the paragraph above applies to value 9 unamended:
+it MUST NOT be written and MUST poison on read. Values 10..255 remain
+reserved/unassigned unconditionally.
 
 **Note on the brief's checklist.** The plan's §5 checklist enumerates
 `UNARY_REQ, UNARY_RESP, STREAM_OPEN, STREAM_MSG, STREAM_ACK, STREAM_CLOSE,
@@ -2050,7 +2062,11 @@ can never map a region.
 
 `max_payload(dir)` is bounded by the largest configured size class (§18). Messages
 larger than that are rejected in v1 with a typed error (design §19). Four future
-paths exist; **v1 ships Path 1 only**. **Path 4 (size-based transport routing) is
+paths exist; **the raw per-frame ABI ships Path 1 only** — no single v1 frame
+ever exceeds `max_payload(dir)` — while the negotiated `stream-chunking`
+feature (`stream-protocol.md` §13) now realizes Path 2's direction at the RPC
+layer, in fragments that each respect that per-frame bound (see Path 2
+below). **Path 4 (size-based transport routing) is
 the PREFERRED mechanism for M3 and supersedes Path 3 (spill)**, which stays
 documented as an alternative. The relevant ABI extension points are preserved so
 that adopting any path later needs no `layout_version` bump:
@@ -2066,6 +2082,12 @@ that adopting any path later needs no `layout_version` bump:
   semantics layered on the existing descriptor path; it needs **no
   `layout_version` bump** (the kinds are already reserved and numbered). *Extension
   point:* the frozen `STREAM_*` kind values and the shared `call_id`.
+  The `stream-chunking` feature (`stream-protocol.md` §13) ships this path's
+  direction — RPC-layer chunking of oversize stream messages — with a
+  different encoding than the one sketched here: rather than expressing
+  fragments over the frozen kinds 3–7, it assigns the reserved kind
+  `STREAM_CHUNK` (9, §5) behind a negotiated feature, the additive mechanism
+  §19 independently authorizes.
 - **Path 3 — out-of-band spill via a separate memfd over the control socket
   (alternative; superseded by Path 4).** For a truly large transfer, pass a
   dedicated sealed memfd out of band on the control plane (as hot-reload snapshots

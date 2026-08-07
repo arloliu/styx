@@ -9,7 +9,7 @@ carries no independent authority of its own — wherever it and
 Every cross-reference below names the document it points into —
 `stream-protocol.md §N`, `shm-abi.md §N`, or `design §N` for
 `2026-07-16-styx-design.md`. This file's own sections are the plain numbers
-`1`–`6` below, deliberately without a `§` prefix, so the two numbering
+`1`–`7` below, deliberately without a `§` prefix, so the two numbering
 schemes never collide.
 
 Mirroring `shm-abi.md` §13's litmus-test approach. All examples use the defaults
@@ -460,3 +460,123 @@ descriptors and two slabs the client optimistically spent, released by ordinary
 head advancement — against which the alternative, a mandatory round trip before
 the first message of every stream, is the more expensive trade and the one that
 deadlocks client-streaming outright (stream-protocol.md §7.4).
+
+## 7 Chunked logical messages (`stream-chunking` feature)
+
+Vectors for stream-protocol.md §13. Examples in this section additionally
+resolve the `stream-chunking` feature (stream-protocol.md §13.1) with the
+`checksum` feature on and `trace` off over the stock ladder, so both
+directions' inline limit is `L = 1048636` bytes — the 1048640-byte top class
+minus the 4-byte CRC trailer (shm-abi.md §18's `max_payload(dir)`) — and the
+attach announced `chunk_max_payload = 4194304` (4 MiB). "frag seq" and
+"logical" are stream-protocol.md §13.3's two accounting units. All traffic
+shown is S→C on a server-streaming stream; the direction is arbitrary.
+
+### 7.1 MUST accept
+
+**(A1) The two-unit worked example (stream-protocol.md §13.3, verbatim).** One
+logical message of 1500000 bytes, then close.
+
+| # | Dir | Kind | ctrl word | payload bytes | Note |
+|--:|---|---|--:|--:|---|
+| 1 | S→C | `STREAM_CHUNK` | 1 | 1048636 | non-final fragment: exactly `L` (canonical form, stream-protocol.md §13.2). Consumes frag seq 1 and **no** credit — the message's one unit was consumed at admission (stream-protocol.md §13.4) |
+| 2 | S→C | `STREAM_MSG` | 2 | 451364 | final fragment (`1500000 − 1048636`); completes and delivers the logical message; frag seq 2 |
+| 3 | C→S | `STREAM_ACK` | 1 | — | **one** logical message consumed — not two frames (stream-protocol.md §13.3) |
+| 4 | S→C | `STREAM_CLOSE` | 2 | 0 | `F = 2`, the last fragment sequence consumed; receiver checks `2 == expected_seq − 1` ✓ (stream-protocol.md §6.4) |
+
+Continuation: had the server sent a second, single-fragment message (say
+4096 bytes) instead of closing at row 4 — a `STREAM_MSG` with frag seq **3** —
+the cumulative `STREAM_ACK` value `2` is legal (two logical messages consumed)
+while the direction's final fragment sequence is **3**, and the close then
+carries `F = 3`.
+
+**(A2) Multi-message mix — differing fragment counts.** Three logical
+messages: 2500000 bytes (three fragments), 4096 bytes (one), 1100000 bytes
+(two).
+
+| # | Dir | Kind | ctrl word | payload bytes | Note |
+|--:|---|---|--:|--:|---|
+| 1 | S→C | `STREAM_CHUNK` | 1 | 1048636 | message 1, fragment 1/3 |
+| 2 | S→C | `STREAM_CHUNK` | 2 | 1048636 | fragment 2/3 |
+| 3 | S→C | `STREAM_MSG` | 3 | 402728 | fragment 3/3 (`2500000 − 2·1048636`); delivers message 1 |
+| 4 | S→C | `STREAM_MSG` | 4 | 4096 | message 2, single fragment — a message at or below `L` never grows a train (stream-protocol.md §13.2) |
+| 5 | C→S | `STREAM_ACK` | 2 | — | two **logical** messages; the highest fragment sequence is 4 |
+| 6 | S→C | `STREAM_CHUNK` | 5 | 1048636 | message 3, fragment 1/2 |
+| 7 | S→C | `STREAM_MSG` | 6 | 51364 | fragment 2/2 (`1100000 − 1048636`); delivers message 3 |
+| 8 | C→S | `STREAM_ACK` | 3 | — | three logical messages |
+| 9 | S→C | `STREAM_CLOSE` | 6 | 0 | `F = 6 == expected_seq − 1` ✓ |
+
+**(A3) Completed train, then half-close.** Rows 1–2 of (A1) followed
+immediately by `STREAM_CLOSE(F = 2)`, with no intervening `STREAM_ACK`: a
+completed train leaves the accumulation empty, so a following legal half-close
+finds nothing pending and is accepted (contrast R8/R9 below, the two illegal
+orders). Whether the pending ACK for the consumed message is still emitted
+after the close is stream-protocol.md §6.4's existing permission, unchanged.
+
+**(A4) Feature off: the oversize send fails before the wire.** On a connection
+where `stream-chunking` is not active, the same 1500000-byte `Send` is
+rejected with the definitive `ErrPayloadTooLarge` while the train is still
+invisible (stream-protocol.md §13.4): no fragment is built, nothing reaches
+the transport, kind 9 never appears, and the credit unit and sequence
+reservation roll back under stream-protocol.md §4.5's ordinary
+pre-acceptance rule. The stream itself lives.
+
+### 7.2 MUST reject
+
+Each vector below is a conformance violation — poison `POISON_BAD_FRAME`
+(stream-protocol.md §3.3, §13.7). The receiving side has accepted rows 1–2 of
+(A1) wherever a pending or completed train is named.
+
+**(R1) ACK in fragment units.** After (A1) rows 1–2 — one logical message from
+two fragments — a `STREAM_ACK` with control word `2` exceeds the one logical
+message completed (stream-protocol.md §4.6 as amended). The same wire value is
+legal at (A2) row 5; the unit, not the number, is what the rule checks.
+
+**(R2) Reused fragment sequence.** `STREAM_CHUNK(1, 1048636)` then
+`STREAM_CHUNK(1, 1048636)`: `expected_seq` is 2 (stream-protocol.md §3.2,
+spanning both kinds).
+
+**(R3) Fragment sequence gap.** `STREAM_CHUNK(1, 1048636)` then
+`STREAM_MSG(3, …)`: `expected_seq` is 2.
+
+**(R4) Over-ceiling accumulation.** `STREAM_CHUNK` frag seqs 1..3 of
+1048636 bytes each accumulate 3145908 bytes; a fourth `STREAM_CHUNK(4,
+1048636)` would carry the accumulation to `4194544 > 4194304` and is rejected
+at the breaching fragment, **before** it is buffered, in arithmetic that
+cannot wrap (stream-protocol.md §13.6). Every individual fragment is legal;
+the reassembled length is what breaches. A conformant sender would have
+refused this message send-side — the receive-side check is what enforces the
+ceiling against a non-conformant peer.
+
+**(R5) Short `STREAM_CHUNK`.** `STREAM_CHUNK(1, 1048635)`: a non-final
+fragment carries exactly `L` bytes (canonical form, stream-protocol.md §13.2).
+
+**(R6) Empty `STREAM_CHUNK`.** `STREAM_CHUNK(1, 0)`: same rule, and the case
+that closes the descriptor-amplification hole — one credit unit driving ring
+descriptors unbounded by anything credit bounds (stream-protocol.md §13.7).
+
+**(R7) Empty final `STREAM_MSG` over a pending train.**
+`STREAM_CHUNK(1, 1048636)` then `STREAM_MSG(2, 0)`: the remainder is 1..`L`
+(stream-protocol.md §13.2). An empty `STREAM_MSG` with **no** pending
+accumulation stays legal, exactly as without the feature.
+
+**(R8) `STREAM_CHUNK` after `STREAM_CLOSE`.** The sending direction emits
+`STREAM_CLOSE(F = 2)` after (A1) rows 1–2, then `STREAM_CHUNK(3, 1048636)`:
+the close bit is checked before any sequence mutation or append
+(stream-protocol.md §13.5), so the frame is a violation regardless of its
+sequence — the dual of the post-close `STREAM_MSG` row (stream-protocol.md
+§8.1 as amended).
+
+**(R9) `STREAM_CLOSE` over a pending accumulation.**
+`STREAM_CHUNK(1, 1048636)` then `STREAM_CLOSE(F = 1)`: a half-close cannot
+legitimately interrupt its own direction's train; the check runs before any
+close state is mutated (stream-protocol.md §6.4 as amended, §13.7). R8 and R9
+are the two orders of the close/chunk interleaving, and both are
+deterministic violations; the legal order is (A3)'s.
+
+**(R10) Kind 9 without the feature.** On a connection where `stream-chunking`
+is not active — a dormant shm attach, or any peer that did not resolve the
+flag — a received frame kind 9 is an unassigned kind and poisons per
+shm-abi.md §5, restated (not re-legislated) by stream-protocol.md §13.7. On
+UDS the kind is never implemented at all, regardless of the `streaming` flag
+(stream-protocol.md §13.1).

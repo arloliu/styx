@@ -35,6 +35,15 @@ existing `reserved` word at offset 56, gated on the negotiated `streaming`
 feature. Where this document and the design document's prose disagree about a
 descriptor field, `shm-abi.md` wins (`shm-abi.md` §0).
 
+**One additive exception, self-contained in §13.** The `stream-chunking`
+feature (§13) — a separate feature flag, negotiated independently of
+`streaming` — assigns one reserved frame-kind value (`STREAM_CHUNK` = 9, from
+`shm-abi.md` §5's 9..255 range) behind its own negotiated flag, which is
+`shm-abi.md` §19's additive category and still no `layout_version` bump. On a
+connection where `stream-chunking` is not active, every sentence of this
+document outside §13 — including the paragraph above — applies exactly as
+written, and kind 9 remains unassigned.
+
 ---
 
 ## §1 Scope and non-goals
@@ -117,6 +126,12 @@ other, `shm-abi.md` §5). Every other streaming kind is a payload-bearing data
 frame and travels the data lane, subject to ordinary data admission
 (`shm-abi.md` §18).
 
+When the `stream-chunking` feature is active on a connection (§13.1), a sixth
+streaming kind, `STREAM_CHUNK` (9), may additionally appear on the wire; §13
+defines it. On every other connection the table above is the complete
+streaming kind set and kind 9 is an unassigned value that poisons on receipt
+(`shm-abi.md` §5).
+
 ### §2.2 The stream control word
 
 Streaming needs one 64-bit value per frame that unary calls do not carry: a
@@ -137,6 +152,11 @@ The word is carried on the five `STREAM_*` kinds and on exactly one other kind: 
 `CANCEL` that tears down a stream, where it carries the **teardown discriminant**
 (§9.1). On every other kind, and on a `CANCEL` for a unary call, it MUST be zero
 even when `streaming` is negotiated.
+
+When the `stream-chunking` feature is active (§13.1), the word is additionally
+carried on `STREAM_CHUNK` (9), where it holds the fragment sequence number
+(§13.3) — the same additive, feature-scoped use of offset 56, scoped by that
+feature exactly as this section scopes it by `streaming`.
 
 **On "ignored on read".** `shm-abi.md` §4 also records that this field is
 *"ignored on read in v1"*, and a `streaming` peer plainly does not ignore it. The
@@ -251,6 +271,10 @@ Notes on individual cells:
   (`shm-abi.md` §5) — it is **not** a descriptor-only kind, so it may still
   allocate a slab under a negotiated `checksum`/`trace` feature.
 
+When the `stream-chunking` feature is active (§13.1), `STREAM_CHUNK` (9) is
+field-mapped exactly as the `STREAM_MSG` column above, its control word
+carrying the fragment's own sequence number; §13.2 states the mapping.
+
 ### §2.4 The transport surface
 
 `transport.Frame` (`internal/transport/transport.go`) has no field able to carry
@@ -347,6 +371,13 @@ already-reserved word at offset 56, whose use is sanctioned as additive by
 - Wrap is not a concern: at one message per nanosecond a 64-bit counter wraps in
   ~584 years, far beyond any stream's deadline-bounded lifetime.
 
+When the `stream-chunking` feature is active (§13.1), the counter this section
+defines is consumed by every `STREAM_CHUNK` **and** every `STREAM_MSG` frame
+alike — one value per **fragment**, assigned at the same acceptance boundary,
+under the same one-sender-per-direction rule (§13.3). On a connection without
+the feature, `STREAM_MSG` is the only kind that consumes it, exactly as stated
+above.
+
 ### §3.2 Monotonicity invariant
 
 > For each (call ID, direction), the sequence numbers of the `STREAM_MSG` frames
@@ -356,6 +387,13 @@ already-reserved word at offset 56, whose use is sanctioned as additive by
 The receiver maintains `expected_seq`, initialized to 1 at stream establishment
 and incremented on each accepted `STREAM_MSG`. A received `STREAM_MSG` on a
 **live** stream MUST carry `control_word == expected_seq`.
+
+When the `stream-chunking` feature is active (§13.1), the invariant and the
+`expected_seq` check span `STREAM_CHUNK` and `STREAM_MSG` alike: the sequence
+numbers of the frames of both kinds a sender emits on one direction are
+exactly `1, 2, 3, …` with no repetition and no omission, and each arriving
+frame of either kind on a **live** stream MUST carry
+`control_word == expected_seq` (§13.3).
 
 ### §3.3 What a gap signals
 
@@ -382,6 +420,12 @@ else; the second row's other half is the control-word conformance check for the
 remaining kinds, which shares this table's disposition but not its counter. Checking the sequence
 against a terminal or unknown stream would be checking a counter that is either
 dead or absent, and would turn an ordinary late frame into a poisoned region.
+
+When the `stream-chunking` feature is active (§13.1), this table and the scope
+statement above read with `STREAM_CHUNK` beside `STREAM_MSG`: the sequence
+check applies to both kinds on a `LIVE` stream, row for row with the same
+dispositions (§13.3), and §13.7 adds the chunk-specific conformance checks,
+each sharing this table's disposition.
 
 **Poison cause.** `POISON_BAD_FRAME` is the cause for every conformance
 violation this document defines. `shm-abi.md` §3 describes that value as
@@ -556,6 +600,33 @@ a budget of 30, so the defaults refuse to load. Such a deployment MUST lower
 fallback: a silently downgraded credit scheme is the class of surprise design §10
 rejects everywhere else.
 
+When the `stream-chunking` feature is active (§13.1), the worst case this
+derivation counts is no longer the descriptor count: `N_max · S_max` bounds
+outstanding **logical messages** (§13.3), and a chunked logical message can
+occupy up to `ceil(chunk_max_payload / L)` ring descriptors while its
+fragments await consumption (§13.9), so the credit-governed worst case in
+ring descriptors is `N_max · S_max · ceil(chunk_max_payload / L)`. (S1) as
+written therefore no longer implies the half-window property for chunked
+traffic. The policy remains a policy — the half factor was never a physical
+constraint — and a deployment chooses which side of it to stand on:
+
+- one that wants the half-window descriptor property to keep holding under
+  chunking provisions to the scaled form, as guidance in this derivation's
+  own terms:
+
+```
+N_max · S_max · ceil(chunk_max_payload / L)  ≤  max_data_inflight / 2
+```
+
+- one that keeps stock provisioning accepts instead that chunked trains may
+  transiently occupy data-window slots beyond half of the declared window,
+  resolved as ordinary typed backpressure (`shm-abi.md` §18) — the accepted
+  stance.
+
+Deadlock-freedom is unaffected either way, and not because (S1) still holds:
+it rests on the `max_data_inflight ≤ C − R` admission bound and the lifecycle
+reserve `R` (`shm-abi.md` §18(i)), neither of which chunking touches.
+
 #### (S2) — why `1 ≤ lifecycle_queue_depth` and not `S_max ≤ lifecycle_queue_depth`
 
 §5 places a pending `STREAM_ACK` in the **ordinary lifecycle-intent queue**, the
@@ -720,6 +791,13 @@ stream per direction, so their aggregate is bounded by `S_max` without a credit
 mechanism; `STREAM_ACK` and `CANCEL` are descriptor-only lifecycle frames whose
 bound is §5's coalescing rule and the ABI's lifecycle reserve.
 
+When the `stream-chunking` feature is active (§13.1), this section's unit is
+the **logical message**, not the frame: a chunked logical message consumes
+exactly one credit unit — once, at admission, before its first fragment — and
+its `STREAM_CHUNK` fragments consume none (§13.3, §13.4). On a connection
+without the feature the two readings coincide, because every logical message
+is exactly one `STREAM_MSG` frame.
+
 ### §4.5 Sender-side reservation semantics
 
 Each direction of each stream keeps, on the **sending** side:
@@ -869,6 +947,18 @@ context, and adding a withdrawal edge would mean a second party mutating an
 intent the single writer is entitled to publish — precisely the single-writer
 invariant the data plane is built on (design §12). Making acceptance final and
 making the ambiguous case terminal keeps the writer untouched.
+
+When the `stream-chunking` feature is active (§13.1), the variables of this
+section count **logical messages** — `sent` increments once per admitted
+logical message — while sequence reservation stays per **fragment**. §13.4
+restates this section's acceptance boundary and rollback rule for fragment
+trains: rollback stays legal exactly while the transport's rejection proves no
+fragment of the train was ever accepted, and a train with any
+possibly-accepted fragment follows §13.8's termination rules instead of any
+rollback path. §13.4 also enumerates the chunk path's proven never-published
+set exactly — it includes the shared-memory path's pre-admission oversize
+rejection, which the table above names only under UDS — and neither
+`ErrClosed` nor any context error is ever in it.
 
 ### §4.6 The credit-return rule (receiver side)
 
@@ -1051,6 +1141,18 @@ the drain trigger fires). This yields the bound §10 needs:
 > with the deferred bit **set**, one becomes pending at the back-off delay's
 > expiry, which is at most 32 ms away and needs no further consumption at all.
 > Either way the wait is bounded by an event that provably occurs.
+
+When the `stream-chunking` feature is active (§13.1), `consumed`, `acked_out`,
+and every `STREAM_ACK` control value in this section count **logical
+messages**: a reassembled logical message increments `consumed` by one on
+delivery, and its `STREAM_CHUNK` fragments increment nothing (§13.3, §13.5).
+The upper bound on an ACK's cumulative value reads in the same unit — it MUST
+NOT exceed the count of logical messages **completed** on that direction, a
+smaller number than the highest fragment sequence received wherever any
+message was chunked — and §7.3's no-messages-sent row keeps its disposition
+with its rationale read in this unit. The ack-due triggers, the cumulative
+payload semantics, the publication rule, and the back-off are all unchanged;
+only the unit is fixed.
 
 ### §4.7 Negotiation at `STREAM_OPEN`
 
@@ -1926,6 +2028,15 @@ therefore not depend on **not** seeing such an ACK, and equally must not depend
 on seeing one: the permission stands, and this arrangement's choice within it is
 to emit.
 
+When the `stream-chunking` feature is active (§13.1), the final sequence `F`
+stays in **fragment sequence** units: it is the last sequence number the
+sender consumed on the closing direction — necessarily the sequence of the
+last `STREAM_MSG` it sent, because every fragment train ends in one (§13.2) —
+so the receiver's `F == expected_seq − 1` check above is unchanged. One check
+is added ahead of it: a `STREAM_CLOSE` arriving on a direction whose pending
+accumulation is non-empty is a conformance violation, detected before any
+close state is mutated (§13.7).
+
 ### §6.5 Simultaneous half-close
 
 Both sides calling `CloseSend` concurrently is **legal and requires no
@@ -2023,6 +2134,16 @@ first case by outcome alone. `COMPLETED`, `FAILED`, `REJECTED`, and
 `OUTCOME_UNKNOWN` likewise emit nothing. §5.1 step 3 and §9.1 step 1 **cite** this
 definition rather than restating it, so the three sites cannot drift into
 different extensions of one predicate.
+
+When the `stream-chunking` feature is active (§13.1), the definition admits
+one further locally initiated trigger: a visible fragment train's `Send`
+failure that is neither a context error nor connection-fatal (§13.8
+shape 4). This side's own send path caused the termination, so the winner
+emits the teardown pair exactly as for the three triggers above. It records
+`CANCELED`, wrapping the underlying transport cause in the locally delivered
+error only — the cause never travels on the wire — and the pair carries the
+`CANCELED` discriminant, indistinguishable at the peer from a local
+cancellation (§9.1, §13.8).
 
 Terminal outcomes, reusing the unary terminal set (design §14):
 
@@ -2221,6 +2342,13 @@ poisoning is the correct response. "Late" frames are real, but they are always
 frames for a stream that has *already terminated* (level 2) or a call ID that no
 longer exists (level 1) — never a sequence anomaly on a live stream.
 
+When the `stream-chunking` feature is active (§13.1), level 3's table reads in
+§13.3's two units: the sequence rows span `STREAM_CHUNK` and `STREAM_MSG`
+alike; the `STREAM_ACK` row's upper bound is the count of logical messages
+completed (§4.6); the post-close row gains its dual — a `STREAM_CHUNK` after
+the direction's `STREAM_CLOSE` is equally a conformance violation — and §13.7
+adds the remaining chunk-specific rows, all sharing this table's dispositions.
+
 ### §8.2 Disposal action
 
 A frame discarded at level 1 or level 2 is disposed of identically on the wire,
@@ -2356,6 +2484,14 @@ runtime.
 
 Both are emitted **only** by step 1, and only by the winner of a locally
 initiated terminal CAS. Neither ever appears on a `UNARY_ERR`.
+
+When the `stream-chunking` feature is active (§13.1), the `CANCELED` encoding
+of the pair serves one additional locally initiated trigger — a visible
+fragment train's non-context, non-connection-fatal `Send` failure (§7.1 as
+amended; §13.8 shape 4). The wire form is identical to a local
+cancellation's, deliberately: the underlying cause is reported only in the
+locally delivered error, and the peer neither can nor needs to distinguish
+the two.
 
 #### The two rejection status codes (allocated here)
 
@@ -3252,6 +3388,13 @@ Because both maxima are local and locally enforced, §4.2's startup invariant
 no dependence on anything the peer says or does, and (S2) is a property of this
 side's own writer alone.
 
+`stream-chunking` (§13) is a second, independent feature flag on the stream
+plane, with the same shape: a stable string identifier, boolean, no
+parameters. Its one numeric input, the chunk ceiling, travels on the attach
+message rather than in any flag (§13.6), so the constraint above — the
+handshake exchanges no streaming values of any kind — holds for it
+identically.
+
 ### §11.2 Fail-closed on a missing feature
 
 A side that intends to call or serve a streaming method declares `streaming` as a
@@ -3322,3 +3465,340 @@ already state normatively elsewhere.
 ---
 
 *End of the `streaming` feature's wire contract.*
+
+---
+
+## §13 Chunked stream messages (`stream-chunking` feature)
+
+Everything before this section is the `streaming` feature's protocol-v1
+contract and is complete without this section. `stream-chunking` is a second,
+independently negotiated feature that amends that contract **additively**: on a
+connection where it is not active, every rule above applies exactly as written
+and nothing in this section exists on the wire. Where an earlier section states
+a rule this feature changes, that section carries an appended,
+feature-conditional clause pointing here; the unconditional text keeps its
+exact meaning for peers without the feature.
+
+What the feature is for: without it, a logical stream message must fit the
+sending direction's **inline limit** — `L = max_payload(dir)`, the largest
+payload the direction's top size class can store under the negotiated feature
+overheads (`shm-abi.md` §18) — and a larger `Send` is rejected with the
+definitive `ErrPayloadTooLarge` (design §19). With it, a larger logical message
+is split into ladder-sized **fragments** that ride the same ring, in order,
+under the stream's existing per-frame sequence discipline, and are reassembled
+by the receiver into one logical message delivered whole, exactly once.
+
+### §13.1 The feature flag and activation
+
+`stream-chunking` is a **named feature flag** in the handshake's acknowledged
+compatibility tuple (design §10), with the stable string identifier
+`stream-chunking`. Like `streaming` (§11.1) it is a **boolean flag and nothing
+else**: it carries no numeric parameters. Its one numeric input, the chunk
+ceiling, travels on the attach message, not in the flag (§13.6). Each side
+offers it **optional**; a required offer follows the ordinary fail-closed rule
+(design §10).
+
+The feature is **active** on a connection iff all three hold:
+
+1. the negotiated transport is **shared memory**;
+2. the `stream-chunking` flag resolved true in the acknowledged tuple; and
+3. the attach carried a **non-zero** `chunk_max_payload` (§13.6).
+
+On every connection where the feature is not active — a shared-memory attach
+where the flag did not resolve or the announced ceiling is zero (a **dormant**
+attach), and every UDS connection — frame kind 9 remains **unassigned**: a
+shared-memory receiver MUST poison on it (`shm-abi.md` §5, §16), and the UDS
+transport never implements it, regardless of the `streaming` flag. A conformant
+sender on such a connection never emits kind 9, and an oversize logical message
+fails exactly as it does without this section: the definitive
+`ErrPayloadTooLarge`, before anything reaches the wire.
+
+The activation conjunction does not name `streaming`, but chunking is inert
+without it: only `STREAM_MSG` payloads are chunked, and without `streaming` in
+the acknowledged tuple no `STREAM_*` kind may appear at all (§11.2), so kind 9
+never appears either.
+
+**No layout version bump.** Assigning kind 9 consumes reserved numbering space
+(`shm-abi.md` §5's 9..255 range) behind a negotiated feature, which is
+precisely `shm-abi.md` §19's additive category (*"assigning a **reserved
+frame-kind** value (§5, 9..255)"*). No descriptor field is added, no existing
+value moves, and the control word's use on the new kind is the same additive
+offset-56 use §2.2 sanctions, scoped by this feature exactly as §2.2 scopes it
+by `streaming`.
+
+### §13.2 Wire form: the fragment train
+
+Chunking covers `STREAM_MSG` payloads **only**. The single server-streaming
+request riding `STREAM_OPEN`'s payload and the single client-streaming
+response riding `STREAM_CLOSE`'s payload remain bounded by the sending
+direction's inline limit and keep the definitive `ErrPayloadTooLarge`
+rejection when they exceed it, feature or no feature.
+
+> **Split rule (normative).** On a direction where the feature is active, a
+> logical stream message whose marshaled length exceeds the direction's inline
+> limit `L` is emitted as `N = ceil(length / L)` fragments, in order:
+> fragments `1..N−1` ride frame kind **`STREAM_CHUNK` (9)** and each carries
+> **exactly `L` payload bytes**; fragment `N` rides an ordinary
+> **`STREAM_MSG` (4)** and carries the remainder — **at least 1 and at most
+> `L` bytes**. The `STREAM_MSG` completes the logical message. A message at or
+> below `L` is emitted exactly as without the feature: one `STREAM_MSG`, no
+> `STREAM_CHUNK`.
+
+The canonical shape is exact on both ends, not advisory: a received non-final
+fragment whose payload length differs from `L` — shorter, longer, or empty —
+is a conformance violation (§13.7), and so is a completing `STREAM_MSG` that
+arrives empty over a pending train.
+
+`STREAM_CHUNK` is a payload-bearing **data** frame on the **data lane**,
+subject to ordinary data admission (`shm-abi.md` §18), field-mapped exactly as
+`STREAM_MSG` is in §2.3's table — same call ID, same `service_id`/`method_id`,
+`budget_ns` carrying the stream's remaining budget at that fragment's send —
+with one difference: its control word carries the fragment's own **fragment
+sequence number** (§13.3). It MUST NOT carry an empty payload, and it is never
+a train's last frame: kind 9 tells the receiver, from the descriptor alone,
+that at least one more fragment of this logical message follows.
+
+Fragment trains do not interleave within a direction. §3.1's
+one-sender-per-direction rule already serializes `Send`s on a direction, so
+the fragments of one logical message are contiguous in that direction's frame
+order, and the transports deliver them in that order, losslessly (§3.3). The
+receiver therefore reassembles by contiguous append (§13.5); there is no
+resequencing problem to solve.
+
+### §13.3 Two accounting units
+
+Without this feature one counter serves two roles, because every logical
+message is exactly one frame. Chunking splits the roles, and every rule in
+this document binds to exactly one of the two:
+
+- **Fragment sequence numbers** order frames within a direction and are
+  checked per frame. Every `STREAM_CHUNK` **and** every `STREAM_MSG` consumes
+  one: the per-direction counter of §3.1 increments by exactly 1 on each
+  fragment, both kinds alike, and the receiver's `expected_seq` check (§3.2)
+  applies to each arriving fragment unchanged — same counter, same initial
+  value 1, same conformance violation on mismatch (§3.3).
+- **Logical-message counts** govern everything credit-shaped: admission and
+  the credit window (§4.4/§4.5 — `sent`, `acked`, and `available` count
+  logical messages; a chunked logical message consumes exactly **one** credit
+  unit and its `STREAM_CHUNK` fragments consume **none**), `STREAM_ACK`
+  control values (§4.6 — the cumulative count of **logical messages**
+  consumed), and delivery (one `Recv` per logical message).
+
+`STREAM_CLOSE`'s control word stays in **fragment sequence** units: `F` is the
+last sequence number the sender consumed on the closing direction — which is
+the sequence of the last `STREAM_MSG` it sent, because every train ends in one
+(§13.2) — so the receiver's `F == expected_seq − 1` acceptance check (§6.4) is
+unchanged, mechanically and in meaning.
+
+> **Worked example (normative).** A direction with the feature active sends
+> one logical message as two fragments, then closes:
+>
+> | # | Kind | control word | Unit | Note |
+> |--:|---|--:|---|---|
+> | 1 | `STREAM_CHUNK` | 1 | fragment seq | non-final fragment, exactly `L` bytes. Consumes no credit: the message's one unit was consumed at admission (§13.4). |
+> | 2 | `STREAM_MSG` | 2 | fragment seq | final fragment, 1..`L` bytes; completes and delivers the logical message |
+> | 3 | `STREAM_ACK` | 1 | **logical** | **one** logical message consumed — not two frames |
+> | 4 | `STREAM_CLOSE` | 2 | fragment seq | `F = 2`, the last sequence consumed; the receiver checks `2 == expected_seq − 1` ✓ |
+>
+> Had the sender continued with a second, single-fragment message instead of
+> closing — a `STREAM_MSG` with fragment sequence **3** — the cumulative
+> `STREAM_ACK` value `2` would be legal (two logical messages consumed) while
+> the direction's final fragment sequence is **3**, and the close would carry
+> `F = 3`. An ACK carrying a fragment count where a logical count is required
+> — control word 2 after only the first, two-fragment message was consumed —
+> is a conformance violation under §4.6's amended bound (§13.7).
+
+### §13.4 Sender-side admission, reservation, and train visibility
+
+Admission is **per logical message**, once, before the first fragment: one
+credit unit is consumed under §4.5's ordinary admission rule (block or
+`ErrBackpressure`, per the connection's admission mode) before any fragment
+reaches the transport. The fragments themselves consume no credit (§13.3).
+
+Sequence reservation is **per fragment**: each fragment's sequence number is
+reserved immediately before that fragment's `Send` and retained after any
+possibly-accepted `Send`, per §4.5's acceptance boundary — acceptance is per
+fragment, at the same lane-queue handoff.
+
+> **Train visibility (normative).** A train is **invisible** until the first
+> fragment's enqueue is attempted; it is **visible** from that attempt onward,
+> unless the attempt returned one of the transport's proven never-published
+> rejections (the exact set enumerated below; a context error is never in it).
+> Rollback — the credit unit returned to `available`, the newest sequence
+> reservation released — is legal **iff the train is invisible**. This is
+> §4.5's rollback rule restated for trains: the whole train rolls back or none
+> of it does, and after visibility no rollback of any kind is permitted. A
+> visible train that cannot complete follows §13.8, never the rollback path.
+
+The proven never-published set for the chunk path is exact, and it is
+enumerated here rather than read off §4.5's transport rows: an
+**unimplemented frame kind**, an **oversize payload**
+(`ErrPayloadTooLarge`), and **reject-mode `ErrBackpressure`**. The
+shared-memory send path can return the oversize rejection before any
+admission effect, even though the frozen §4.5 table names that error only
+under UDS; such a rejection proves non-publication identically and is
+rollback-eligible. A **closed-transport error (`ErrClosed`) and every
+context error are never in the proven set**: neither proves a fragment
+unpublished, so neither is ever rollback-eligible — a first-fragment
+`ErrClosed` makes the train visible and lands in §13.8's connection-failure
+shape, never in rollback.
+
+The whole-message size check runs while the train is still invisible: a
+logical message larger than `chunk_max_payload` (§13.6) is rejected with the
+definitive `ErrPayloadTooLarge` before any fragment is built — pre-visibility,
+so the rejection is rollback-eligible and the stream lives.
+
+### §13.5 Receiver-side reassembly
+
+The receiver keeps, per stream per direction, a **pending accumulation**: the
+concatenated payloads of the `STREAM_CHUNK` fragments received since the last
+completed logical message. On each arriving `STREAM_CHUNK` or `STREAM_MSG`,
+its checks run in this order, each before any state the later ones mutate:
+
+1. **Close bit.** A `STREAM_CHUNK` on a direction whose `STREAM_CLOSE` was
+   already observed is a conformance violation (§13.7), checked before any
+   sequence mutation or append.
+2. **Fragment sequence.** `control_word == expected_seq` (§3.2, spanning both
+   kinds); a mismatch is a conformance violation (§3.3).
+3. **Canonical length.** A `STREAM_CHUNK` carries exactly `L` bytes; a
+   `STREAM_MSG` completing a non-empty accumulation carries 1..`L` bytes;
+   anything else is a conformance violation (§13.7).
+4. **Ceiling.** The accumulation after this fragment must not exceed
+   `chunk_max_payload`, checked **before** the fragment is buffered, in
+   arithmetic that cannot wrap (§13.6).
+5. **Append.** A `STREAM_CHUNK` appends and delivers nothing. A `STREAM_MSG`
+   over a non-empty accumulation appends and delivers the reassembled logical
+   message — once, whole, incrementing `consumed` by **one** (§4.6). A
+   `STREAM_MSG` with no pending accumulation is the pre-feature path
+   unchanged.
+
+Delivery, credit return, and ACK arming then proceed exactly as §4.6
+specifies, in logical units.
+
+### §13.6 The chunk ceiling (`chunk_max_payload`)
+
+`chunk_max_payload` is a `uint32` byte ceiling on the **reassembled logical
+message**, one value bounding both directions. It is **announced, not
+negotiated**: the host selects it and carries it as **field 7** of the
+control plane's attach message (`AttachRegion.chunk_max_payload`), and the
+plugin adopts the announced value verbatim. Zero means the host selected
+no value, leaving the feature dormant on that attach (§13.1). Every non-zero
+value is legal, including the full `uint32` range, so every bound involving it
+MUST be computed in arithmetic that cannot wrap — widened to 64 bits, or in
+subtraction form — never by summing 32-bit lengths before comparing.
+
+- **Send side:** a logical message larger than `chunk_max_payload` is rejected
+  with the definitive `ErrPayloadTooLarge` before the first fragment leaves —
+  pre-visibility, rollback-eligible (§13.4).
+- **Receive side:** the accumulation is bounded as it grows: a fragment whose
+  acceptance would carry it past `chunk_max_payload` is a conformance
+  violation, detected **before** the fragment is buffered (§13.7). The
+  receive-side check is not redundant with the send-side one: it is what makes
+  the bound hold against a non-conformant peer, which is the only peer that
+  can breach it.
+
+### §13.7 Conformance violations
+
+Each of the following is a conformance violation with §3.3's disposition —
+poison `POISON_BAD_FRAME` (`shm-abi.md` §16); chunking never runs on UDS:
+
+| Observation | Why it is a violation |
+|---|---|
+| a `STREAM_CHUNK` or `STREAM_MSG` whose control word is not `expected_seq` — a gap or a repeated fragment sequence | §3.2/§3.3, unchanged, spanning both kinds (§13.3) |
+| a fragment whose acceptance would carry the accumulation past `chunk_max_payload` — the breaching fragment, checked before it is buffered | §13.6 |
+| a `STREAM_CHUNK` whose payload length differs from `L` — short and **empty** alike | canonical form (§13.2). The exact-length rule closes a descriptor-amplification hole: were short or empty fragments legal, one credit unit could drive one ring descriptor per payload byte — or per zero bytes — unbounded by anything credit bounds. |
+| a `STREAM_MSG` completing a pending accumulation with an **empty** payload | the remainder is 1..`L` by the split rule (§13.2). An empty `STREAM_MSG` stays legal exactly where it is legal today: with **no** pending accumulation. |
+| a `STREAM_CHUNK` arriving after its direction's `STREAM_CLOSE` was observed | the dual of §8.1's post-close `STREAM_MSG` row, checked against the close bit **before** any sequence mutation or append (§13.5) |
+| a `STREAM_CLOSE` arriving on a direction whose accumulation is non-empty | a half-close cannot legitimately interrupt its own direction's train — a conformant sender ends every train with the completing `STREAM_MSG` before any close (§13.2). Checked **before** any close state is mutated (§6.4). |
+| kind 9 on a connection where the feature is not active | already `shm-abi.md` §5's unassigned-kind poison — restated here, not re-legislated |
+
+Both orders of the close/chunk interleaving are therefore deterministic
+violations — chunk-then-close by the sixth row, close-then-chunk by the fifth
+— while the legal order, the train's completing `STREAM_MSG` **then**
+`STREAM_CLOSE`, is unaffected: a completed train leaves the accumulation
+empty, so a following half-close finds nothing pending.
+
+### §13.8 Termination of a partial train
+
+Silent discard of a pending accumulation is reserved for events that are
+**genuinely terminal** for the stream — an observed `STREAM_ERR`, a teardown
+`CANCEL`, connection failure or region poison, and this side's own terminal
+transition (§7). In every such case the accumulation is discarded with the
+stream, the partial logical message is never delivered — a logical message is
+delivered whole or not at all — and the stream's terminal status already
+reports the failure; no additional signal exists and none is needed.
+
+The sender-side dual: a **visible** train (§13.4) that cannot complete
+resolves into exactly one of four shapes, each with a defined local outcome
+and a peer-visible result the receiver already accepts:
+
+1. **Reject-mode `ErrBackpressure` on fragment `k`** proves non-acceptance of
+   that fragment alone (§4.5's pre-acceptance table). The sender retries
+   fragment `k` — the same fragment, the same reserved sequence — and, until
+   it is accepted, MUST NOT emit any other frame on that direction, MUST NOT
+   release the reservation, and MUST NOT skip or reorder. Mirroring block-mode
+   admission, the only bound on the retry is the send's own context ending,
+   which is the next shape; retry exhaustion is not a distinct outcome.
+2. **The send context ends mid-train** — canceled or expired, before or after
+   an enqueue: §4.5's post-admission context rule applies unchanged. The
+   transition is locally initiated (§7.1), records `CANCELED` or `DEADLINE`,
+   and emits §9.1 step 1's teardown pair. The pair travels the lifecycle and
+   data lanes and MAY overtake fragments the writer has already accepted and
+   may still publish (§4.5); the receiver's terminal discard above clears its
+   pending accumulation, and train fragments arriving after the terminal are
+   ordinary late frames, disposed at §8.1 level 1 or 2 with their slabs
+   released by head advancement (§8.3).
+3. **`ErrClosed` or region poison**, on any fragment: the connection itself is
+   failing. The stream terminates through the ordinary connection-teardown
+   path (§9); no stream-local frame is emitted or required, both sides'
+   accumulations are cleared by the terminal discard above, and poison keeps
+   its connection-fatal escalation unchanged (`shm-abi.md` §16).
+4. **Any other `Send` failure** — neither a context error nor
+   connection-fatal — is locally initiated (§7.1 as amended): one terminal
+   transition records `CANCELED`, wrapping the underlying cause in the
+   locally delivered error only — the cause never travels on the wire — and
+   emits §9.1 step 1's pair with the `CANCELED` discriminant. On the wire
+   this shape is identical to shape 2's canceled form; the peer cannot and
+   need not distinguish the two.
+
+In every shape the logical message's credit unit is **not** returned — the
+stream is terminal and its window dies with it (the counters are per-stream,
+so no other stream's window is affected; §10.1 case (T)) — the train's
+completing `STREAM_MSG` is **never** emitted, the train is never resumed, and
+no reservation is rolled back (§13.4).
+
+### §13.9 Capacity
+
+Credit bounds **logical messages** in flight (§13.3), so the worst-case
+transient slab footprint of one direction's chunked traffic on one stream is
+`N · chunk_max_payload` bytes at a granted credit of `N` — computed in wide
+arithmetic, since both operands are full-range 32-bit values — rather than
+`N · L`. Chunking does not change the ABI's capacity stance: arena exhaustion
+under a chunked train is the same **typed backpressure** as ever
+(`shm-abi.md` §18) — the writer sets the stuck fragment aside, and the sender
+blocks or retries per §13.8 — never a safety violation. A deployment sizing
+for sustained oversize stream traffic watches the arena set-aside diagnostic
+counter (`styx.arena.setaside.count`), exactly as `shm-abi.md` §18's sizing
+guideline directs.
+
+Ring descriptors are a second capacity axis, and the feature changes what
+(S1) buys there. `N_max · S_max` bounds outstanding **logical messages**
+(§13.3), and a chunked logical message can occupy up to
+`ceil(chunk_max_payload / L)` ring descriptors while its fragments await
+consumption, so the credit-governed worst case in descriptors is
+`N_max · S_max · ceil(chunk_max_payload / L)` — and (S1) as written no longer
+implies §4.3's half-window descriptor policy for chunked traffic. §4.3 (as
+amended) states the scaled provisioning form for a deployment that wants the
+policy to keep holding under chunking; a deployment that keeps stock
+provisioning accepts instead that chunked trains may transiently occupy
+data-window slots beyond half of the declared window, resolved as ordinary
+typed backpressure (`shm-abi.md` §18) — the accepted stance. Deadlock-freedom
+is genuinely unaffected, and not because (S1) still holds: it rests on the
+`max_data_inflight ≤ C − R` admission bound and the lifecycle reserve `R`
+(`shm-abi.md` §18(i)), neither of which chunking touches; the fragments of a
+train pass through the data window one admission at a time, as ordinary data
+frames.
+
+---
+
+*End of the `stream-chunking` feature's wire contract.*
