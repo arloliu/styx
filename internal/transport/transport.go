@@ -25,6 +25,16 @@ const MaxFrameSize = 1 << 20 // 1 MiB
 // unassigned value, not streaming.
 var ErrUnimplementedFrameKind = errors.New("transport: unimplemented frame kind")
 
+// ErrStreamChunkOnUDS is returned by UDSTransport.Recv for an inbound frame
+// kind 9 (STREAM_CHUNK): stream-chunking is shared-memory only
+// (stream-protocol.md §13.1), so a uds peer that emits it is not speaking a
+// dialect this side can skip past — it is violating the frozen contract's
+// per-connection assignment rule, whatever the streaming flag negotiated.
+// Recv wraps it with ErrPoisoned and fails the connection closed, unlike an
+// ordinary ErrUnimplementedFrameKind, which IsFrameLocalRecvErr classifies
+// frame-local and a reader loop skips and keeps serving.
+var ErrStreamChunkOnUDS = errors.New("transport: frame kind 9 (STREAM_CHUNK) is never carried by uds")
+
 // ErrPayloadTooLarge is returned when a payload exceeds the limit the transport
 // bounds it by, always before any write or allocation for that payload:
 //
@@ -216,8 +226,11 @@ func NeverPublished(err error) bool {
 }
 
 // FrameKind identifies a Frame's role in the RPC protocol.
-// All nine kinds (unary request/response/error, cancel, and five streaming
-// kinds) are transport-agnostic and carried by both uds and shm implementations.
+// The original nine kinds (unary request/response/error, cancel, and five
+// streaming kinds) are transport-agnostic and carried by both uds and shm
+// implementations unconditionally. FrameStreamChunk is a tenth, additive kind
+// carried only where a connection's admission policy says so (see
+// checkImplementedKind and FrameStreamChunk's own doc).
 // The transport does not interpret stream semantics; frames sharing a CallID are
 // assembled into streams by internal/rpcruntime.
 type FrameKind uint8
@@ -247,6 +260,19 @@ const (
 	// field (encoded into the wire body in place of Payload), never a
 	// normal Payload.
 	FrameUnaryErr
+
+	// FrameStreamChunk (value 9) marks a non-final fragment of an oversize
+	// STREAM_MSG, assigned from shm-abi.md §5's reserved 9..255 range behind
+	// the stream-chunking feature (stream-protocol.md §13). Unlike the nine
+	// kinds above, it is not unconditionally implemented: it rides the
+	// shared-memory transport only, and only on a connection where the
+	// feature resolved active with a non-zero chunk ceiling — everywhere
+	// else (a dormant shm attach, or any uds connection regardless of the
+	// streaming flag) it stays unassigned, and a receiver poisons on it
+	// (§5, §13.1). A FrameStreamChunk carries the fragment's own payload
+	// slice and its fragment sequence number in Control, exactly as
+	// FrameStreamMsg's own control word does (§13.3).
+	FrameStreamChunk
 )
 
 // FrameStatus is the application/framework error carried by a FrameUnaryErr or
@@ -751,10 +777,14 @@ type ArenaCarryCounter interface {
 	ArenaCarries() []ArenaCarry
 }
 
-// checkImplementedKind returns nil for the nine implemented kinds (unary
-// request/response/error, cancel, and five stream kinds) and ErrUnimplementedFrameKind
-// for any out-of-range byte. Stream kinds are checked explicitly to ensure removing
-// one becomes a compile error, not a silent range widening.
+// checkImplementedKind returns nil for the nine kinds every uds connection
+// carries unconditionally (unary request/response/error, cancel, and five
+// stream kinds) and ErrUnimplementedFrameKind for any other byte — including
+// FrameStreamChunk (9), which uds never carries: stream-chunking is a
+// shared-memory-only feature (stream-protocol.md §13.1), so this is not a
+// version gap uds could ever close. Every kind is checked explicitly,
+// FrameStreamChunk included, to ensure removing or adding one becomes a
+// compile error here, not a silent range widening.
 //
 //nolint:revive // identical-switch-branches: explicit enumeration catches removals
 func checkImplementedKind(k FrameKind) error {
@@ -763,6 +793,8 @@ func checkImplementedKind(k FrameKind) error {
 		return nil
 	case FrameStreamOpen, FrameStreamMsg, FrameStreamAck, FrameStreamClose, FrameStreamErr:
 		return nil
+	case FrameStreamChunk:
+		return ErrUnimplementedFrameKind
 	default:
 		return ErrUnimplementedFrameKind
 	}

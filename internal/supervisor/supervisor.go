@@ -189,6 +189,14 @@ type Instance struct {
 	// An un-negotiated connection has no stream plane and fails stream open as closed.
 	Streaming bool
 
+	// ChunkPolicy is this connection's resolved stream-chunking policy
+	// (stream-protocol.md §13), the zero value (inactive) whenever the
+	// feature did not resolve active. OnReady threads it into the
+	// connection's stream plane so it is plumbed and populated regardless of
+	// Streaming's value -- constructing it costs nothing when Streaming is
+	// false, since no stream plane is built to consume it either way.
+	ChunkPolicy rpcruntime.ChunkPolicy
+
 	// NotifyConnLost escalates a data-plane fault the routing layer detects to this
 	// instance's supervisor.
 	// This can be a stream conformance poison or a connection-fatal terminal-CANCEL
@@ -342,6 +350,15 @@ type Config struct {
 	// non-zero -- zero (the default) keeps the burst path off and the flag
 	// unoffered, matching today's behavior.
 	BurstMaxPayload uint32
+
+	// ChunkMaxPayload is the host-selected byte ceiling on a reassembled
+	// logical stream message (styx.PluginSpec.MaxPayload's derived chunk
+	// ceiling): hostOffer offers the stream-chunking feature flag if and only
+	// if this is non-zero, and sendAttachRegion announces it on
+	// AttachRegion.chunk_max_payload regardless of how the flag resolves --
+	// zero (the default) keeps chunking off and the flag unoffered, mirroring
+	// BurstMaxPayload's own contract.
+	ChunkMaxPayload uint32
 
 	// Transport selects the data-plane transport this host offers.
 	// "shm" pins the shared-memory transport (a plugin that cannot speak it fails
@@ -1019,7 +1036,7 @@ func (s *Supervisor) newLiveInstance(
 
 		return nil, crashReason(stderrTail, hsErr, exitStatus, exitStatusKnown)
 	}
-	tr, streaming, shmRes := hs.tr, hs.streaming, hs.shmRes
+	tr, streaming, chunkPolicy, shmRes := hs.tr, hs.streaming, hs.chunkPolicy, hs.shmRes
 
 	li := &liveInstance{
 		conn: conn, generation: generation, stderrTail: stderrTail, capture: capture,
@@ -1032,6 +1049,7 @@ func (s *Supervisor) newLiveInstance(
 
 		return s.cfg.OnReady(Instance{
 			Process: proc, ControlConn: conn, Transport: tr, Generation: generation, Streaming: streaming,
+			ChunkPolicy: chunkPolicy,
 			// The routing layer calls this to escalate a data-plane fault the
 			// control-watching heartbeat loop cannot see.
 			NotifyConnLost: li.notifyConnLost,
@@ -1410,13 +1428,15 @@ func deltaSinceBaseline(cur, last uint64) uint64 {
 // styx package, so each side reimplements the exchange against its own control.Conn.
 //
 // handshakeResult bundles what a completed handshake-and-attach hands back: the
-// data-plane transport, the acknowledged streaming state, and the host-owned
-// shared-memory resources to close at teardown (nil for uds).
+// data-plane transport, the acknowledged streaming state, the connection's
+// resolved stream-chunking policy, and the host-owned shared-memory resources
+// to close at teardown (nil for uds).
 // It is a single return value so the function stays within the result-count limit.
 type handshakeResult struct {
-	tr        transport.Transport
-	streaming bool
-	shmRes    *shmHostResources
+	tr          transport.Transport
+	streaming   bool
+	chunkPolicy rpcruntime.ChunkPolicy
+	shmRes      *shmHostResources
 }
 
 func (s *Supervisor) handshakeAndAttach(
@@ -1478,8 +1498,21 @@ func (s *Supervisor) handshakeAndAttach(
 	if err != nil {
 		return handshakeResult{}, err
 	}
+	chunkPolicy := chunkPolicyFor(tr, tuple, s.cfg.ChunkMaxPayload)
 
-	return handshakeResult{tr: tr, streaming: streaming, shmRes: shmRes}, nil
+	return handshakeResult{tr: tr, streaming: streaming, chunkPolicy: chunkPolicy, shmRes: shmRes}, nil
+}
+
+// chunkPolicyFor resolves this connection's stream-chunking policy from the
+// negotiated tuple, the host's configured ceiling, and tr's own negotiated
+// per-direction payload limits. control.ChunkingActive decides whether the
+// feature is active here (internal/supervisor's own read of the negotiated
+// tuple); the transport-inspecting half of the resolution is shared with
+// styx's own buildChunkPolicy via rpcruntime.ChunkPolicyFor, since
+// internal/supervisor cannot import the public styx package to share that
+// code directly (the reverse import exists).
+func chunkPolicyFor(tr transport.Transport, tuple control.Tuple, chunkMaxPayload uint32) rpcruntime.ChunkPolicy {
+	return rpcruntime.ChunkPolicyFor(tr, control.ChunkingActive(tuple, chunkMaxPayload), chunkMaxPayload)
 }
 
 // shmHostResources are the host-side shared-memory resources the transport does
@@ -1820,6 +1853,13 @@ func (s *Supervisor) sendAttachRegion(
 	// One read of the configured ceiling serves the wire field, the socket's frame
 	// limit, and the composite's routing boundary, so the three can never disagree.
 	ceiling := s.cfg.BurstMaxPayload
+	// One read of the configured chunk ceiling serves the wire field and the
+	// plugin's own ChunkingActive evaluation; it is stamped unconditionally
+	// (unlike the burst ceiling, chunking needs no socketpair) so a dormant
+	// resolution -- flag unresolved, or this value zero -- is exactly what
+	// control.ChunkingActive already treats as inactive on either side.
+	chunkCeiling := s.cfg.ChunkMaxPayload
+	attachMsg.GetAttachRegion().ChunkMaxPayload = chunkCeiling
 	var latch *rpcruntime.BurstFatalLatch
 	if control.BurstActive(tuple, ceiling) {
 		pair, perr := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
@@ -1908,6 +1948,7 @@ func (s *Supervisor) shmConfig(maxInflight int, tuple control.Tuple) shmtranspor
 		DataQueueDepth:      shmDataQueueDepth,
 		LifecycleQueueDepth: shmLifecycleQueueDepth,
 		Checksum:            tuple.Features["checksum"],
+		ChunkingActive:      control.ChunkingActive(tuple, s.cfg.ChunkMaxPayload),
 		Escalation: shmtransport.EscalationConfig{
 			ConsumeFaultRunThreshold: s.cfg.ConsumeFaultRunThreshold,
 		},
@@ -1924,12 +1965,17 @@ func (s *Supervisor) shmConfig(maxInflight int, tuple control.Tuple) shmtranspor
 // The burst feature is offered, always optional, if and only if
 // Config.BurstMaxPayload is non-zero -- a zero ceiling means the burst path was
 // never configured on, so nothing here asks a plugin to support it.
+// The stream-chunking feature follows the identical rule against
+// Config.ChunkMaxPayload.
 func (s *Supervisor) hostOffer() control.Offer {
 	transports, layoutVersions := s.offeredTransports()
 
 	features := []control.FeatureFlag{{Name: featureStreaming, Required: s.cfg.RequireStreaming}}
 	if s.cfg.BurstMaxPayload > 0 {
 		features = append(features, control.FeatureFlag{Name: control.FeatureBurst, Required: false})
+	}
+	if s.cfg.ChunkMaxPayload > 0 {
+		features = append(features, control.FeatureFlag{Name: control.FeatureStreamChunking, Required: false})
 	}
 
 	return control.Offer{

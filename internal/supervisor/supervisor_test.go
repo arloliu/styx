@@ -1490,6 +1490,40 @@ func TestHostOffer_OffersBurst_FromConfig(t *testing.T) {
 	require.False(t, required, "the burst feature is always offered optional")
 }
 
+// hostOffer lists the stream-chunking feature if and only if
+// Config.ChunkMaxPayload is non-zero, always as optional -- the identical
+// rule TestHostOffer_OffersBurst_FromConfig pins for the burst feature.
+func TestHostOffer_OffersChunking_FromConfig(t *testing.T) {
+	offersChunking := func(o control.Offer) (offered, required bool) {
+		for _, f := range o.Features {
+			if f.Name == control.FeatureStreamChunking {
+				return true, f.Required
+			}
+		}
+
+		return false, false
+	}
+
+	// Given a supervisor with no configured chunk ceiling.
+	off := supervisor.New(supervisor.Config{}, supervisor.NewEventBus())
+
+	// When its host offer is built.
+	offered, _ := offersChunking(off.HostOfferForTest())
+
+	// Then the stream-chunking feature is not offered at all.
+	require.False(t, offered, "a zero ChunkMaxPayload must not offer the stream-chunking feature")
+
+	// Given a supervisor with a non-zero configured chunk ceiling.
+	on := supervisor.New(supervisor.Config{ChunkMaxPayload: 1 << 20}, supervisor.NewEventBus())
+
+	// When its host offer is built.
+	offered, required := offersChunking(on.HostOfferForTest())
+
+	// Then the feature is offered, always as optional.
+	require.True(t, offered, "a non-zero ChunkMaxPayload must offer the stream-chunking feature")
+	require.False(t, required, "the stream-chunking feature is always offered optional")
+}
+
 // attachSeen is what a scripted plugin observed on one AttachRegion: the wire
 // shape of the message and of the descriptors that rode with it. The scripted
 // side collects it and hands it back over a channel, so every assertion runs on
@@ -2673,4 +2707,31 @@ func TestSupervisor_ShmConfig_CarriesTheConsumeFaultRunThreshold(t *testing.T) {
 	t.Run("an unset threshold stays zero so the transport picks its own default", func(t *testing.T) {
 		require.Zero(t, thresholdFor(t, 0))
 	})
+}
+
+// Test that shmConfig resolves ChunkingActive from Config.ChunkMaxPayload and
+// the negotiated tuple exactly as control.ChunkingActive defines it, so the
+// shared-memory transport admits frame kind 9 on precisely the connections
+// the feature negotiation says it should.
+func TestSupervisor_ShmConfig_ResolvesChunkingActive(t *testing.T) {
+	// Given tuples with the feature resolved and unresolved.
+	active := control.Tuple{
+		Transport: control.TransportSHM, Features: map[string]bool{control.FeatureStreamChunking: true},
+	}
+	unresolved := control.Tuple{Transport: control.TransportSHM, Features: map[string]bool{}}
+
+	// Given a supervisor configured with a non-zero chunk ceiling.
+	on := supervisor.New(supervisor.Config{ChunkMaxPayload: 1 << 20}, supervisor.NewEventBus())
+
+	// When / Then: the resolved flag activates chunking, the unresolved one does not.
+	require.True(t, on.ShmConfigForTest(16, active).ChunkingActive)
+	require.False(t, on.ShmConfigForTest(16, unresolved).ChunkingActive,
+		"an unresolved flag leaves chunking dormant even with a non-zero configured ceiling")
+
+	// Given a supervisor with no configured chunk ceiling.
+	off := supervisor.New(supervisor.Config{}, supervisor.NewEventBus())
+
+	// When / Then: a resolved flag still leaves chunking dormant with a zero ceiling.
+	require.False(t, off.ShmConfigForTest(16, active).ChunkingActive,
+		"a zero configured ceiling leaves chunking dormant even with the flag resolved")
 }

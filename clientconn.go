@@ -697,6 +697,7 @@ func (state *connState) handleInboundFrame(f transport.Frame, borrowed bool) inb
 		if borrowed {
 			f.Payload = clonePayload(f.Payload)
 		}
+		notifyBeforeStreamDispatch(f)
 		// A CANCEL is routed here whenever streaming is negotiated; dispatchStreamFrame
 		// decides its disposition by call-ID lookup — a live stream makes it a teardown
 		// (whose discriminant, 0 or illegal, poisons), any other call ID discards it.
@@ -955,6 +956,23 @@ var duplicateUnaryResponseHook atomic.Pointer[func(callID uint64)]
 func notifyDiscardedUnaryResponse(callID uint64) {
 	if f := duplicateUnaryResponseHook.Load(); f != nil {
 		(*f)(callID)
+	}
+}
+
+// beforeStreamDispatchHook, when set, is invoked with the exact frame value
+// handleInboundFrame is about to hand to dispatchStreamFrame — after the
+// borrow-copy decision above has already run. It is a TEST SEAM: unset in
+// production (one atomic load on the stream-data branch, never on the unary
+// path), so a test can observe the bytes dispatch will see and prove they do
+// not alias the lender's memory, for a frame kind whose dispatch outcome
+// never reads far enough into Payload to reveal a missing copy on its own
+// (a STREAM_CHUNK reaching a live stream is a conformance violation before
+// any byte of it is read).
+var beforeStreamDispatchHook atomic.Pointer[func(transport.Frame)]
+
+func notifyBeforeStreamDispatch(f transport.Frame) {
+	if fn := beforeStreamDispatchHook.Load(); fn != nil {
+		(*fn)(f)
 	}
 }
 

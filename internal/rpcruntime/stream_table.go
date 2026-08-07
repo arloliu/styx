@@ -150,6 +150,12 @@ type StreamTable struct {
 	// live-check. Holding a frame there lets a test land a terminal transition in
 	// the level-2 window the inbound frame is about to enter.
 	beforeDispatchLock func(f transport.Frame)
+
+	// chunkPolicy is this connection's stream-chunking admission policy
+	// (stream-protocol.md §13), installed at construction via WithChunkPolicy.
+	// Its zero value (chunking inactive) is the default set by every
+	// construction site that supplies no option.
+	chunkPolicy ChunkPolicy
 }
 
 // emitJob is one queued data-lane STREAM_ERR for the connection emitter to
@@ -213,8 +219,10 @@ func (t *StreamTable) closeObligation(callID uint64) {
 // NewStreamTable builds a stream table capped at maxOpenStreams (S_max,
 // stream-protocol.md §4.2) over tr, and starts the connection's single
 // ack-dispatch goroutine (§5.5). Call Close to stop the goroutine and release
-// the connection context.
-func NewStreamTable(maxOpenStreams int, tr transport.Transport) *StreamTable {
+// the connection context. opts configures construction-time options (see
+// WithChunkPolicy); omitted, the table's chunking policy is the zero
+// ChunkPolicy (inactive), leaving every pre-existing caller unchanged.
+func NewStreamTable(maxOpenStreams int, tr transport.Transport, opts ...StreamTableOption) *StreamTable {
 	ctx, cancel := context.WithCancel(context.Background())
 	// The emitter queue reserves S_max slots for the teardown (step 1) and
 	// handler-error (step 4) classes and gives rejections a budget of the same size
@@ -243,6 +251,9 @@ func NewStreamTable(maxOpenStreams int, tr transport.Transport) *StreamTable {
 		emitDone:    make(chan struct{}),
 		emitReserve: reserve,
 		fatalCh:     make(chan struct{}),
+	}
+	for _, opt := range opts {
+		opt(t)
 	}
 
 	go t.runAckDispatch()
@@ -412,12 +423,13 @@ func (t *StreamTable) remove(callID uint64) {
 	t.mu.Unlock()
 }
 
-// Dispatch routes an inbound STREAM_MSG/STREAM_ACK/STREAM_CLOSE/STREAM_ERR frame
-// to its stream through stream-protocol.md §8.1's three-level disposal. Level 1
-// (call ID absent) and level 2 (stream terminal) discard the frame, count it,
-// and return nil without blocking. Level 3 (LIVE) delivers or transitions; a
-// sequence/state anomaly there returns ErrStreamConformance for the reader loop
-// to poison the connection on.
+// Dispatch routes an inbound STREAM_MSG/STREAM_ACK/STREAM_CLOSE/STREAM_ERR/
+// STREAM_CHUNK frame to its stream through stream-protocol.md §8.1's
+// three-level disposal. Level 1 (call ID absent) and level 2 (stream
+// terminal) discard the frame, count it, and return nil without blocking.
+// Level 3 (LIVE) delivers or transitions; a sequence/state anomaly there, or
+// a STREAM_CHUNK (reassembly is a later change), returns ErrStreamConformance
+// for the reader loop to poison the connection on.
 func (t *StreamTable) Dispatch(f transport.Frame) error {
 	// A frame was available to dispatch, so the reader's inbound queue was not
 	// drained (stream-protocol.md §4.6): clear the drain mark a delivery consults.
@@ -449,7 +461,8 @@ func (t *StreamTable) Dispatch(f transport.Frame) error {
 		return nil
 	}
 
-	//exhaustive:ignore -- only the four inbound stream kinds reach a stream table; others are a routing bug.
+	//exhaustive:ignore -- four kinds get their own case; FrameStreamChunk (not yet
+	// consumable, see default below) and anything else fall to default on purpose.
 	switch f.Kind {
 	case transport.FrameStreamMsg:
 		return s.onStreamMsg(f)
@@ -462,6 +475,11 @@ func (t *StreamTable) Dispatch(f transport.Frame) error {
 
 		return nil
 	default:
+		// FrameStreamChunk lands here today: reassembly is a later change
+		// (stream-protocol.md §13.5 names onStreamChunk as the eventual
+		// handler), so until it exists a chunk frame reaching a live stream
+		// is not silently dropped — it gets the same conformance-violation
+		// disposition a genuine routing bug would.
 		return ErrStreamConformance
 	}
 }

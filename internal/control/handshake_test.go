@@ -270,6 +270,50 @@ func TestBurstActive_RequiresFlagAndSharedMemoryAndCeiling(t *testing.T) {
 		"a tuple with no feature map resolves the flag false")
 }
 
+// Test that ChunkingActive resolves the same conjunction as BurstActive
+// (shared memory ∧ the negotiated flag ∧ a non-zero ceiling), covering all
+// eight combinations of the three inputs so a future change to any one
+// operand cannot silently widen or narrow the conjunction.
+func TestChunkingActive_RequiresFlagAndSharedMemoryAndCeiling(t *testing.T) {
+	tuple := func(transport string, flag bool) control.Tuple {
+		return control.Tuple{Transport: transport, Features: map[string]bool{control.FeatureStreamChunking: flag}}
+	}
+
+	cases := []struct {
+		name     string
+		trans    string
+		flag     bool
+		ceiling  uint32
+		wantsSet bool
+	}{
+		{"shm+flag+ceiling", control.TransportSHM, true, 1 << 20, true},
+		{"shm+flag+zero", control.TransportSHM, true, 0, false},
+		{"shm+noflag+ceiling", control.TransportSHM, false, 1 << 20, false},
+		{"shm+noflag+zero", control.TransportSHM, false, 0, false},
+		{"uds+flag+ceiling", control.TransportUDS, true, 1 << 20, false},
+		{"uds+flag+zero", control.TransportUDS, true, 0, false},
+		{"uds+noflag+ceiling", control.TransportUDS, false, 1 << 20, false},
+		{"uds+noflag+zero", control.TransportUDS, false, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			given := tuple(tc.trans, tc.flag)
+
+			// When
+			got := control.ChunkingActive(given, tc.ceiling)
+
+			// Then
+			require.Equal(t, tc.wantsSet, got)
+		})
+	}
+
+	// Given a tuple with no feature map at all.
+	// When / Then: the flag resolves false rather than panicking on the nil map.
+	require.False(t, control.ChunkingActive(control.Tuple{Transport: control.TransportSHM}, 1<<20),
+		"a tuple with no feature map resolves the flag false")
+}
+
 // Test the nonce round-trip: OfferToHello embeds a caller-supplied nonce and
 // VerifyNonce rejects a HelloAck whose echoed nonce does not match, returning
 // ErrProtocolViolation (guards against attaching to a stale/foreign

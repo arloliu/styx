@@ -1945,6 +1945,28 @@ func TestAttachRegionBurstMaxPayload_RoundTripsMathMaxUint32_WithoutABodySizedAl
 	require.EqualValues(t, math.MaxUint32, got.GetBurstMaxPayload())
 }
 
+// Test AttachRegion.ChunkMaxPayload -- field 7, chunk_max_payload -- round-tripping
+// math.MaxUint32 exactly, at a few bytes of varint rather than a payload-sized
+// allocation, mirroring TestAttachRegionBurstMaxPayload_RoundTripsMathMaxUint32's
+// proof for the burst ceiling field.
+func TestAttachRegionChunkMaxPayload_RoundTripsMathMaxUint32_WithoutABodySizedAllocation(t *testing.T) {
+	// Given
+	msg := &controlpb.AttachRegion{ChunkMaxPayload: math.MaxUint32}
+
+	// When
+	data, err := msg.MarshalVT()
+	require.NoError(t, err)
+
+	// Then: the wire form stays a small fixed-shape varint, never a body sized
+	// to the value it carries.
+	require.LessOrEqual(t, len(data), 16,
+		"chunk_max_payload must stay a plain scalar field regardless of its value")
+
+	var got controlpb.AttachRegion
+	require.NoError(t, got.UnmarshalVT(data))
+	require.EqualValues(t, math.MaxUint32, got.GetChunkMaxPayload())
+}
+
 // Test that a zero PluginSpec.BurstMaxPayload -- even against a geometry a
 // non-zero ceiling would be refused under -- still carries through
 // Host.supervisorConfig as the zero that keeps the burst path off. The

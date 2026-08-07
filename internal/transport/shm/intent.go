@@ -2,6 +2,7 @@ package shm
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/arloliu/styx/internal/ring"
@@ -16,11 +17,20 @@ import (
 var ErrBackpressure = errors.New("shm: submission queue full")
 
 // errUnsupportedKind is returned for a frame kind this writer does not emit
-// under layout_version = 1. This is an in-process caller bug, not a peer fault,
-// so it is surfaced on the completion channel rather than poisoning the region.
-// Poisoning is the consumer's response to a bad received frame (shm-abi.md §5/§16),
-// never the producer's response to its own malformed request.
-var errUnsupportedKind = errors.New("shm: unsupported frame kind")
+// under layout_version = 1 -- either a genuinely out-of-range byte, or a kind
+// this connection has not activated (a dormant FrameStreamChunk send). This is
+// an in-process caller bug, not a peer fault, so it is surfaced on the
+// completion channel rather than poisoning the region. Poisoning is the
+// consumer's response to a bad received frame (shm-abi.md §5/§16), never the
+// producer's response to its own malformed request.
+//
+// It wraps transport.ErrUnimplementedFrameKind so a Send that reaches this
+// rejection satisfies transport.NeverPublished: the check runs before the
+// descriptor is built and before anything reaches the ring, which is exactly
+// the proof NeverPublished exists to make available to a caller (rollback
+// logic classifies this alongside the same rejection uds returns for a kind
+// it never carries).
+var errUnsupportedKind = fmt.Errorf("shm: unsupported frame kind: %w", transport.ErrUnimplementedFrameKind)
 
 // errLaneKindMismatch is returned when an intent's frame kind does not match
 // its queue lane. The lifecycle lane carries only descriptor-only kinds
@@ -138,9 +148,9 @@ func (p *payloadFill) abandoned() bool {
 type lane uint8
 
 const (
-	// laneData carries payload-bearing kinds: unary kinds and the four
-	// payload-bearing stream kinds (STREAM_OPEN/MSG/CLOSE/ERR). Data admission is
-	// bounded (design §19); a full queue is backpressure.
+	// laneData carries payload-bearing kinds: unary kinds and the five
+	// payload-bearing stream kinds (STREAM_OPEN/MSG/CLOSE/ERR/CHUNK). Data
+	// admission is bounded (design §19); a full queue is backpressure.
 	laneData lane = iota
 	// laneLifecycle carries descriptor-only kinds: CANCEL and STREAM_ACK
 	// (stream-protocol.md §2.1). It has a reserved ring budget (shm-abi.md §18)
@@ -201,9 +211,19 @@ type intent struct {
 // under layout_version = 1, rather than silently forwarding a stale value.
 //
 // STREAM_ACK is descriptor-only (a lifecycle credit return, like CANCEL);
-// the other four stream kinds are payload-bearing (stream-protocol.md §2.1/§2.3).
-// Only an unassigned byte yields errUnsupportedKind.
-func mapKind(k transport.FrameKind) (rk ring.FrameKind, descriptorOnly bool, err error) {
+// the other five stream kinds are payload-bearing (stream-protocol.md §2.1/§2.3, §13).
+//
+// chunkingActive is this connection's own admission policy for
+// FrameStreamChunk (§13.1): true only when the stream-chunking feature
+// resolved active on this attach. A FrameStreamChunk intent submitted while
+// it is false is rejected here, before the descriptor is built and before
+// anything reaches the ring — the producer-side half of the feature's
+// per-connection assignment rule, so a misrouted fragment can never reach a
+// peer that would poison on it (the consumer-side half is unmapKind).
+//
+// Only an unassigned byte, or FrameStreamChunk on a connection where the
+// feature is not active, yields errUnsupportedKind.
+func mapKind(k transport.FrameKind, chunkingActive bool) (rk ring.FrameKind, descriptorOnly bool, err error) {
 	switch k {
 	case transport.FrameUnaryReq:
 		return ring.KindUnaryReq, false, nil
@@ -223,6 +243,12 @@ func mapKind(k transport.FrameKind) (rk ring.FrameKind, descriptorOnly bool, err
 		return ring.KindStreamClose, false, nil
 	case transport.FrameStreamErr:
 		return ring.KindStreamErr, false, nil
+	case transport.FrameStreamChunk:
+		if !chunkingActive {
+			return 0, false, errUnsupportedKind
+		}
+
+		return ring.KindStreamChunk, false, nil
 	default:
 		return 0, false, errUnsupportedKind
 	}

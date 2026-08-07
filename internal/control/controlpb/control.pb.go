@@ -799,6 +799,12 @@ type AttachRegion struct {
 	// burst feature flag has resolved true. Zero means the host did not select
 	// a value (burst dormant on this attach even if the flag resolved true).
 	BurstMaxPayload uint32 `protobuf:"varint,6,opt,name=burst_max_payload,json=burstMaxPayload,proto3" json:"burst_max_payload,omitempty"`
+	// chunk_max_payload is the host-selected byte ceiling on a reassembled
+	// logical stream message when the stream-chunking feature flag has
+	// resolved true. Zero means the host did not select a value (chunking
+	// dormant on this attach even if the flag resolved true). One value
+	// governs both directions.
+	ChunkMaxPayload uint32 `protobuf:"varint,7,opt,name=chunk_max_payload,json=chunkMaxPayload,proto3" json:"chunk_max_payload,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -871,6 +877,13 @@ func (x *AttachRegion) GetMaxDataInflight() uint32 {
 func (x *AttachRegion) GetBurstMaxPayload() uint32 {
 	if x != nil {
 		return x.BurstMaxPayload
+	}
+	return 0
+}
+
+func (x *AttachRegion) GetChunkMaxPayload() uint32 {
+	if x != nil {
+		return x.ChunkMaxPayload
 	}
 	return 0
 }
@@ -1697,7 +1710,7 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\bservices\x18\n" +
 	" \x03(\v2\x1c.styx.control.ServiceVersionR\bservices\x12/\n" +
 	"\x13incompatible_reason\x18\v \x01(\tR\x12incompatibleReason\x126\n" +
-	"\fplugin_offer\x18\f \x01(\v2\x13.styx.control.HelloR\vpluginOffer\"\xe9\x01\n" +
+	"\fplugin_offer\x18\f \x01(\v2\x13.styx.control.HelloR\vpluginOffer\"\x95\x02\n" +
 	"\fAttachRegion\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\x04R\n" +
@@ -1707,7 +1720,8 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\x0elayout_version\x18\x03 \x01(\rR\rlayoutVersion\x12\x19\n" +
 	"\bfd_count\x18\x04 \x01(\rR\afdCount\x12*\n" +
 	"\x11max_data_inflight\x18\x05 \x01(\rR\x0fmaxDataInflight\x12*\n" +
-	"\x11burst_max_payload\x18\x06 \x01(\rR\x0fburstMaxPayload\"\x11\n" +
+	"\x11burst_max_payload\x18\x06 \x01(\rR\x0fburstMaxPayload\x12*\n" +
+	"\x11chunk_max_payload\x18\a \x01(\rR\x0fchunkMaxPayload\"\x11\n" +
 	"\x0fAttachRegionAck\"\x8c\x01\n" +
 	"\x12ActiveHandlerLease\x12\x17\n" +
 	"\acall_id\x18\x01 \x01(\x04R\x06callId\x12&\n" +

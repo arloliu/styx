@@ -35,6 +35,16 @@ type Config struct {
 	// payload, and the receiver verifies it (shm-abi.md §5). The 4-byte
 	// trailer is included in per-frame overhead calculations (shm-abi.md §18).
 	Checksum bool
+	// ChunkingActive records whether the stream-chunking feature resolved
+	// active for this connection (control.ChunkingActive, evaluated by the
+	// caller against the negotiated tuple and the announced chunk ceiling —
+	// this package does not import internal/control). When set, frame kind 9
+	// (FrameStreamChunk) is this connection's own admitted kind, on both the
+	// producer side (mapKind) and the consumer side (unmapKind); when clear,
+	// a FrameStreamChunk send is rejected pre-publication and an inbound one
+	// poisons the region, exactly as any other unassigned kind does
+	// (stream-protocol.md §13.1, shm-abi.md §5).
+	ChunkingActive bool
 	// Escalation configures the discard escalation policy that adjudicates both
 	// the stale-generation discard stream (shm-abi.md §15) and the consume-fault
 	// stream (§9) — recovery.go's EscalationPolicy. The zero value is valid:

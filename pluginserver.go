@@ -181,7 +181,8 @@ func (s *PluginServer) serve(ctx context.Context) error {
 		return fmt.Errorf("styx: serve: attach: %w", err)
 	}
 
-	err = s.runServing(ctx, conn, tr, tuple.Features[featureStreaming])
+	chunkPolicy := buildChunkPolicy(tr, tuple, shmRes.chunkMaxPayloadOrZero())
+	err = s.runServing(ctx, conn, tr, tuple.Features[featureStreaming], withChunkPolicy(chunkPolicy))
 	// runServing has released the data-plane transport (its own duplicate region
 	// mapping + fd) before returning; the two received eventfds — which the
 	// transport does not own (shm.AttachParams) — are the plugin's to close now,
@@ -208,7 +209,7 @@ func (s *PluginServer) serve(ctx context.Context) error {
 // reload retired it (exit 0), and a non-nil error on disconnect/crash or a
 // protocol violation (exit 1).
 func (s *PluginServer) runServing(
-	ctx context.Context, conn *control.Conn, tr transport.Transport, streaming bool,
+	ctx context.Context, conn *control.Conn, tr transport.Transport, streaming bool, opts ...streamPlaneOption,
 ) error {
 	// Snapshot the reload hooks once, at serving-session start, under s.mu — the
 	// same immutable-copy discipline the services, stream handlers, and panic
@@ -263,7 +264,7 @@ func (s *PluginServer) runServing(
 	// serve loop poisons on any STREAM_* frame a peer sends (§11.2).
 	var srv *streamServer
 	if streaming {
-		srv = newStreamServer(tr, streamHandlers, codec.Proto{}, leases)
+		srv = newStreamServer(tr, streamHandlers, codec.Proto{}, leases, opts...)
 		srv.setPanicController(panicPolicy)
 	}
 
@@ -652,6 +653,15 @@ func incompatibleReason(err error) string {
 type pluginShmResources struct {
 	hpEFD *event.EventFD // host->plugin: the plugin's inbound
 	phEFD *event.EventFD // plugin->host: the plugin's outbound
+
+	// chunkMaxPayload is the ceiling the host announced on this attach's
+	// AttachRegion.chunk_max_payload (zero if the host never selected one).
+	// Carried here, rather than returned as its own value, because this is
+	// already the struct pluginAttach threads from the shm attach back to
+	// Serve, which needs it to build the connection's chunking policy after
+	// the transport composite exists (buildChunkPolicy also needs the
+	// transport's own negotiated inline limits).
+	chunkMaxPayload uint32
 }
 
 // close closes both received eventfd wrappers (each NewEventFDFromFD took
@@ -662,6 +672,17 @@ func (r *pluginShmResources) close() {
 	}
 	_ = r.hpEFD.Close()
 	_ = r.phEFD.Close()
+}
+
+// chunkMaxPayloadOrZero returns the announced chunk ceiling, or zero for a
+// uds instance (r == nil, since pluginAttach only ever builds
+// pluginShmResources on the shared-memory path).
+func (r *pluginShmResources) chunkMaxPayloadOrZero() uint32 {
+	if r == nil {
+		return 0
+	}
+
+	return r.chunkMaxPayload
 }
 
 // pluginAttach performs the plugin side of AttachRegion -> AttachRegionAck,
@@ -767,13 +788,14 @@ func pluginAttachFailStep(step string) error {
 // process-local, because each side runs its own writer and adjudicates only its
 // own receive path. MaxPayload is zero so the transport derives each direction's
 // limit from the region header, exactly as the host does.
-func (s *PluginServer) shmConfig(maxInflight int, tuple control.Tuple) shmtransport.Config {
+func (s *PluginServer) shmConfig(maxInflight int, chunkMaxPayload uint32, tuple control.Tuple) shmtransport.Config {
 	return shmtransport.Config{
 		MaxInflight:         maxInflight,
 		MaxPayload:          0, // derive per-direction from the region header
 		DataQueueDepth:      shmDataQueueDepth,
 		LifecycleQueueDepth: shmLifecycleQueueDepth,
 		Checksum:            tuple.Features["checksum"],
+		ChunkingActive:      control.ChunkingActive(tuple, chunkMaxPayload),
 		Escalation: shmtransport.EscalationConfig{
 			ConsumeFaultRunThreshold: s.consumeFaultRunThreshold,
 		},
@@ -979,7 +1001,7 @@ func (s *PluginServer) pluginAttachSHM(
 		return nil, nil, err
 	}
 
-	cfg := s.shmConfig(int(ar.GetMaxDataInflight()), tuple)
+	cfg := s.shmConfig(int(ar.GetMaxDataInflight()), ar.GetChunkMaxPayload(), tuple)
 	pluginTr, terr := shmtransport.Attach(shmtransport.AttachParams{
 		RegionFD:     regionFD,
 		ExpectedSize: ar.GetLayoutSize(),
@@ -1040,7 +1062,7 @@ func (s *PluginServer) pluginAttachSHM(
 		return nil, nil, err
 	}
 
-	return dataTr, &pluginShmResources{hpEFD: hpEFD, phEFD: phEFD}, nil
+	return dataTr, &pluginShmResources{hpEFD: hpEFD, phEFD: phEFD, chunkMaxPayload: ar.GetChunkMaxPayload()}, nil
 }
 
 // serviceVersions projects the registered services into the version list the
@@ -1090,14 +1112,17 @@ func pluginBaseOffer(transports []string, requireStreaming bool) control.Offer {
 		ProtocolMax: m1ProtocolVersion,
 		Transports:  transports,
 		Codecs:      []string{codecProto},
-		// The burst feature is always offered, always optional: a plugin built with
-		// support for it can wrap whatever burst socket a host chooses to establish,
-		// and asks nothing of a host that never offers it (the flag then resolves
-		// false, as it does against any older peer). The ceiling is the host's
-		// alone, so there is nothing here to configure.
+		// The burst feature and the stream-chunking feature are both always
+		// offered, always optional: a plugin built with support for either can
+		// use whatever the host announces (a burst socket, or a chunk ceiling
+		// on the attach message), and asks nothing of a host that never offers
+		// it (the flag then resolves false, as it does against any older
+		// peer). Both ceilings are the host's alone, so there is nothing here
+		// to configure.
 		Features: []control.FeatureFlag{
 			{Name: featureStreaming, Required: requireStreaming},
 			{Name: control.FeatureBurst, Required: false},
+			{Name: control.FeatureStreamChunking, Required: false},
 		},
 	}
 	if slices.Contains(transports, control.TransportSHM) {
@@ -1547,7 +1572,7 @@ func serveOneFrame(ctx context.Context, deps *serveDeps) (done bool, loopErr err
 		return true, errServeLoopHandlerPanicked
 	}
 
-	// A STREAM_OPEN is admitted by the accept half; the four STREAM_* data kinds route
+	// A STREAM_OPEN is admitted by the accept half; the five STREAM_* data kinds route
 	// to the stream table; a CANCEL is a stream teardown only when its call ID names a
 	// live stream (decided by lookup, not the control value), otherwise it is a unary
 	// cancel; everything else is a unary request.
@@ -1953,7 +1978,7 @@ func sendUnaryResponse(
 
 // routeStreamFrame routes one inbound STREAM_* frame on the plugin accept side: a
 // STREAM_OPEN to the accept half (which admits or rejects it), and each of the
-// four data kinds to the stream table, marking the §4.6 drain boundary OWED after a
+// five data kinds to the stream table, marking the §4.6 drain boundary OWED after a
 // dispatched data frame — the serve loop's top-of-iteration probeDrain signals it
 // once the inbound queue empties. A CANCEL never reaches here — the serve loop
 // routes it by call-ID lookup.
@@ -1962,7 +1987,7 @@ func sendUnaryResponse(
 // streaming handler panic's taint store cannot land between the taint check and the
 // handler launch; when the session is already tainted the open is not admitted and
 // fenced is true, telling the serve loop to terminate for a controlled restart. The
-// four data kinds carry no new admission — they feed an already-admitted stream — so
+// five data kinds carry no new admission — they feed an already-admitted stream — so
 // they need no gate; the serve loop's coarse fence already drops them once a taint is
 // established. It returns rpcruntime.ErrStreamConformance for a conformance violation
 // the serve loop poisons the connection on.

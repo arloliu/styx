@@ -1703,7 +1703,7 @@ func TestWriter_RejectsUnsupportedKind_AtBuild(t *testing.T) {
 	// Given an intent carrying a reserved/unassigned kind.
 	w := newWriterFromParts(&recordRing{}, noArena{}, 1, 1, admitBlock)
 	i := intent{
-		frame: transport.Frame{CallID: 1, Kind: transport.FrameKind(9)},
+		frame: transport.Frame{CallID: 1, Kind: transport.FrameKind(10)},
 		lane:  laneData,
 		done:  make(chan error, 1),
 	}

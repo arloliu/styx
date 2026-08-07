@@ -104,6 +104,12 @@ message AttachRegion {
   // burst feature flag has resolved true. Zero means the host did not select
   // a value (burst dormant on this attach even if the flag resolved true).
   uint32 burst_max_payload = 6;
+  // chunk_max_payload is the host-selected byte ceiling on a reassembled
+  // logical stream message when the stream-chunking feature flag has
+  // resolved true. Zero means the host did not select a value (chunking
+  // dormant on this attach even if the flag resolved true). One value
+  // governs both directions.
+  uint32 chunk_max_payload = 7;
 }
 message AttachRegionAck {}
 
