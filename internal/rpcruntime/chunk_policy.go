@@ -14,13 +14,21 @@ import (
 // this zero value, unchanged behavior.
 //
 // Ceiling bounds the reassembled logical stream message on both directions
-// (§13.6). SendInline and RecvInline are this connection's exact negotiated
+// (§13.6). SendInline and RecvInline are this connection's EFFECTIVE
 // per-direction payload maxima — the outbound and inbound canonical fragment
 // length the split rule is defined against (§13.2) — read off the concrete
 // transport underneath the transport.Transport interface (raw shared memory,
 // or the burst composite wrapping it). They differ from Ceiling, which bounds
-// the whole reassembled message rather than one fragment, and from each
-// other whenever the two directions' negotiated limits are asymmetric.
+// the whole reassembled message rather than one fragment, and from each other
+// whenever the two directions' negotiated limits are asymmetric.
+//
+// "Effective" is load-bearing on the send side: the shared-memory transport's
+// outbound limit is the geometry-derived maximum unless a local caller ceiling
+// lowered it, and a lowered one would make every fragment shorter than the
+// canonical length the peer validates against, poisoning the connection on the
+// first oversize message. An active policy therefore requires that local
+// outbound clamp to be disengaged, which the two attach seams that build the
+// shared-memory configuration enforce before a transport is ever constructed.
 type ChunkPolicy struct {
 	Active     bool
 	Ceiling    uint32
@@ -51,10 +59,16 @@ func WithChunkPolicy(p ChunkPolicy) StreamTableOption {
 // transport underneath it: the raw shared-memory transport's
 // MaxSendPayload/MaxRecvPayload, or the burst composite's InlineMax/
 // InboundInlineMax when the burst path also wraps this connection. The
-// result is the zero (inactive) ChunkPolicy whenever active is false, or tr
-// is a transport that never carries this frame kind (uds).
+// result is the zero (inactive) ChunkPolicy whenever active is false, the
+// ceiling is zero, or tr is a transport that never carries this frame kind
+// (uds).
+//
+// The zero-ceiling case is refused here as well as by the caller's activation
+// predicate, so no active ChunkPolicy can exist with a ceiling of zero — a
+// combination that would reject every oversize message while claiming the
+// feature is on.
 func ChunkPolicyFor(tr transport.Transport, active bool, ceiling uint32) ChunkPolicy {
-	if !active {
+	if !active || ceiling == 0 {
 		return ChunkPolicy{}
 	}
 

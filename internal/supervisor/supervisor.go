@@ -597,6 +597,15 @@ type Supervisor struct {
 	// nil in production.
 	observeSampleForTest func(HeartbeatSample)
 
+	// adjustShmConfigForTest, when set, adjusts the candidate shared-memory
+	// configuration in shmConfig immediately before it is validated. It exists
+	// so a test can drive that validation with a configuration no production
+	// path can currently produce — an outbound payload clamp under active
+	// chunking — and observe the refusal at the seam that owns it, rather than
+	// re-running the predicate on the seam's output and proving nothing about
+	// the seam. Set once at setup, before any attach; nil in production.
+	adjustShmConfigForTest func(*shmtransport.Config)
+
 	// senderCadence is the plugin's ACTUAL heartbeat send interval.
 	// It is the nominal cadence the wedge-window conversion keys on.
 	// The conversion divides the window by the admitted MINIMUM spacing this cadence
@@ -1747,13 +1756,17 @@ func (s *Supervisor) attachSHM(
 	// construction failure is caught before the ack wait.
 	// shm.Attach opens its own duplicate of the region fd; the host retains the
 	// original region and both eventfds for teardown.
+	shmCfg, cerr := s.shmConfig(maxInflight, tuple)
+	if cerr != nil {
+		return nil, nil, cerr
+	}
 	hostTr, terr := shmtransport.Attach(shmtransport.AttachParams{
 		RegionFD:     region.FD(),
 		ExpectedSize: regionSize,
 		Role:         shmtransport.RoleHost,
 		InboundEFD:   phEFD, // host consumes plugin->host
 		OutboundEFD:  hpEFD, // host produces host->plugin
-		Config:       s.shmConfig(maxInflight, tuple),
+		Config:       shmCfg,
 	})
 	if terr != nil {
 		return nil, nil, fmt.Errorf("supervisor: handshake: attach shm host: %w", terr)
@@ -1941,8 +1954,16 @@ func (s *Supervisor) shmMaxDataInflight(layout shm.Layout) int {
 // payload limit from the region header (both sides derive identically, no wire field).
 // The consume-fault run threshold is process-local too: each side adjudicates only
 // its own receive path, so it needs no agreement with the plugin.
-func (s *Supervisor) shmConfig(maxInflight int, tuple control.Tuple) shmtransport.Config {
-	return shmtransport.Config{
+//
+// It is one of the two places that hold both the shared-memory configuration and
+// the chunking activation decision, so it is where the two are checked against
+// each other: an outbound payload clamp and active chunking cannot coexist
+// (shmtransport.ValidateChunkingClamp). The clamp is hardcoded off just below,
+// which is exactly why the check belongs here — a future ceiling wired into this
+// mapping fails at attach rather than poisoning a region on the first oversize
+// stream message.
+func (s *Supervisor) shmConfig(maxInflight int, tuple control.Tuple) (shmtransport.Config, error) {
+	cfg := shmtransport.Config{
 		MaxInflight:         maxInflight,
 		MaxPayload:          0, // derive per-direction from the region geometry
 		DataQueueDepth:      shmDataQueueDepth,
@@ -1953,6 +1974,14 @@ func (s *Supervisor) shmConfig(maxInflight int, tuple control.Tuple) shmtranspor
 			ConsumeFaultRunThreshold: s.cfg.ConsumeFaultRunThreshold,
 		},
 	}
+	if s.adjustShmConfigForTest != nil {
+		s.adjustShmConfigForTest(&cfg)
+	}
+	if err := shmtransport.ValidateChunkingClamp(cfg); err != nil {
+		return shmtransport.Config{}, fmt.Errorf("supervisor: host shm config: %w", err)
+	}
+
+	return cfg, nil
 }
 
 // hostOffer is the host's negotiation offer.

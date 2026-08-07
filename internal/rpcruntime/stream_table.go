@@ -427,9 +427,8 @@ func (t *StreamTable) remove(callID uint64) {
 // STREAM_CHUNK frame to its stream through stream-protocol.md §8.1's
 // three-level disposal. Level 1 (call ID absent) and level 2 (stream
 // terminal) discard the frame, count it, and return nil without blocking.
-// Level 3 (LIVE) delivers or transitions; a sequence/state anomaly there, or
-// a STREAM_CHUNK (reassembly is a later change), returns ErrStreamConformance
-// for the reader loop to poison the connection on.
+// Level 3 (LIVE) delivers or transitions; a sequence/state anomaly there
+// returns ErrStreamConformance for the reader loop to poison the connection on.
 func (t *StreamTable) Dispatch(f transport.Frame) error {
 	// A frame was available to dispatch, so the reader's inbound queue was not
 	// drained (stream-protocol.md §4.6): clear the drain mark a delivery consults.
@@ -461,11 +460,13 @@ func (t *StreamTable) Dispatch(f transport.Frame) error {
 		return nil
 	}
 
-	//exhaustive:ignore -- four kinds get their own case; FrameStreamChunk (not yet
-	// consumable, see default below) and anything else fall to default on purpose.
+	//exhaustive:ignore -- the five stream kinds routed here get their own case;
+	// anything else falls to default on purpose.
 	switch f.Kind {
 	case transport.FrameStreamMsg:
 		return s.onStreamMsg(f)
+	case transport.FrameStreamChunk:
+		return s.onStreamChunk(f)
 	case transport.FrameStreamAck:
 		return s.onStreamAck(f)
 	case transport.FrameStreamClose:
@@ -475,11 +476,9 @@ func (t *StreamTable) Dispatch(f transport.Frame) error {
 
 		return nil
 	default:
-		// FrameStreamChunk lands here today: reassembly is a later change
-		// (stream-protocol.md §13.5 names onStreamChunk as the eventual
-		// handler), so until it exists a chunk frame reaching a live stream
-		// is not silently dropped — it gets the same conformance-violation
-		// disposition a genuine routing bug would.
+		// A kind that is not one of the five stream kinds cannot reach a live
+		// stream through a correct reader; it is not silently dropped, it gets
+		// the same conformance-violation disposition a genuine routing bug would.
 		return ErrStreamConformance
 	}
 }

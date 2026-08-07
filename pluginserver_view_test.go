@@ -180,9 +180,12 @@ func TestPrepareInboundFrame_CopiesABorrowedStreamPayload(t *testing.T) {
 
 // Test that a borrowed STREAM_CHUNK fragment gets the identical copy
 // prepareInboundFrame gives every other stream kind (isStreamKind covers
-// FrameStreamChunk exactly as it does FrameStreamMsg): reassembly is a later
-// change, but a fragment's bytes must never alias reclaimed transport memory
-// from the moment they are received, whether or not anything consumes them yet.
+// FrameStreamChunk exactly as it does FrameStreamMsg). The copy is what
+// reassembly then appends to a pending logical message, which outlives the
+// lender's frame by many more frames than a delivered STREAM_MSG does, and it
+// must hold whatever the connection's chunking policy decides: a fragment's
+// bytes must never alias reclaimed transport memory from the moment they are
+// received, including on a connection where the fragment is a violation.
 func TestPrepareInboundFrame_CopiesABorrowedStreamChunkPayload(t *testing.T) {
 	// Given a borrowed STREAM_CHUNK frame.
 	deps := newViewTestDeps(t, codec.Proto{}, nil)

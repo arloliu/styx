@@ -113,9 +113,13 @@ func (c *creditCounter) replenishStrict(v uint64) bool {
 	return true
 }
 
-// sentCount returns the cumulative count of admitted sends — the highest
-// sequence number placed on the wire for this direction, used to reject a
-// STREAM_ACK whose cumulative value exceeds it (stream-protocol.md §8.1).
+// sentCount returns the cumulative count of admitted sends in LOGICAL MESSAGES
+// — the unit credit is accounted in — used to reject a STREAM_ACK whose
+// cumulative value exceeds it (stream-protocol.md §8.1), since an ACK counts
+// logical messages too. It is not a count of frames or of fragment sequence
+// numbers: a chunked message is admitted once and consumes one unit here while
+// consuming one sequence number per fragment (§13.3), so the two counters part
+// company as soon as chunking is active.
 func (c *creditCounter) sentCount() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()

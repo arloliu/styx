@@ -507,14 +507,15 @@ func TestConnState_HandleInboundFrame_CopiesABorrowedStreamPayload_BeforeQueuein
 // Test that a borrowed STREAM_CHUNK fragment is copied before
 // dispatchStreamFrame ever sees it, causally: isStreamDataFrame routes
 // FrameStreamChunk through the identical copy-before-dispatch branch a
-// STREAM_MSG takes, but nothing yet delivers a fragment's bytes anywhere a
-// test could read them back from (Dispatch's own conformance-violation
-// disposition for STREAM_CHUNK never reads Payload, so a test that only
-// checked that disposition would stay green even if the clonePayload call
-// were deleted). The beforeStreamDispatchHook test seam captures the frame
-// at the exact point dispatchStreamFrame receives it, so the copy is
-// verified directly, the same way TestPrepareInboundFrame_CopiesABorrowedStreamPayload
-// verifies it for the plugin's receive path.
+// STREAM_MSG takes, and the copy is what the engine then accumulates into a
+// pending logical message. This asserts the boundary directly rather than
+// through delivery, because Dispatch's disposition alone cannot prove it: on a
+// connection without chunking a fragment is a conformance violation whose path
+// never reads Payload, so a test resting on that disposition would stay green
+// with the clonePayload call deleted. The beforeStreamDispatchHook test seam
+// captures the frame at the exact point dispatchStreamFrame receives it, the
+// same way TestPrepareInboundFrame_CopiesABorrowedStreamPayload verifies it for
+// the plugin's receive path.
 func TestConnState_HandleInboundFrame_CopiesABorrowedStreamChunkPayload_BeforeDispatch(t *testing.T) {
 	// Given STREAM_CHUNK routed through the same borrow-copy branch as STREAM_MSG.
 	require.True(t, isStreamDataFrame(transport.FrameStreamChunk),
@@ -550,8 +551,8 @@ func TestConnState_HandleInboundFrame_CopiesABorrowedStreamChunkPayload_BeforeDi
 		CallID: 1, Kind: transport.FrameStreamChunk, Control: 1, Payload: lent,
 	}, true)
 
-	// Then: reassembly does not exist yet, so the frame is the conformance
-	// violation an unhandled fragment already is.
+	// Then: this plane carries the zero chunking policy, so the fragment is
+	// a conformance violation rather than an accumulated one.
 	require.Equal(t, inboundStreamConformance, fault)
 
 	// And the frame dispatch actually received is a copy, not an alias of

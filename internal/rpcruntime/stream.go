@@ -404,6 +404,16 @@ type Stream struct {
 	recvCh      chan recvItem
 	expectedSeq uint64 // next expected inbound sequence; guarded by stateMu
 
+	// recvAccum is the pending accumulation of this direction's inbound
+	// STREAM_CHUNK payloads: the bytes of a logical message whose completing
+	// STREAM_MSG has not arrived yet (stream-protocol.md §13.5). It is empty
+	// between logical messages, and always empty on a connection where
+	// stream-chunking is not active, since no STREAM_CHUNK can arrive there.
+	// Like expectedSeq it is guarded by stateMu, so the inbound handlers that
+	// grow it and the terminal CAS that discards it are serialized; a partial
+	// message is never delivered (§13.8).
+	recvAccum []byte
+
 	// recvClosed is closed once the peer's STREAM_CLOSE is observed (§6.4): it is
 	// the remote-EOF signal RecvMsg waits on, distinct from whole-stream
 	// termination (done). The peer will send no further STREAM_MSG, so once
@@ -688,12 +698,23 @@ func (s *Stream) isLive() bool {
 // The frame is sent under the stream's OWN context (never the caller's or
 // context.Background) so a post-admission context error is terminal for the
 // stream — a deliberate divergence from the unary Invoke path.
+//
+// A message larger than the outbound direction's inline limit is emitted as a
+// fragment train instead of one frame, on a connection where the stream-chunking
+// feature is active (stream-protocol.md §13.2, sendChunked). Everywhere else —
+// every message that fits the limit, and every connection without the feature —
+// the single-frame path below is taken unchanged, so an oversize send on a
+// connection without chunking keeps failing with the transport's definitive
+// oversize rejection.
 func (s *Stream) SendMsg(ctx context.Context, payload []byte) error {
 	if s.sendClosed.Load() {
 		return ErrCanceledLocally // §6.4: no Send after CloseSend
 	}
 	if err := ctx.Err(); err != nil {
 		return err // pre-admission caller-ctx error: nothing reserved, no terminate (§4.5)
+	}
+	if p := s.tbl.chunkPolicy; p.Active && uint64(len(payload)) > uint64(p.SendInline) {
+		return s.sendChunked(ctx, payload, p)
 	}
 
 	if err := s.admit(ctx); err != nil {
@@ -786,6 +807,12 @@ func (s *Stream) deliveredErr() error {
 // consulted to tell a caller cancel from a caller deadline — the merged send
 // context collapses a caller deadline into a plain cancel, so the returned error
 // alone cannot distinguish them.
+//
+// A fragment train reaches this helper only while it is still invisible — its
+// first fragment's enqueue not yet attempted, or that attempt rejected with
+// proof it never published (stream-protocol.md §13.4). A visible train's
+// failures are resolved by failVisibleTrain instead, so the rollback below can
+// never run behind a published fragment.
 func (s *Stream) handleSendErr(callerCtx context.Context, err error, seq uint64) error {
 	if isRollbackEligible(err) {
 		s.sendCredit.release()
@@ -1339,6 +1366,13 @@ func (s *Stream) casTerminal(code StreamOutcomeCode, teardownCode uint32, from .
 			// Record the discriminant before the winner claims the token; stable
 			// now the CAS has landed (§5.1 step 2).
 			s.teardownCode.Store(teardownCode)
+			// Every terminal path funnels through this CAS — inbound dispatch
+			// winners via terminateLocked, local cancellation and deadline,
+			// connection failure and table close via terminate — so this is the
+			// one place a partially reassembled logical message can be discarded
+			// exactly once, under the same lock the inbound handlers grow it
+			// under (§13.8).
+			s.discardRecvAccum()
 			// Register this finisher while still under stateMu, before the winner
 			// leaves the lock. A concurrent FailAll that skips this now-terminal
 			// stream serializes on the same lock, so it cannot miss the
@@ -1608,6 +1642,12 @@ func (s *Stream) resetBackoff() {
 // It runs with stateMu held (Dispatch took it after finding the stream LIVE), so
 // this enqueue and any concurrent terminal transition are serialized: a frame
 // racing a terminal transition is enqueued only while the stream is still LIVE.
+//
+// A STREAM_MSG arriving over a pending accumulation is the last fragment of a
+// chunked logical message (stream-protocol.md §13.2): it completes the train and
+// the whole reassembled message is what gets delivered, as one credited item.
+// With nothing pending — every connection without stream-chunking, and every
+// message that fit the inline limit — the payload is delivered as it stands.
 func (s *Stream) onStreamMsg(f transport.Frame) error {
 	if s.closeBits.Load()&closeRemoteBit != 0 {
 		return ErrStreamConformance // STREAM_MSG after the peer's STREAM_CLOSE (§8.1)
@@ -1615,10 +1655,19 @@ func (s *Stream) onStreamMsg(f transport.Frame) error {
 	if f.Control != s.expectedSeq {
 		return ErrStreamConformance // out-of-order / duplicate on a LIVE stream (§8.1)
 	}
+
+	payload := f.Payload
+	if len(s.recvAccum) > 0 {
+		msg, err := s.completeRecvAccum(f.Payload)
+		if err != nil {
+			return err
+		}
+		payload = msg
+	}
 	s.expectedSeq++
 
 	select {
-	case s.recvCh <- recvItem{payload: f.Payload, credited: true}:
+	case s.recvCh <- recvItem{payload: payload, credited: true}:
 		return nil
 	default:
 		return ErrStreamConformance // credit guarantees room; a full buffer is a violation
@@ -1627,8 +1676,15 @@ func (s *Stream) onStreamMsg(f transport.Frame) error {
 
 // onStreamAck handles an inbound STREAM_ACK, returning credit to the send
 // direction (stream-protocol.md §4.5). Its cumulative value must be strictly
-// greater than the previous one and must not exceed the highest sequence sent —
-// either violation is a conformance violation (§8.1).
+// greater than the previous one and must not exceed the count of logical
+// messages admitted on this direction — either violation is a conformance
+// violation (§8.1).
+//
+// Both the ACK's value and the bound it is checked against are LOGICAL MESSAGE
+// counts, not fragment sequence numbers (§13.3). Under chunking the two differ:
+// a peer that acknowledged one two-fragment message may send only the value 1,
+// and a value of 2 there exceeds the bound and is rejected here, even though
+// the direction's last fragment sequence was 2.
 func (s *Stream) onStreamAck(f transport.Frame) error {
 	if f.Control == 0 {
 		return ErrStreamConformance // a cumulative ACK of 0 acknowledges nothing (§8.1)
@@ -1651,7 +1707,17 @@ func (s *Stream) onStreamAck(f transport.Frame) error {
 // §6.3), and completes the stream if both directions are now closed. It runs
 // with stateMu held (Dispatch found the stream LIVE), so it terminates through
 // terminateLocked.
+//
+// A half-close cannot legitimately interrupt its own direction's fragment train:
+// a conformant sender ends every train with the completing STREAM_MSG before it
+// closes (stream-protocol.md §13.2), so a STREAM_CLOSE over a pending
+// accumulation is a conformance violation. That check runs before any close
+// state is mutated, so a rejected close leaves the direction exactly as it was
+// (§13.7).
 func (s *Stream) onStreamClose(f transport.Frame) error {
+	if len(s.recvAccum) > 0 {
+		return ErrStreamConformance // STREAM_CLOSE over a pending fragment train (§13.7)
+	}
 	if !s.setCloseBit(closeRemoteBit) {
 		return ErrStreamConformance // second STREAM_CLOSE in this direction (§6.5)
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -74,6 +75,15 @@ type PluginServer struct {
 	// dispatcher's self-report hook (SetDropReporter) must call it directly,
 	// bypassing the same queue whose loss it is reporting. nil when metrics is nil.
 	metricsSink observe.MetricsSink
+
+	// adjustShmConfigForTest, when set, adjusts the candidate shared-memory
+	// configuration in shmConfig immediately before it is validated. It exists
+	// so a test can drive that validation with a configuration no production
+	// path can currently produce — an outbound payload clamp under active
+	// chunking — and observe the refusal at the seam that owns it, rather than
+	// re-running the predicate on the seam's output and proving nothing about
+	// the seam. Set once at setup, before Serve; nil in production.
+	adjustShmConfigForTest func(*shmtransport.Config)
 
 	// continueAfterPanic is the handler-panic policy from PluginServerConfig, fixed
 	// at construction and read once when the serving session builds its
@@ -252,9 +262,7 @@ func (s *PluginServer) runServing(
 		dispatcher.Register(rs.desc.ServiceID, newServiceHandler(rs, codec.Proto{}, panicPolicy))
 	}
 	streamHandlers := make(map[streamKey]streamHandlerReg, len(s.streamHandlers))
-	for k, h := range s.streamHandlers {
-		streamHandlers[k] = h
-	}
+	maps.Copy(streamHandlers, s.streamHandlers)
 	s.mu.Unlock()
 
 	// The plugin accept half over the same transport, built ONLY when streaming was
@@ -318,10 +326,8 @@ func (s *PluginServer) runServing(
 		stop := func() { stopOnce.Do(func() { metricsCancel(); repWG.Wait() }) }
 		stopReporter = stop
 		s.metrics.SetProducerJoin(stop)
-		dispWG.Add(1)
-		go func() { defer dispWG.Done(); s.metrics.Run(metricsCtx) }()
-		repWG.Add(1)
-		go func() { defer repWG.Done(); s.runMetricsReporter(metricsCtx, tr) }()
+		dispWG.Go(func() { ; s.metrics.Run(metricsCtx) })
+		repWG.Go(func() { ; s.runMetricsReporter(metricsCtx, tr) })
 	}
 
 	// Serving reader loop (data plane). Its only stop/join owner is this
@@ -788,8 +794,18 @@ func pluginAttachFailStep(step string) error {
 // process-local, because each side runs its own writer and adjudicates only its
 // own receive path. MaxPayload is zero so the transport derives each direction's
 // limit from the region header, exactly as the host does.
-func (s *PluginServer) shmConfig(maxInflight int, chunkMaxPayload uint32, tuple control.Tuple) shmtransport.Config {
-	return shmtransport.Config{
+//
+// It is one of the two places that hold both the shared-memory configuration and
+// the chunking activation decision, so it is where the two are checked against
+// each other: an outbound payload clamp and active chunking cannot coexist
+// (shmtransport.ValidateChunkingClamp). The clamp is hardcoded off just below,
+// which is exactly why the check belongs here — a future ceiling wired into this
+// mapping fails at attach rather than poisoning a region on the first oversize
+// stream message.
+func (s *PluginServer) shmConfig(
+	maxInflight int, chunkMaxPayload uint32, tuple control.Tuple,
+) (shmtransport.Config, error) {
+	cfg := shmtransport.Config{
 		MaxInflight:         maxInflight,
 		MaxPayload:          0, // derive per-direction from the region header
 		DataQueueDepth:      shmDataQueueDepth,
@@ -800,6 +816,14 @@ func (s *PluginServer) shmConfig(maxInflight int, chunkMaxPayload uint32, tuple 
 			ConsumeFaultRunThreshold: s.consumeFaultRunThreshold,
 		},
 	}
+	if s.adjustShmConfigForTest != nil {
+		s.adjustShmConfigForTest(&cfg)
+	}
+	if err := shmtransport.ValidateChunkingClamp(cfg); err != nil {
+		return shmtransport.Config{}, fmt.Errorf("plugin shm config: %w", err)
+	}
+
+	return cfg, nil
 }
 
 // attachFDs are the descriptors one AttachRegion carried, in the fixed order both
@@ -1001,7 +1025,10 @@ func (s *PluginServer) pluginAttachSHM(
 		return nil, nil, err
 	}
 
-	cfg := s.shmConfig(int(ar.GetMaxDataInflight()), ar.GetChunkMaxPayload(), tuple)
+	cfg, cerr := s.shmConfig(int(ar.GetMaxDataInflight()), ar.GetChunkMaxPayload(), tuple)
+	if cerr != nil {
+		return nil, nil, cerr
+	}
 	pluginTr, terr := shmtransport.Attach(shmtransport.AttachParams{
 		RegionFD:     regionFD,
 		ExpectedSize: ar.GetLayoutSize(),

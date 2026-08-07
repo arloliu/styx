@@ -771,9 +771,11 @@ func TestSHM_FrameStreamChunk_RejectedAtSend_WhenChunkingDormant(t *testing.T) {
 
 // Test that a FrameStreamChunk sends and round-trips on a connection where
 // stream-chunking IS active on both ends: kind 9's per-connection admission
-// (stream-protocol.md §13.1) is symmetric with every other implemented
-// kind once the feature resolved active, even though nothing yet reassembles
-// what it carries.
+// (stream-protocol.md §13.1) is symmetric with every other implemented kind
+// once the feature resolved active. This is the transport's half of the
+// contract only — carrying the fragment's bytes and control word intact. What
+// the stream layer above then does with them, accumulating them into a pending
+// logical message, is proven where that reassembly lives.
 func TestSHM_FrameStreamChunk_RoundTrips_WhenChunkingActive(t *testing.T) {
 	// Given a host and plugin both configured with chunking active.
 	cfg := validConfig(false)

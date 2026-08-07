@@ -868,9 +868,8 @@ func releaseTransport(tr transport.Transport) {
 // isStreamDataFrame reports whether a frame kind is one of the five inbound
 // STREAM_* kinds routed to StreamTable.Dispatch (stream-protocol.md §8.1). A
 // STREAM_OPEN is handled separately (accept side), not dispatched.
-// FrameStreamChunk (STREAM_CHUNK, §13) routes here too: reassembly is a later
-// change, so today Dispatch answers it with the same conformance-violation
-// path an unhandled frame already gets, never a silent drop.
+// FrameStreamChunk (STREAM_CHUNK, §13) routes here too: it is a data frame the
+// stream reassembles into its logical message (§13.5).
 func isStreamDataFrame(k transport.FrameKind) bool {
 	//exhaustive:ignore -- only the five dispatchable STREAM_* kinds return true; every
 	// other kind (unary, CANCEL, STREAM_OPEN) is routed elsewhere and returns false.
@@ -920,8 +919,12 @@ func isStreamTeardownCancel(f transport.Frame) bool {
 // the pair alone determines the outcome, so a CANCEL that arrives without —
 // or before — its STREAM_ERR still terminates the stream). It returns
 // rpcruntime.ErrStreamConformance when the frame is a conformance violation
-// on a LIVE stream — which a STREAM_CHUNK always is today, since reassembly
-// is a later change — so the reader loop poisons the connection (§8.1).
+// on a LIVE stream, so the reader loop poisons the connection (§8.1).
+//
+// A STREAM_CHUNK's disposition belongs to the connection's chunking policy:
+// where the feature is active the engine accumulates the fragment into its
+// stream's pending logical message and delivers nothing yet (§13.5); where it
+// is not, kind 9 is unassigned and every one of them is that violation (§13.1).
 func (p *streamPlane) dispatchStreamFrame(f transport.Frame) error {
 	if f.Kind == transport.FrameCancel {
 		// A CANCEL routed here names a live stream (the reader decided this by
