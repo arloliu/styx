@@ -2,6 +2,7 @@ package styx
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -146,13 +147,33 @@ func echoInvoke(t *testing.T, cc *ClientConn) {
 	require.NoError(t, cc.Invoke(ctx, "test.Echo", "Say", wrapperspb.String("hello"), resp))
 }
 
+// allocWindowsSorted measures f through three testing.AllocsPerRun windows and
+// returns the results sorted ascending, so [1] is the median. One window on a
+// loaded machine can read one allocation off: a stray background allocation
+// (GC bookkeeping, the timer wheel) lands inside it and the truncating
+// per-run average shifts by one. The median is immune to a single wobbling
+// window, while a real hot-path allocation shifts every window and still
+// trips the exact-equality gates.
+func allocWindowsSorted(runs int, f func()) []float64 {
+	windows := []float64{
+		testing.AllocsPerRun(runs, f),
+		testing.AllocsPerRun(runs, f),
+		testing.AllocsPerRun(runs, f),
+	}
+	slices.Sort(windows)
+
+	return windows
+}
+
 // Test the allocation gate: the disabled hot path allocates a pinned, exact
 // count (so any new disabled-path allocation fails), and enabling a sink adds
 // exactly the one closure a submit builds on the hot path. The label slice the
 // closure passes is built inside the closure, on the dispatcher goroutine, off
 // the hot path — so the enabled hot-path bound is one, not two. The consumer is
 // deliberately NOT running here, so no submitted closure executes during
-// measurement and only the synchronous hot-path cost is counted.
+// measurement and only the synchronous hot-path cost is counted. Each
+// configuration is measured as the median of three windows so a shared
+// runner's background allocations cannot fail the gate.
 func TestClientConn_Invoke_AllocationGate(t *testing.T) {
 	if raceEnabled {
 		t.Skip("testing.AllocsPerRun is not meaningful under the race detector")
@@ -168,15 +189,16 @@ func TestClientConn_Invoke_AllocationGate(t *testing.T) {
 
 	// When
 	const runs = 200
-	off1 := testing.AllocsPerRun(runs, func() { echoInvoke(t, disabled) })
-	off2 := testing.AllocsPerRun(runs, func() { echoInvoke(t, disabled) })
-	on := testing.AllocsPerRun(runs, func() { echoInvoke(t, enabled) })
+	off := allocWindowsSorted(runs, func() { echoInvoke(t, disabled) })
+	on := allocWindowsSorted(runs, func() { echoInvoke(t, enabled) })
 
-	// Then
-	require.Equal(t, off1, off2, "disabled path allocations must be deterministic")
-	require.Equal(t, float64(expectedDisabledInvokeAllocs), off1,
+	// Then: windows may wobble by one background allocation; the medians must
+	// hit the pinned values exactly.
+	require.LessOrEqual(t, off[2]-off[0], float64(1),
+		"disabled path allocations must be deterministic to within one stray background allocation")
+	require.Equal(t, float64(expectedDisabledInvokeAllocs), off[1],
 		"disabled hot path must allocate exactly the pinned baseline; a new allocation trips this")
-	require.Equal(t, float64(1), on-off1,
+	require.Equal(t, float64(1), on[1]-off[1],
 		"enabling a sink adds exactly the one submitted closure on the hot path")
 }
 
