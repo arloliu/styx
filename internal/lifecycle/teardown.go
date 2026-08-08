@@ -38,7 +38,7 @@ const (
 	StepStopAdmission    TeardownStep = iota + 1 // 1: stop admission, detach routing
 	StepFailInFlight                             // 2: fail in-flight calls, wake waiters
 	StepJoinGoroutines                           // 3: join goroutines that touch the mapping
-	StepUnmap                                    // 4: munmap (currently a no-op)
+	StepUnmap                                    // 4: release the host's own region mapping
 	StepTerminateAndReap                         // 5: graceful Shutdown -> SIGKILL -> waitpid
 	StepCloseFDs                                 // 6: close all local fds exactly once
 )
@@ -60,13 +60,16 @@ type Teardown struct {
 	// and joins the read loop; there is no separate writer goroutine in this
 	// inline-send design.
 	JoinGoroutines func()
-	// Unmap is currently a no-op; a later stage will replace it with a real
-	// munmap of the SHM region. Kept as an explicit field precisely so that
-	// future change is a one-line callback swap, never a Run restructuring.
-	// Currently the transport fd is released by JoinGoroutines (the UDS socket
-	// is simultaneously the reader-wake and the "mapping"); once SHM exists,
-	// the reader will be woken by the step-2 shutdown eventfd instead, leaving
-	// this seam to do the real munmap after the join.
+	// Unmap releases the region mapping the host itself created (step 4). On the
+	// shared-memory path that is a real munmap plus the memfd close; on uds there
+	// is no region and it is a no-op.
+	//
+	// It is a step of its own rather than part of JoinGoroutines because two
+	// distinct mappings exist: the data-plane transport owns a duplicate of the
+	// region and releases that one when step 3 closes it, while this seam releases
+	// the original, which the transport never owned. Step 3 must precede it so no
+	// goroutine can still be reading the mapping when it goes away — see Run for
+	// the one path where that ordering is not enforced.
 	Unmap func()
 	// Process and ControlConn back step 5's graceful-Shutdown-then-reap;
 	// ControlConn must still be open when Run reaches step 5
@@ -98,6 +101,10 @@ type Teardown struct {
 // caller-supplied callback. A panic in steps 1-4 still runs the reap, then
 // re-propagates. Run returns the step-3 join error (ErrJoinTimeout) if the join
 // was abandoned; the reap happens regardless.
+//
+// Step 4 also runs regardless: an abandoned join leaves its goroutine running,
+// and Unmap is called anyway, so the join-before-unmap ordering holds only on
+// the path where the join completes.
 func (t *Teardown) Run(ctx context.Context) (err error) {
 	defer func() {
 		t.terminateAndReap(ctx) // 5: graceful Shutdown -> SIGKILL fallback -> reap, always
@@ -107,7 +114,7 @@ func (t *Teardown) Run(ctx context.Context) (err error) {
 	t.StopAdmission()           // 1: stop admission, detach routing target
 	t.FailInFlight(ErrTornDown) // 2: fail in-flight calls, wake waiters
 	err = t.joinGoroutines()    // 3: join every goroutine that can touch the mapping (bounded)
-	t.Unmap()                   // 4: munmap (currently a no-op; must later gate on a successful join)
+	t.Unmap()                   // 4: release the host's own region mapping
 
 	return err
 }
