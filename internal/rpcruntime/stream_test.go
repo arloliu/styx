@@ -238,11 +238,16 @@ func TestStream_SendMsg_PostAdmissionCtxCancel_Terminates(t *testing.T) {
 	}
 
 	err := s.SendMsg(t.Context(), []byte("x"))
-	require.ErrorIs(t, err, context.Canceled)
+	// The send reports the terminal it drove, not the context error that woke it:
+	// a send answers with the stream's recorded outcome, the same one Outcome and
+	// RecvMsg report, so a terminal that won during the Send is never masked by
+	// the cancellation that winning performs on the stream's context.
+	require.ErrorIs(t, err, ErrCanceledLocally)
 
 	oc, terminal := s.Outcome()
 	require.True(t, terminal, "a post-admission ctx error is terminal (§4.5)")
 	require.Equal(t, OutcomeCanceled, oc.Code)
+	require.ErrorIs(t, err, oc.Err, "the send reports exactly the recorded outcome")
 
 	cancelFrame, ok := rt.firstOfKind(transport.FrameCancel)
 	require.True(t, ok, "a locally-initiated teardown emits a CANCEL (§9.1)")
@@ -701,7 +706,10 @@ func TestStream_SendMsg_PostAdmissionCallerCancel_TerminatesCanceled(t *testing.
 
 	select {
 	case err := <-errCh:
-		require.ErrorIs(t, err, context.Canceled)
+		// The recorded terminal, not the raw caller-context error: every send
+		// answers with the outcome the stream recorded (see the post-admission
+		// context-error test above).
+		require.ErrorIs(t, err, ErrCanceledLocally)
 	case <-time.After(time.Second):
 		t.Fatal("SendMsg did not return after the caller context was canceled")
 	}
@@ -709,6 +717,83 @@ func TestStream_SendMsg_PostAdmissionCallerCancel_TerminatesCanceled(t *testing.
 	oc, terminal := s.Outcome()
 	require.True(t, terminal, "a post-admission caller cancel is terminal (§4.5)")
 	require.Equal(t, OutcomeCanceled, oc.Code)
+}
+
+// Test that a send parked in the transport when a DIFFERENT terminal wins
+// reports the outcome that won, not the cancellation that winning performs
+// (stream-protocol.md §4.5, §7.1).
+//
+// A terminal transition cancels the stream's context as its first teardown step,
+// so an in-flight Send always observes a plain context cancellation no matter
+// what the outcome actually was. A send that reported that cancellation would
+// name CANCELED for a stream whose recorded outcome is a peer status, a
+// deadline, or a lost connection — disagreeing with Err and RecvMsg about the
+// same stream.
+//
+// Determinism is order-based: the terminal is driven only after the transport
+// has signalled that the send is genuinely parked inside it, so the race the
+// window describes is entered on every run rather than sampled.
+func TestStream_SendMsg_ReportsTheWinningTerminal_WhenOneWinsDuringTheSend(t *testing.T) {
+	// Given a send parked inside the transport, post-admission.
+	tbl, s, rt := newTestStream(t, StreamConfig{Credits: 4, Deadline: time.Minute})
+	rt.blockMsgSend = true
+	rt.msgReached = make(chan struct{}, 1)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.SendMsg(context.Background(), []byte("x")) }()
+	select {
+	case <-rt.msgReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the STREAM_MSG send never reached its blocking point")
+	}
+
+	// When the connection fails under it, recording an outcome of its own.
+	peerGone := errors.New("the peer is gone")
+	tbl.FailAll(peerGone, errors.New("not dispatched"))
+
+	// Then the send reports that outcome, not the cancellation it observed.
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, peerGone, "the send must report the terminal that won, not its symptom")
+		require.NotErrorIs(t, err, context.Canceled, "the observed cancellation is not the outcome")
+	case <-time.After(2 * time.Second):
+		t.Fatal("SendMsg did not return after the connection failed under it")
+	}
+
+	oc, terminal := s.Outcome()
+	require.True(t, terminal)
+	require.ErrorIs(t, oc.Err, peerGone, "the recorded outcome is the one the send reported")
+}
+
+// Test the same rule for a half-close parked in the transport: CloseSend reports
+// the terminal that won during its Send, not the cancellation winning performs
+// (stream-protocol.md §4.5, §7.1).
+func TestStream_CloseSend_ReportsTheWinningTerminal_WhenOneWinsDuringTheSend(t *testing.T) {
+	// Given a half-close parked inside the transport.
+	tbl, s, rt := newTestStream(t, StreamConfig{Credits: 4, Deadline: time.Minute})
+	rt.blockCloseSend = true
+	rt.closeReached = make(chan struct{}, 1)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.CloseSend(context.Background(), nil) }()
+	select {
+	case <-rt.closeReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the STREAM_CLOSE send never reached its blocking point")
+	}
+
+	// When the connection fails under it.
+	peerGone := errors.New("the peer is gone")
+	tbl.FailAll(peerGone, errors.New("not dispatched"))
+
+	// Then the close reports that outcome, not the cancellation it observed.
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, peerGone, "the close must report the terminal that won, not its symptom")
+		require.NotErrorIs(t, err, context.Canceled, "the observed cancellation is not the outcome")
+	case <-time.After(2 * time.Second):
+		t.Fatal("CloseSend did not return after the connection failed under it")
+	}
 }
 
 // packedWord models the FORBIDDEN single-word design of stream-protocol.md §6.1,
@@ -1206,7 +1291,9 @@ func TestStream_CloseSend_HonorsCallerContext(t *testing.T) {
 
 	select {
 	case err := <-errCh:
-		require.ErrorIs(t, err, context.Canceled, "a caller cancellation aborts the blocked close")
+		// The close reports the terminal it drove rather than the context error
+		// that aborted it, exactly as a send does.
+		require.ErrorIs(t, err, ErrCanceledLocally, "a caller cancellation aborts the blocked close")
 	case <-time.After(time.Second):
 		t.Fatal("CloseSend ignored the caller context and did not return")
 	}
@@ -1244,10 +1331,15 @@ func TestTerminalPhaseFor_FiveDistinctTargets(t *testing.T) {
 	}
 }
 
-// Test that Outcome reports the outcome from the phase word in the window AFTER
-// the terminal CAS lands but BEFORE the winner closes done (stream-protocol.md
-// §6.1): a terminal stream is never observed as live, even mid-publication.
-func TestStream_Outcome_ReportsFromPhaseWord_BeforeDoneClosed(t *testing.T) {
+// Test that Outcome reports the whole recorded outcome in the window AFTER the
+// terminal CAS lands but BEFORE the winner closes done (stream-protocol.md
+// §6.1/§7.1): a terminal stream is never observed as live mid-publication, and
+// never as a terminal phase whose error detail is missing.
+//
+// The winner's minimal commit — the CAS together with the record it carries — is
+// driven directly, so the window is entered structurally rather than by racing a
+// real teardown.
+func TestStream_Outcome_ReportsTheRecordedOutcome_BeforeDoneClosed(t *testing.T) {
 	rt := &recordingTransport{}
 	tbl := NewStreamTable(8, rt)
 	t.Cleanup(func() { _ = tbl.Close() })
@@ -1255,17 +1347,24 @@ func TestStream_Outcome_ReportsFromPhaseWord_BeforeDoneClosed(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, s.Publish())
 
-	// Land the terminal CAS on the phase word exactly as a winner would, but do NOT
-	// yet close done — the CAS-before-done window.
-	require.True(t, s.phase.CompareAndSwap(streamPublished, streamTermDeadline))
+	// Land the winner's commit exactly as a terminal transition would, but do NOT
+	// close done — the CAS-before-done window. The commit registers the winner's
+	// finisher, which this test discharges in the winner's place so the table's
+	// Close still joins.
+	s.stateMu.Lock()
+	won, _ := s.casTerminal(
+		StreamOutcome{Code: OutcomeDeadlineExceeded, Err: ErrDeadlineExceeded}, 0, streamPublished,
+	)
+	s.stateMu.Unlock()
+	require.True(t, won)
+	defer s.tbl.finishers.Done()
 
 	oc, terminal := s.Outcome()
 	require.True(t, terminal, "the phase word alone makes the stream terminal in the pre-done window")
 	require.Equal(t, OutcomeDeadlineExceeded, oc.Code, "the terminal phase value IS the outcome code")
-	require.NoError(t, oc.Err, "the Err detail rides done and is not yet published in this window")
+	require.ErrorIs(t, oc.Err, ErrDeadlineExceeded, "the recorded error is readable from the CAS onward")
 
-	// Once done closes with the published outcome, Outcome returns it in full.
-	s.outcome = StreamOutcome{Code: OutcomeDeadlineExceeded, Err: ErrDeadlineExceeded}
+	// And the same outcome is reported once done closes, then read lock-free.
 	close(s.done)
 	oc, terminal = s.Outcome()
 	require.True(t, terminal)
@@ -1496,6 +1595,51 @@ func TestStream_Terminate_DoesNotHoldStateMuAcrossLifecycleSend(t *testing.T) {
 	gt.releaseCancel()
 }
 
+// Test that a terminated stream reports its recorded error the instant the
+// terminal CAS wins, not only once the winner has finished its teardown
+// (stream-protocol.md §7.1). The winner holds the phase word terminal from the
+// CAS onward, so an Outcome read that answered with the phase word's code alone
+// would report a terminal outcome whose error detail is still nil — and every
+// caller reading it through Err would see no error on a stream that has already
+// failed.
+//
+// The window is entered structurally, not by timing: the gated transport parks
+// the winner inside its teardown CANCEL Send, which runs after the CAS and
+// before done is closed, so the read below always lands in exactly that window.
+func TestStream_Outcome_ReportsTheRecordedError_WhileTheWinnerIsStillFinishing(t *testing.T) {
+	// Given a stream whose locally-initiated terminal winner is parked in its
+	// teardown CANCEL Send: the terminal CAS has landed, done is still open.
+	gt := &cancelGateTransport{entered: make(chan struct{}), release: make(chan struct{})}
+	tbl := NewStreamTable(8, gt)
+	t.Cleanup(func() { gt.releaseCancel(); _ = tbl.Close() })
+	s, err := tbl.Open(1, ClientStream, StreamConfig{Credits: 4, Deadline: time.Minute})
+	require.NoError(t, err)
+	require.True(t, s.Publish())
+
+	cause := errors.New("the recorded cause")
+	go func() { mapCancelToTerminal(s, cause) }()
+	select {
+	case <-gt.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the teardown CANCEL Send never entered")
+	}
+	select {
+	case <-s.Done():
+		t.Fatal("the winner published its outcome before the window under test was entered")
+	default:
+	}
+
+	// When the outcome is read inside that window.
+	oc, ok := s.Outcome()
+
+	// Then it is the whole recorded outcome, code and error together.
+	require.True(t, ok, "a stream whose terminal CAS has landed is never reported as live")
+	require.Equal(t, OutcomeCanceled, oc.Code)
+	require.ErrorIs(t, oc.Err, cause, "the recorded terminal error must be readable from the CAS onward")
+
+	gt.releaseCancel()
+}
+
 // closeGateTransport blocks every STREAM_CLOSE Send until released and counts how
 // many are accepted, so a test can force two concurrent CloseSend callers to both
 // reach the transport and prove only one same-direction close is ever put on the
@@ -1572,9 +1716,10 @@ func TestStream_CloseSend_ConcurrentCallers_PublishOneClose(t *testing.T) {
 }
 
 // Test that Close joins an in-flight terminal finisher: with a locally-initiated
-// winner parked in its lifecycle CANCEL Send before it stores the outcome, closes
-// done, or removes the stream, Close must not return until that finisher completes
-// (2026-07-16-styx-design.md teardown order; stream-protocol.md §7.1).
+// winner parked in its lifecycle CANCEL Send — its outcome already recorded by
+// the terminal CAS, but done not closed and the stream not yet removed — Close
+// must not return until that finisher completes (2026-07-16-styx-design.md
+// teardown order; stream-protocol.md §7.1).
 //
 // Determinism is order-based, proven by the race detector rather than an elapsed
 // window. The finisher writes a plain, unsynchronized cell as its final act, before
@@ -1586,8 +1731,9 @@ func TestStream_CloseSend_ConcurrentCallers_PublishOneClose(t *testing.T) {
 // every time. Both accesses always execute (the finisher is released, Close runs
 // its post-join hook), so the two sides are distinguished structurally.
 func TestStreamTable_Close_JoinsInFlightTerminalFinisher(t *testing.T) {
-	// Given: a locally-initiated terminal winner parked in its CANCEL Send, before
-	// it has stored the outcome, closed done, or removed the stream.
+	// Given: a locally-initiated terminal winner parked in its CANCEL Send, past
+	// the CAS that recorded its outcome but before it has closed done or removed
+	// the stream.
 	gt := &cancelGateTransport{entered: make(chan struct{}), release: make(chan struct{})}
 	tbl := NewStreamTable(8, gt)
 	t.Cleanup(func() { gt.releaseCancel(); _ = tbl.Close() })

@@ -244,23 +244,21 @@ func awaitTrainOutcome(t *testing.T, done <-chan error) error {
 // what Err reports. Sampling Err after further operations is what says no later
 // operation minted a terminal of its own.
 //
-// The receive runs FIRST, and that ordering is load-bearing rather than
-// stylistic. A receive on a terminating stream waits for the terminal outcome to
-// be fully published, whereas Err reads it through a window where the terminal's
-// code exists but its error has not been stored yet — and reports nil for the
-// duration. That window is a recorded pre-existing defect in Err's publication
-// ordering, not something chunking introduced: Done's own documentation names
-// the barrier Err does not respect. So the receive-first ordering here is a
-// workaround to DELETE once Err respects it, not a property worth keeping.
+// The receive runs FIRST as the barrier, and it is a barrier against the
+// TERMINAL not having been recorded yet, not against reading it. Some callers
+// reach here off a connection that failed under them, where the abandoned send
+// returns on the transport's own failure while the terminal is still being
+// driven by the connection-teardown fan-out; a receive parks until that terminal
+// is published, whereas Err on a stream that is still live correctly answers
+// nil. Every caller asserts on a stream it has already established must
+// terminate, so the receive cannot park forever.
 //
-// The send is asserted to FAIL rather than to fail with a particular sentinel,
-// and that too is a recorded defect rather than the contract. Err and RecvMsg
-// report the recorded class; a send does not always — after a connection failure
-// it surfaces the transport's own "transport: closed" where ErrOutcomeUnknown is
-// wanted, and after a deadline it reports ErrCanceled — both contradicting
-// SendMsg's documented "once the stream has terminated it returns that terminal
-// error". Tighten this require.Error to a require.ErrorIs on want once the
-// send path translates its terminal like the other two do.
+// Past that barrier every surface is required to name the SAME class — receive,
+// Err, send, and Err again afterwards. A surface that reported a symptom of the
+// terminal instead of the terminal (the transport's own closed error, or the
+// cancellation that every terminal transition performs on the stream's context)
+// would disagree with the others here, which is the disagreement this helper
+// exists to catch.
 func requireOneTerminal(t *testing.T, ctx context.Context, stream *styx.Stream, want error) {
 	t.Helper()
 
@@ -269,8 +267,8 @@ func requireOneTerminal(t *testing.T, ctx context.Context, stream *styx.Stream, 
 	require.Nil(t, payload, "a terminated stream must never hand back a payload")
 
 	require.ErrorIs(t, stream.Err(), want, "the stream recorded the wrong terminal class")
-	require.Error(t, stream.SendMsg(ctx, chunkPattern(chunkWarmUpSize)),
-		"a send on a terminated stream must fail")
+	require.ErrorIs(t, stream.SendMsg(ctx, chunkPattern(chunkWarmUpSize)), want,
+		"a send on a terminated stream reports its recorded outcome")
 	require.ErrorIs(t, stream.Err(), want, "the recorded terminal changed under later operations")
 }
 
@@ -572,12 +570,12 @@ func TestHostStream_ConvergeOnARestart_WhenThePeerDiesUnderAStalledTrain(t *test
 	// terminal: the connection failed under it, so the outcome of a message whose
 	// fragments were already published is one nobody can know.
 	//
-	// The abandoned send is only required to fail, not to name that outcome: after
-	// a connection failure the send path surfaces the transport's own
-	// "transport: closed" instead of translating it, a recorded defect against
-	// SendMsg's own documentation. Err and RecvMsg do report the class, which is
-	// what requireOneTerminal checks.
-	require.Error(t, awaitTrainOutcome(t, done), "a send whose peer died must not report success")
+	// The abandoned send names that outcome itself, whichever way the connection's
+	// failure reached it: a closed transport does not prove the fragments
+	// unpublished, and a send that instead observed the teardown's context
+	// cancellation answers with the terminal the teardown recorded.
+	require.ErrorIs(t, awaitTrainOutcome(t, done), styx.ErrOutcomeUnknown,
+		"a send whose peer died reports the outcome nobody can know")
 	requireOneTerminal(t, context.Background(), stream, styx.ErrOutcomeUnknown)
 
 	// And the dead generation delivered nothing of the train and left no region
@@ -633,9 +631,7 @@ func TestHostStream_ConvergeOnARestart_WhenThePeerDiesOwingAnOversizeAnswer(t *t
 	require.ErrorIs(t, recvErr, styx.ErrOutcomeUnknown,
 		"a peer that died holding a completed logical message leaves an outcome nobody can know")
 
-	// The receive names the class; a send after the same terminal does not, for the
-	// recorded reason in requireOneTerminal's own doc — it hands back the
-	// transport's "transport: closed" rather than translating it.
+	// And every surface names that same class, once.
 	requireOneTerminal(t, context.Background(), stream, styx.ErrOutcomeUnknown)
 
 	// And the fixture's own record rules out the degenerate run: the message it died

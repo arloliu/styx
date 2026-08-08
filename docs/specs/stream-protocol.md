@@ -466,13 +466,15 @@ stream may have **outstanding**: emitted but not yet acknowledged as consumed.
 
 ### §4.2 The configured maxima and the per-stream values
 
-Streaming has **two configured maxima**, both local to a side and both fixed
-before any stream opens, and **two per-stream values** derived from them.
+Streaming has **two side-local maxima**, both fixed before any stream opens, and
+**two per-stream values** derived from them. The bracketed names are what this
+contract calls them; no implementation exposes either as configuration today —
+both are compiled-in constants at the defaults below (§4.2, §11.1).
 
 | Name | Kind | Default | Meaning |
 |---|---|--:|---|
-| `N_max` (`stream.max_credit`) | configured maximum | **16** | the largest per-stream, per-direction credit this side will grant (§4.7) |
-| `S_max` (`stream.max_open`) | configured maximum | **32** | the largest number of simultaneously open streams this side will hold on one connection |
+| `N_max` (`stream.max_credit`) | side-local maximum | **16** | the largest per-stream, per-direction credit this side will grant (§4.7) |
+| `S_max` (`stream.max_open`) | side-local maximum | **32** | the largest number of simultaneously open streams this side will hold on one connection |
 | `N` | per stream | ≤ `N_max` | the credit actually granted to one stream, both directions (§4.7) |
 | `A` | per stream | `ceil(N/2)` | the ack threshold for that stream, derived from that stream's **granted** `N` (§4.6) |
 | `B` (lifecycle burst bound) | connection-wide constant | **4** | see §5 |
@@ -481,8 +483,8 @@ before any stream opens, and **two per-stream values** derived from them.
 number. At the default grant `N = 16` it is 8; at `N = 4` it is 2; at `N = 1` it
 is 1. Every bound in this document that mentions `A` is a bound in terms of that
 stream's `A`, and every bound that mentions `N` or `S_max` outside a specific
-stream's context is a bound in terms of the **configured maxima**, which is what
-makes the startup checks below cover the worst case a deployment can reach.
+stream's context is a bound in terms of the **side-local maxima**, which is what
+makes the invariants below cover the worst case a deployment can reach.
 
 **Both maxima are enforced purely locally.** Neither travels in the handshake
 (§11.1). A side's own worst case is bounded by its own configuration because:
@@ -493,17 +495,60 @@ makes the startup checks below cover the worst case a deployment can reach.
 - it never *opens* beyond its own `S_max`, and rejects an inbound `STREAM_OPEN`
   that would carry it past its own `S_max` (§4.7).
 
-A peer therefore cannot drive this side past either maximum, and a startup check
-over the local maxima is a check over the true worst case.
+A peer therefore cannot drive this side past either maximum, so reasoning over
+the local maxima is reasoning over the true worst case.
 
-**Normative startup invariants (streaming admission).** A shared-memory
-connection that negotiates `streaming` MUST validate **both**, per direction, at
-startup and **refuse to load** on failure.
+**Provisioning invariants (streaming admission).** A shared-memory connection
+that negotiates `streaming` is provisioned against **both**, per direction.
 
 ```
 (S1)  ring budget:        N_max · S_max  ≤  max_data_inflight / 2
 (S2)  lifecycle queue:    1              ≤  lifecycle_queue_depth
 ```
+
+**(S1) is provisioning guidance, not a load gate.** An earlier form of this
+section required a side to validate (S1) at startup and refuse to load on
+failure. That requirement is withdrawn. Three facts retire it, recorded here so
+the next reader does not re-derive them:
+
+- **No implementation ever carried the check.** `N_max` and `S_max` are private
+  constants in the streaming host, not configuration; nothing has ever computed
+  (S1) or refused a connection over it. The requirement described a gate that
+  was never built, which is worse than no gate: it read as enforced.
+- **The remedy it prescribes does not exist.** The instruction to a small-ring
+  deployment is to lower `stream.max_open`, `stream.max_credit`, or both. Neither
+  knob was ever built, so a side that enforced (S1) would refuse to load with no
+  configuration change available to make it load again.
+- **Enforcing it now would refuse configurations that work.** `streaming` is
+  offered unconditionally by both sides with no opt-out, so a load gate on (S1)
+  would hard-require `max_data_inflight ≥ 1024` on every shared-memory
+  connection — permanently refusing the documented lean geometry, which carries
+  streams correctly today.
+
+(S1) therefore has exactly the standing §4.3's chunking paragraph already gives
+it: a deployment provisions toward it, or stands off it and accepts what that
+costs, and what it costs is ordinary typed backpressure (`shm-abi.md` §18) —
+never a lost frame and never a deadlock. Deadlock-freedom does not rest on (S1);
+it rests on the `max_data_inflight ≤ C − R` admission bound and the lifecycle
+reserve `R` (`shm-abi.md` §18(i)). §4.3's derivation stands unchanged: it is what
+tells an operator what (S1) buys and what standing off it costs, and the half
+factor remains a deliberate policy choice, stated so a reviewer can challenge the
+policy rather than reverse-engineer it.
+
+The retirement is host-local. (S1) never travelled in the handshake (§11.1), no
+frame carries it, and no peer can observe whether the other side provisioned to
+it — so nothing about interoperability, negotiation, or the wire changes here.
+
+**(S2) needs no streaming check, because a zero-depth queue cannot be built.**
+The transport's own capacity validation rejects a non-positive
+`lifecycle_queue_depth` (`internal/transport/shm/admission.go`), and attach runs
+it at a point that forecloses the queue existing at depth 0: the region is
+mapped and its geometry read first, then the check runs, and a failure unmaps
+and returns before any writer, arena, or transport is constructed
+(`internal/transport/shm/transport.go`, `Attach`). So no lifecycle queue is ever
+built at a depth (S2) rejects, and a streaming-specific gate would only restate
+a refusal the transport already performs. (S2) stays stated below as the premise
+§5.5's fairness bound rests on, not as a check for streaming to perform.
 
 Every operand is a quantity that exists in the running system, and each is named
 here rather than approximated by a nearby one:
@@ -522,25 +567,26 @@ double-count the ABI's pre-existing per-in-flight-call `CANCEL` accounting, whic
 tightens"*. (S2) is consequently satisfied by every geometry in this repository
 and by every configuration the transport already accepts: `Config` validation
 rejects a non-positive depth (`internal/transport/shm/admission.go`), which is
-(S2) exactly. It is stated as an invariant rather than dropped because it is the
-premise §5.5's fairness bound rests on — a queue of depth 0 would have nowhere to
-put the dispatcher's ACK.
+(S2) exactly — and is why streaming performs no check of its own for it. It is
+stated rather than dropped because it is the premise §5.5's fairness bound rests
+on: a queue of depth 0 would have nowhere to put the dispatcher's ACK.
 
 `C = ring_capacity` and `R = lifecycle_reserve` are read from the layout page
 (`shm-abi.md` §2) and still appear in the derivations below, because they fix the
 ceiling `max_data_inflight` is admitted against.
 
-These are the streaming analogues of the ABI's own two startup invariants and are
-checked the same way: before any resource is allocated, refusing configurations
+These are the streaming counterparts of the ABI's own two startup invariants, and
+sit where the ABI puts class counts rather than where it puts ring capacity:
+provisioning that an operator reasons about ahead of load, not a configuration
 the region cannot represent (design §19; `shm-abi.md` §18). They are written over
-`N_max` and `S_max` — the **configurable** maxima — so a deployment that raises
-either is checked against the case it can actually reach, not against the
-shipped defaults.
+`N_max` and `S_max` — the maxima themselves, not the numbers those maxima
+currently hold — so they keep naming the worst case a side can reach if either
+ever moves, rather than silently describing only the shipped defaults.
 
-**Scope: shared memory only.** (S1) and (S2) are checks over a shared-memory
+**Scope: shared memory only.** (S1) and (S2) are statements about a shared-memory
 region's geometry. A UDS connection has no ring, no arena, no lifecycle reserve,
 and no lane queues — its writer is a single serialized socket writer — so neither
-invariant has operands there and neither is checked. `N_max` and `S_max`
+has operands there and neither applies. `N_max` and `S_max`
 themselves still apply on UDS: they bound per-stream credit and the request-table
 population, which every transport has.
 
@@ -572,11 +618,17 @@ reverse-engineer it; it is not a physical constraint.
 The window the policy is written over is the host's declared
 `max_data_inflight`, not the ABI ceiling `C − R`, and the difference is not
 cosmetic. A host on the `default` profile may declare `max_data_inflight = 600`,
-which admission accepts (`600 ≤ 3840`). Written over `C − R`, (S1) would pass at
-`512 ≤ 1920` while streaming's worst case occupied 512 of the 600 slots the host
-actually admits — 85% of the window, not 50%, and the promise the derivation
-makes would be false. Written over `max_data_inflight`, that configuration is
-refused, which is what the policy says should happen.
+which admission accepts (`600 ≤ 3840`). Written over `C − R`, (S1) would read as
+satisfied at `512 ≤ 1920` while streaming's worst case occupied 512 of the 600
+slots the host actually admits — 85% of the window, not 50%, and the promise the
+derivation makes would be false. Written over `max_data_inflight`, (S1) names
+that configuration as one standing off the policy, which is the reading that
+matches what the deployment would actually experience: streams able to crowd
+unary traffic out of the declared window, resolved as typed backpressure
+(`shm-abi.md` §18). Which quantity the rule is written over is what decides
+whether it describes the deployment or flatters it — that is why the operand is
+the declaration and not the ceiling, and it is unaffected by (S1) being guidance
+rather than a gate.
 
 Against the documented geometries, taking the host's declaration at the ABI
 ceiling (`max_data_inflight = C − R`, the largest value admission permits;
@@ -589,16 +641,20 @@ ceiling (`max_data_inflight = C − R`, the largest value admission permits;
 
 A host that declares less scales the budget column down with it: at
 `max_data_inflight = 1024` the budget is 512 and the shipped defaults sit exactly
-at the limit; below that they refuse to load.
+at the limit; below that they stand off (S1).
 
 The defaults satisfy (S1) at the ceiling on both documented geometries, but they
 are **not** universally valid: the ABI permits rings as small as `C = 64`
 (`shm-abi.md` §1), where `R = C/16 = 4` caps `max_data_inflight` at 60 and gives
-a budget of 30, so the defaults refuse to load. Such a deployment MUST lower
-`stream.max_open`, `stream.max_credit`, or both (`N_max = 16, S_max = 1` and
-`N_max = 4, S_max = 7` both fit). Refusing to load is the correct outcome, not a
-fallback: a silently downgraded credit scheme is the class of surprise design §10
-rejects everywhere else.
+a budget of 30, which the shipped `N_max · S_max = 512` overruns by an order of
+magnitude. A deployment that wants the half-window property at that size needs
+`N_max` and `S_max` to come down with the ring (`N_max = 16, S_max = 1` and
+`N_max = 4, S_max = 7` both fit) — and both are private constants today, so what
+it can actually do is give the ring more room. A deployment that stands off (S1)
+instead runs a lean ring with the shipped credit scheme, and what it gets is
+typed backpressure under streaming load, not a silently downgraded credit
+scheme: nothing here changes `N` or `A` behind the operator's back, which is the
+class of surprise design §10 rejects everywhere else.
 
 When the `stream-chunking` feature is active (§13.1), the worst case this
 derivation counts is no longer the descriptor count: `N_max · S_max` bounds
@@ -651,9 +707,9 @@ What streaming owes, and what it does not:
   charges for is the ABI's pre-existing per-in-flight-call accounting, not a new
   streaming cost, so the `S_max` form double-counted it. It also had a concrete
   consequence — the in-repo lifecycle-queue depths are 64, 16, and 8, so the
-  shipped `S_max = 32` would have refused to load at two of the three, on an
-  obligation streaming does not have. Under (S2) as stated, `S_max = 32` loads at
-  all three with no geometry change and no change to the shipped default.
+  shipped `S_max = 32` would have been unmeetable at two of the three, on an
+  obligation streaming does not have. Under (S2) as stated, `S_max = 32` is met
+  at all three with no geometry change and no change to the shipped default.
 - **What it does not owe, stated so nobody mistakes (S2) for a proof of it.**
   Sizing the queue for the *combined* population — in-flight unary calls plus
   open streams — is the host's and the ABI's concern, not streaming's, and this
@@ -703,16 +759,16 @@ while leaving the monopolization share under half a percent.
 
 **`S_max = 32` is a shipped default, not a derived maximum, and the distinction
 is stated because the opposite claim is the tempting one.** (S1) and (S2) are the
-contract; 32 is the number the contract ships with. The binding invariant admits
-more: at the `default` profile's ceiling, `N_max = 16, S_max = 64` gives 1024,
-inside (S1)'s budget of 1920. (S2) does not constrain `S_max` at all. So 32 is
-*not* the largest power of two the invariants permit, and no derivation should
-claim it is.
+provisioning rules; 32 is the number the contract ships with. Those rules leave
+room for more: at the `default` profile's ceiling, `N_max = 16, S_max = 64` gives
+1024, inside (S1)'s budget of 1920. (S2) does not constrain `S_max` at all. So 32
+is *not* the largest power of two the invariants describe as sound, and no
+derivation should claim it is.
 
 The policy that selects 32 is this: **the shipped configuration's worst case
 should remain a minority of the streaming budget at the documented geometries**,
-so that raising `stream.max_open` is a deliberate act taken with visible headroom
-rather than the last step before (S1) refuses to load. Concretely, at
+so that raising `S_max` is a deliberate act taken with visible headroom rather
+than the last step before (S1) stops describing the deployment. Concretely, at
 `N_max = 16` and the `default` profile's ceiling:
 
 | `S_max` | `N_max · S_max` | share of the 1920 budget | share of the 3840-slot window |
@@ -725,10 +781,17 @@ which the half-window policy stops describing the deployment even though (S1)
 still passes. 32 leaves a factor of 3.75 of headroom at the `default` profile and
 7.5 at `benchmark`, so the shipped configuration is not sitting on a limit.
 
-A deployment that wants more concurrent streams raises `stream.max_open` and is
-checked by (S1) against the case it can actually reach. That is the intended
-path, and it is why (S1) is written over the configurable maxima rather than over
-the defaults.
+A deployment that wants more concurrent streams cannot raise `S_max` today:
+`stream.max_open` and `stream.max_credit` name the two maxima this contract
+defines, but no implementation exposes either as configuration — both are
+compiled-in constants (§4.2). The remedies actually available to such a
+deployment are to give the connection a larger ring so the same 32 streams sit
+further inside the half-window policy, or to open fewer streams and multiplex
+more work onto each; changing `S_max` itself is a framework change, not a
+deployment one. (S1) is nonetheless written over `N_max` and `S_max` rather than
+over the shipped numbers, so that it keeps describing the worst case reachable
+whenever those maxima do become settable, without the rule having to be
+rewritten around whatever they are set to.
 
 The arena is *not* a binding constraint on either, and the rest of this
 subsection says why.
@@ -1189,7 +1252,7 @@ only the unit is fixed.
   applied per stream. Because the grant is the opener's proposal and the proposal
   is bounded by the opener's `N_max`, while acceptance is bounded by the
   accepter's `N_max`, every established stream satisfies `N ≤ N_max` on **both**
-  sides — which is the premise §4.2's startup checks rest on.
+  sides — which is the premise §4.2's provisioning invariants rest on.
 - `granted` is symmetric: both directions of a stream carry the same credit. A
   per-direction asymmetric grant would need a reply field the wire does not have,
   and no requirement motivates it.
@@ -3359,8 +3422,12 @@ values. A contract that negotiated `stream.max_credit` or `stream.max_open` at
 handshake would therefore not be derivable from the frozen wire, which is exactly
 what this document promises it is.
 
-`stream.max_credit` and `stream.max_open` are consequently **local
-configuration**, not negotiated parameters:
+`stream.max_credit` and `stream.max_open` are consequently **local to a side**,
+not negotiated parameters. "Local" is the claim being made here, and it is about
+where the value is decided, not about whether an operator can set it: no
+implementation exposes either as configuration today — both are compiled-in
+constants at their defaults (§4.2) — and that changes nothing in this section,
+because a value fixed at build time is as local as one read from a file.
 
 | Setting | Default | Scope |
 |---|--:|---|
@@ -3383,10 +3450,10 @@ be safe:
   retryable, because §4.7 shows it is reachable between two sides with identical
   caps.
 
-Because both maxima are local and locally enforced, §4.2's startup invariant
-(S1) — written over `N_max` and `S_max` — bounds this side's true worst case with
-no dependence on anything the peer says or does, and (S2) is a property of this
-side's own writer alone.
+Because both maxima are local and locally enforced, §4.2's provisioning
+invariant (S1) — written over `N_max` and `S_max` — describes this side's true
+worst case with no dependence on anything the peer says or does, and (S2) is a
+property of this side's own writer alone.
 
 `stream-chunking` (§13) is a second, independent feature flag on the stream
 plane, with the same shape: a stable string identifier, boolean, no

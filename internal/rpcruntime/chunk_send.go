@@ -218,10 +218,10 @@ func (s *Stream) failVisibleTrain(callerCtx context.Context, err error) error {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		if errors.Is(s.ctx.Err(), context.DeadlineExceeded) ||
 			errors.Is(callerCtx.Err(), context.DeadlineExceeded) {
-			return trainOutcomeErr(mapDeadlineToTerminal(s), err)
+			return recordedOutcomeErr(mapDeadlineToTerminal(s), err)
 		}
 
-		return trainOutcomeErr(mapCancelToTerminal(s, ErrCanceledLocally), err)
+		return recordedOutcomeErr(mapCancelToTerminal(s, ErrCanceledLocally), err)
 
 	case errors.Is(err, transport.ErrClosed), errors.Is(err, transport.ErrPoisoned):
 		return err
@@ -229,20 +229,8 @@ func (s *Stream) failVisibleTrain(callerCtx context.Context, err error) error {
 	default:
 		cause := fmt.Errorf("%w: chunked stream send failed: %w", ErrCanceledLocally, err)
 
-		return trainOutcomeErr(mapCancelToTerminal(s, cause), err)
+		return recordedOutcomeErr(mapCancelToTerminal(s, cause), err)
 	}
-}
-
-// trainOutcomeErr returns the stream's recorded terminal error, so SendMsg
-// surfaces exactly what every later call on the stream surfaces. It falls back
-// to the send error only if the terminal transition recorded no error detail,
-// which the mapping helpers never do.
-func trainOutcomeErr(oc StreamOutcome, fallback error) error {
-	if oc.Err != nil {
-		return oc.Err
-	}
-
-	return fallback
 }
 
 // chunkTooLargeErr is the definitive rejection of a logical message larger than
