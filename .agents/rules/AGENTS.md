@@ -5,7 +5,7 @@ task, then the files whose triggers match the work. If in doubt, read the
 file rather than guess its contents.
 
 ## Default Load
-- Most Go implementation tasks: `000`, `100`, `200`, `500`, `700`.
+- Most Go implementation tasks: `000`, `100`, `150`, `200`, `500`, `700`.
 - Add `300` for test changes. Add `400` for docs, examples, README, or
   exported API changes.
 - Add `600` for commits/branches/PRs. Add `800` for hot paths (especially
@@ -22,6 +22,9 @@ file rather than guess its contents.
 - **[100-project-map.md](100-project-map.md)** — package layout, layering
   (`styx` is the only public import; everything sharp lives under
   `internal/`), codegen, dependency policy.
+- **[150-memex.md](150-memex.md)** — the `.knowledges/` bundle: read the
+  relevant package's entries before deriving a mechanic from source; capture
+  one you had to derive yourself.
 - **[200-coding-standards.md](200-coding-standards.md)** — Go idioms, error handling,
   interface assertions, file layout, linter limits, naming, import aliases.
 

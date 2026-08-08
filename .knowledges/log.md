@@ -1,0 +1,13 @@
+# Log
+
+## 2026-08-08
+
+* **Verification**: [Crash-to-restart event sequence](/internal/supervisor/crash-restart-events.md) promoted to stable. Corrections along the way: a `Run` iteration is one failure incident, not one generation — a successful hot reload allocates a successor generation and publishes an extra `Ready` inside the same iteration, with no `Starting` before it; an `Unhealthy` verdict is never terminal, since both its paths return non-terminal and are followed by `Crashed`; the reset window measures from the run's first Ready and survives a reload; four truncation points, not three; `Seq` cannot substitute for a drop counter because delivery is priority-ordered; provenance added for the reload, package-doc, and restart-policy claims.
+* **Verification**: [Known outcome versus safe retry](/crosscutting/call-outcome-boundary.md) promoted to stable. Corrections: cancellation takes the call terminal and the later `Publish` returns false; a successful hot reload uses two drains on opposite sides of promotion, drain-ack before and `JoinResponses` after.
+* **Verification**: [Teardown step order](/internal/lifecycle/teardown-step-order.md) promoted to stable. Corrections: step 5 is also deadline-bearing and the host's step-1 hook bounds its wait and discards the result; the join-timeout overlap is between two distinct mappings rather than a demonstrated use-after-unmap; the host hook substitutes its error pair rather than translating; the full release-ownership split recorded per step.
+* **Update**: [Known outcome versus safe retry](/crosscutting/call-outcome-boundary.md) rewritten after verification refuted its premise: `StatePublished` is a provisional pre-send CAS result that `Reject` can move a call out of, so outcome-known and safe-to-retry are separate axes.
+* **Deprecation**: Host start ordering removed — `Host.Start`'s own doc comment already states the serial bring-up, the non-aborting failure, and the joined error. Recorded in `CONVENTIONS.md` under `declined`.
+* **Creation**: bundle bootstrapped over 17 Go packages plus `crosscutting/`; skeleton index for every unit.
+* **Creation**: [Teardown step order](/internal/lifecycle/teardown-step-order.md) which of the six steps' orderings the code enforces, and the join-before-unmap constraint it does not.
+* **Creation**: [Known outcome versus safe retry](/crosscutting/call-outcome-boundary.md) the two axes deciding a failed call's fate.
+* **Creation**: [Crash-to-restart event sequence](/internal/supervisor/crash-restart-events.md) the per-incident event order, its truncation points, and how the restart budget resets.
