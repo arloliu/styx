@@ -287,7 +287,10 @@ func TestStream_SendMsg_AbandonedAfterAcceptance_KeepsItsCreditAndSequence(t *te
 	case <-time.After(creditWait):
 		require.FailNow(t, "the abandoned send never returned to its caller")
 	}
-	require.ErrorIs(t, sendErr, context.Canceled)
+	// The abandoned send reports the terminal it drove rather than the raw context
+	// error: every send answers with the stream's recorded outcome, so a send can
+	// never name a different outcome from the one Err and RecvMsg name.
+	require.ErrorIs(t, sendErr, ErrCanceledLocally)
 
 	// Then the stream is terminal — a post-admission context error is, whatever the
 	// writer still holds (§4.5) — and neither the unit nor the number came back.

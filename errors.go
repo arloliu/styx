@@ -389,17 +389,45 @@ var (
 	// a lifecycle/framework error, not a per-call one, so IsRetryable does not
 	// classify it.
 	ErrUnknownPlugin = errors.New("styx: unknown plugin")
-	// ErrStreamAlreadyClosed reports that a stream recorded a completed outcome at a
-	// point where its STREAM_OPEN provably never reached the peer, so there is no
-	// usable stream and no peer result to return. A completion the peer actually
-	// produced is not this error: OpenStream returns that stream to the caller, who
-	// drains the delivered payloads and then reads io.EOF.
-	// It is distinct from the peer-error and teardown outcomes, which carry their own
-	// mapped errors; it names specifically a completed outcome with no underlying
-	// error of its own, and it also guards the theoretical case of a peer-error or
-	// crashed outcome whose recorded error is nil. It is not retryable by default: the
-	// guard case cannot rule out a peer that already processed the stream, and
-	// reissuing blindly in that case could repeat a side effect.
+	// ErrStreamAlreadyClosed reports that there was nothing left to hand back or
+	// hand over, because the stream — or the one direction being closed — is
+	// already closed or is being closed by somebody else. Three paths return it,
+	// and they support different conclusions, so each is named with what a caller
+	// may actually infer. IsRetryable is false for all three.
+	//
+	// From OpenStream: the stream recorded a completed outcome at a point where its
+	// STREAM_OPEN provably never reached the peer, so there is no usable stream and
+	// no peer result to return. A completion the peer actually produced is not this
+	// error: OpenStream returns that stream to the caller, who drains the delivered
+	// payloads and then reads io.EOF. It is distinct from the peer-error and teardown
+	// outcomes, which carry their own mapped errors; it names specifically a completed
+	// outcome with no underlying error of its own, and it also guards the theoretical
+	// case of a peer-error or crashed outcome whose recorded error is nil. Not
+	// retryable: the guard case cannot rule out a peer that already processed the
+	// stream, and reissuing blindly in that case could repeat a side effect.
+	//
+	// From Stream.CloseSend, when this side already half-closed its send direction:
+	// the second CloseSend has nothing to close (stream-protocol.md §6.5). The
+	// stream itself may be perfectly healthy — the receive direction can still be
+	// delivering, and a bidi stream stays live until the peer closes too. The
+	// half-close already succeeded, so there is nothing to retry and reissuing can
+	// only fail the same way. This is also what a close on a NORMALLY COMPLETED
+	// stream reports: a completion means both directions closed, so this side's own
+	// half-close is what committed, and a completion records no error for the close
+	// to report instead. A close on a stream that terminated any OTHER way reports
+	// that stream's terminal outcome rather than this sentinel.
+	//
+	// From Stream.CloseSend, when another goroutine currently OWNS the half-close:
+	// publication has a single in-progress owner, and the caller that loses that
+	// claim is refused without sending. Here the direction is NOT known to be
+	// closed. The owner may yet fail definitively before the transport accepts
+	// anything — or return on its own context before it sends at all — and either
+	// restores the direction to closable, so this answer says only that a close was
+	// in flight at that instant. Nothing is safe to conclude about the direction's
+	// final state from it. Retrying is not the remedy: concurrent CloseSend on one
+	// stream is a caller programming error (the send direction has a single owner,
+	// stream-protocol.md §3.1), and a caller that observes this has a race to fix
+	// rather than a call to reissue.
 	ErrStreamAlreadyClosed = errors.New("styx: stream already closed")
 	// ErrHeartbeatsMissed reports that a plugin was declared unhealthy after
 	// missing enough consecutive heartbeats. errors.Is(err,

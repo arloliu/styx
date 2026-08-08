@@ -163,8 +163,9 @@ const (
 // PUBLISHED so the peer-crash split (§7.2) can key on them; each terminal value
 // is a SPECIFIC outcome, so the terminal CAS itself records the outcome and a
 // reader can never observe a terminal phase without an outcome (§7.1). The Err
-// detail of an outcome (a peer status, a crash cause) still rides Stream.outcome
-// behind done, exactly as table.go delivers Result behind its result channel.
+// detail of an outcome (a peer status, a crash cause) is stored in Stream.outcome
+// by that same CAS, under stateMu, so it exists before the phase word makes the
+// stream terminal — see the field's own comment and casTerminal.
 // The close bits live in a SEPARATE word; packing them here is forbidden (§6.1).
 const (
 	streamSubmitted int32 = iota // live: publication not yet committed
@@ -464,8 +465,13 @@ type Stream struct {
 	// path (which leaves it nil and emits no handler-error STREAM_ERR).
 	handlerErrStatus *transport.FrameStatus
 
-	// Terminal delivery. outcome is written once, by the CAS winner, before done
-	// is closed — readers observe it only after done, giving a happens-before.
+	// Terminal delivery. outcome is written once, by the terminal-CAS winner,
+	// under stateMu and atomically with the CAS itself (casTerminal) — so the
+	// phase word never becomes terminal before the outcome behind it exists.
+	// It is read two ways: after done is closed, without the lock (close(done)
+	// gives the happens-before), and under stateMu by a reader that found the
+	// phase terminal while done was still open, which is the same lock the
+	// winner wrote it under.
 	done    chan struct{}
 	outcome StreamOutcome
 }
@@ -656,31 +662,41 @@ func (s *Stream) ConfirmOpenSent() bool {
 
 // Outcome reports the stream's terminal state once reached; ok is false while
 // the stream is still live. It reads the phase word, whose terminal value IS the
-// outcome (stream-protocol.md §6.1): the common path returns the fully-published
-// StreamOutcome (with its Err detail) once done is closed, and in the small
-// window after the terminal CAS lands but before the winner finishes publishing
-// the Err, it still reports the outcome code from the phase word — so a terminal
-// stream is never observed as live.
+// outcome (stream-protocol.md §6.1), and always answers with the WHOLE recorded
+// outcome — its code and its Err together — so a terminal stream is neither
+// observed as live nor observed as a code whose error detail is missing.
+//
+// Once done is closed the read is lock-free, ordered by that close. Before it,
+// a terminal phase means the winner is still running its teardown, and the
+// outcome behind that phase was recorded under stateMu atomically with the CAS
+// (casTerminal) — so taking the same lock here reads exactly what the winner
+// wrote, without waiting on the teardown work the winner does outside the lock
+// (§7.1 forbids holding stateMu across its lifecycle Send, so this never parks
+// behind one).
 func (s *Stream) Outcome() (StreamOutcome, bool) {
 	select {
 	case <-s.done:
 		return s.outcome, true
 	default:
 	}
-	if code, ok := terminalOutcomeOf(s.phase.Load()); ok {
-		return StreamOutcome{Code: code}, true
+	if _, ok := terminalOutcomeOf(s.phase.Load()); ok {
+		s.stateMu.Lock()
+		oc := s.outcome
+		s.stateMu.Unlock()
+
+		return oc, true
 	}
 
 	return StreamOutcome{}, false
 }
 
-// Done returns a channel closed once this stream's terminal outcome is FULLY
-// published — the terminal-CAS winner stores the outcome (its code AND its Err)
-// before closing this channel, so a receive here happens-before an Outcome() read
-// that observes the complete outcome, never a code whose Err has not yet been
-// written. OpenStream waits on it when its Publish loses to a terminal transition,
-// so it translates the fully-published outcome rather than the winner's brief
-// code-before-Err window (stream-protocol.md §7.4).
+// Done returns a channel closed once this stream's terminal outcome is published
+// AND the winner has finished its teardown work: the winner records the outcome
+// (its code AND its Err) with the terminal CAS itself and closes this channel at
+// the end of that work, so a receive here happens-before a lock-free Outcome()
+// read of the complete outcome. OpenStream waits on it when its Publish loses to
+// a terminal transition, so it resolves the stream only once its teardown has run
+// (stream-protocol.md §7.4).
 func (s *Stream) Done() <-chan struct{} {
 	return s.done
 }
@@ -693,6 +709,8 @@ func (s *Stream) isLive() bool {
 }
 
 // SendMsg admits and sends one STREAM_MSG.
+// On an already-terminated stream it sends nothing and returns the recorded
+// terminal error, the same one Outcome and RecvMsg report (§7.1).
 // Credit is reserved before the frame is built; when credit is exhausted the
 // caller blocks on ctx, the stream's termination, or credit return.
 // The frame is sent under the stream's OWN context (never the caller's or
@@ -707,6 +725,9 @@ func (s *Stream) isLive() bool {
 // connection without chunking keeps failing with the transport's definitive
 // oversize rejection.
 func (s *Stream) SendMsg(ctx context.Context, payload []byte) error {
+	if err := s.terminalErr(); err != nil {
+		return err // already terminated: the recorded outcome is the answer (§7.1)
+	}
 	if s.sendClosed.Load() {
 		return ErrCanceledLocally // §6.4: no Send after CloseSend
 	}
@@ -790,6 +811,44 @@ func (s *Stream) admit(ctx context.Context) error {
 	}
 }
 
+// terminalErr returns the recorded terminal error of an already-terminated
+// stream, and nil while it is live or once it completed normally (a completion
+// records no error).
+//
+// It is what makes an operation on a terminated stream report the outcome that
+// was recorded rather than a symptom of it. The terminal transition cancels the
+// stream's context whatever the outcome was, so an operation that ran on and
+// read only that context would report a cancellation for a stream whose recorded
+// outcome is a deadline, a peer error, or a connection loss — a different answer
+// from the one RecvMsg and Outcome give for the same stream.
+//
+// The live check is a single phase-word load, so a send on a live stream pays
+// one atomic load and never touches the lock Outcome may take.
+func (s *Stream) terminalErr() error {
+	if s.isLive() {
+		return nil
+	}
+	oc, _ := s.Outcome()
+
+	return oc.Err
+}
+
+// recordedOutcomeErr returns the stream's recorded terminal error, so an
+// operation that drove or raced a terminal transition surfaces exactly what
+// every later call on the stream surfaces. The mapping helpers return the
+// stream's ACTUAL outcome, which is not necessarily the one their caller
+// attempted: a transition that lost the CAS to a deadline, a peer status, or a
+// connection teardown must report the winner's outcome, not its own attempt and
+// not the context error that woke it. It falls back to the send error only if
+// the terminal recorded no error detail, which the mapping helpers never do.
+func recordedOutcomeErr(oc StreamOutcome, fallback error) error {
+	if oc.Err != nil {
+		return oc.Err
+	}
+
+	return fallback
+}
+
 // deliveredErr returns the terminated stream's outcome error for a caller that
 // was blocked on credit when the stream terminated.
 func (s *Stream) deliveredErr() error {
@@ -825,13 +884,19 @@ func (s *Stream) handleSendErr(callerCtx context.Context, err error, seq uint64)
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		// §4.5: a post-admission context error is terminal for the stream. A
 		// deadline — whether the stream's own or the caller's — records DEADLINE;
-		// any other cancellation records CANCELED.
+		// any other cancellation records CANCELED. What is returned is the
+		// RECORDED outcome, not this context error: a terminal that won during the
+		// Send (its own deadline, a peer status, a connection teardown) cancels the
+		// stream's context as part of winning, so this Send observes a plain
+		// cancellation for a stream whose outcome is something else entirely.
+		// Returning the record keeps this send's answer identical to the one Err
+		// and RecvMsg give for the same stream, exactly as the chunked path does.
 		if errors.Is(s.ctx.Err(), context.DeadlineExceeded) ||
 			errors.Is(callerCtx.Err(), context.DeadlineExceeded) {
-			mapDeadlineToTerminal(s)
-		} else {
-			mapCancelToTerminal(s, ErrCanceledLocally)
+			return recordedOutcomeErr(mapDeadlineToTerminal(s), err)
 		}
+
+		return recordedOutcomeErr(mapCancelToTerminal(s, ErrCanceledLocally), err)
 	}
 
 	return err
@@ -1009,6 +1074,10 @@ func (s *Stream) recvErr() error {
 // A post-acceptance context error is terminal for the stream (the frame may
 // already be published, so the intent cannot be withdrawn).
 // It returns ErrSendClosed if this side already closed its send half.
+// On an already-terminated stream it sends nothing and returns the recorded
+// terminal error instead, the same one Outcome and RecvMsg report (§7.1); a
+// stream that merely completed normally records no error and still reports the
+// already-closed refusal.
 // A server's STREAM_CLOSE for a client-streaming method also carries the single
 // response/trailer payload: the streaming host passes it through payload, which
 // rides the STREAM_CLOSE frame.
@@ -1025,6 +1094,9 @@ func (s *Stream) recvErr() error {
 // A purely SEQUENTIAL retry after a pre-acceptance failure still succeeds,
 // because that failure rolls the state back to idle.
 func (s *Stream) CloseSend(ctx context.Context, payload []byte) error {
+	if err := s.terminalErr(); err != nil {
+		return err // already terminated: the recorded outcome is the answer (§7.1)
+	}
 	if !s.sendCloseState.CompareAndSwap(closeSendIdle, closeSendPublishing) {
 		return ErrSendClosed // already closed, or another caller owns publication (§6.4/§6.5)
 	}
@@ -1086,12 +1158,16 @@ func (s *Stream) handleCloseSendErr(callerCtx context.Context, err error) error 
 	// cannot be withdrawn — commit closed and drive the terminal transition (§4.5).
 	s.sendCloseState.Store(closeSendClosed)
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// The recorded outcome is what is returned, for the same reason SendMsg's
+		// handler returns it: a terminal that won during this Send cancels the
+		// stream's context as part of winning, so the context error this close
+		// observed names the symptom rather than the outcome.
 		if errors.Is(s.ctx.Err(), context.DeadlineExceeded) ||
 			errors.Is(callerCtx.Err(), context.DeadlineExceeded) {
-			mapDeadlineToTerminal(s)
-		} else {
-			mapCancelToTerminal(s, ErrCanceledLocally)
+			return recordedOutcomeErr(mapDeadlineToTerminal(s), err)
 		}
+
+		return recordedOutcomeErr(mapCancelToTerminal(s, ErrCanceledLocally), err)
 	}
 
 	return err
@@ -1168,12 +1244,12 @@ func (s *Stream) terminate(oc StreamOutcome, teardownCode uint32, locallyInitiat
 	// preserved: the CAS still arbitrates the LIVE->terminal edge first-wins, and
 	// finishTerminal runs the winner's steps in order.
 	s.stateMu.Lock()
-	won, presend := s.casTerminal(oc.Code, teardownCode, from...)
+	won, presend := s.casTerminal(oc, teardownCode, from...)
 	s.stateMu.Unlock()
 	if !won {
 		return false
 	}
-	s.finishTerminal(oc, locallyInitiated, presend)
+	s.finishTerminal(locallyInitiated, presend)
 
 	return true
 }
@@ -1193,8 +1269,10 @@ func (s *Stream) TerminateHandlerError(status *Status) {
 		fs = &transport.FrameStatus{Code: status.Code, Message: status.Message, Details: status.Details}
 	}
 
+	oc := StreamOutcome{Code: OutcomePeerError, Err: &StreamStatusError{Status: status}}
+
 	s.stateMu.Lock()
-	won, presend := s.casTerminal(OutcomePeerError, 0, streamSubmitted, streamPublished)
+	won, presend := s.casTerminal(oc, 0, streamSubmitted, streamPublished)
 	if won {
 		s.handlerErrStatus = fs
 	}
@@ -1203,8 +1281,7 @@ func (s *Stream) TerminateHandlerError(status *Status) {
 		return
 	}
 
-	oc := StreamOutcome{Code: OutcomePeerError, Err: &StreamStatusError{Status: status}}
-	s.finishTerminal(oc, false, presend)
+	s.finishTerminal(false, presend)
 }
 
 // DiscardUnaccepted terminates the opener's stream when its STREAM_OPEN Send failed
@@ -1341,11 +1418,11 @@ func (s *Stream) EmitOwedOpenTeardown() {
 // termination always arrives through terminate, which releases the lock before
 // the teardown work.
 func (s *Stream) terminateLocked(oc StreamOutcome, from ...int32) {
-	won, presend := s.casTerminal(oc.Code, 0, from...)
+	won, presend := s.casTerminal(oc, 0, from...)
 	if !won {
 		return
 	}
-	s.finishTerminal(oc, false, presend)
+	s.finishTerminal(false, presend)
 }
 
 // casTerminal performs stream-protocol.md §7.1's first-wins, never-retrying CAS
@@ -1360,10 +1437,18 @@ func (s *Stream) terminateLocked(oc StreamOutcome, from ...int32) {
 // (see finishTerminal). The flag is read here under stateMu, so it is coherent with
 // the CAS and with ConfirmOpenSent's clear. The close bits are a separate word and
 // never lose (§6.1).
-func (s *Stream) casTerminal(code StreamOutcomeCode, teardownCode uint32, from ...int32) (won, presend bool) {
-	target := terminalPhaseFor(code)
+//
+// The winner stores the WHOLE outcome — code and Err detail — here, still under
+// stateMu, and not later in its teardown. The phase word is what makes a stream
+// observably terminal, so recording the detail anywhere after the CAS would leave
+// a window in which the stream reports a terminal it cannot name, and every
+// caller reading the error (Err, RecvMsg, a send on a terminated stream) would
+// see none. Under the lock the two are one step for any reader that takes it.
+func (s *Stream) casTerminal(oc StreamOutcome, teardownCode uint32, from ...int32) (won, presend bool) {
+	target := terminalPhaseFor(oc.Code)
 	for _, src := range from {
 		if s.phase.CompareAndSwap(src, target) {
+			s.outcome = oc
 			// Record the discriminant before the winner claims the token; stable
 			// now the CAS has landed (§5.1 step 2).
 			s.teardownCode.Store(teardownCode)
@@ -1390,13 +1475,15 @@ func (s *Stream) casTerminal(code StreamOutcomeCode, teardownCode uint32, from .
 
 // finishTerminal runs the terminal-CAS winner's teardown work in §7.1's order —
 // stop the deadline timer, claim the lifecycle token (submitting the teardown
-// CANCEL itself or handing it off), hand off the data-lane STREAM_ERR, deliver
-// the outcome, remove the stream. It runs WITHOUT stateMu: only the phase CAS
+// CANCEL itself or handing it off), hand off the data-lane STREAM_ERR, signal
+// the finished teardown, remove the stream. The outcome itself was already
+// recorded by the CAS (casTerminal), so nothing here decides what a reader will
+// see — only when the teardown is done. It runs WITHOUT stateMu: only the phase CAS
 // needs to be atomic with Dispatch (§8.1 level 2), and the winner MUST NOT wait
 // on the data-lane frame (§7.1) nor hold stateMu across the synchronous lifecycle
 // Send. Cancelling ctx stops the deadline watcher and aborts any in-flight
 // data-lane Send.
-func (s *Stream) finishTerminal(oc StreamOutcome, locallyInitiated, presend bool) {
+func (s *Stream) finishTerminal(locallyInitiated, presend bool) {
 	defer s.tbl.finishers.Done() // paired with casTerminal's Add; joined by Close
 	s.cancelCtx()
 
@@ -1457,7 +1544,9 @@ func (s *Stream) finishTerminal(oc StreamOutcome, locallyInitiated, presend bool
 		s.tbl.closeObligation(s.callID)
 	}
 
-	s.outcome = oc
+	// The outcome itself was recorded with the terminal CAS (casTerminal); this
+	// close only publishes the winner's finished teardown, and gives readers past
+	// it a lock-free ordering onto that record.
 	if s.tbl.beforeFinisherDone != nil {
 		s.tbl.beforeFinisherDone()
 	}

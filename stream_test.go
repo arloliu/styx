@@ -1505,3 +1505,258 @@ func TestStream_NeverTakesTheFillPath_ForStreamingFrames(t *testing.T) {
 	require.Positive(t, clientTr.wireSends.Load(), "the stream did send frames")
 	require.Positive(t, pluginTr.wireSends.Load())
 }
+
+// terminalGateTransport blocks the teardown CANCEL Send until released, so a test
+// can hold a stream in the window between its terminal commit — the CAS that
+// records the outcome — and the winner finishing its teardown and closing done,
+// and read the public surface from inside it.
+type terminalGateTransport struct {
+	entered   chan struct{}
+	release   chan struct{}
+	enterOnce sync.Once
+	relOnce   sync.Once
+}
+
+func newTerminalGateTransport() *terminalGateTransport {
+	return &terminalGateTransport{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *terminalGateTransport) Send(_ context.Context, f transport.Frame) error {
+	if f.Kind == transport.FrameCancel {
+		g.enterOnce.Do(func() { close(g.entered) })
+		<-g.release
+	}
+
+	return nil
+}
+
+func (g *terminalGateTransport) Recv(ctx context.Context) (transport.Frame, error) {
+	<-ctx.Done()
+
+	return transport.Frame{}, ctx.Err()
+}
+
+func (g *terminalGateTransport) Close() error { return nil }
+
+func (g *terminalGateTransport) unblock() { g.relOnce.Do(func() { close(g.release) }) }
+
+// newTerminalWindowStream returns a published stream and the gate holding its
+// terminal winner mid-teardown, so a test can read the public surface from inside
+// the terminal-publication window.
+//
+// deadline picks which terminal the winner records. It is a bool rather than a
+// cause, because TerminateLocal reads its argument only to make that choice: a
+// CANCELED terminal records the engine's own local-cancel sentinel whatever error
+// was passed in, so a caller handing it a distinctive error would be asserting on
+// a value the stream never stores.
+func newTerminalWindowStream(t *testing.T, deadline bool) (*Stream, *terminalGateTransport) {
+	t.Helper()
+
+	gt := newTerminalGateTransport()
+	tbl := rpcruntime.NewStreamTable(4, gt)
+	t.Cleanup(func() { gt.unblock(); _ = tbl.Close() })
+
+	st, err := tbl.Open(1, rpcruntime.ClientStream, rpcruntime.StreamConfig{Credits: 4, Deadline: time.Minute})
+	require.NoError(t, err)
+	require.True(t, st.Publish())
+
+	trigger := context.Canceled
+	if deadline {
+		trigger = context.DeadlineExceeded
+	}
+	go func() { st.TerminateLocal(trigger) }()
+	select {
+	case <-gt.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the teardown CANCEL Send never entered, so the terminal window was never reached")
+	}
+	select {
+	case <-st.Done():
+		t.Fatal("the winner published its outcome before the window under test was entered")
+	default:
+	}
+
+	return newClientStream(st, codec.Proto{}), gt
+}
+
+// Test that Err reports a stream's terminal error from the terminal transition
+// onward, including while the winner is still running its teardown. A stream that
+// has already failed must never answer Err with nil: callers branch on that nil to
+// mean "still live or completed normally", so a nil answer inside the window reads
+// a failed stream as a healthy one.
+func TestStream_Err_ReportsTheTerminalError_WhileTheWinnerIsStillFinishing(t *testing.T) {
+	// Given a stream whose terminal winner is parked in its teardown CANCEL Send.
+	st, gt := newTerminalWindowStream(t, false)
+
+	// When Err is read from inside that window.
+	err := st.Err()
+
+	// Then it names the recorded terminal, not nil.
+	require.ErrorIs(t, err, ErrCanceled, "a stream whose terminal CAS has landed never reports a nil error")
+
+	gt.unblock()
+}
+
+// Test that a send on an already-terminated stream reports the terminal that was
+// recorded, not the stream context's cancellation. The terminal transition cancels
+// the stream's context whatever the outcome was, so a send that reads only that
+// context reports CANCELED for a stream whose recorded outcome is DEADLINE —
+// contradicting SendMsg's and CloseSend's own contract that a terminated stream
+// returns its terminal error, and disagreeing with what Err and RecvMsg report for
+// the very same stream.
+func TestStream_SendAfterTerminal_ReportsTheRecordedOutcome_NotTheCanceledContext(t *testing.T) {
+	// Given a stream terminated by an elapsed budget, with its own deadline still
+	// far away — so the stream context carries a cancellation, not an expiry.
+	tr := newRecordingSendTransport()
+	t.Cleanup(func() { _ = tr.Close() })
+	tbl := rpcruntime.NewStreamTable(4, tr)
+	t.Cleanup(func() { _ = tbl.Close() })
+
+	rst, err := tbl.Open(1, rpcruntime.ClientStream, rpcruntime.StreamConfig{Credits: 4, Deadline: time.Hour})
+	require.NoError(t, err)
+	require.True(t, rst.Publish())
+	st := newClientStream(rst, codec.Proto{})
+
+	rst.TerminateLocal(context.DeadlineExceeded)
+	<-rst.Done()
+	require.ErrorIs(t, st.Err(), ErrDeadlineExceeded, "the recorded terminal is DEADLINE")
+
+	// When a send and a close run afterwards under a context of their own.
+	ctx := context.Background()
+
+	// Then both name the recorded terminal, the same one Err reports.
+	require.ErrorIs(t, st.SendMsg(ctx, []byte("x")), ErrDeadlineExceeded,
+		"a send on a terminated stream reports its recorded outcome")
+	require.ErrorIs(t, st.CloseSend(ctx, nil), ErrDeadlineExceeded,
+		"a close on a terminated stream reports its recorded outcome")
+	require.ErrorIs(t, st.Err(), ErrDeadlineExceeded, "the recorded terminal changed under later operations")
+}
+
+// Test that a second CloseSend on a live stream reports the public
+// already-closed sentinel rather than the engine's internal one. CloseSend
+// promises an error already in the styx taxonomy, and the taxonomy has the
+// sentinel for exactly this: a caller branching on it cannot match a bare
+// internal error the translation never mapped.
+func TestStream_CloseSendTwice_ReportsTheAlreadyClosedSentinel(t *testing.T) {
+	// Given a live stream whose send direction is already half-closed.
+	tr := newRecordingSendTransport()
+	t.Cleanup(func() { _ = tr.Close() })
+	tbl := rpcruntime.NewStreamTable(4, tr)
+	t.Cleanup(func() { _ = tbl.Close() })
+
+	rst, err := tbl.Open(1, rpcruntime.ClientStream, rpcruntime.StreamConfig{Credits: 4, Deadline: time.Minute})
+	require.NoError(t, err)
+	require.True(t, rst.Publish())
+	st := newClientStream(rst, codec.Proto{})
+	require.NoError(t, st.CloseSend(t.Context(), nil))
+
+	// When the direction is closed a second time.
+	second := st.CloseSend(t.Context(), nil)
+
+	// Then the refusal is the public sentinel.
+	require.ErrorIs(t, second, ErrStreamAlreadyClosed, "a second close reports the public already-closed sentinel")
+}
+
+// closeGateTransport blocks every STREAM_CLOSE Send until released and signals
+// when one is entered, so a test can hold a half-close in flight — its
+// publication claim owned, nothing yet accepted — and drive a second caller into
+// the loser's branch.
+type closeGateTransport struct {
+	entered   chan struct{}
+	release   chan struct{}
+	enterOnce sync.Once
+	relOnce   sync.Once
+}
+
+func newCloseGateTransport() *closeGateTransport {
+	return &closeGateTransport{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *closeGateTransport) Send(_ context.Context, f transport.Frame) error {
+	if f.Kind == transport.FrameStreamClose {
+		g.enterOnce.Do(func() { close(g.entered) })
+		<-g.release
+	}
+
+	return nil
+}
+
+func (g *closeGateTransport) Recv(ctx context.Context) (transport.Frame, error) {
+	<-ctx.Done()
+
+	return transport.Frame{}, ctx.Err()
+}
+
+func (g *closeGateTransport) Close() error { return nil }
+
+func (g *closeGateTransport) unblock() { g.relOnce.Do(func() { close(g.release) }) }
+
+// Test that the loser of a concurrent half-close reports the public already-closed
+// sentinel rather than the engine's internal one. Publication has a single
+// in-progress owner and the loser is refused without sending; that refusal reaches
+// application code through the same translation every other stream error takes, so
+// it has to arrive as a sentinel a caller can branch on.
+//
+// This is a distinct return path from a second close of an already-closed
+// direction, and the two are not interchangeable: here the direction is not known
+// to be closed at all, because the owner may still fail before the transport
+// accepts anything. The gate is what makes the path deterministic — the second
+// call runs only once the transport has signalled that the first is parked inside
+// it, so the claim is provably owned and not merely likely to be.
+func TestStream_CloseSendConcurrentLoser_ReportsTheAlreadyClosedSentinel(t *testing.T) {
+	// Given a live stream whose half-close is parked in the transport, its
+	// publication claim owned and nothing yet accepted.
+	gt := newCloseGateTransport()
+	tbl := rpcruntime.NewStreamTable(4, gt)
+	t.Cleanup(func() { gt.unblock(); _ = tbl.Close() })
+
+	rst, err := tbl.Open(1, rpcruntime.ClientStream, rpcruntime.StreamConfig{Credits: 4, Deadline: time.Minute})
+	require.NoError(t, err)
+	require.True(t, rst.Publish())
+	st := newClientStream(rst, codec.Proto{})
+
+	owner := make(chan error, 1)
+	go func() { owner <- st.CloseSend(context.Background(), nil) }()
+	select {
+	case <-gt.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the owning CloseSend never reached the transport, so no claim was held")
+	}
+
+	// When a second caller closes the same direction while that claim is held.
+	loser := st.CloseSend(context.Background(), nil)
+
+	// Then it is refused with the public sentinel, not the engine's internal one.
+	require.ErrorIs(t, loser, ErrStreamAlreadyClosed,
+		"the loser of a concurrent half-close reports the public already-closed sentinel")
+
+	gt.unblock()
+	require.NoError(t, <-owner, "the owner's half-close still commits")
+}
+
+// Test that a send failing on a closed transport surfaces a styx sentinel while
+// keeping the transport cause reachable. A closed transport is outside the proven
+// never-published set, so the frame may or may not have reached the peer: that is
+// what ErrOutcomeUnknown names, and it is what SendMsg's contract owes instead of
+// the engine-internal closed-transport error, which matches no public sentinel at
+// all. The wrap is idempotent, since generated streaming code translates an
+// already-translated return a second time.
+func TestStreamError_ClosedTransport_ReportsAnUnknownOutcomeKeepingTheCause(t *testing.T) {
+	// Given the transport's closed error, bare and wrapped.
+	bare := transport.ErrClosed
+	wrapped := fmt.Errorf("stream send: %w", transport.ErrClosed)
+
+	// When each is translated.
+	gotBare := StreamError(bare)
+	gotWrapped := StreamError(wrapped)
+
+	// Then both name the unknown outcome and both keep the cause reachable.
+	require.ErrorIs(t, gotBare, ErrOutcomeUnknown)
+	require.ErrorIs(t, gotBare, transport.ErrClosed, "the transport cause stays reachable")
+	require.ErrorIs(t, gotWrapped, ErrOutcomeUnknown)
+	require.ErrorIs(t, gotWrapped, transport.ErrClosed)
+
+	// And translating an already-translated value again changes nothing.
+	require.Equal(t, gotBare, StreamError(gotBare), "the translation is idempotent")
+	require.Equal(t, gotWrapped, StreamError(gotWrapped), "the translation is idempotent")
+}

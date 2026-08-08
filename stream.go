@@ -150,6 +150,11 @@ func (s *Stream) Context() context.Context {
 // Err reports the stream's terminal error once it has terminated — translated to the
 // styx taxonomy — or nil while it is still live or completed normally. It gives seam
 // users the terminal outcome without exposing the engine's internal outcome type.
+//
+// A nil answer therefore means live-or-completed and nothing else: the terminal
+// error is recorded by the terminal transition itself, so it is readable from that
+// instant, without waiting on the teardown the transition's winner still has to run
+// and without any other operation on the stream having to publish it first.
 func (s *Stream) Err() error {
 	oc, ok := s.stream.Outcome()
 	if !ok || oc.Code == rpcruntime.OutcomeCompleted {
@@ -1397,8 +1402,12 @@ func acceptanceUnknown(tr transport.Transport, sendErr error) bool {
 // it surfaces a stream error to user code.
 //
 // It maps the engine's local terminal sentinels (a local cancel or an elapsed
-// budget), a send that provably never reached the peer because it exceeded the
-// transport's per-frame limit (ErrPayloadTooLarge), and the four framework
+// budget), a second half-close of an already-closed send direction
+// (ErrStreamAlreadyClosed), a send that provably never reached the peer because
+// it exceeded the transport's per-frame limit (ErrPayloadTooLarge), a send the
+// transport's closure ended after admission (ErrOutcomeUnknown — a closed
+// transport does not prove the frame unpublished, so the outcome is genuinely
+// unknown), and the four framework
 // stream status codes a peer STREAM_ERR may carry (stream-protocol.md §9.1):
 // CANCELED -> ErrCanceled, DEADLINE -> ErrDeadlineExceeded, INCOMPATIBLE ->
 // ErrIncompatible, BACKPRESSURE -> ErrBackpressure. A peer STREAM_ERR carrying
@@ -1406,9 +1415,11 @@ func acceptanceUnknown(tr transport.Transport, sendErr error) bool {
 // response does. A nil error stays nil, and io.EOF (normal remote/stream end)
 // is returned unchanged.
 //
-// The CANCELED arm preserves a wrapped cause when the local cancel carries
-// one (a visible chunked-train failure, stream-protocol.md §13.8 shape 4):
-// the returned error still satisfies errors.Is(_, ErrCanceled), but the
+// The CANCELED and closed-transport arms preserve a wrapped cause when the
+// error carries one (a visible chunked-train failure, stream-protocol.md §13.8
+// shapes 3 and 4):
+// the returned error still satisfies errors.Is(_, ErrCanceled) or
+// errors.Is(_, ErrOutcomeUnknown), but the
 // cause stays reachable through errors.Is/As on that same returned value,
 // rather than being discarded into the bare sentinel. Calling StreamError
 // again on its own previous return value is idempotent -- generated
@@ -1457,8 +1468,31 @@ func StreamError(err error) error {
 		return ErrDeadlineExceeded
 	case errors.Is(err, rpcruntime.ErrStreamTableClosed):
 		return ErrPluginUnavailable
+	case errors.Is(err, rpcruntime.ErrSendClosed):
+		// A half-close refused because the direction is already closed, or because
+		// another caller currently owns closing it. The engine's sentinel says
+		// exactly what the public one says and carries no detail distinguishing the
+		// two, so the public one is the whole answer and there is no cause to
+		// preserve; ErrStreamAlreadyClosed's own documentation is where the
+		// difference between them lives. Repeating the call on this return is
+		// idempotent: the public sentinel matches no arm and passes through.
+		return ErrStreamAlreadyClosed
 	case errors.Is(err, transport.ErrPayloadTooLarge):
 		return ErrPayloadTooLarge
+	case errors.Is(err, transport.ErrClosed):
+		// The transport went away under an operation that had already been
+		// admitted. A closed transport is outside the proven never-published set
+		// (transport.NeverPublished), so the frame may or may not have reached the
+		// peer — which is what ErrOutcomeUnknown names, and why this is not the
+		// retryable unavailable sentinel. The transport cause is kept reachable
+		// through the returned value, and the ErrOutcomeUnknown guard makes a
+		// repeated translation return the identical value rather than a second
+		// wrap (generated streaming code translates an already-translated return).
+		if errors.Is(err, ErrOutcomeUnknown) {
+			return err
+		}
+
+		return fmt.Errorf("%w: %w", ErrOutcomeUnknown, err)
 	case errors.Is(err, context.Canceled):
 		// A raw caller-context cancellation a byte op surfaced (RecvMsg/SendMsg/
 		// CloseSend return ctx.Err() directly on a pre-admission or credit-blocked

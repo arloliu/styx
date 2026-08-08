@@ -619,11 +619,12 @@ func TestChunkFragment_ConvergeOnARestart_WhenThePeerIsKilledAfterAMiddleFragmen
 	// terminal: fragments were already published under a connection that then
 	// failed, so the message's outcome is one nobody can know.
 	//
-	// The abandoned send is only required to fail, not to name that outcome: after
-	// a connection failure the send path surfaces the transport's own
-	// "transport: closed" instead of translating it, the recorded defect
-	// requireOneTerminal's own doc names. Err and RecvMsg do report the class.
-	require.Error(t, awaitTrainOutcome(t, done), "a send whose peer died must not report success")
+	// The abandoned send names that outcome itself, whichever way the connection's
+	// failure reached it: a closed transport does not prove the published
+	// fragments unpublished, and a send that instead observed the teardown's
+	// context cancellation answers with the terminal the teardown recorded.
+	require.ErrorIs(t, awaitTrainOutcome(t, done), styx.ErrOutcomeUnknown,
+		"a send whose peer died reports the outcome nobody can know")
 	require.NoError(t, killErr, "the row never managed to kill the peer it selected")
 	require.True(t, killed.Load(), "the train never reached the fragment the row selected")
 	requireOneTerminal(t, context.Background(), stream, styx.ErrOutcomeUnknown)

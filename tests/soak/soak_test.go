@@ -207,10 +207,14 @@ func isCanceled(err error) bool {
 // spawn on either path reuses a region — a crash restart and a reload successor
 // each attach a freshly created one, so no writer ever outlives its region's
 // generation. ErrStreamAlreadyClosed is not accepted
-// on either transport: a completion the peer produced is handed back as a live,
-// drainable stream rather than an error, so the sentinel names only a completed
-// outcome recorded where the STREAM_OPEN never reached the peer — a
-// stream-lifecycle defect this workload must never mask.
+// on either transport, and neither of the two situations that produce it can
+// arise here legitimately. A completion the peer produced is handed back as a
+// live, drainable stream rather than an error, so the open-side meaning is a
+// completed outcome recorded where the STREAM_OPEN never reached the peer. The
+// close-side meaning — a second CloseSend on a direction already half-closed —
+// is a caller bug, and this workload issues no CloseSend at all: its only
+// streaming call is server-streaming Feed, whose opener is half-closed at
+// establishment. Either way it is a defect this workload must never mask.
 //
 // The control-plane and routing sentinels (ErrServiceNotFound, ErrMethodNotFound,
 // ErrIncompatible) are excluded: the workload only ever calls a valid method on a
