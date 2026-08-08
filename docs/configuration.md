@@ -2,8 +2,9 @@
 
 This guide covers the knobs on `PluginSpec` (one entry per plugin a `Host`
 spawns and supervises) and `PluginServerConfig` (the plugin-side counterpart),
-with a deeper look at the two settings that most often need a deliberate
-choice: `Transport` and `Geometry`.
+with a deeper look at the settings that most often need a deliberate choice:
+`Transport`, `MaxPayload`, and — for the deployments `MaxPayload`'s stock
+derivation doesn't fit — `Geometry` by hand.
 
 ## PluginSpec at a glance
 
@@ -30,10 +31,11 @@ to a reasonable value:
 | `Services`          | `nil` (no requirement) | The version range this host requires from each service it intends to call. Normally set from a generated `<Service>Requirement()` value, not written by hand. |
 | `RequireStreaming`  | `false`        | Set when the host's generated client calls a streaming method, so a plugin that cannot stream fails at startup instead of at the first streaming call. |
 | `Transport`         | `TransportAuto` | Which data-plane transport to negotiate. See [Choosing a transport](#choosing-a-transport). |
-| `Geometry`          | zero value (selects `GeometryDefault()`) | The shape of the shared-memory region, when the shared-memory transport is used. See [Shared-memory geometry](#shared-memory-geometry). |
+| `MaxPayload`        | `0` (off; use `Geometry`/`BurstMaxPayload` by hand) | The single field to set for a plugin that needs to carry payloads larger than the stock ladder's default ceiling — derives `Geometry`, `BurstMaxPayload`, and the stream-chunking ceiling together. See [Setting MaxPayload](#setting-maxpayload). |
+| `Geometry`          | zero value (selects `GeometryDefault()`) | The shape of the shared-memory region, when the shared-memory transport is used. See [Shared-memory geometry](#shared-memory-geometry) (the expert path — most plugins should reach for `MaxPayload` first). |
 | `MaxDataInflight`   | `0` (derived from `Geometry`) | The peak number of concurrent data calls this host admits. |
 | `StrictCapacity`    | `false`        | Opts into an extra, up-front capacity check described in [Shared-memory geometry](#shared-memory-geometry). |
-| `BurstMaxPayload`   | `0` (burst path off) | The ceiling, in bytes, on a payload routed over the burst socket instead of the shared-memory region. See [The burst path for oversize payloads](#the-burst-path-for-oversize-payloads). |
+| `BurstMaxPayload`   | `0` (burst path off) | The ceiling, in bytes, on a payload routed over the burst socket instead of the shared-memory region. See [The burst path for oversize payloads](#the-burst-path-for-oversize-payloads) (the expert path — most plugins should reach for `MaxPayload` first). |
 | `HeartbeatTimeout`  | `0` (one second) | How long the host waits for the plugin's next heartbeat before counting a miss. See [Tuning liveness detection](#tuning-liveness-detection). |
 | `MissedHeartbeatThreshold` | `0` (three) | How many consecutive missed heartbeats declare the instance unhealthy. |
 | `WedgeWindow`       | `0` (five seconds) | How long a stalled data plane must keep stalling before the instance is declared unhealthy for it. |
@@ -96,7 +98,121 @@ srv := styx.NewPluginServer(styx.PluginServerConfig{
 })
 ```
 
+## Setting MaxPayload
+
+For a plugin whose calls or streamed messages can be larger than a few
+hundred kilobytes, the one field to set is `MaxPayload`:
+
+```go
+styx.PluginSpec{
+    Name:       "reporter",
+    Path:       "/opt/plugins/reporter",
+    MaxPayload: 4 << 20, // this plugin's calls and streamed messages can be up to 4 MiB
+}
+```
+
+`MaxPayload` is a capacity **guarantee**, not an enforced cap: it states that
+styx will carry any marshaled frame handed to it up to this many bytes, for a
+unary request or response body and for a whole streamed message, whatever
+transport or chunking gets it there. It is not itself a new rejection bound —
+a value at or below what the transport already carries adds no enforcement —
+and it is not a wire framing limit either: add your own envelope before
+choosing a value.
+
+Setting it derives everything the sections below describe by hand: the stock
+shared-memory geometry (`GeometryDefault()`, both directions), the burst-path
+ceiling, and the stream-chunking ceiling. `MaxPayload` is mutually exclusive
+with a non-zero `Geometry` or `BurstMaxPayload` on the same `PluginSpec` —
+`Start` refuses the combination with a `*ConfigError` naming `MaxPayload`,
+before spawning the plugin, since a hand-authored geometry and a derived one
+cannot both govern the same spec.
+
+A value at or below the stock ladder's certain-fit bound (the top size
+class, minus the worst-case checksum trailer) derives the stock geometry
+alone, with the burst path and stream chunking both left off — the guarantee
+is already met by the region itself, so nothing new switches on, and
+`MaxPayload` never shrinks the geometry it derives. A larger value derives
+the stock geometry plus a burst ceiling and a chunking ceiling, both at least
+`MaxPayload`, so an oversize unary call takes the burst path and an oversize
+streamed message is split into ladder-sized fragments and reassembled on the
+receiving side — invisibly to the caller, who just sees one big message
+arrive whole.
+
+Two surfaces stay outside the guarantee. The single server-streaming request
+that opens a stream and the single client-streaming response that closes one
+are never chunked; each stays bounded by its sending direction's stock
+inline limit (about 1 MiB), and an oversize one fails with
+`ErrPayloadTooLarge` regardless of `MaxPayload`. Every ordinary message a
+streaming method exchanges after the open is covered.
+
+Zero (the default) leaves `MaxPayload` out of it entirely — today's expert
+path, unchanged. A memory-constrained deployment that needs a custom ladder
+keeps using `Geometry` (`GeometryLean()` or a hand-built table) and, if it
+also needs an oversize-payload path, sets `BurstMaxPayload` directly; see
+[Shared-memory geometry](#shared-memory-geometry) and
+[The burst path for oversize payloads](#the-burst-path-for-oversize-payloads)
+below.
+
+### The transport interlock
+
+The guarantee is only as good as the transport that ends up carrying it, so
+`Start` checks it twice. Before spawning the plugin, a `Transport` pinned to
+`TransportUDS` with `MaxPayload` above the uds transport's fixed frame cap
+(about 1 MiB, and unaffected by this field — uds gets no burst path or
+chunking) is refused with a `*ConfigError` naming `PluginSpec.MaxPayload`.
+
+After a shared-memory attach negotiates — once the checksum choice is known,
+and with it the connection's exact per-direction inline limits — the same
+requirement is checked again against those exact limits, and again against
+uds if negotiation fell back there (`TransportAuto` can do that). A plugin
+that left burst or chunking unresolved, or an auto-negotiated uds
+connection, that cannot actually meet the stated `MaxPayload` fails the
+attach with a typed `*IncompatibleError` naming `MaxPayload` and the missing
+capability. The error names the two remedies directly: upgrade the plugin,
+or lower `MaxPayload`.
+
+### Sizing for chunked streaming traffic
+
+One stream's transient shared-memory **slab footprint** under chunking, per
+direction, is bounded by that stream's own granted credit times the chunk
+ceiling — `N × MaxPayload` bytes in the worst case, computed in wide
+arithmetic since `MaxPayload` can be the full `uint32` range. `N` is the
+credit negotiated for that stream at open, not `MaxDataInflight`:
+`MaxDataInflight` bounds how many data calls the connection admits at once,
+while `N` is a per-stream, per-direction window that defaults to 16
+(`docs/specs/stream-protocol.md` §13). As with the region's own size classes,
+`styx.arena.setaside.count` is the signal to watch in production: a
+deployment sizing for sustained oversize stream traffic that sees this
+counter climbing on the top size class is running short of arena headroom
+for the ceiling it configured.
+
+That bound covers the arena slabs only. The sending side also holds its own
+copy of the whole outgoing message — allocated once, outside the arena,
+before the message is split into fragments — so a stream's actual transient
+memory use is the slab footprint above plus that one non-slab, full-message
+copy per message in flight on the send side.
+
+That per-stream slab bound is not the same as a whole-connection worst case.
+If a deployment wants a conservative aggregate figure — every concurrently
+admitted data call turning out to be a chunked stream at its full credit,
+all at once — that upper bound on slab footprint is `MaxDataInflight × N ×
+MaxPayload` bytes. It is a deliberately pessimistic ceiling, not a typical
+figure, and, like the per-stream bound, does not include the sending side's
+non-slab message copies.
+
+If `StrictCapacity` is also set, remember the derived stock profile's top
+size class has 8 slabs: `MaxDataInflight` must not exceed 8, or `Start`
+fails with the existing typed STRICT error naming that class. A strict
+derived profile needs `MaxDataInflight` sized to the smallest reachable
+class, exactly as for a hand-built geometry (see
+[Shared-memory geometry](#shared-memory-geometry)).
+
 ## Shared-memory geometry
+
+This section, and [the burst path](#the-burst-path-for-oversize-payloads)
+below it, are the expert path: hand-authoring a shape directly, for a
+deployment [`MaxPayload`](#setting-maxpayload)'s stock derivation doesn't
+fit. Most plugins should start with `MaxPayload` above instead.
 
 When the shared-memory transport is negotiated, the host also decides the
 *shape* of the shared-memory region: how many in-flight calls it can hold at
@@ -314,6 +430,15 @@ Both figures are the whole *region*, not just the arena — the ring pair and
 the two fixed pages add a small, constant amount on top of whatever the
 size-class tables cost.
 
+This also covers the derived path: setting [`MaxPayload`](#setting-maxpayload)
+above the certain-fit bound still derives the stock `GeometryDefault()`
+profile underneath, so the region cost above applies unchanged —
+`RegionBytes()` reports it exactly as it does for a hand-set
+`GeometryDefault()`. The burst ceiling and the stream-chunking ceiling that
+`MaxPayload` may also derive add no region bytes beyond that: the burst
+socket is a plain Unix domain socket with transient, per-transfer memory,
+and chunking reuses the same arena the geometry already provisions.
+
 **Multiple plugins.** A `Host` running four plugins all left at
 `GeometryDefault()` holds four independent regions at steady state — roughly
 251.75 MiB (4 × 62.9375 MiB) — before any of them has served a single call,
@@ -413,6 +538,10 @@ start reopening it.
 
 ## The burst path for oversize payloads
 
+This is the expert-path way to give a plugin an oversize-payload route by
+hand; most plugins should reach for [`MaxPayload`](#setting-maxpayload)
+instead, which derives this ceiling (and a stream-chunking ceiling) for you.
+
 `Geometry`'s size-class tables cap what a shared-memory call can carry: a
 unary payload larger than the largest configured slab in its direction is
 rejected outright rather than served from an oversized class. `BurstMaxPayload`
@@ -452,8 +581,12 @@ overhead, goes through the region as before; a larger one, up to
 `BurstMaxPayload`, goes over the burst socket; a payload above
 `BurstMaxPayload` is refused up front with `ErrPayloadTooLarge`, before
 anything is published. The burst socket carries only oversize unary request
-and response payloads — every stream frame, and every unary payload within
-the region's own ceiling, stays on shared memory unchanged.
+and response payloads. Stream messages never route over it: on this
+hand-set path a stream message that fits the sending direction's inline
+shared-memory limit goes through the region as before, and a larger one
+fails with `ErrPayloadTooLarge`, exactly as in earlier releases — reaching a
+higher ceiling for stream messages needs the stream-chunking feature, which
+only the derived [`MaxPayload`](#setting-maxpayload) path enables.
 
 ### Receive-budget defaults on the burst socket
 

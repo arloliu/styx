@@ -686,9 +686,11 @@ genuine head-of-line stall this one send mode accepts. The trade is deliberate: 
 what lets a fill-send caller always learn the frame's true fate, published or provably
 not, where an abandoning wire-buffer sender can only ever be told `ErrOutcomeUnknown`.
 Fairness in v1 is FIFO admission with per-stream
-credits; per-service quotas are an explicit extension point. Large messages: payloads
-above a negotiated threshold are rejected with a typed error in v1 (chunking/bulk
-transfer is roadmap).
+credits; per-service quotas are an explicit extension point. Large messages: a
+unary payload above a negotiated threshold is rejected with a typed error; an
+oversize stream message is instead split into fragments and reassembled on
+shared memory when the stream-chunking feature is negotiated
+(stream-protocol.md §13), and rejected with the same typed error otherwise.
 Slow-consumer handling is therefore deterministic and local — no unbounded queues, no
 OOM-by-queue.
 

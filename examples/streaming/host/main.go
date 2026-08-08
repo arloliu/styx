@@ -4,6 +4,10 @@
 // streaming a hard requirement for handshake success; a plugin lacking streaming
 // support fails Start rather than only failing at the first OpenStream.
 //
+// It also sends one stream message larger than the shared-memory region's own
+// inline limit, to show that MaxPayload is all a caller needs: styx splits and
+// reassembles the oversize message transparently, with no other code change.
+//
 // Usage: streaming-host <path-to-echo-plugin-binary>
 //
 // Expected output:
@@ -11,6 +15,7 @@
 //	server-streaming: tick-0 tick-1 tick-2
 //	client-streaming: collected:abc
 //	bidi: chat:x chat:y
+//	oversize: 2097152 bytes echoed intact
 package main
 
 import (
@@ -46,6 +51,10 @@ func run() error {
 			Path:             os.Args[1],
 			RequireStreaming: true,
 			Services:         []styx.ServiceRequirement{echopb.EchoStreamRequirement()},
+			// MaxPayload derives the stock geometry plus a burst ceiling and a
+			// stream-chunking ceiling, both at least 4 MiB — enough for the
+			// 2 MiB oversize message oversizeStream sends below.
+			MaxPayload: 4 << 20,
 		}},
 	})
 
@@ -84,6 +93,12 @@ func run() error {
 		return err
 	}
 	fmt.Println("bidi:", bidi)
+
+	oversize, err := oversizeStream(ctx, client)
+	if err != nil {
+		return err
+	}
+	fmt.Println("oversize:", oversize, "bytes echoed intact")
 
 	return nil
 }
@@ -171,4 +186,42 @@ func bidiStreaming(ctx context.Context, client echopb.EchoStreamClient) (string,
 	}
 
 	return strings.Join(got, " "), nil
+}
+
+// oversizeStream sends one Chat message well past the shared-memory region's
+// own inline limit and confirms it comes back byte-for-byte. PluginSpec.
+// MaxPayload (set in run, above) is what makes this succeed: past the
+// region's stock ceiling, styx transparently splits the message into
+// ladder-sized fragments and reassembles it on the other side, so this
+// caller does nothing differently than the small messages above.
+func oversizeStream(ctx context.Context, client echopb.EchoStreamClient) (int, error) {
+	stream, err := client.Chat(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("chat: %w", err)
+	}
+
+	const big = 2 << 20 // 2 MiB: well past the region's ~1 MiB inline limit.
+	payload := strings.Repeat("z", big)
+
+	if err := stream.Send(&echopb.SayRequest{Message: payload}); err != nil {
+		return 0, fmt.Errorf("chat send: %w", err)
+	}
+	if err := stream.CloseSend(); err != nil {
+		return 0, fmt.Errorf("chat close: %w", err)
+	}
+
+	resp, err := stream.Recv()
+	if err != nil {
+		return 0, fmt.Errorf("chat recv: %w", err)
+	}
+	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+		return 0, fmt.Errorf("chat: expected EOF after one response, got %v", err)
+	}
+
+	want := "chat:" + payload
+	if resp.GetMessage() != want {
+		return 0, fmt.Errorf("chat: got %d bytes back, want %d", len(resp.GetMessage()), len(want))
+	}
+
+	return len(payload), nil
 }

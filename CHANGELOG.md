@@ -5,6 +5,70 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Adds `MaxPayload`: one field that gives a plugin a large-payload story for
+both unary calls and streamed messages, derived rather than hand-computed.
+
+### Added
+
+- **Stream-chunking for oversize `STREAM_MSG` messages.** A streamed message
+  larger than the sending direction's shared-memory inline limit used to be
+  a hard rejection, with no oversize route the way unary calls got from the
+  burst path. On a connection where the negotiated `stream-chunking`
+  feature is active, such a message is now split into ladder-sized
+  fragments that ride the same shared-memory ring in order and are
+  reassembled on the receiving side into one logical message, delivered
+  whole and exactly once. Chunking is shm-only and stream-local: it never
+  routes over the burst socket, and the single server-streaming request on
+  `STREAM_OPEN` and the single client-streaming response on `STREAM_CLOSE`
+  are not chunked — each stays bounded by its direction's inline limit and
+  fails with `ErrPayloadTooLarge` when exceeded, feature or no feature.
+
+- **`PluginSpec.MaxPayload`.** One field states a capacity guarantee — styx
+  will carry a call or a streamed message up to this many bytes — and
+  derives the stock shared-memory geometry, the burst-path ceiling, and the
+  new stream-chunking ceiling from it, so nobody hand-computes a burst
+  ceiling or a per-direction slab ladder anymore. A value at or below the
+  stock ladder's certain-fit bound derives the stock geometry alone, with
+  burst and chunking left off; a larger value derives all three together.
+  It is mutually exclusive with a non-zero `Geometry` or `BurstMaxPayload`
+  on the same spec: hand-set geometry and burst ceilings keep their exact
+  v0.4.0 semantics, unchanged — this field is not a second way to reach the
+  same knobs.
+
+  The guarantee is checked against the transport that actually has to carry
+  it, twice. Before spawning the plugin, `Transport` pinned to
+  `TransportUDS` with `MaxPayload` above the uds transport's fixed frame
+  cap is refused with a `*ConfigError`. After a shared-memory attach
+  negotiates — once the checksum choice, and with it the connection's exact
+  per-direction inline limits, is known — the same requirement is checked
+  again against those exact limits: an old plugin that offers shared memory
+  but leaves burst or chunking unresolved is accepted as long as
+  `MaxPayload` fits what the connection can actually carry, and refused
+  with a typed `*IncompatibleError` naming `MaxPayload` and the missing
+  capability only once it genuinely does not. The error states both
+  remedies directly: upgrade the plugin, or lower `MaxPayload`.
+
+### Performance
+
+- Measured on one machine (`bench/stream`, `-benchtime=1000x`, plus repeated
+  `-count=3` runs at `-benchtime=200x` and `500x`; advisory numbers, not a
+  gate). Below the per-direction inline limit, a send on a connection with
+  `MaxPayload` set (which derives burst and chunking together) shows no
+  latency regression against the same size on a connection with `MaxPayload`
+  unset: 4KiB 4.76µs vs. 4.10µs, 64KiB 37.1µs vs. 36.2µs, 1MiB− 494µs vs.
+  493µs. Across the repeated runs, the paired differences were smaller than
+  the run-to-run variance measured on the same cell, which is the basis for
+  calling them noise rather than a regression. Above the inline limit, where
+  a send can only go through chunking:
+  2MiB costs 987µs and about 2.10MB/op across 34 allocations; 8MiB costs
+  3.97ms and about 8.40MB/op across 88 allocations. Both oversize figures
+  are the total cost of the derived configuration end to end —
+  fragmentation, the repeated underlying sends, credit and arena
+  bookkeeping, and the one train-owned copy together — not the cost of any
+  single one of those isolated.
+
 ## [0.4.0] - 2026-08-07
 
 Adds the burst path: oversize unary payloads stop being a hard limit.

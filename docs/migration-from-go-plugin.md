@@ -168,8 +168,10 @@ A `Host` supervises one or more plugins declared up front as `PluginSpec`s;
 generated client wraps, and `Stop` tears them all down. `PluginSpec` carries the
 per-plugin knobs: `Restart` (a `RestartPolicy` of `Max` attempts and a `Backoff`
 function), `Services` (declared acceptable version ranges), `RequireStreaming`,
-`Transport`, and the shared-memory geometry knobs (`Geometry`, `MaxDataInflight`,
-`StrictCapacity`). Lifecycle events are observed by ranging over `host.Events()`,
+`Transport`, `MaxPayload` (the single field to raise the payload ceiling for
+large calls or streamed messages), and the expert-path shared-memory geometry
+knobs (`Geometry`, `MaxDataInflight`, `StrictCapacity`). Lifecycle events are
+observed by ranging over `host.Events()`,
 a subscription rather than a callback invoked under a lock — see
 [docs/supervisor-events.md](supervisor-events.md) for what each event means and
 how to consume the channel.
@@ -230,9 +232,24 @@ a fresh attempt is safe:
   turn it into anything it could dispatch, so it answered with a refusal instead
   of leaving the call unanswered (retryable: no handler ran, so a fresh attempt
   repeats no side effect).
-- `ErrPayloadTooLarge` — the payload exceeded the transport's per-frame limit.
-  The rejection happens before anything is published, so the outcome is known
-  (not retryable: an identical retry at the same size fails identically).
+- `ErrPayloadTooLarge` — the payload exceeded the transport's limit. For a
+  unary request or response body, or an ordinary `STREAM_MSG` a streaming
+  call exchanges after it opens, that limit is what `PluginSpec.MaxPayload`
+  governs — for `STREAM_MSG` it bounds the reassembled logical message, not
+  any one wire frame, since an oversize message travels as a train of
+  fragments chunking reassembles on the receiving side. The rejection
+  happens before anything is published, so the outcome is known (not
+  retryable: an identical retry at the same size fails identically). Raise
+  the limit with `PluginSpec.MaxPayload` rather than hand-computing a burst
+  ceiling or a custom geometry (see
+  [docs/configuration.md](configuration.md#setting-maxpayload)); the expert
+  path (`Geometry`, `BurstMaxPayload`) is still there for a deployment that
+  needs a custom ladder. Two surfaces stay outside `MaxPayload`'s reach: the
+  single server-streaming request that opens a stream (`STREAM_OPEN`) and
+  the single client-streaming response that closes one (`STREAM_CLOSE`) are
+  never chunked and stay bounded by the sending direction's stock inline
+  limit regardless of `MaxPayload` — raising `MaxPayload` will not admit an
+  oversize open or close payload.
 - A `*Status` — an application-level error your handler returned, with a code and
   message, round-tripped as a typed value.
 - `*PluginPanicError` — a handler panicked. A unary caller receives it directly;
