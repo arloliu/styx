@@ -179,9 +179,12 @@ plugin — and what it means when a reload fails — see [docs/plugin-lifecycle.
 The Quickstart above leaves every `PluginSpec` and `PluginServerConfig` field at
 its default. Real deployments usually set at least one of: `Transport` (which
 data-plane transport to negotiate — shared memory, Unix domain sockets, or let
-the host pick), `Geometry` (the shape and capacity of the shared-memory
-region), `Restart` (the crash-restart policy), or `Services` (the version
-range a host requires from a plugin).
+the host pick), `MaxPayload` (the single-field way to size a plugin for
+payloads and streamed messages larger than the stock default, deriving the
+shared-memory geometry and the burst/chunking ceilings underneath it),
+`Geometry` (hand-authoring that shape directly, for a deployment
+`MaxPayload`'s stock derivation doesn't fit), `Restart` (the crash-restart
+policy), or `Services` (the version range a host requires from a plugin).
 
 See [docs/configuration.md](docs/configuration.md) for the full field-by-field
 guide, including a plain-language walkthrough of shared-memory geometry (ring

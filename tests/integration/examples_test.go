@@ -9,12 +9,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Test that examples/streaming's host drives all three streaming shapes against
-// examples/echo's plugin end to end over the real cross-process attach path,
-// proving the streaming example — not just the framework under it — works.
-func TestExample_Streaming_DrivesAllThreeShapes(t *testing.T) {
+// Test that examples/streaming's host drives all three streaming shapes and an
+// oversize message against examples/echo's plugin end to end over the real
+// cross-process attach path, proving the streaming example — not just the
+// framework under it — works. The oversize line is the one that only appears
+// when a message past the inline limit chunks and reassembles intact.
+func TestExample_Streaming_DrivesAllThreeShapesAndAnOversizeMessage(t *testing.T) {
 	// Given the streaming host and the echo plugin built by TestMain.
-	// When the host runs the plugin through server-, client-, and bidi streaming.
+	// When the host runs the plugin through server-, client-, and bidi
+	// streaming, then sends one message past the shared-memory inline limit.
 	stdout, err := exec.Command(streamingHostBin, echoPluginBin).Output()
 
 	// Then it completes and prints each shape's exact result.
@@ -22,7 +25,8 @@ func TestExample_Streaming_DrivesAllThreeShapes(t *testing.T) {
 	require.Equal(t,
 		"server-streaming: tick-0 tick-1 tick-2\n"+
 			"client-streaming: collected:abc\n"+
-			"bidi: chat:x chat:y\n",
+			"bidi: chat:x chat:y\n"+
+			"oversize: 2097152 bytes echoed intact\n",
 		string(stdout))
 }
 
