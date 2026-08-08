@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-08-08
 
 Adds `MaxPayload`: one field that gives a plugin a large-payload story for
 both unary calls and streamed messages, derived rather than hand-computed.
@@ -50,20 +50,60 @@ both unary calls and streamed messages, derived rather than hand-computed.
   capability only once it genuinely does not. The error states both
   remedies directly: upgrade the plugin, or lower `MaxPayload`.
 
+### Changed
+
+- **The stream spec's provisioning text now matches the implementation**
+  (`docs/specs/stream-protocol.md` §4.2). The section's sizing rules are
+  documented as provisioning guidance enforced through typed backpressure at
+  admission time, not as startup refusals; its per-side maxima are stated to
+  be compiled-in constants rather than operator knobs; and the one structural
+  check that does refuse an attach — a non-positive lifecycle queue depth —
+  is documented with its real ordering: validated after the region is mapped,
+  before anything is constructed on top of it. No wire behavior changed.
+
+### Fixed
+
+- **A stream's terminal outcome is fully visible the moment its terminal
+  phase is.** The engine used to publish the terminal phase first and store
+  the outcome detail a few instructions later, so a caller observing the
+  phase at exactly the wrong moment could read an incomplete outcome. The
+  winning terminal transition now records the whole outcome inside the same
+  critical section that publishes the phase, closing the window.
+
+- **Sends that lose a race with a failing terminal report the winner, not a
+  symptom.** `SendMsg` or `CloseSend` on a stream that already terminated
+  with an error — or during whose send such a terminal won — used to surface
+  a generic cancellation. Both now return the recorded terminal outcome (the
+  peer status, the deadline, the crash cause), so the error a caller gets
+  from a send agrees with what `Err` and `RecvMsg` report for the same
+  stream. Normal completion records no terminal error, so a send after it
+  keeps reporting the closed-direction refusal it always did.
+
+- **Transport-shutdown errors during stream sends map to the documented
+  sentinels.** A send that hit a closed transport used to leak an internal
+  error. It now maps to `ErrOutcomeUnknown` — the bytes may or may not have
+  reached the peer, the same meaning that sentinel carries everywhere else —
+  and a send on a direction the caller already half-closed maps to
+  `ErrStreamAlreadyClosed`. The `ErrStreamAlreadyClosed` documentation now
+  walks every path that returns it: the open-side guard, an already-closed
+  direction (including normal completion), and a concurrent `CloseSend`
+  loser, each with what a caller may conclude from it.
+
 ### Performance
 
-- Measured on one machine (`bench/stream`, `-benchtime=1000x`, plus repeated
-  `-count=3` runs at `-benchtime=200x` and `500x`; advisory numbers, not a
-  gate). Below the per-direction inline limit, a send on a connection with
-  `MaxPayload` set (which derives burst and chunking together) shows no
-  latency regression against the same size on a connection with `MaxPayload`
-  unset: 4KiB 4.76µs vs. 4.10µs, 64KiB 37.1µs vs. 36.2µs, 1MiB− 494µs vs.
-  493µs. Across the repeated runs, the paired differences were smaller than
-  the run-to-run variance measured on the same cell, which is the basis for
-  calling them noise rather than a regression. Above the inline limit, where
-  a send can only go through chunking:
-  2MiB costs 987µs and about 2.10MB/op across 34 allocations; 8MiB costs
-  3.97ms and about 8.40MB/op across 88 allocations. Both oversize figures
+- Measured on one machine at the release commit (`bench/stream`,
+  `-benchtime=1000x`, plus repeated `-count=3` runs at `-benchtime=500x`;
+  advisory numbers, not a gate). Below the per-direction inline limit, a
+  send on a connection with `MaxPayload` set (which derives burst and
+  chunking together) shows no latency regression against the same size on a
+  connection with `MaxPayload` unset: 4KiB 4.70µs vs. 4.32µs, 64KiB 38.3µs
+  vs. 36.2µs, 1MiB− 490µs vs. 490µs. Across the repeated runs, the paired
+  differences were smaller than the run-to-run variance measured on the
+  same cell, which is the basis for calling them noise rather than a
+  regression. Above the inline limit, where a send can only go through
+  chunking:
+  2MiB costs 991µs and about 2.10MB/op across 34 allocations; 8MiB costs
+  4.14ms and about 8.40MB/op across 88 allocations. Both oversize figures
   are the total cost of the derived configuration end to end —
   fragmentation, the repeated underlying sends, credit and arena
   bookkeeping, and the one train-owned copy together — not the cost of any
@@ -389,6 +429,7 @@ Initial release.
 - **Migration guide** from `hashicorp/go-plugin`
   (`docs/migration-from-go-plugin.md`).
 
+[0.5.0]: https://github.com/arloliu/styx/releases/tag/v0.5.0
 [0.4.0]: https://github.com/arloliu/styx/releases/tag/v0.4.0
 [0.3.1]: https://github.com/arloliu/styx/releases/tag/v0.3.1
 [0.3.0]: https://github.com/arloliu/styx/releases/tag/v0.3.0
