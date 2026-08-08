@@ -1007,6 +1007,55 @@ func TestStreamChunk_RefuseTheOversizeMessage_OverARealShmPair(t *testing.T) {
 	}
 }
 
+// Test that a STREAM_CLOSE payload is never chunked, even on a connection
+// whose chunking is active in both directions: a close payload past the
+// direction's inline limit is refused definitively, no STREAM_CHUNK is
+// emitted for it, and the refusal is pre-acceptance so the same caller can
+// still close the direction with a conforming payload (stream-protocol.md
+// §13.2 scopes chunking to STREAM_MSG alone; §4.5's rollback rule).
+//
+// Each direction first proves the same length rides the message path on the
+// same stream, so the close-side rejection can only come from the lifecycle
+// exception — not from the connection being unable to carry the length.
+func TestStreamChunk_ClosePayloadIsNeverChunked_OverARealShmPair(t *testing.T) {
+	// Given: an active-chunking connection observed from both ends.
+	h := setupShmChunkTestHelper(t, false)
+	client, server := h.openPair(t, 13)
+
+	for _, d := range h.directions(client, server) {
+		t.Run(d.name, func(t *testing.T) {
+			oversize := d.inline + 1
+
+			// And: the message path provably carries this length in this direction.
+			h.requireExactDelivery(t, d, oversize)
+
+			before := d.chunks.Load()
+
+			// When: the same length is offered as the STREAM_CLOSE payload.
+			err := d.send.CloseSend(t.Context(), shmChunkPayload(oversize))
+
+			// Then: it is refused with the definitive size error.
+			require.ErrorIs(t, err, transport.ErrPayloadTooLarge)
+
+			// And: the refusal was pre-acceptance — the direction is still open and
+			// closes normally with a payload the inline limit admits.
+			require.NoError(t, d.send.CloseSend(t.Context(), shmChunkPayload(d.inline)))
+
+			// And: no fragment was ever built for the refused close. The counter is
+			// read only after the RECEIVER delivers the conforming close's payload:
+			// the ring is FIFO and the pump counts every frame before dispatching
+			// it, so once that FIFO-later close has come through, any fragment the
+			// refused close had published would already be in the count.
+			closePayload, recvErr := d.recv.RecvMsg(t.Context())
+			require.NoError(t, recvErr)
+			require.Equal(t, shmChunkPayload(d.inline), closePayload,
+				"the close-borne payload arrives whole, exactly as sent")
+			require.Equal(t, before, d.chunks.Load(), "a refused close emits no fragment")
+			h.requireNoDispatchFault(t)
+		})
+	}
+}
+
 // Test that a configuration pairing active chunking with an outbound payload
 // clamp is refused, and that the configuration a real chunking pair is built
 // from carries no clamp (stream-protocol.md §13.2).

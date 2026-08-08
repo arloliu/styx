@@ -399,6 +399,39 @@ func TestHostStream_RefuseOversizeSend_WhenMessageExceedsTheCeiling(t *testing.T
 	require.NoError(t, stream.CloseSend(ctx, nil))
 }
 
+// Test that the single server-streaming request riding STREAM_OPEN is never
+// chunked, even on a connection whose chunking is provably active: the same
+// length that round-trips as a chunked stream message is refused with
+// ErrPayloadTooLarge when offered as the open request (stream-protocol.md
+// §13.2 scopes chunking to STREAM_MSG alone).
+//
+// The pair of calls is what makes the refusal decisive. An active connection
+// carries this length on the message path, so the open-side rejection can only
+// come from the lifecycle exception — not from the connection being unable to
+// carry the length at all.
+func TestHostStream_RefuseOversizeOpenRequest_EvenWhenChunkingIsActive(t *testing.T) {
+	// Given the ordinary fixture, with chunking announced and a length one byte
+	// past the host-to-plugin inline limit.
+	files := startChunkHost(t)
+	oversize := int(chunkHostToPluginTop) + 1
+
+	// And proof the connection carries that length when it rides STREAM_MSG.
+	got, err := echoRoundTrip(t, files.conn, oversize)
+	require.NoError(t, err)
+	require.Len(t, got, oversize)
+
+	// When the same length is offered as the server-streaming open request.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err = files.conn.OpenStream(
+		ctx, chunkService, chunkMethodFeed,
+		styx.WithServerStreamRequest(chunkPattern(oversize)),
+	)
+
+	// Then it is refused with the definitive size error, active feature or not.
+	require.ErrorIs(t, err, styx.ErrPayloadTooLarge)
+}
+
 // Test the plugin-to-host direction alone: a server-streaming Feed answering
 // with a message at every plugin-to-host boundary, each delivered whole and in
 // order. The single request rides STREAM_OPEN, which chunking does not cover, so
