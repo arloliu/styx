@@ -360,6 +360,17 @@ type Config struct {
 	// BurstMaxPayload's own contract.
 	ChunkMaxPayload uint32
 
+	// MaxPayload is the host's ORIGINAL intent-level payload guarantee
+	// (styx.PluginSpec.MaxPayload), carried through unresolved by derivation --
+	// unlike ShmLayout/BurstMaxPayload/ChunkMaxPayload above, which already
+	// carry what MaxPayload derived from it. validateMaxPayloadInterlock reads
+	// it at attach, after negotiation has resolved the transport and (for
+	// shared memory) the checksum feature, to compare the guarantee against
+	// the connection's EXACT limits rather than the derivation's pre-spawn
+	// worst-case bound. Zero means the field was never set, exactly as every
+	// other carrier here treats its own zero: nothing to enforce.
+	MaxPayload uint32
+
 	// Transport selects the data-plane transport this host offers.
 	// "shm" pins the shared-memory transport (a plugin that cannot speak it fails
 	// handshake, never a silent downgrade).
@@ -1502,6 +1513,10 @@ func (s *Supervisor) handshakeAndAttach(
 		return handshakeResult{}, fmt.Errorf("supervisor: handshake: negotiated codec=%q unsupported", tuple.Codec)
 	}
 
+	if verr := validateMaxPayloadInterlock(s.cfg, tuple); verr != nil {
+		return handshakeResult{}, verr
+	}
+
 	streaming := tuple.Features[featureStreaming]
 	tr, shmRes, err := s.attach(ctx, conn, generation, tuple)
 	if err != nil {
@@ -1522,6 +1537,111 @@ func (s *Supervisor) handshakeAndAttach(
 // code directly (the reverse import exists).
 func chunkPolicyFor(tr transport.Transport, tuple control.Tuple, chunkMaxPayload uint32) rpcruntime.ChunkPolicy {
 	return rpcruntime.ChunkPolicyFor(tr, control.ChunkingActive(tuple, chunkMaxPayload), chunkMaxPayload)
+}
+
+// maxPayloadInterlockCRCOverhead is the CRC32C trailer width
+// (shm-abi.md §5), the same worst-case width styx's own derivation budgets
+// unconditionally at Start. Here the checksum choice is no longer unknown --
+// tuple.Features["checksum"] is the negotiated truth -- so the interlock
+// applies it only when it actually resolved true.
+const maxPayloadInterlockCRCOverhead = 4
+
+// validateMaxPayloadInterlock enforces the attach-time half of MaxPayload's
+// guarantee. Config.MaxPayload is the host's original intent-level
+// guarantee, carried unresolved by derivation (unlike
+// ShmLayout/BurstMaxPayload/ChunkMaxPayload, which already carry what it
+// derived); this checks it against the connection's EXACT limits, now that
+// negotiation has resolved the transport and, for shared memory, the
+// checksum feature -- never against the derivation's pre-spawn worst-case
+// bound, which decided what to turn on, not what gets refused
+// post-negotiation. A zero MaxPayload is inert: the field asked for nothing,
+// so there is nothing to enforce.
+//
+// On a uds tuple the exact limit is the transport's fixed frame cap: uds
+// carries neither burst nor stream-chunking regardless of what either side
+// offers, so MaxPayload above that cap is unmeetable the moment the
+// transport resolves to uds -- including a TransportAuto negotiated down to
+// it, which Start's own check (styx's validateMaxPayload, pinned
+// TransportUDS only) never sees.
+//
+// On a shared-memory tuple the exact limit is the smaller direction's
+// largest configured slab, minus the negotiated checksum overhead (0 or 4
+// bytes) -- the identical arithmetic internal/transport/shm's Attach applies
+// (shm-abi.md §18). MaxPayload beyond that limit is a real requirement on
+// both burst (for unary bodies) and stream-chunking (for STREAM_MSG), since
+// the guarantee spans both covered surfaces (styx's PluginSpec.MaxPayload
+// godoc); the refusal fires only when the negotiated tuple actually left one
+// of them unresolved; it names whichever is missing.
+func validateMaxPayloadInterlock(cfg Config, tuple control.Tuple) error {
+	if cfg.MaxPayload == 0 {
+		return nil
+	}
+
+	if tuple.Transport != control.TransportSHM {
+		if cfg.MaxPayload > transport.MaxFrameSize {
+			return &control.IncompatibleError{Reason: fmt.Sprintf(
+				"PluginSpec.MaxPayload=%d exceeds the uds transport's fixed %d-byte frame cap, and "+
+					"this connection negotiated uds, which carries neither burst nor stream-chunking "+
+					"to widen it; upgrade the plugin to negotiate shared memory, or lower MaxPayload",
+				cfg.MaxPayload, transport.MaxFrameSize),
+			}
+		}
+
+		return nil
+	}
+
+	overhead := uint32(0)
+	if tuple.Features["checksum"] {
+		overhead = maxPayloadInterlockCRCOverhead
+	}
+	hostToPlugin := largestSlabSize(cfg.ShmLayout.Arenas[shm.HostToPlugin].Classes)
+	pluginToHost := largestSlabSize(cfg.ShmLayout.Arenas[shm.PluginToHost].Classes)
+	limit := min(hostToPlugin, pluginToHost)
+	if limit < overhead {
+		// A geometry too small to hold a positive payload after overhead: every
+		// send is already rejected elsewhere (ValidateStartupCapacity), so the
+		// exact limit here is zero rather than an underflowed uint32.
+		limit = 0
+	} else {
+		limit -= overhead
+	}
+	if cfg.MaxPayload <= limit {
+		return nil
+	}
+
+	var missing []string
+	if !control.BurstActive(tuple, cfg.BurstMaxPayload) {
+		missing = append(missing, "burst")
+	}
+	if !control.ChunkingActive(tuple, cfg.ChunkMaxPayload) {
+		missing = append(missing, "stream-chunking")
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	return &control.IncompatibleError{Reason: fmt.Sprintf(
+		"PluginSpec.MaxPayload=%d exceeds this connection's negotiated inline limit of %d bytes, "+
+			"and the plugin did not resolve %s; upgrade the plugin or lower MaxPayload",
+		cfg.MaxPayload, limit, strings.Join(missing, " and ")),
+	}
+}
+
+// largestSlabSize returns the largest SlabSize among classes, scanning rather
+// than trusting the ascending order shm-abi.md §2 requires of a validated
+// table -- validateMaxPayloadInterlock runs before ValidateStartupCapacity has
+// had a chance to reject a malformed one. Duplicates geometry.go's
+// unexported helper of the same name: that one lives in the root styx
+// package, which this package must not import.
+func largestSlabSize(classes []shm.SizeClass) uint32 {
+	var largest uint32
+	for _, c := range classes {
+		if c.SlabSize > largest {
+			largest = c.SlabSize
+		}
+	}
+
+	return largest
 }
 
 // shmHostResources are the host-side shared-memory resources the transport does

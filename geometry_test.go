@@ -1,6 +1,7 @@
 package styx
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -349,4 +350,54 @@ func TestShmGeometry_RegionBytes_RejectsInvalidGeometry(t *testing.T) {
 	var cfgErr *ConfigError
 	require.ErrorAs(t, err, &cfgErr)
 	require.Equal(t, "ShmGeometry", cfgErr.Field)
+}
+
+// Test deriveFromMaxPayload across the boundary that decides whether burst
+// and chunking switch on: the stock ladder's top class is 1048640 (1 MiB +
+// the 64-byte slabHeadroom margin) and the worst-case CRC32C trailer is 4, so
+// the certain-fit bound -- the largest MaxPayload the stock geometry alone
+// already guarantees -- is 1048636. At or below it, burst and chunking both
+// stay off; above it, both switch on together, the burst ceiling raised to
+// strictly clear the top class and the chunk ceiling set to MaxPayload
+// exactly.
+func TestDeriveFromMaxPayload_MatchesThePlanTable(t *testing.T) {
+	cases := []struct {
+		name                 string
+		maxPayload           uint32
+		wantBurst, wantChunk uint32
+	}{
+		{name: "zero is inert", maxPayload: 0, wantBurst: 0, wantChunk: 0},
+		{name: "small: guarantee already met", maxPayload: 4096, wantBurst: 0, wantChunk: 0},
+		{name: "at the certain-fit bound", maxPayload: 1048636, wantBurst: 0, wantChunk: 0},
+		{name: "one past the bound", maxPayload: 1048637, wantBurst: 1048704, wantChunk: 1048637},
+		{name: "well above the ladder", maxPayload: 4 << 20, wantBurst: 4 << 20, wantChunk: 4 << 20},
+		{name: "max uint32", maxPayload: math.MaxUint32, wantBurst: math.MaxUint32, wantChunk: math.MaxUint32},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// When
+			g, burst, chunk := deriveFromMaxPayload(tc.maxPayload)
+
+			// Then: the derivation always returns the stock geometry, whether or
+			// not burst/chunking end up switched on.
+			require.Equal(t, GeometryDefault(), g)
+			require.Equal(t, tc.wantBurst, burst, "burst ceiling")
+			require.Equal(t, tc.wantChunk, chunk, "chunk ceiling")
+		})
+	}
+}
+
+// Test that every non-zero derivation from deriveFromMaxPayload's table
+// passes validateBurstCeiling unchanged: the burst ceiling is constructed to
+// strictly exceed the derived geometry's top class by at least slabHeadroom,
+// so the existing expert-path check never refuses a derived spec.
+func TestDeriveFromMaxPayload_PassesValidateBurstCeiling(t *testing.T) {
+	for _, maxPayload := range []uint32{1048637, 4 << 20, math.MaxUint32} {
+		g, burst, _ := deriveFromMaxPayload(maxPayload)
+		require.NotZero(t, burst, "maxPayload=%d must derive a non-zero burst ceiling", maxPayload)
+
+		err := validateBurstCeiling(PluginSpec{Geometry: g, BurstMaxPayload: burst})
+		require.NoError(t, err, "maxPayload=%d", maxPayload)
+	}
 }

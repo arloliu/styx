@@ -627,10 +627,26 @@ func TestGeneratedStreaming_CarriesAnOversizeMessage_WhenChunkingIsActive(t *tes
 // over the stock ladder, whose inline limit is a megabyte, so the fragment count
 // and the arena pressure are what a real deployment would see rather than what a
 // compact test ladder produces.
+//
+// Driven through the public PluginSpec.MaxPayload derivation rather than the
+// internal chunk-ceiling seam: this is exactly the derived-path story
+// (stock ladder, multi-megabyte) the derivation exists to tell, so it is one
+// of the rows that migrated off the test-only seam once the public field
+// landed. The asymmetric-geometry rows elsewhere in this matrix stay on the
+// seam -- mutual exclusion means MaxPayload cannot express a hand-authored,
+// per-direction ladder.
 func TestHostStream_CarriesAMultiMegabyteMessage_OnTheStockLadder(t *testing.T) {
-	// Given the stock ladder and a ceiling well above it.
-	const stockCeiling uint32 = 8 << 20
-	files := startChunkHostSpec(t, stockCeiling, styx.GeometryDefault(), styx.TransportSHM, nil)
+	// Given MaxPayload set well above the stock ladder's inline limit, so the
+	// derivation switches on chunking at a ceiling matching MaxPayload
+	// exactly. The ceiling and geometry arguments below are the seam's
+	// dormant defaults (0, the zero ShmGeometry): the shape mutator is what
+	// actually drives this row, overwriting MaxPayload after chunkSpec builds
+	// the rest of the spec -- Host.Start's own derivation then fills in
+	// Geometry, BurstMaxPayload, and the internal chunk ceiling from it,
+	// exactly as it would for any adopter setting MaxPayload alone.
+	const maxPayload uint32 = 8 << 20
+	files := startChunkHostSpec(t, 0, styx.ShmGeometry{}, styx.TransportSHM,
+		func(spec *styx.PluginSpec, _ chunkHost) { spec.MaxPayload = maxPayload })
 	size := 3 << 20
 
 	// When

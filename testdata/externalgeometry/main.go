@@ -32,6 +32,9 @@ func main() {
 			{Name: "lean-profile", Path: "/nonexistent", Transport: "shm", Geometry: styx.GeometryLean(), MaxDataInflight: 32, StrictCapacity: true},
 			{Name: "uds", Path: "/nonexistent", Transport: "uds"},
 
+			// The intent-level payload guarantee: one field, everything else derived.
+			{Name: "max-payload", Path: "/nonexistent", Transport: "shm", MaxPayload: 4 << 20},
+
 			// The consume-fault teardown is tunable and switchable from out here,
 			// which is what makes it an operator's knob rather than a constant.
 			{Name: "tuned-teardown", Path: "/nonexistent", Transport: "shm", ConsumeFaultRunThreshold: 4096},

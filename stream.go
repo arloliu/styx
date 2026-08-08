@@ -1405,13 +1405,54 @@ func acceptanceUnknown(tr transport.Transport, sendErr error) bool {
 // an application status surfaces as a *styx.Status, exactly as a unary error
 // response does. A nil error stays nil, and io.EOF (normal remote/stream end)
 // is returned unchanged.
+//
+// The CANCELED arm preserves a wrapped cause when the local cancel carries
+// one (a visible chunked-train failure, stream-protocol.md §13.8 shape 4):
+// the returned error still satisfies errors.Is(_, ErrCanceled), but the
+// cause stays reachable through errors.Is/As on that same returned value,
+// rather than being discarded into the bare sentinel. Calling StreamError
+// again on its own previous return value is idempotent -- generated
+// streaming code does exactly this (Send/Recv wrap an already-translated
+// *Stream method return a second time), and gets the identical result back
+// rather than a doubly-wrapped one.
 func StreamError(err error) error {
 	if err == nil {
 		return nil
 	}
 	switch {
 	case errors.Is(err, rpcruntime.ErrCanceledLocally):
-		return ErrCanceled
+		// The termination contract promises the underlying cause stays reachable
+		// in the locally delivered error (a visible chunked-train failure wraps
+		// it: internal/rpcruntime/chunk_send.go's failVisibleTrain, shape 4).
+		// Three shapes reach here, each handled so this stays idempotent under a
+		// repeated call -- generated Send/Recv wrap SendMsg/RecvMsg's already-
+		// translated return through StreamError a second time (the underlying
+		// *Stream's own driveLocal already ran it once):
+		//  1. err already carries the public sentinel (a previous StreamError
+		//     call, most commonly this second generated-code wrap): return it
+		//     unchanged rather than wrapping ErrCanceled onto itself again.
+		//  2. err IS the bare sentinel, nothing else wrapped onto it (the
+		//     ordinary local-cancellation shape, no train involved): there is no
+		//     cause to preserve, so this matches the pre-chunking mapping
+		//     exactly -- the same value every repeated call would produce.
+		//  3. Anything else: err wraps a real cause beyond the bare sentinel
+		//     (chunk_send.go's shape 4). Wrap ErrCanceled onto err ONCE, so
+		//     errors.Is(_, ErrCanceled) holds while err's own chain --
+		//     ErrCanceledLocally and whatever it wraps -- stays reachable
+		//     through errors.Is/As on the value this function returns.
+		switch {
+		case errors.Is(err, ErrCanceled):
+			return err
+		//nolint:errorlint // deliberate identity check, not a sentinel match:
+		// errors.Is(err, rpcruntime.ErrCanceledLocally) already holds by the
+		// switch's own case above, so this asks the different question of
+		// whether err IS that exact bare value with nothing else wrapped onto
+		// it, which only == (not errors.Is) can distinguish.
+		case err == rpcruntime.ErrCanceledLocally:
+			return ErrCanceled
+		default:
+			return fmt.Errorf("%w: %w", ErrCanceled, err)
+		}
 	case errors.Is(err, rpcruntime.ErrDeadlineExceeded):
 		return ErrDeadlineExceeded
 	case errors.Is(err, rpcruntime.ErrStreamTableClosed):
