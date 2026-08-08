@@ -282,6 +282,16 @@ func (s *Supervisor) SetShmConfigAdjusterForTest(f func(*shmtransport.Config)) {
 	s.adjustShmConfigForTest = f
 }
 
+// ValidateMaxPayloadInterlockForTest re-exports validateMaxPayloadInterlock
+// for supervisor_test (external test package): it drives the attach-time
+// MaxPayload interlock directly against a hand-built Tuple, which is the only way to
+// reach a checksum-resolved-true tuple -- no production offer in this module
+// ever lists the checksum feature, so that half of the exact-limit matrix is
+// unreachable cross-process and is proven here instead.
+func ValidateMaxPayloadInterlockForTest(cfg Config, tuple control.Tuple) error {
+	return validateMaxPayloadInterlock(cfg, tuple)
+}
+
 // StoppedForTest re-exports stopped for the crash-to-give-up gap failpoint
 // test (internal/supervisor's failpoint-tagged suite):
 // it lets that test prove Stop has already closed stopCh before releasing

@@ -1375,10 +1375,11 @@ func TestHost_RunsFreshHost_AfterOldHostStopsFollowingNoRestartGaveUp(t *testing
 // TestExternalGeometryFixture_Compiles builds the external-module fixture under
 // testdata/externalgeometry, which imports the public styx module from OUTSIDE it
 // and configures every public shared-memory geometry form (ShmGeometry, the
-// GeometryDefault/GeometryLean profile helpers, and the PluginSpec Transport /
-// Geometry / MaxDataInflight / StrictCapacity knobs). Successful compilation is
-// the assertion: an external user cannot import internal/shm, so the public
-// geometry API must expose no internal types. It is built, never run.
+// GeometryDefault/GeometryLean profile helpers, the PluginSpec Transport /
+// Geometry / MaxDataInflight / StrictCapacity knobs, and the intent-level
+// MaxPayload field). Successful compilation is the assertion: an external
+// user cannot import internal/shm, so the public geometry API must expose no
+// internal types. It is built, never run.
 func TestExternalGeometryFixture_Compiles(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "externalgeometry")
 	cmd := exec.Command("go", "build", "-o", out, ".")
@@ -2018,4 +2019,262 @@ func TestHost_SupervisorConfig_CarriesBurstMaxPayload_WhenSet(t *testing.T) {
 
 	// Then
 	require.EqualValues(t, 1<<20, cfg.BurstMaxPayload)
+}
+
+// Test Host.Start refusing a non-zero PluginSpec.MaxPayload combined with a
+// non-zero Geometry or a non-zero BurstMaxPayload, with a *styx.ConfigError
+// naming PluginSpec.MaxPayload, before any plugin process is spawned. The two
+// paths -- derived (MaxPayload) and expert (Geometry/BurstMaxPayload by hand)
+// -- never mix on one spec.
+//
+// The LifecycleReserve-only row is the exact no-spawn proof for the
+// mutual-exclusion bypass a LifecycleReserve-only Geometry could otherwise
+// slip through: ShmGeometry.isZero (toLayout's own default-profile rule)
+// deliberately ignores that field alone, so this row would previously have
+// been silently accepted and its Geometry overwritten by the derivation
+// instead of refused.
+func TestHost_Start_RefusesMaxPayload_CombinedWithTheExpertPath(t *testing.T) {
+	// Given a table of specs that each combine a non-zero MaxPayload with
+	// something the expert path already occupies, and the other field each
+	// row's Reason must name alongside MaxPayload.
+	tests := []struct {
+		name             string
+		spec             styx.PluginSpec
+		wantReasonNaming string
+	}{
+		{
+			name: "combined with a non-zero Geometry",
+			spec: styx.PluginSpec{
+				Name: "max-payload-geometry", Path: fixtureReadyPlugin,
+				MaxPayload: 1 << 20, Geometry: styx.GeometryLean(),
+			},
+			wantReasonNaming: "Geometry",
+		},
+		{
+			name: "combined with a Geometry that sets only LifecycleReserve",
+			spec: styx.PluginSpec{
+				Name: "max-payload-lifecycle-reserve", Path: fixtureReadyPlugin,
+				MaxPayload: 4 << 20, Geometry: styx.ShmGeometry{LifecycleReserve: 1},
+			},
+			wantReasonNaming: "Geometry",
+		},
+		{
+			name: "combined with a non-zero BurstMaxPayload",
+			spec: styx.PluginSpec{
+				Name: "max-payload-burst", Path: fixtureReadyPlugin,
+				MaxPayload: 1 << 20, BurstMaxPayload: 2 << 20,
+			},
+			wantReasonNaming: "BurstMaxPayload",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Given a host configured with that spec.
+			h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{tt.spec}})
+
+			// When started.
+			err := h.Start(t.Context())
+
+			// Then it is refused with a *ConfigError naming MaxPayload as the
+			// offending field and the Reason naming both conflicting fields,
+			// and no plugin process is ever spawned.
+			require.ErrorIs(t, err, styx.ErrInvalidConfig)
+			var cfgErr *styx.ConfigError
+			require.ErrorAs(t, err, &cfgErr)
+			require.Equal(t, "PluginSpec.MaxPayload", cfgErr.Field)
+			require.Contains(t, cfgErr.Reason, "MaxPayload")
+			require.Contains(t, cfgErr.Reason, tt.wantReasonNaming)
+			require.False(t, processFromBinaryExists(t, fixtureReadyPlugin),
+				"a refused MaxPayload must not have spawned a plugin")
+			require.NoError(t, h.Stop(t.Context()))
+		})
+	}
+}
+
+// Test Host.Start's startup check: a PluginSpec.Transport pinned to
+// TransportUDS with MaxPayload above the uds transport's fixed frame cap is
+// refused with a *styx.ConfigError before any process is spawned, while a
+// value at or below the cap is accepted and reaches Ready with nothing
+// derived beyond the bare declaration -- uds carries neither burst nor
+// stream-chunking, so nothing else could switch on.
+func TestHost_Start_MaxPayload_AgainstThePinnedUDSFrameCap(t *testing.T) {
+	const udsCap = 1 << 20 // internal/transport.MaxFrameSize
+
+	// Given a TransportUDS-pinned spec one byte over the uds frame cap.
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+		Name: "uds-over-cap", Path: fixtureReadyPlugin,
+		Transport: styx.TransportUDS, MaxPayload: udsCap + 1,
+	}}})
+
+	// When started.
+	err := h.Start(t.Context())
+
+	// Then it is refused with a *ConfigError naming MaxPayload, before any
+	// process is spawned.
+	require.ErrorIs(t, err, styx.ErrInvalidConfig)
+	var cfgErr *styx.ConfigError
+	require.ErrorAs(t, err, &cfgErr)
+	require.Equal(t, "PluginSpec.MaxPayload", cfgErr.Field)
+	require.False(t, processFromBinaryExists(t, fixtureReadyPlugin),
+		"a refused MaxPayload must not have spawned a plugin")
+	require.NoError(t, h.Stop(t.Context()))
+
+	// Given the same pin at exactly the cap, when started, then it reaches
+	// Ready, and nothing beyond the bare declaration was derived: at the uds
+	// cap, the value never crosses the stock ladder's certain-fit bound, so
+	// burst and chunking both stay off even though MaxPayload itself is
+	// non-zero.
+	atCapSpec := styx.PluginSpec{
+		Name: "uds-at-cap", Path: fixtureReadyPlugin,
+		Transport: styx.TransportUDS, MaxPayload: udsCap,
+	}
+	atCap := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{atCapSpec}})
+	require.NoError(t, atCap.Start(t.Context()))
+	ev := awaitEvent(t, atCap.Events(), styx.EventReady)
+	require.Equal(t, "uds-at-cap", ev.Plugin)
+	require.NoError(t, atCap.Stop(t.Context()))
+
+	cfg := atCap.SupervisorConfigForTest(atCapSpec)
+	require.Zero(t, cfg.BurstMaxPayload)
+	require.Zero(t, cfg.ChunkMaxPayload)
+}
+
+// Test PluginSpec.MaxPayload's derivation reaching the internal supervision
+// configuration Host builds for it -- Geometry, BurstMaxPayload, and (via
+// AttachRegionForTest-style plumbing, ChunkMaxPayload) all resolved from one
+// intent-level value, exactly as SupervisorConfigForTest's own doc promises
+// ("the exact value startOne hands to supervisor.New").
+func TestHost_SupervisorConfig_DerivesFromMaxPayload(t *testing.T) {
+	// Given a host and a spec setting a non-zero MaxPayload alone.
+	h := styx.NewHost(styx.HostConfig{})
+
+	// When the supervision configuration is built for it.
+	cfg := h.SupervisorConfigForTest(styx.PluginSpec{
+		Name: "derived", Path: fixtureReadyPlugin,
+		MaxPayload: 4 << 20,
+	})
+
+	// Then Geometry, BurstMaxPayload, and ChunkMaxPayload are all resolved
+	// from it, and the original intent-level value is also carried through.
+	require.EqualValues(t, 4<<20, cfg.BurstMaxPayload)
+	require.EqualValues(t, 4<<20, cfg.ChunkMaxPayload)
+	require.EqualValues(t, 4<<20, cfg.MaxPayload, "the original intent-level value is also carried through")
+	require.NotEmpty(t, cfg.ShmLayout.Arenas[0].Classes, "the stock geometry must have been derived")
+}
+
+// Test PluginSpec.MaxPayload leaving SupervisorConfigForTest's output
+// completely unaffected when zero -- the field's own "zero is inert" rule,
+// observed at the same layer TestHost_SupervisorConfig_CarriesZeroBurstMaxPayload_
+// EvenUnderARefusingGeometry checks for BurstMaxPayload.
+func TestHost_SupervisorConfig_LeavesConfigUnaffected_WhenMaxPayloadIsZero(t *testing.T) {
+	// Given a host and a spec that never sets MaxPayload.
+	h := styx.NewHost(styx.HostConfig{})
+
+	// When the supervision configuration is built for it.
+	cfg := h.SupervisorConfigForTest(styx.PluginSpec{
+		Name: "no-max-payload", Path: fixtureReadyPlugin,
+	})
+
+	// Then nothing was derived.
+	require.Zero(t, cfg.BurstMaxPayload)
+	require.Zero(t, cfg.ChunkMaxPayload)
+	require.Zero(t, cfg.MaxPayload)
+}
+
+// Test that the derived stock geometry's top class has 8 slabs per
+// direction, so StrictCapacity with MaxDataInflight one above that count
+// still fails attach with the existing typed STRICT error, and at the count
+// itself still succeeds -- the derived path adds no new validation of its
+// own, the existing attach-time check is the single source of this refusal.
+func TestHost_Start_DerivedGeometry_StillPinsStrictCapacityAgainstTheTopClass(t *testing.T) {
+	// Given a builder for a derived, STRICT-certified spec at a chosen peak
+	// concurrency.
+	build := func(maxDataInflight int) *styx.Host {
+		return styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+			Name:            "strict-derived",
+			Path:            fixtureReadyPlugin,
+			Transport:       styx.TransportSHM,
+			MaxPayload:      4 << 20,
+			MaxDataInflight: maxDataInflight,
+			StrictCapacity:  true,
+		}}})
+	}
+
+	// When MaxDataInflight is one above the derived top class's 8 usable
+	// slabs, then STRICT refuses it.
+	over := build(9)
+	t.Cleanup(func() { _ = over.Stop(context.Background()) })
+	err := over.Start(t.Context())
+	require.Error(t, err, "MaxDataInflight above the derived top class's 8 usable slabs must fail STRICT")
+	require.ErrorContains(t, err, "usable slabs")
+
+	// When MaxDataInflight is exactly that count.
+	atCap := build(8)
+	t.Cleanup(func() { _ = atCap.Stop(context.Background()) })
+
+	// Then it reaches Ready.
+	require.NoError(t, atCap.Start(t.Context()))
+	ev := awaitEvent(t, atCap.Events(), styx.EventReady)
+	require.Equal(t, "strict-derived", ev.Plugin)
+}
+
+// Test the attach-time check against a REAL negotiation that resolves to
+// uds: a TransportAuto spec against a plugin that offers only uds
+// (fixtureUDSOnlyPlugin) with MaxPayload above the uds frame cap fails the
+// attach with a typed *styx.IncompatibleError naming MaxPayload -- caught
+// only here, since Start's own check only looks at a PINNED TransportUDS
+// spec and this one is not pinned.
+func TestHost_Start_MaxPayload_RefusesAutoNegotiatedDownToUDS_AboveTheCap(t *testing.T) {
+	const udsCap = 1 << 20
+
+	// Given a TransportAuto spec above the uds frame cap, against a plugin
+	// that offers only uds.
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+		Name: "auto-to-uds", Path: fixtureUDSOnlyPlugin,
+		Transport: styx.TransportAuto, MaxPayload: udsCap + 1,
+	}}})
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// When started.
+	err := h.Start(t.Context())
+
+	// Then the attach fails with a typed *IncompatibleError naming
+	// MaxPayload, the two missing capabilities the uds transport can never
+	// resolve, and both operator remedies -- the exact tokens the
+	// production Reason text emits, not invented phrases.
+	require.ErrorIs(t, err, styx.ErrIncompatible)
+	var incompatible *styx.IncompatibleError
+	require.ErrorAs(t, err, &incompatible)
+	require.Contains(t, incompatible.Reason, "MaxPayload")
+	require.Contains(t, incompatible.Reason, "carries neither burst nor stream-chunking")
+	require.Contains(t, incompatible.Reason, "upgrade the plugin to negotiate shared memory")
+	require.Contains(t, incompatible.Reason, "lower MaxPayload")
+}
+
+// Test the attach-time check against a REAL shared-memory negotiation with
+// checksum off (the only cross-process reachable case: no production offer
+// in this module ever lists the checksum feature, so a live attach always
+// resolves checksum=false) and a feature-mute peer for burst/chunking
+// (fixtureReadyPlugin, an ordinary plugin server that never intends either):
+// MaxPayload at the stock top class's inline limit (1048640, no trailer
+// since checksum is off) is accepted even though the peer never resolved
+// burst or chunking -- the guarantee is already met without them.
+func TestHost_Start_MaxPayload_AcceptsAtTheNegotiatedInlineLimit_WithChecksumOff(t *testing.T) {
+	const stockTop = 1048640
+
+	// Given a shared-memory spec at exactly the stock top class's
+	// checksum-off inline limit, against a feature-mute peer.
+	h := styx.NewHost(styx.HostConfig{Plugins: []styx.PluginSpec{{
+		Name: "fits-inline", Path: fixtureReadyPlugin,
+		Transport: styx.TransportSHM, MaxPayload: stockTop,
+	}}})
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	// When started.
+	require.NoError(t, h.Start(t.Context()))
+
+	// Then it reaches Ready.
+	ev := awaitEvent(t, h.Events(), styx.EventReady)
+	require.Equal(t, "fits-inline", ev.Plugin)
 }

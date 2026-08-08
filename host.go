@@ -16,6 +16,7 @@ import (
 	"github.com/arloliu/styx/internal/observeq"
 	"github.com/arloliu/styx/internal/rpcruntime"
 	"github.com/arloliu/styx/internal/supervisor"
+	"github.com/arloliu/styx/internal/transport"
 	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 	"github.com/arloliu/styx/observe"
 )
@@ -162,6 +163,60 @@ type PluginSpec struct {
 	// Geometry.PluginToHost may differ); Start refuses anything else with a
 	// *ConfigError naming this field, before any plugin process is spawned.
 	BurstMaxPayload uint32
+
+	// MaxPayload is a capacity GUARANTEE, not an enforced cap: "styx will carry
+	// any marshaled frame handed to it up to this many bytes, on the covered
+	// surfaces" — unary request/response bodies (shm or burst) and logical
+	// STREAM_MSG messages (shm or stream-chunking). It is not a new rejection
+	// bound of its own, and not a ceiling on what actually gets through: a
+	// value at or below what the transport already carries adds no
+	// enforcement, and the derived burst/chunk ceilings this field resolves
+	// to are themselves frequently larger than MaxPayload (raised to clear
+	// the stock ladder's top class), so a send larger than MaxPayload can
+	// still succeed. What DOES fail with the existing definitive
+	// ErrPayloadTooLarge is a send beyond the derived transport ceilings
+	// themselves. Add your own envelope before choosing a value — this
+	// field states a floor, not a wire framing limit.
+	//
+	// Two surfaces are excepted. STREAM_OPEN's single server-streaming request
+	// and STREAM_CLOSE's single client-streaming response are not chunked and
+	// stay bounded by the sending direction's stock inline limit (about 1 MiB),
+	// regardless of MaxPayload; oversize there fails the same
+	// ErrPayloadTooLarge. And the guarantee is only as good as the transport
+	// that carries it (below).
+	//
+	// Setting MaxPayload derives everything else: the stock shared-memory
+	// geometry (GeometryDefault, both directions), the burst-path ceiling, and
+	// the stream-chunking ceiling, all internal from here on. It is mutually
+	// exclusive with a non-zero Geometry or a non-zero BurstMaxPayload on the
+	// same spec — Start refuses the combination with a *ConfigError naming
+	// this field before any plugin process is spawned, since a hand-authored
+	// geometry and a derived one cannot both govern the same spec. A value at
+	// or below the stock ladder's certain-fit bound (the top class minus the
+	// worst-case checksum trailer) derives the stock geometry alone, with
+	// burst and chunking both left off: the guarantee is already met,
+	// so nothing new switches on, and MaxPayload never shrinks the geometry
+	// it derives. Zero (the default) leaves MaxPayload
+	// entirely out of it — today's expert path, unchanged; a
+	// memory-constrained deployment that needs a custom ladder keeps using
+	// Geometry (GeometryLean or a hand-built table) and, if it also needs an
+	// oversize-payload path, BurstMaxPayload directly.
+	//
+	// The guarantee is validated against the transport that will actually
+	// carry it, and refused loudly where unmeetable. The ordinary uds
+	// transport has a fixed frame cap (about 1 MiB) and gets no burst or
+	// chunking to widen it: Transport pinned to TransportUDS with MaxPayload
+	// above that cap is a *ConfigError at Start, before spawn. Once a
+	// shared-memory attach has negotiated — when the checksum choice and
+	// therefore the connection's EXACT per-direction inline limits are known —
+	// the same requirement is checked again against those exact limits, and
+	// again against uds if negotiation resolved there (e.g. TransportAuto
+	// falling back). An unmet requirement at that point — an old peer that
+	// left burst or chunking unresolved, or an auto-negotiated uds connection
+	// — fails the attach with a typed *IncompatibleError naming MaxPayload
+	// and the missing capability; the operator's two remedies, upgrade the
+	// plugin or lower MaxPayload, are stated in the error text.
+	MaxPayload uint32
 
 	// MaxDataInflight is the peak number of concurrent data calls.
 	// Carried to the plugin so both sides admit identically.
@@ -669,6 +724,13 @@ func (h *Host) startOne(ctx context.Context, spec PluginSpec, pinErr error) erro
 	if err := validateLivenessTuning(spec); err != nil {
 		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, err)
 	}
+	// validateMaxPayload runs against the spec as the caller wrote it -- its
+	// mutual-exclusion check would otherwise see the very fields
+	// applyMaxPayloadDerivation is about to fill in below.
+	if err := validateMaxPayload(spec); err != nil {
+		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, err)
+	}
+	spec = applyMaxPayloadDerivation(spec)
 	if err := validateBurstCeiling(spec); err != nil {
 		return fmt.Errorf("styx: start plugin %q: %w", spec.Name, err)
 	}
@@ -920,6 +982,13 @@ func (h *Host) supervisorConfig(spec PluginSpec, cc *ClientConn, origin uint64) 
 		StrictCapacity:  spec.StrictCapacity,
 		BurstMaxPayload: spec.BurstMaxPayload,
 		ChunkMaxPayload: spec.chunkMaxPayload,
+		// MaxPayload carries the ORIGINAL intent-level bound through, unresolved
+		// by derivation, so the attach-time interlock can compare it against the
+		// connection's negotiated exact limits -- the derivation's pre-spawn
+		// worst-case bound decided what to turn on, never what gets refused
+		// post-negotiation. Zero here means the field was never set, exactly as
+		// every other carrier on this struct treats its own zero.
+		MaxPayload: spec.MaxPayload,
 
 		// The names differ on purpose: both sides mean the host's own wait for the
 		// next heartbeat, but "Interval" reads publicly as the plugin's send cadence,
@@ -1016,6 +1085,83 @@ func validateBurstCeiling(spec PluginSpec) error {
 	}
 
 	return nil
+}
+
+// validateMaxPayload refuses a PluginSpec.MaxPayload this Host cannot honor,
+// before anything is spawned. Zero is never an error: it is how the field
+// asks to stay off, so an unset spec passes unchanged.
+//
+// A non-zero MaxPayload is mutually exclusive with a hand-authored Geometry
+// or BurstMaxPayload on the same spec: MaxPayload derives its own stock
+// geometry and its own burst ceiling, and a spec cannot ask for both the
+// derived path and the expert path at once. And when Transport pins
+// TransportUDS, MaxPayload must not exceed the uds transport's fixed frame
+// cap, since a pinned uds connection gets no burst or stream-chunking path
+// to widen it — a TransportAuto spec that later negotiates down to uds is
+// checked again, against the exact cap, at attach (internal/supervisor's own
+// attach-time interlock).
+func validateMaxPayload(spec PluginSpec) error {
+	if spec.MaxPayload == 0 {
+		return nil
+	}
+
+	// isFullyZero, not isZero: isZero only asks whether toLayout would
+	// substitute the default profile, which deliberately ignores
+	// LifecycleReserve alone. A caller who set only LifecycleReserve has
+	// still authored a Geometry and must be refused here, not have it
+	// silently overwritten by the derivation below.
+	if !spec.Geometry.isFullyZero() {
+		return &ConfigError{
+			Field: "PluginSpec.MaxPayload",
+			Reason: "set together with a non-zero PluginSpec.Geometry; MaxPayload derives its own " +
+				"shared-memory geometry and cannot be combined with a hand-authored one -- use one " +
+				"path or the other",
+		}
+	}
+	if spec.BurstMaxPayload != 0 {
+		return &ConfigError{
+			Field: "PluginSpec.MaxPayload",
+			Reason: "set together with a non-zero PluginSpec.BurstMaxPayload; MaxPayload derives its " +
+				"own burst ceiling and cannot be combined with a hand-set one -- use one path or the " +
+				"other",
+		}
+	}
+
+	if spec.Transport == TransportUDS && spec.MaxPayload > transport.MaxFrameSize {
+		return &ConfigError{
+			Field: "PluginSpec.MaxPayload",
+			Reason: fmt.Sprintf(
+				"%d exceeds the uds transport's fixed %d-byte frame cap, and Transport pins "+
+					"TransportUDS, which carries neither burst nor stream-chunking to widen it; "+
+					"select TransportAuto or TransportSHM, or lower MaxPayload",
+				spec.MaxPayload, transport.MaxFrameSize),
+		}
+	}
+
+	return nil
+}
+
+// applyMaxPayloadDerivation resolves a non-zero spec.MaxPayload into the
+// existing carriers the rest of Start consumes -- Geometry, BurstMaxPayload,
+// and the internal chunkMaxPayload -- via deriveFromMaxPayload, so every
+// route to a derived configuration writes the same fields the expert path
+// writes by hand. A zero MaxPayload leaves spec entirely untouched:
+// this is how the field asks for the expert path, and an untouched spec is
+// what keeps the existing pass-through behavior true for it.
+//
+// Callers must run validateMaxPayload against the ORIGINAL spec first: this
+// call overwrites the very fields that check's mutual exclusion reads.
+func applyMaxPayloadDerivation(spec PluginSpec) PluginSpec {
+	if spec.MaxPayload == 0 {
+		return spec
+	}
+
+	geometry, burst, chunk := deriveFromMaxPayload(spec.MaxPayload)
+	spec.Geometry = geometry
+	spec.BurstMaxPayload = burst
+	spec.chunkMaxPayload = chunk
+
+	return spec
 }
 
 // relayEvents forwards every internal/supervisor.Event this plugin's bus

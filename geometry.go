@@ -55,6 +55,21 @@ const (
 	// rejected. 64 is the ABI's mandatory slab-size granularity (shm-abi.md §1),
 	// so it is the smallest headroom that exists — anything less rounds up to it.
 	slabHeadroom = 64
+	// crcTrailerWorstCase is the CRC32C trailer width (shm-abi.md §5), budgeted
+	// unconditionally by PluginSpec.MaxPayload's derivation: the checksum feature
+	// negotiates after spawn, so a derivation that runs at Start cannot know
+	// whether the trailer will actually be present and must assume the worst
+	// case every time. validateBurstCeiling faces the identical unknown but
+	// answers it the opposite way: it compares the ceiling against the RAW
+	// largest class, never subtracting a trailer, because the raw class
+	// upper-bounds whatever the negotiated limit turns out to be -- a
+	// permissive check that can only pass a ceiling too low, never wrongly
+	// refuse one that is actually fine. This derivation instead needs a
+	// number the stock geometry is CERTAIN to satisfy without deriving
+	// anything further, so it subtracts the trailer to get the tighter,
+	// conservative bound -- the two strategies solve the same problem in
+	// opposite directions, not the same way.
+	crcTrailerWorstCase = 4
 )
 
 // GeometryDefault returns the ABI's recommended default profile:
@@ -142,9 +157,27 @@ func (g ShmGeometry) RegionBytes() (uint64, error) {
 }
 
 // isZero reports whether g is the zero ShmGeometry (no ring capacity and no
-// classes), which selects the default profile.
+// classes), which selects the default profile. It deliberately does not look
+// at LifecycleReserve: toLayout treats a LifecycleReserve-only value as zero
+// too, replacing the whole geometry with the complete default profile — the
+// caller's LifecycleReserve is not retained. isFullyZero is the predicate
+// that sees every public field; mutual-exclusion validation uses that one.
 func (g ShmGeometry) isZero() bool {
 	return g.RingCapacity == 0 && len(g.HostToPlugin) == 0 && len(g.PluginToHost) == 0
+}
+
+// isFullyZero reports whether g has NONE of its public fields set --
+// stricter than isZero, which toLayout uses to decide whether to substitute
+// the default profile and deliberately ignores LifecycleReserve alone (see
+// isZero's own doc). PluginSpec.MaxPayload's mutual exclusion with a
+// hand-authored Geometry needs the stricter meaning: a caller who sets
+// LifecycleReserve alone has still authored something, even though that
+// something would itself select the default profile's classes through
+// toLayout's rule, so it must not be silently accepted and overwritten
+// alongside a non-zero MaxPayload.
+func (g ShmGeometry) isFullyZero() bool {
+	return g.RingCapacity == 0 && g.LifecycleReserve == 0 &&
+		len(g.HostToPlugin) == 0 && len(g.PluginToHost) == 0
 }
 
 // toLayout converts the public geometry into the internal region layout, applying
@@ -197,6 +230,43 @@ func (g ShmGeometry) largestClasses() (hostToPlugin, pluginToHost uint32) {
 	pluginToHost = largestSlabSize(layout.Arenas[shm.PluginToHost].Classes)
 
 	return hostToPlugin, pluginToHost
+}
+
+// deriveFromMaxPayload resolves an intent-level PluginSpec.MaxPayload into the
+// three explicit fields the rest of Start consumes: the stock geometry, the
+// burst ceiling, and the chunk ceiling. It is the one place that implements
+// that derivation, so PluginSpec.MaxPayload's godoc can point at a single
+// function.
+//
+// Burst and stream-chunking switch on together, exactly when a frame of
+// maxPayload bytes might not fit shared memory under any negotiation
+// outcome: the CRC32C trailer is budgeted unconditionally
+// (crcTrailerWorstCase) because the checksum feature negotiates after spawn,
+// so this pre-spawn derivation cannot know whether it will be present. A
+// maxPayload at or below the stock ladder's certain-fit bound (the top
+// class minus that worst-case trailer) leaves both off: the stock geometry
+// alone already guarantees it, so nothing new is enabled and nothing new is
+// rejected -- MaxPayload never shrinks the geometry it derives. Above that
+// bound, the burst ceiling is raised to strictly exceed the top class --
+// validateBurstCeiling's only requirement is the strict inequality itself,
+// not any particular margin; adding slabHeadroom is simply a convenient
+// already-defined granularity unit that trivially satisfies it -- even when
+// maxPayload itself would already clear it, and the chunk ceiling is set to
+// maxPayload exactly, since stream-chunking's ceiling bounds the reassembled
+// logical message directly rather than a single frame.
+//
+// The returned geometry is always the stock default: MaxPayload's derivation
+// is shape-blind and symmetric by construction (the mutual exclusion with a
+// hand-authored Geometry guarantees no caller ever sees the two combined).
+func deriveFromMaxPayload(maxPayload uint32) (g ShmGeometry, burst, chunk uint32) {
+	g = GeometryDefault()
+	shmTop, _ := g.largestClasses() // symmetric: both directions equal
+
+	if maxPayload <= shmTop-crcTrailerWorstCase {
+		return g, 0, 0
+	}
+
+	return g, max(maxPayload, shmTop+slabHeadroom), maxPayload
 }
 
 // largestSlabSize returns the largest SlabSize among classes. A direction's

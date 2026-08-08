@@ -505,13 +505,16 @@ func TestChunkFragment_TerminateWithoutPartialDelivery_WhenAMiddleFragmentFailsB
 		// Then exactly one terminal is recorded, and it records CANCELED.
 		//
 		// §13.8 shape 4 also has the terminal wrap the underlying cause in the
-		// LOCALLY delivered error. The engine does wrap it, but the public seam's
-		// translation (styx.StreamError) maps a local cancel onto the bare
-		// styx.ErrCanceled sentinel and drops the chain, so no adopter-visible error
-		// names the cause. That is a divergence from §13.8, not something this row
-		// endorses: tighten the assertion below to also require the cause once the
-		// translation preserves it.
+		// LOCALLY delivered error. The engine wraps it (chunk_send.go's
+		// failVisibleTrain, shape 4), and the public seam's translation
+		// (styx.StreamError) now preserves that chain instead of collapsing it
+		// into the bare styx.ErrCanceled sentinel: the injected cause stays
+		// reachable through errors.Is on the exact error stream.SendMsg
+		// returned, proving §13.8's cause-preservation promise holds all the
+		// way to the public boundary, not just inside the engine.
 		require.ErrorIs(t, err, styx.ErrCanceled)
+		require.ErrorIs(t, err, errChunkFaultInjected,
+			"the public error stream.SendMsg returns must still carry the injected cause")
 		requireOneTerminal(t, context.Background(), stream, styx.ErrCanceled)
 		requireChunkFaultStoppedAt(t, trace, chunkFaultMiddle, chunkFaultFragments)
 

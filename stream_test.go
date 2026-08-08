@@ -423,6 +423,79 @@ func TestStreamError_MapsStatusCodesAndSentinels(t *testing.T) {
 	require.False(t, IsRetryable(panicReply))
 }
 
+// Test the termination contract's wrapped-cause promise at the public
+// boundary: a visible chunked-train failure wraps its underlying cause onto
+// rpcruntime.ErrCanceledLocally (internal/rpcruntime/chunk_send.go's
+// failVisibleTrain, shape 4), and StreamError must translate that into a
+// public error that still satisfies errors.Is(_, ErrCanceled) while keeping
+// the cause reachable — not the bare sentinel a caller cannot inspect past.
+func TestStreamError_PreservesTheWrappedCause_ForCanceledLocally(t *testing.T) {
+	// Given a distinguishable cause, shaped exactly as failVisibleTrain's
+	// default branch wraps it onto the local-cancellation sentinel.
+	type causeType struct{ error }
+	cause := causeType{errors.New("transport: something broke mid-train")}
+	wrapped := fmt.Errorf("%w: chunked stream send failed: %w", rpcruntime.ErrCanceledLocally, cause)
+
+	// When translated at the public boundary.
+	got := StreamError(wrapped)
+
+	// Then the public sentinel still matches...
+	require.ErrorIs(t, got, ErrCanceled)
+	// ...the internal engine sentinel is still reachable for anything that
+	// inspects past the public taxonomy...
+	require.ErrorIs(t, got, rpcruntime.ErrCanceledLocally)
+	// ...and the original cause itself is recoverable by both errors.Is and
+	// errors.As, exactly as fmt.Errorf's multi-%w chain promises.
+	require.ErrorIs(t, got, cause)
+	var recovered causeType
+	require.ErrorAs(t, got, &recovered)
+	require.Equal(t, cause.error, recovered.error)
+
+	// And the bare sentinel case (no train involved, no cause to preserve)
+	// still maps exactly as before: identically ErrCanceled, not merely
+	// something that satisfies errors.Is against it.
+	require.Equal(t, ErrCanceled, StreamError(rpcruntime.ErrCanceledLocally))
+}
+
+// Test that StreamError is idempotent on the canceled path: applying it a
+// second time to its own return value reproduces that same value, message
+// and chain alike, rather than wrapping ErrCanceled onto itself again.
+// Generated streaming code relies on this directly -- Send/Recv wrap
+// SendMsg/RecvMsg's return through StreamError a second time, even though
+// the underlying *Stream already ran it once via driveLocal.
+func TestStreamError_IsIdempotent_OnTheCanceledPath(t *testing.T) {
+	// Given the two shapes the canceled branch can see: the bare sentinel
+	// (no cause to preserve) and a chunked-train failure wrapping a real
+	// cause.
+	cause := errors.New("transport: something broke mid-train")
+	wrapped := fmt.Errorf("%w: chunked stream send failed: %w", rpcruntime.ErrCanceledLocally, cause)
+
+	cases := map[string]error{
+		"bare sentinel, no cause to preserve": rpcruntime.ErrCanceledLocally,
+		"a real wrapped cause":                wrapped,
+	}
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			// When translated twice, the second time over the first
+			// translation's own return value -- exactly what generated
+			// Send/Recv do over the underlying *Stream's already-translated
+			// result.
+			once := StreamError(in)
+			twice := StreamError(once)
+
+			// Then the second call returns the IDENTICAL error value, not
+			// merely one with an equal message: a fresh, redundant wrapper
+			// around the same content would fail this, even though it would
+			// pass a message-only or errors.Is-only comparison.
+			require.Same(t, once, twice,
+				"a repeated translation must return the exact same error value, not a redundant rewrap")
+			require.ErrorIs(t, twice, ErrCanceled)
+			require.Equal(t, errors.Is(once, cause), errors.Is(twice, cause),
+				"a repeated translation must not change whether the original cause is still reachable")
+		})
+	}
+}
+
 // Test translateStreamSendErr mapping an oversize STREAM_OPEN to the public,
 // not-retryable styx.ErrPayloadTooLarge, rather than falling into the default
 // arm's retryable styx.ErrPluginUnavailable — the frame provably never reached

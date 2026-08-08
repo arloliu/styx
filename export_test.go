@@ -244,11 +244,15 @@ func (h *Host) AddRuntimeForTest(name string, sup *supervisor.Supervisor) {
 }
 
 // SupervisorConfigForTest re-exports the internal supervision configuration a Host
-// builds for spec — the exact value startOne hands to supervisor.New — so host_test
-// (external test package) can assert what the public tuning knobs actually reach,
-// including that an unset knob still passes the zero that selects
-// internal/supervisor's own default.
+// builds for spec — the exact value startOne hands to supervisor.New, including
+// startOne's own applyMaxPayloadDerivation pass — so host_test (external test
+// package) can assert what the public tuning knobs actually reach, including
+// that an unset knob still passes the zero that selects internal/supervisor's
+// own default, and that a non-zero MaxPayload resolves into Geometry,
+// BurstMaxPayload, and ChunkMaxPayload exactly as startOne would derive them.
 func (h *Host) SupervisorConfigForTest(spec PluginSpec) supervisor.Config {
+	spec = applyMaxPayloadDerivation(spec)
+
 	return h.supervisorConfig(spec, newUnavailableClientConn(spec.Name), h.nextHealthOrigin(spec.Name))
 }
 

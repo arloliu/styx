@@ -22,6 +22,7 @@ import (
 	"github.com/arloliu/styx/internal/shm"
 	"github.com/arloliu/styx/internal/supervisor"
 	"github.com/arloliu/styx/internal/testutil"
+	"github.com/arloliu/styx/internal/transport"
 	shmtransport "github.com/arloliu/styx/internal/transport/shm"
 	pubsupervisor "github.com/arloliu/styx/supervisor"
 	"github.com/stretchr/testify/require"
@@ -2777,4 +2778,204 @@ func TestSupervisor_ShmConfig_NeverClampsTheOutboundPayloadUnderChunking(t *test
 	s.SetShmConfigAdjusterForTest(func(c *shmtransport.Config) { c.MaxPayload = 4096 })
 	_, clampErr := s.ShmConfigForTest(16, active)
 	require.ErrorIs(t, clampErr, shmtransport.ErrChunkingSendClamp)
+}
+
+// maxPayloadInterlockLayout builds a symmetric single-class shm.Layout whose
+// one class is the stock top class -- enough for validateMaxPayloadInterlock's
+// per-direction arithmetic, which reads only the largest configured slab per
+// direction.
+func maxPayloadInterlockLayout() shm.Layout {
+	classes := []shm.SizeClass{{SlabSize: maxPayloadInterlockStockTop, SlabCount: 8}}
+
+	return shm.Layout{
+		Arenas: [2]shm.ArenaGeometry{
+			shm.HostToPlugin: {Classes: classes},
+			shm.PluginToHost: {Classes: classes},
+		},
+	}
+}
+
+// The stock top class and its exact per-direction inline limits under the two
+// checksum outcomes: the top class is 1048640 bytes and the CRC32C trailer is
+// 4, so checksum on lowers the exact limit to 1048636.
+const (
+	maxPayloadInterlockStockTop        uint32 = 1048640
+	maxPayloadInterlockChecksumOnLimit uint32 = 1048636
+)
+
+// Test validateMaxPayloadInterlock accepting a zero Config.MaxPayload
+// unconditionally -- the field asked for nothing, so nothing is enforced,
+// regardless of transport or negotiated features.
+func TestValidateMaxPayloadInterlock_AcceptsZero(t *testing.T) {
+	// Given a zero Config.MaxPayload on an otherwise ordinary negotiated tuple.
+	cfg := supervisor.Config{ShmLayout: maxPayloadInterlockLayout()}
+	tuple := control.Tuple{Transport: control.TransportUDS}
+
+	// When validated, then it passes.
+	require.NoError(t, supervisor.ValidateMaxPayloadInterlockForTest(cfg, tuple))
+}
+
+// Test validateMaxPayloadInterlock's uds half: a MaxPayload above the fixed
+// uds frame cap is refused with a typed *control.IncompatibleError naming
+// MaxPayload, once a tuple has negotiated uds -- including a TransportAuto
+// spec that negotiated there, which Start's own check (pinned TransportUDS
+// only) never sees. A value at the cap is accepted.
+func TestValidateMaxPayloadInterlock_UDS_RefusesAboveTheFrameCap(t *testing.T) {
+	// Given a tuple that negotiated uds.
+	tuple := control.Tuple{Transport: control.TransportUDS}
+
+	// Given a MaxPayload one byte over the fixed uds frame cap, when
+	// validated, then it is refused with a typed error naming MaxPayload.
+	over := supervisor.Config{MaxPayload: transport.MaxFrameSize + 1}
+	err := supervisor.ValidateMaxPayloadInterlockForTest(over, tuple)
+	var incompatErr *control.IncompatibleError
+	require.ErrorAs(t, err, &incompatErr)
+	require.Contains(t, incompatErr.Reason, "MaxPayload")
+
+	// Given a MaxPayload exactly at the cap, when validated, then it passes.
+	atCap := supervisor.Config{MaxPayload: transport.MaxFrameSize}
+	require.NoError(t, supervisor.ValidateMaxPayloadInterlockForTest(atCap, tuple))
+}
+
+// Test validateMaxPayloadInterlock's shared-memory half against a
+// feature-mute peer (burst and stream-chunking both unresolved): MaxPayload
+// at or below the stock top class's checksum-off inline limit (1048640) is
+// accepted -- the guarantee is already met without either capability -- and
+// refusal begins exactly one byte over it.
+func TestValidateMaxPayloadInterlock_SHM_FeatureMutePeer_ChecksumOff(t *testing.T) {
+	// Given a shared-memory tuple that resolved neither burst nor
+	// stream-chunking, and checksum off.
+	cfg := supervisor.Config{ShmLayout: maxPayloadInterlockLayout()}
+	tuple := control.Tuple{Transport: control.TransportSHM} // no features resolved true
+
+	// When MaxPayload is at or below the stock top class's checksum-off
+	// inline limit, then it is accepted.
+	for _, maxPayload := range []uint32{maxPayloadInterlockStockTop - 1, maxPayloadInterlockStockTop} {
+		cfg.MaxPayload = maxPayload
+		require.NoError(t, supervisor.ValidateMaxPayloadInterlockForTest(cfg, tuple),
+			"maxPayload=%d must fit the top class inline without the trailer", maxPayload)
+	}
+
+	// When MaxPayload is one byte over that limit, then it is refused,
+	// naming MaxPayload and both missing capabilities.
+	cfg.MaxPayload = maxPayloadInterlockStockTop + 1
+	err := supervisor.ValidateMaxPayloadInterlockForTest(cfg, tuple)
+	var incompatErr *control.IncompatibleError
+	require.ErrorAs(t, err, &incompatErr)
+	require.Contains(t, incompatErr.Reason, "MaxPayload")
+	require.Contains(t, incompatErr.Reason, "burst")
+	require.Contains(t, incompatErr.Reason, "stream-chunking")
+}
+
+// Test validateMaxPayloadInterlock against the SAME feature-mute peer with
+// checksum resolved on: the exact limit drops by the 4-byte CRC32C trailer to
+// 1048636, so both values TestValidateMaxPayloadInterlock_SHM_FeatureMutePeer_
+// ChecksumOff accepted now refuse -- proving the interlock reads the
+// NEGOTIATED checksum choice, not the derivation's unconditional worst-case
+// budgeting. Checksum is unreachable cross-process (no production offer in
+// this module lists it), so this tuple is hand-built rather than driven
+// through a real handshake.
+func TestValidateMaxPayloadInterlock_SHM_FeatureMutePeer_ChecksumOn(t *testing.T) {
+	// Given the same feature-mute shared-memory tuple, now with checksum
+	// resolved on.
+	cfg := supervisor.Config{ShmLayout: maxPayloadInterlockLayout()}
+	tuple := control.Tuple{
+		Transport: control.TransportSHM,
+		Features:  map[string]bool{"checksum": true},
+	}
+
+	// When MaxPayload is exactly at the checksum-on exact limit, then it is
+	// accepted.
+	require.NoError(t, supervisor.ValidateMaxPayloadInterlockForTest(
+		supervisor.Config{ShmLayout: cfg.ShmLayout, MaxPayload: maxPayloadInterlockChecksumOnLimit}, tuple),
+		"the exact limit under checksum is 1048636")
+
+	// When MaxPayload is one byte over the checksum-on exact limit -- the
+	// FIRST refused byte, not merely a value comfortably past it -- then it
+	// is refused. This is the boundary a trailer-arithmetic mutation
+	// (budgeting 3 bytes instead of 4) would otherwise leave unnoticed: at
+	// 1048637 such a mutation would compute an exact limit of 1048637 and
+	// wrongly accept, while every other row in this test stays green.
+	oneOverLimit := supervisor.Config{ShmLayout: cfg.ShmLayout, MaxPayload: maxPayloadInterlockChecksumOnLimit + 1}
+	err := supervisor.ValidateMaxPayloadInterlockForTest(oneOverLimit, tuple)
+	var incompatErr *control.IncompatibleError
+	require.ErrorAsf(t, err, &incompatErr,
+		"maxPayload=%d is one byte over the checksum-on limit of %d and the peer is feature-mute",
+		maxPayloadInterlockChecksumOnLimit+1, maxPayloadInterlockChecksumOnLimit)
+
+	// When MaxPayload is either value the checksum-off case accepted, then
+	// both now refuse -- the checksum-on trailer lowered the exact limit
+	// out from under them.
+	for _, maxPayload := range []uint32{maxPayloadInterlockStockTop - 1, maxPayloadInterlockStockTop} {
+		got := supervisor.Config{ShmLayout: cfg.ShmLayout, MaxPayload: maxPayload}
+		err := supervisor.ValidateMaxPayloadInterlockForTest(got, tuple)
+		var incompatErr *control.IncompatibleError
+		require.ErrorAsf(t, err, &incompatErr,
+			"maxPayload=%d exceeds the checksum-on limit of %d and the peer is feature-mute",
+			maxPayload, maxPayloadInterlockChecksumOnLimit)
+	}
+}
+
+// Test validateMaxPayloadInterlock accepting a MaxPayload beyond the exact
+// inline limit when the negotiated tuple actually resolved both burst and
+// stream-chunking -- the ordinary production case a real derived spec
+// reaches once the plugin genuinely supports both.
+func TestValidateMaxPayloadInterlock_SHM_AcceptsAboveTheLimit_WhenBothCapabilitiesResolved(t *testing.T) {
+	// Given a MaxPayload well above the exact inline limit, with both burst
+	// and stream-chunking resolved active on the negotiated tuple.
+	cfg := supervisor.Config{
+		ShmLayout:       maxPayloadInterlockLayout(),
+		MaxPayload:      4 << 20,
+		BurstMaxPayload: 4 << 20,
+		ChunkMaxPayload: 4 << 20,
+	}
+	tuple := control.Tuple{
+		Transport: control.TransportSHM,
+		Features:  map[string]bool{control.FeatureBurst: true, control.FeatureStreamChunking: true},
+	}
+
+	// When validated, then it passes.
+	require.NoError(t, supervisor.ValidateMaxPayloadInterlockForTest(cfg, tuple))
+}
+
+// Test validateMaxPayloadInterlock naming exactly the capability that stayed
+// unresolved when only one of burst/stream-chunking is active -- a peer that
+// implements one but not the other, which the derivation's own "both switch
+// on together" rule never produces on its own but the interlock must still
+// diagnose precisely for a hand-built or partially upgraded peer.
+func TestValidateMaxPayloadInterlock_SHM_NamesOnlyTheUnresolvedCapability(t *testing.T) {
+	// Given a MaxPayload above the exact limit that needs both capabilities.
+	base := supervisor.Config{
+		ShmLayout:       maxPayloadInterlockLayout(),
+		MaxPayload:      4 << 20,
+		BurstMaxPayload: 4 << 20,
+		ChunkMaxPayload: 4 << 20,
+	}
+
+	// When only burst resolved active, then the refusal names
+	// stream-chunking as missing, using the EXACT token production emits
+	// ("the plugin did not resolve %s", supervisor.go's own Reason format),
+	// and does not emit that same token for burst -- an incorrect
+	// "burst and stream-chunking" reason (naming both when only one is
+	// actually missing) would still contain "stream-chunking" alone, so the
+	// negative assertion is what catches that.
+	burstOnly := control.Tuple{Transport: control.TransportSHM, Features: map[string]bool{control.FeatureBurst: true}}
+	err := supervisor.ValidateMaxPayloadInterlockForTest(base, burstOnly)
+	var incompatErr *control.IncompatibleError
+	require.ErrorAs(t, err, &incompatErr)
+	require.Contains(t, incompatErr.Reason, "did not resolve stream-chunking")
+	require.NotContains(t, incompatErr.Reason, "did not resolve burst",
+		"burst itself is active here and must not be named as missing")
+
+	// When only stream-chunking resolved active, then the refusal names
+	// burst as missing, using the same exact production token, and does not
+	// also name stream-chunking as missing.
+	chunkOnly := control.Tuple{
+		Transport: control.TransportSHM, Features: map[string]bool{control.FeatureStreamChunking: true},
+	}
+	err = supervisor.ValidateMaxPayloadInterlockForTest(base, chunkOnly)
+	require.ErrorAs(t, err, &incompatErr)
+	require.Contains(t, incompatErr.Reason, "did not resolve burst")
+	require.NotContains(t, incompatErr.Reason, "did not resolve stream-chunking",
+		"stream-chunking itself is active here and must not be named as missing")
 }
