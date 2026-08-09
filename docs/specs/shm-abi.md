@@ -178,8 +178,9 @@ roundup(32729600, 4096) = 32731136` (~31.21 MiB); `region_size = 2·4096 +
 2·(4096·64) + 2·32731136 = 8192 + 524288 + 65462272 = 65994752` (~62.9 MiB).
 Asymmetric variants (e.g. a smaller P→H arena) are allowed.
 
-**`benchmark` profile (the spike-equivalent 146 MiB geometry — used by the Task 11
-spike comparison and MUST remain exactly this geometry for comparability):**
+**`benchmark` profile (the spike-equivalent 146 MiB geometry
+— used by the spike-comparison benchmarks
+and MUST remain exactly this geometry for comparability):**
 `ring_capacity = 8192`; per direction classes {64 B ×8192, 4 KiB ×2048,
 1 MiB ×64} ⇒ `arena_bytes_dir = 64·8192 + 4096·2048 + 1048576·64 = 524288 +
 8388608 + 67108864 = 76021760`; `region_size = 2·4096 + 2·(8192·64) +
@@ -635,12 +636,10 @@ and every UDS connection — the paragraph above applies to value 9 unamended:
 it MUST NOT be written and MUST poison on read. Values 10..255 remain
 reserved/unassigned unconditionally.
 
-**Note on the brief's checklist.** The plan's §5 checklist enumerates
-`UNARY_REQ, UNARY_RESP, STREAM_OPEN, STREAM_MSG, STREAM_ACK, STREAM_CLOSE,
-STREAM_ERR, CANCEL` and omits `UNARY_ERR`. `UNARY_ERR = 8` is included here
+**Note on `UNARY_ERR`.** `UNARY_ERR = 8` is included
 because the SHM `FrameKind` mirrors `transport.FrameKind` at the wire level, and
-`transport.go` defines `FrameUnaryErr = 8`. Omitting it would desynchronize the
-two wire numberings.
+`transport.go` defines `FrameUnaryErr = 8`.
+Omitting it would desynchronize the two wire numberings.
 
 ### Flag bits (`flags`, offset 50)
 
@@ -819,7 +818,7 @@ slab only after the consumer's head has advanced past the referencing descriptor
 and a conforming consumer reads nothing from the slab after that advance (§9), so
 a slab can never be simultaneously in-flight and reallocated.
 This is honest about what the ABI can actually
-guarantee (the reviewer's requirement) and matches the retained `bench/spike`
+guarantee and matches the retained `bench/spike`
 allocator, which carries no per-slab stamp at all.
 
 - The producer maintains a **process-local**, per-arena `alloc_seq` counter
@@ -1416,8 +1415,7 @@ dispatched after `shutdown` is observed.
 (a `time.Duration`), never an iteration count, tuned by benchmarking. What is
 **ABI-normative** is only the state-word protocol and its seq_cst ordering above;
 the concrete budget is configuration. The following requirement, however, is
-**binding** (M0 gate exit condition, `docs/plans/2026-07-16-m0-gate-report.md`
-§10–§11): `effectiveSpinBudget()` MUST be **quota-aware** — spin MUST be disabled
+**binding**: `effectiveSpinBudget()` MUST be **quota-aware** — spin MUST be disabled
 (budget forced to 0), or sharply shrunk, under **any finite cgroup CPU quota**
 (not merely below a 2-CPU threshold), and MUST be 0 when `GOMAXPROCS == 1`. A
 spinner MUST NEVER be able to starve the producer, dispatcher, heartbeat, or GC of
@@ -1838,8 +1836,8 @@ Admission control runs **before any resource is allocated** (design §19).
 deadlock-freedom** and **per-frame fit** (below) — and **refuses to load** if
 either fails. It does **not** certify that the region can physically hold every
 concurrently-admitted call: arena exhaustion — running out of free slabs of a
-serving class at runtime — is **typed backpressure by design** (design §12/§19;
-M2 plan Task 4, "exhaustion as typed backpressure"), **not** a safety violation.
+serving class at runtime — is **typed backpressure by design** (design §12/§19),
+**not** a safety violation.
 `Admit` (§8) returns a backpressure result and the caller blocks until space or
 receives `ErrBackpressure` (design §19). Avoiding exhaustion at a target load is a
 **sizing** concern (a non-normative guideline, and an optional STRICT
@@ -1852,9 +1850,9 @@ Let, **per direction** (arenas and class tables are per-direction, §2/§6):
 - `R = lifecycle_reserve` — read from the **layout page** (§2), `0 < R < C`,
   **RECOMMENDED default `R = C/16`** (= 256 at the `default` profile `C = 4096`,
   512 at the `benchmark` `C = 8192`): ring slots kept unavailable to data frames so
-  the lifecycle lane (design §12/§19) always has room. This is a **starting**
-  default, empirically tuned in Task 11; it is a scaling rule, not a magic
-  constant. Both producers read the same `R` from the layout page, so the
+  the lifecycle lane (design §12/§19) always has room. This is a **starting** default,
+  tuned empirically on the SHM-transport benchmarks;
+  it is a scaling rule, not a magic constant. Both producers read the same `R` from the layout page, so the
   reservation is identical on both sides.
 - `overhead = 32·[TRACE_PRESENT ∈ allowed_flags] + 4·[CRC32C_PRESENT ∈ allowed_flags]`:
   the **conservative** worst-case per-frame slab overhead, counted for exactly the

@@ -1527,8 +1527,8 @@ progress"*. Under the collapse those classes resolve into two rules on one queue
 design §12 assigns it and what the ABI's `R`-slot reserve exists to deliver. It
 is not a claim that a `CANCEL` overtakes lifecycle intents submitted before it,
 because the production writer's single FIFO queue cannot express that and this
-document specifies nothing the writer cannot do (§5.4). The rule the brief states
-— *"`CANCEL` must never be delayed by `STREAM_ACK` coalescing"* — holds exactly:
+document specifies nothing the writer cannot do (§5.4).
+The rule that `CANCEL` must never be delayed by `STREAM_ACK` coalescing holds exactly:
 coalescing happens in the receiver's own state before submission (§5.1) and never
 holds a submitted `CANCEL` behind an unsubmitted ACK.
 
