@@ -95,3 +95,17 @@ func SetReceiveDeadlineArmHookForTest(fn func(deadline time.Time)) (restore func
 
 	return func() { receiveDeadlineArmHook = prev }
 }
+
+// SetReceiveConsumeHookForTest installs a hook that fires on the first destructive byte a receive consumes,
+// and returns a restore func.
+// It lets a test that must expire a budget mid-frame wait
+// until the frame has provably started before it advances the clock —
+// without it, the expiry can beat the first read
+// and the abort is correctly judged non-fatal.
+// Test-only; nil in production.
+func SetReceiveConsumeHookForTest(fn func()) (restore func()) {
+	prev := receiveConsumeHook
+	receiveConsumeHook = fn
+
+	return func() { receiveConsumeHook = prev }
+}

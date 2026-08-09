@@ -1977,6 +1977,10 @@ func TestUDSTransport_Recv_PoisonsTransport_WhenHeaderBudgetExpiresMidHeader(t *
 	budget := transport.ReceiveBudget{Slack: 10 * time.Second, Clock: clock}
 	peer, recv := newBudgetedTransportPair(t, budget, func(err error) { observed <- err })
 
+	consumed := make(chan struct{}, 1)
+	restore := transport.SetReceiveConsumeHookForTest(func() { consumed <- struct{}{} })
+	defer restore()
+
 	writeRaw(t, peer.FD(), []byte{0x00}) // one header byte, then the peer stops
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute) // far later than the budget
@@ -1985,6 +1989,15 @@ func TestUDSTransport_Recv_PoisonsTransport_WhenHeaderBudgetExpiresMidHeader(t *
 	// When
 	out := recvAsync(ctx, recv)
 	headerDeadline := arms.next(t)
+	// The clock must not pass the deadline
+	// until the receive has consumed the written byte:
+	// an expiry that beats the first read is correctly judged non-fatal,
+	// and this test is about the fatal, byte-consumed abort.
+	select {
+	case <-consumed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the receive never consumed the written header byte")
+	}
 	clock.set(headerDeadline.Add(time.Nanosecond)) // one tick past the header budget
 
 	// Then
