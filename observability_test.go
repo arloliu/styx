@@ -455,12 +455,16 @@ func TestHost_StdioDroppedHook_SubmitsWhenEnabled(t *testing.T) {
 	require.NotNil(t, hook)
 	hook(3, 2)
 
+	// Both counters are incremented by one dispatched closure,
+	// but as two separate sink calls — a poll can land between them,
+	// so neither counter alone proves the other has been written.
+	// Wait for both.
 	require.Eventually(t, func() bool {
 		return sink.labeledCounter(observe.MetricStdioDropped,
-			observe.Label{Key: labelPlugin, Value: "echo"}, observe.Label{Key: labelStream, Value: "stdout"}) == 3
+			observe.Label{Key: labelPlugin, Value: "echo"}, observe.Label{Key: labelStream, Value: "stdout"}) == 3 &&
+			sink.labeledCounter(observe.MetricStdioDropped,
+				observe.Label{Key: labelPlugin, Value: "echo"}, observe.Label{Key: labelStream, Value: "stderr"}) == 2
 	}, time.Second, 5*time.Millisecond)
-	require.Equal(t, int64(2), sink.labeledCounter(observe.MetricStdioDropped,
-		observe.Label{Key: labelPlugin, Value: "echo"}, observe.Label{Key: labelStream, Value: "stderr"}))
 }
 
 // Test the observe-dropped reporter computing the per-interval delta of a
