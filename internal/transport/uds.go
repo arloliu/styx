@@ -72,6 +72,14 @@ var readinessWaitHook func()
 // by a transport that carries a receive budget, so a plain uds receive never sees it.
 var receiveDeadlineArmHook func(deadline time.Time)
 
+// receiveConsumeHook, when non-nil,
+// is invoked as a receive consumes the first destructive byte of its frame
+// — test-only,
+// letting a test that must expire a budget mid-frame wait
+// until the frame has provably started before it advances the clock.
+// Nil in production.
+var receiveConsumeHook func()
+
 // SetReadinessWaitHookForTest installs a hook WaitReadable invokes immediately before it
 // blocks in the readiness peek, and returns a restore func. It is a TEST SEAM: nil in
 // production (the hook is never set outside tests), so the readiness wait runs unchanged.
@@ -874,6 +882,9 @@ func (r *fdReader) Read(p []byte) (int, error) {
 
 		n, err := unix.Read(r.t.fd, p)
 		if n > 0 {
+			if !r.started && receiveConsumeHook != nil {
+				receiveConsumeHook() // test-only: the frame's first destructive byte was just consumed.
+			}
 			r.started = true
 		}
 
