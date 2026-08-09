@@ -1,8 +1,7 @@
 # Styx — High-Level Design
 
 **Date:** 2026-07-16
-**Status:** Draft for review
-**Reference spec:** `tmp/kickoff.md`
+**Status:** Design of record
 **Reference consumer:** a device gateway — a host application that manages a
 fleet of out-of-process device-protocol driver plugins for connected
 hardware
@@ -68,7 +67,7 @@ handshake, typed interfaces, host-side lifecycle ownership, crash isolation.
 - Not a plugin-package distributor/fetcher: `PluginSpec` takes a local binary path and
   an optional SHA-256 hash. Downloading, caching, or resolving plugin packages at
   runtime (the device gateway's own package store/fetcher) is the host application's
-  job, not Styx's (§27, Open Question 4).
+  job, not Styx's (§27).
 
 ## 5. Requirements from the Reference Consumer (a device gateway)
 
@@ -93,8 +92,8 @@ what the device gateway currently builds around go-plugin:
 - **process-group-scoped kill, not single-PID.** `arloliu/go-plugin` originally
   SIGKILL'd only the plugin's own PID, orphaning any grandchild it forked (drivers,
   subprocess tooling); fixed upstream-of-Styx by killing the plugin's whole process
-  group, with a configurable opt-out for TTY-interactive dev use (§27 Open Question 2
-  catalog). Styx's teardown machine (§9) must do the same from day one.
+  group, with a configurable opt-out for TTY-interactive dev use
+  (§27 fork catalog). Styx's teardown machine (§9) must do the same from day one.
 - **panic-isolated internal goroutines.** The same fork catalog found host-crashing
   panics in log-pump/stdout-capture goroutines triggered by malformed plugin output or
   a panicking user-supplied sink. Styx's capture and observability goroutines (§18)
@@ -147,7 +146,7 @@ configurable per plugin.
 
 ## 7. Package Layout
 
-Module `github.com/arloliu/styx` (final org is Open Question 1).
+Module `github.com/arloliu/styx` (final module path; §27).
 
 ```
 styx/                      // public: Host, HostConfig, PluginSpec, PluginServer,
@@ -218,7 +217,7 @@ error and wake all waiters (including parked eventfd waiters, via a dedicated sh
 signal); (3) join every goroutine that can touch the mapping; (4) `munmap`;
 (5) **when teardown is terminating a child process** (old hot-reload instance, poisoned
 or wedged plugin, shutdown), graceful `Shutdown` with a deadline (configurable per
-plugin, not hard-coded — a fork pain point, §27 Open Question 2) over the still-open
+plugin, not hard-coded — a fork pain point, §27 fork catalog) over the still-open
 control socket → `SIGKILL` fallback **sent to the plugin's process group, not just its
 PID** (configurable opt-out for TTY-interactive dev use — the same fork pain point) →
 `waitpid` reap, always; (6) close all local fds exactly
